@@ -506,3 +506,74 @@ fn a_resumed_session_in_the_checkout_is_not_told_it_is_shared() {
     assert_eq!(p.start("s1", "resume", &p.root), "");
     assert!(p.runs().is_empty());
 }
+
+/// A person's `finish --allow-unsafe-local` is the authority the merged-tree
+/// checks need at accept: discovered work must not be accepted on the file and
+/// symbol analysis alone when the project moved under it.
+#[test]
+fn accepting_discovered_work_runs_its_checks_on_the_merged_tree() {
+    let p = Project::new("checks:\n  verify: ['test ! -f forbidden.txt']\n");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let finish = p.dispatch(&["finish", &id, "--allow-unsafe-local"]);
+    assert!(finish.status.success(), "{}", text(&finish));
+    assert_eq!(p.only_run()["outcome"]["verification"], "passed");
+
+    // The project moves in a way only the merged tree's checks can see.
+    fs::write(p.root.join("forbidden.txt"), "added by someone else\n").unwrap();
+    let accept = p.dispatch(&["accept", &id]);
+    assert!(
+        !accept.status.success(),
+        "accepted without its merged-tree checks"
+    );
+    assert!(
+        text(&accept).contains("test ! -f forbidden.txt"),
+        "{}",
+        text(&accept)
+    );
+    assert_eq!(
+        fs::read_to_string(p.root.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    1\n}\n"
+    );
+}
+
+/// The project owner holds a run's lock for a moment while it checks the
+/// Work; a person's finish waits for it rather than failing.
+#[test]
+fn finish_waits_for_the_owner_to_let_go_of_the_run() {
+    use std::os::fd::AsRawFd;
+
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(p.run_dir(&id).join(".operation.lock"))
+        .unwrap();
+    // Held elsewhere for longer than a refusal would take.
+    let held = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(held, 0);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        drop(lock);
+    });
+    let finish = p.dispatch(&["finish", &id]);
+    release.join().unwrap();
+    assert!(finish.status.success(), "{}", text(&finish));
+    assert_eq!(p.only_run()["outcome"]["work_result"], "ready");
+}

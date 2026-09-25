@@ -923,9 +923,12 @@ pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<
 /// itself, and become an ordinary Ready result. See part 14.9.
 pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Result<RunRecord> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
+    // A moment's wait: the project owner holds this lock briefly while it
+    // checks the Work. A live wrapper holds it for the whole session.
+    let _run_lock = OperationLock::acquire_wait(
         &state.run_dir(&resolved_run_id).join(".operation.lock"),
         "attached work has a foreground owner",
+        Duration::from_secs(5),
     )?;
     let run = state.load_run(&resolved_run_id)?;
     anyhow::ensure!(
@@ -940,6 +943,26 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
     );
 
     let mut db = Database::open(state.db_path())?;
+    let mut run = run;
+    if allow_unsafe_local && !run.environment.unsafe_local {
+        // The person's acknowledgement is the run's from now on, so the checks
+        // on the merged tree run at accept too, as for work attached with it.
+        run.environment.unsafe_local = true;
+        db.sync_run(&run)?;
+        persist_event(
+            state,
+            &db,
+            EventRecord {
+                run_id: run.id.clone(),
+                candidate_label: None,
+                event_type: "attach.authorized".into(),
+                timestamp: Utc::now(),
+                payload: serde_json::json!({"unsafe_local": true, "by": "human"}),
+                ..EventRecord::default()
+            },
+            &mut run,
+        )?;
+    }
     let run = finish_locked(
         state,
         &mut db,

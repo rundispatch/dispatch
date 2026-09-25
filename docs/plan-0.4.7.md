@@ -205,3 +205,27 @@ project's own `.claude/settings.local.json`.
 - 2026-09-25: Stage 0. Plan agreed: Codex deferred; consent per project and bound
   to the exact effective `checks.verify` commands; no automatic deletion, with an
   explicit `dispatch clean`.
+- Stage 1. The merged-tree check for discovered Work, and a person's commands
+  racing the owner.
+  - **Reproduced:** discovered Work, finished with `--allow-unsafe-local`, was
+    accepted into a project that had moved in a way only its checks catch (an
+    added `forbidden.txt`): the merged-tree checks were skipped because the run
+    had no recorded authority.
+  - **Fix:** a person's `finish --allow-unsafe-local` records the authority on the
+    run (`environment.unsafe_local`, event `attach.authorized`). Accept now runs
+    the merged-tree checks and refuses, quoting the failing check.
+  - **Found while testing:** a person's `finish` could fail at once ("attached
+    work has a foreground owner") when the background owner briefly held the run
+    lock to check the Work. `accept`/`reject` could likewise fail with "stale
+    review" when the owner recorded a verdict in between.
+    - `finish` and review now wait up to 5 s for the lock.
+    - The command line's `accept`/`reject` name a run, not a revision, so they no
+      longer compare revisions. The interactive review, which shows a particular
+      result, still does.
+  - Tests:
+    - `accepting_discovered_work_runs_its_checks_on_the_merged_tree`;
+    - `finish_waits_for_the_owner_to_let_go_of_the_run` (the test holds the lock
+      for 1.5 s).
+
+    Both fail on the old code.
+  - Full suite: 486 passed.

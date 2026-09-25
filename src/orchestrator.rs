@@ -1690,7 +1690,7 @@ pub(crate) fn review_target(
     state: &State,
     command: &ReviewCommand,
 ) -> Result<(RunRecord, OperationLock)> {
-    let (run, lock) = locked_delivery(state, command)?;
+    let (run, lock) = locked_delivery(state, command, true)?;
     anyhow::ensure!(
         run.outcome.review == ReviewState::Pending,
         "result has already been reviewed"
@@ -1702,19 +1702,29 @@ pub(crate) fn review_target(
 /// A review judges a delivered result: attached work that is still active has
 /// no patch yet (`dispatch finish` produces it), and a native run waiting on a
 /// question is answered, not reviewed.
-fn locked_delivery(state: &State, command: &ReviewCommand) -> Result<(RunRecord, OperationLock)> {
+/// The run's delivered result, under its lock. A person's command waits a
+/// moment for the lock, which the project owner holds briefly while it checks
+/// the Work. `exact_revision` is for a review of the result as it was shown:
+/// the command line names a run, not a revision, and a verdict the owner
+/// records meanwhile is not a change to the result.
+fn locked_delivery(
+    state: &State,
+    command: &ReviewCommand,
+    exact_revision: bool,
+) -> Result<(RunRecord, OperationLock)> {
     let id = state.resolve_run_id(&command.run_id)?;
     anyhow::ensure!(
         id == command.run_id,
         "review requires the complete run identity"
     );
-    let lock = OperationLock::acquire(
+    let lock = OperationLock::acquire_wait(
         &state.run_dir(&id).join(".operation.lock"),
         "run has a foreground owner",
+        std::time::Duration::from_secs(5),
     )?;
     let run = state.load_run(&id)?;
     anyhow::ensure!(
-        run.state_revision == command.revision,
+        !exact_revision || run.state_revision == command.revision,
         "stale review; the result changed"
     );
     anyhow::ensure!(
@@ -1836,7 +1846,7 @@ pub fn accept_or_reject_latest(
     // One lock covers the review and the apply. A result may be reviewed
     // again (the latest revision stands), so this does not require a
     // pending review the way the interactive delivery does.
-    let (run, _lock) = locked_delivery(state, &command)?;
+    let (run, _lock) = locked_delivery(state, &command, false)?;
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     review_locked(state, run, decision, reasons, explanation, false)?;
