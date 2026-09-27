@@ -331,3 +331,51 @@ project's own `.claude/settings.local.json`.
     - PTY: Enter alone removes nothing; "Remove them" removes it.
   - Full suite: 495 passed, 1 failed (`claude_refusal_is_sticky_until_reauthorized`,
     the known timing-sensitive test; it passes on rerun).
+- Stage 6. Real-agent trial (Claude Code and Cursor), with state kept apart from
+  the real `~/.dispatch`. The hooks were only in the trial project's
+  `.claude/settings.local.json`.
+  - **Removal events.** Removal was delivered as the `WorktreeRemove` hook event
+    that Claude Code sends, piped to `dispatch hook claude`. The worktree was then
+    removed with `git worktree unlock` and `git worktree remove --force`, since
+    `claude -p` locks the worktrees it makes.
+  - **C1, consent granted.**
+    - Consent was granted through `setup --checks`, and `status` said "checks run
+      by themselves".
+    - `claude -p --worktree` registered Work with `unsafe_local`, and recorded
+      `attach.authorized` by "project consent".
+    - On removal, the hook kept the exact Δ and exited 0. The owner then finished
+      the Work by consent: Ready, checks passed, `by_consent`, review pending,
+      nothing applied.
+    - A teammate commit landed. Accepting from `dispatch watch` (arrow keys, then
+      `a`) applied it after the merged-tree checks passed, with the verdict
+      CONTINUE.
+  - **C2, consent invalidated.**
+    - The checks in `dispatch.yml` were changed, and `status` said "check consent
+      no longer holds".
+    - The next session registered Work without `unsafe_local`. Removal kept the
+      exact Δ, and the Work stayed in progress, waiting for a person.
+    - **Found:** `dispatch reject` refused that Work ("no delivered result to
+      review"). There was no way to close it except finishing it. **Fixed:**
+      reject now closes any unfinished Work whose workspace is gone, whether its Δ
+      was kept exactly or only last seen (`attach::close_removed`, which replaces
+      the lost-only `close_lost`). The Δ stays in the run. After the fix, the
+      trial's reject printed "Closed …: its workspace is gone, and its kept
+      changes stay at …/delta.patch." New test:
+      `rejecting_removed_work_closes_it_and_keeps_its_changes`.
+    - **Found:** the removal notice said "finish or reject it" even when consent
+      meant Dispatch would verify the Work itself. It now says Dispatch will run
+      the project's checks, as the person allowed, and then waits for review.
+      This is asserted in `consented_work_is_verified_by_itself_…`.
+  - **C3, reject and clean.**
+    - `dispatch attach -- cursor-agent …` from the checkout finished Ready, with
+      checks passed, in a workspace Dispatch made.
+    - It was rejected with `dispatch reject`. Reject from `watch` is covered by
+      the PTY journey, not repeated here. The workspace was kept.
+    - `dispatch clean --dry-run` listed it, along with two older rejected
+      workspaces from earlier trials. Without a terminal, `clean` refused and
+      named `--yes`.
+    - On a terminal, "Remove them" removed all three worktrees and their
+      `dispatch/…` branches. Each run's record and `delta.patch` stay.
+      `managed.removed` is true.
+  - Full suite: 497 passed, 0 failed. The trial's state directory held runs and
+    workspaces from the 0.4.6 trial; 0.4.7 read, listed and cleaned them.

@@ -1398,10 +1398,10 @@ pub(crate) fn note_workspace_gone(
     )
 }
 
-/// Close Work whose workspace vanished before its final changes were kept: a
-/// person's decision (`dispatch reject`), as it can never be finished. The
-/// changes last seen stay beside the run.
-pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
+/// Close unfinished Work whose workspace is gone: the person's decision
+/// (`dispatch reject`) not to keep it. Its changes stay beside the run: the
+/// exact ones kept at removal, or those last seen when it vanished.
+pub(crate) fn close_removed(state: &State, run_id: &str) -> Result<()> {
     let _lock = OperationLock::acquire_wait(
         &state.run_dir(run_id).join(".operation.lock"),
         "attached work has a foreground owner",
@@ -1413,9 +1413,8 @@ pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
             && run
                 .attachment
                 .as_ref()
-                .and_then(|attachment| attachment.workspace_removed.as_ref())
-                .is_some_and(|removal| !removal.exact),
-        "work {run_id} is not work whose workspace was lost"
+                .is_some_and(|attachment| attachment.workspace_removed.is_some()),
+        "work {run_id} is not unfinished work whose workspace is gone"
     );
     let now = Utc::now();
     if let Some(candidate) = run.candidates.first_mut() {
@@ -1429,7 +1428,7 @@ pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
     run.outcome.review = ReviewState::NotRequested;
     if let Some(attempt) = run.attempts.first_mut() {
         attempt.completed_at = Some(now);
-        attempt.outcome = "workspace_lost".into();
+        attempt.outcome = "workspace_removed".into();
     }
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1441,7 +1440,7 @@ pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
             candidate_label: None,
             event_type: "work.closed".into(),
             timestamp: now,
-            payload: serde_json::json!({"reason": "workspace_lost", "by": "human"}),
+            payload: serde_json::json!({"reason": "workspace_removed", "by": "human"}),
             ..EventRecord::default()
         },
         &mut run,

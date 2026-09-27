@@ -1842,22 +1842,27 @@ pub(crate) fn decide(
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_unresolved_single(state, source_path)?,
     };
-    // Work whose workspace vanished before its final changes were kept has no
-    // result to review, and rejecting it is how a person closes it.
-    let lost = run
+    // Unfinished Work whose workspace is gone has no result to review yet;
+    // rejecting it is how a person closes it. Its changes stay in the run.
+    let removed = run
         .attachment
         .as_ref()
         .and_then(|attachment| attachment.workspace_removed.as_ref())
-        .is_some_and(|removal| !removal.exact);
-    if !accept && lost && run.outcome.lifecycle == LifecycleState::Working {
-        attach::close_lost(state, &run.id)?;
+        .map(|removal| removal.exact);
+    if let Some(exact) =
+        removed.filter(|_| !accept && run.outcome.lifecycle == LifecycleState::Working)
+    {
+        attach::close_removed(state, &run.id)?;
+        let kept = if exact {
+            sole_candidate(&run)?.diff_path.clone()
+        } else {
+            state.run_dir(&run.id).join("delta-last-seen.patch")
+        };
         let line = format!(
-            "Closed {}: its workspace is gone, and the changes last seen stay at {}.",
+            "Closed {}: its workspace is gone, and its {} changes stay at {}.",
             run.id,
-            state
-                .run_dir(&run.id)
-                .join("delta-last-seen.patch")
-                .display()
+            if exact { "kept" } else { "last seen" },
+            kept.display()
         );
         if !quiet {
             println!("{line}");

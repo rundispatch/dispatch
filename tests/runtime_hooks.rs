@@ -664,7 +664,13 @@ fn consented_work_is_verified_by_itself_when_its_worktree_is_removed() {
         "pub fn f() -> i32 {\n    2\n}\n",
     )
     .unwrap();
-    assert!(p.remove().status.success());
+    let removed = p.remove();
+    assert!(removed.status.success());
+    assert!(
+        text(&removed).contains("will run the project's checks"),
+        "{}",
+        text(&removed)
+    );
     let run = p.until("verified", |run| run["outcome"]["lifecycle"] == "finished");
     assert_eq!(run["outcome"]["work_result"], "ready", "{run}");
     assert_eq!(run["outcome"]["verification"], "passed", "{run}");
@@ -731,4 +737,32 @@ fn an_empty_worktree_that_vanishes_unannounced_closes_with_no_changes() {
     let run = p.until("closed", |run| run["outcome"]["lifecycle"] == "finished");
     assert_eq!(run["outcome"]["work_result"], "cancelled", "{run}");
     assert_eq!(run["attachment"]["workspace_removed"]["exact"], false);
+}
+
+/// Unfinished Work whose worktree was removed waits for a person: rejecting it
+/// closes it, and its kept changes stay in the run.
+#[test]
+fn rejecting_removed_work_closes_it_and_keeps_its_changes() {
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    assert!(p.remove().status.success());
+    let reject = p.dispatch(&["reject", &id]);
+    assert!(reject.status.success(), "{}", text(&reject));
+    assert!(
+        text(&reject).contains("kept changes stay at"),
+        "{}",
+        text(&reject)
+    );
+    let run = p.only_run();
+    assert_eq!(run["outcome"]["lifecycle"], "finished");
+    assert_eq!(run["outcome"]["work_result"], "cancelled");
+    let patch = fs::read_to_string(p.run_dir(&id).join("delta.patch")).unwrap();
+    assert!(patch.contains("+    2"), "{patch}");
 }
