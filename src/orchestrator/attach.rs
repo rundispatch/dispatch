@@ -409,6 +409,21 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         },
         &mut run,
     )?;
+    if runtime.is_some() && unsafe_local {
+        persist_event(
+            state,
+            &db,
+            EventRecord {
+                run_id: run.id.clone(),
+                candidate_label: None,
+                event_type: "attach.authorized".into(),
+                timestamp: Utc::now(),
+                payload: serde_json::json!({"unsafe_local": true, "by": "project consent"}),
+                ..EventRecord::default()
+            },
+            &mut run,
+        )?;
+    }
 
     // The wrapped form writes nothing to the terminal while the agent runs
     // (part 6.7): its owner loop prints its own single line only after the

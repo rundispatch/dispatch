@@ -123,6 +123,22 @@ pub(crate) fn watcher(state: &State, root: &Path) -> Result<Watcher> {
     })
 }
 
+/// The project line for `watch` and `status`: who watches, and whether Work
+/// here may run its checks by themselves.
+pub(crate) fn project_line(state: &State, root: &Path) -> String {
+    let consent = crate::consent::project_root(root)
+        .and_then(|project| crate::consent::consent(state, &project))
+        .map(|consent| consent.describe());
+    match consent {
+        Ok(Some(consent)) => format!("{} · {consent}", describe(state, root)),
+        Ok(None) => describe(state, root),
+        Err(error) => format!(
+            "{} · check consent unknown: {error:#}",
+            describe(state, root)
+        ),
+    }
+}
+
 /// One line on who watches `root`, for `watch` and `status`.
 pub(crate) fn describe(state: &State, root: &Path) -> String {
     match watcher(state, root) {

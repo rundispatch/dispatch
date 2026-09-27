@@ -1,5 +1,6 @@
 pub mod coherence;
 pub mod config;
+pub mod consent;
 pub mod db;
 pub mod executor;
 pub mod follow;

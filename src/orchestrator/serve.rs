@@ -143,7 +143,7 @@ pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
         let header = format!(
             "{} · {}",
             root.display(),
-            super::background::describe(state, &root)
+            super::background::project_line(state, &root)
         );
         let journal = Database::open_read_only(state.db_path())
             .and_then(|db| db.latest_event_id())

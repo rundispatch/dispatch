@@ -201,6 +201,9 @@ fn start(
         return Ok(Reply::Silent);
     }
     let provider = session.provider.clone();
+    // Authority to run the project's checks comes only from the person's
+    // consent for exactly these checks, never from the session.
+    let consented = crate::consent::consent(state, root)?.is_valid();
     let name = workspace
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
@@ -213,7 +216,7 @@ fn start(
             agent: Some(provider),
             pid: None,
             command: None,
-            allow_unsafe_local: false,
+            allow_unsafe_local: consented,
             auto_apply: false,
             runtime: Some(RuntimeStart { session, resumed }),
         },

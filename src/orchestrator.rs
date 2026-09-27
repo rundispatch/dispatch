@@ -1537,7 +1537,7 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     }
     println!(
         "\nProject: {}",
-        background::describe(state, &run.source_path)
+        background::project_line(state, &run.source_path)
     );
     Ok(())
 }

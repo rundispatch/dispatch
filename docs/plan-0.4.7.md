@@ -229,3 +229,29 @@ project's own `.claude/settings.local.json`.
 
     Both fail on the old code.
   - Full suite: 486 passed.
+- Stage 2. Project check consent.
+  - `src/consent.rs` keeps `<state>/projects/<root-key>.json`: `{version, root,
+    commands, granted_at}`, written durably in a 0700 directory. The root is the
+    repository's main worktree, so every worktree shares one consent.
+  - Consent is `Valid` only while the recorded commands equal the effective
+    `checks.verify`. Otherwise it is `Changed { approved, now }`; any change,
+    even an addition, needs re-approval.
+  - `dispatch setup --checks` with checks chosen offers "Change checks…", "Let
+    Work run these checks by themselves…" / "Stop letting Work run these checks
+    by themselves" and "Back". Allowing shows the exact commands with focus on
+    Cancel.
+  - Runtime registration gives Work local authority only with valid consent, and
+    records `attach.authorized { by: "project consent" }`.
+  - `status` and `watch` project lines add "checks run by themselves" or "check
+    consent no longer holds: the checks changed".
+  - Tests:
+    - 3 unit tests: exact-command binding, including an addition; the repository
+      cannot grant; one project only; no checks means no consent;
+    - a PTY journey: Enter cancels; Allow writes consent to the state, not the
+      project; Stop revokes;
+    - `consent_for_the_projects_checks_gives_discovered_work_its_authority`:
+      authority and event, never auto-apply, and a checks change voids consent
+      for new Work, with `status` saying why.
+  - Full suite: 484 passed, 6 failed. The failures were all in `claude_profiles`
+    ("Claude CLI version changed": the fake CLI's 5 s version probe timed out
+    under machine load). All 10 pass alone.

@@ -108,6 +108,22 @@ for line in sys.stdin:
     with session('checks-plain',['--plain','setup','--checks']) as ui:
         ui.wait('1) sh ./verify.sh');ui.wait('[1] >');ui.send('\r');ui.wait('Approved check saved');ui.finish()
     assert '- sh ./verify.sh' in (source/'dispatch.yml').read_text()
+    # With checks chosen, setup --checks is also where Work may be allowed to
+    # run them by themselves: consent for exactly these commands, kept in the
+    # state, never the project. Enter on the consent screen cancels.
+    consents=lambda: list((state/'projects').glob('*.json')) if (state/'projects').exists() else []
+    with session('checks-consent',['--plain','setup','--checks']) as ui:
+        ui.wait('asks you before running them');ui.wait('2) Let Work run these checks');ui.send('2\r')
+        ui.wait('2) Cancel');ui.mark('consent');ui.send('\r');ui.wait('Nothing changed');ui.finish()
+    assert not consents(), 'Enter alone gave consent'
+    with session('checks-consent-allow',['--plain','setup','--checks']) as ui:
+        ui.wait('2) Let Work run these checks');ui.send('2\r');ui.wait('2) Cancel');ui.send('1\r')
+        ui.wait('will run these checks by themselves');ui.finish()
+    granted=consents();assert len(granted)==1 and 'sh ./verify.sh' in granted[0].read_text(), granted
+    assert 'consent' not in (source/'dispatch.yml').read_text(), 'consent must not be written into the project'
+    with session('checks-consent-revoke',['--plain','setup','--checks']) as ui:
+        ui.wait('runs them by themselves');ui.wait('2) Stop letting Work');ui.send('2\r');ui.wait('now asks you');ui.finish()
+    assert not consents(), 'revoking left consent behind'
     calls=[json.loads(l) for l in (root/'probe-args').read_text().splitlines()]
     assert all('--version' in c or 'app-server' in c or 'status' in c or 'login' in c for c in calls)
     assert not (state/'dispatch.db').exists(), 'setup acquired execution authority'

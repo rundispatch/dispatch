@@ -577,3 +577,58 @@ fn finish_waits_for_the_owner_to_let_go_of_the_run() {
     assert!(finish.status.success(), "{}", text(&finish));
     assert_eq!(p.only_run()["outcome"]["work_result"], "ready");
 }
+
+/// With the person's consent for exactly the project's checks, Work a runtime
+/// registers may run them; a change to the checks voids that for new Work.
+#[test]
+fn consent_for_the_projects_checks_gives_discovered_work_its_authority() {
+    let p = Project::new("checks:\n  verify: ['true']\n");
+    p.watch();
+    let state = dispatch::state::State::discover(Some(p.state.clone())).unwrap();
+    dispatch::consent::grant(&state, &p.root).unwrap();
+    p.start("s1", "startup", &p.worktree);
+    let run = p.only_run();
+    let id = run["id"].as_str().unwrap().to_owned();
+    assert_eq!(run["environment"]["unsafe_local"], true);
+    assert_eq!(
+        run["attachment"]["capabilities"]["integrate"], false,
+        "never auto-apply"
+    );
+    let db = rusqlite::Connection::open(p.state.join("dispatch.db")).unwrap();
+    let by: String = db
+        .query_row(
+            "SELECT json_extract(payload_json, '$.by') FROM events WHERE run_id = ?1 AND event_type = 'attach.authorized'",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(by, "project consent");
+
+    // The checks change: new Work asks first, and the project says why.
+    fs::write(
+        p.root.join("dispatch.yml"),
+        "coherence:\n  poll_secs: 1\nchecks:\n  verify: ['true', 'sh ./other.sh']\n",
+    )
+    .unwrap();
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "worktree-y",
+            ".claude/worktrees/y",
+        ],
+    );
+    let other = fs::canonicalize(p.root.join(".claude/worktrees/y")).unwrap();
+    p.start("s2", "startup", &other);
+    let second = p
+        .runs()
+        .into_iter()
+        .find(|run| run["id"] != id.as_str())
+        .unwrap();
+    assert_eq!(second["environment"]["unsafe_local"], false);
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(status.contains("check consent no longer holds"), "{status}");
+}
