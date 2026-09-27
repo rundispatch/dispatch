@@ -622,3 +622,86 @@ fn wrapped_attach_from_a_plain_directory_works_in_a_private_copy() {
     );
     assert!(f.delta_patch(&id).contains("+    2"));
 }
+
+/// Nothing is removed by a timer: `dispatch clean` lists the workspaces of
+/// Work that is over and removes them only when the person says so.
+#[test]
+fn clean_removes_only_listed_workspaces_of_work_that_is_over() {
+    let f = Fixture::new();
+    let (rejected, _) = f.attach_from_the_checkout(&f.root);
+    assert!(f.dispatch(&["reject", &rejected]).status.success());
+    // A second one waits for review: never cleanable.
+    let before: std::collections::HashSet<String> = fs::read_dir(f.state.join("runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    let mut command = f.attach_command(&f.root, &[]);
+    command
+        .env("STDIN_CAPTURE", f._temp.path().join("stdin-capture-2"))
+        .env("READY", f._temp.path().join("ready-2"))
+        .env_remove("GATE")
+        .env("EXIT_CODE", "0");
+    let mut child = OwnedChild(command.spawn().unwrap());
+    child.write_stdin_line("hello");
+    assert!(child.finish().status.success());
+    let pending = fs::read_dir(f.state.join("runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|id| !before.contains(id))
+        .unwrap();
+    let workspace =
+        |id: &str| PathBuf::from(f.metadata(id)["attachment"]["workspace"].as_str().unwrap());
+    let text = |output: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    let dry = f.dispatch(&["clean", "--dry-run"]);
+    assert!(dry.status.success(), "{}", text(&dry));
+    assert!(
+        text(&dry).contains(&workspace(&rejected).display().to_string()),
+        "{}",
+        text(&dry)
+    );
+    assert!(
+        !text(&dry).contains(&workspace(&pending).display().to_string()),
+        "{}",
+        text(&dry)
+    );
+    assert!(workspace(&rejected).exists());
+
+    let unasked = f.dispatch(&["clean"]);
+    assert!(!unasked.status.success());
+    assert!(text(&unasked).contains("--yes"), "{}", text(&unasked));
+    assert!(workspace(&rejected).exists());
+
+    let cleaned = f.dispatch(&["clean", "--yes"]);
+    assert!(cleaned.status.success(), "{}", text(&cleaned));
+    assert!(!workspace(&rejected).exists());
+    assert!(
+        workspace(&pending).exists(),
+        "work waiting for review keeps its workspace"
+    );
+    assert_eq!(
+        f.metadata(&rejected)["attachment"]["managed"]["removed"],
+        true
+    );
+    let reason: String = f
+        .db()
+        .query_row(
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE run_id = ?1 AND event_type = 'workspace.released'",
+            [&rejected],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "cleaned");
+    let again = f.dispatch(&["clean", "--yes"]);
+    assert!(
+        text(&again).contains("Nothing to clean"),
+        "{}",
+        text(&again)
+    );
+}

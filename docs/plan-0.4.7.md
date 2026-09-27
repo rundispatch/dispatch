@@ -314,3 +314,20 @@ project's own `.claude/settings.local.json`.
     fix (treat a failed probe as unknown, not changed).
   - Full suite: 492 passed, 3 failed (all `claude_profiles`, that probe timeout;
     10/10 pass alone).
+- Stage 5. `dispatch clean`.
+  - `attach::cleanable` lists Dispatch-made workspaces that still exist and whose
+    Work is over: rejected, closed, or applied and not yet released. Work in
+    progress or waiting for review is never listed.
+  - `attach::clean` removes each listed workspace under its run's lock, and only
+    if it is still cleanable. It uses `release_workspace`, which now records a
+    reason: `applied` after apply, `cleaned` here.
+  - **Flags:** `--dry-run` lists only. On a terminal, `clean` confirms with
+    focus on Cancel. Without a terminal, it needs `--yes`.
+  - Tests:
+    - `clean_removes_only_listed_workspaces_of_work_that_is_over`: the dry run
+      lists only the rejected one; without a terminal and without `--yes` it
+      refuses; `--yes` removes the rejected workspace, records `cleaned`, and
+      keeps the one awaiting review; a second clean finds nothing.
+    - PTY: Enter alone removes nothing; "Remove them" removes it.
+  - Full suite: 495 passed, 1 failed (`claude_refusal_is_sticky_until_reauthorized`,
+    the known timing-sensitive test; it passes on rerun).

@@ -516,7 +516,7 @@ fn make_workspace(
 /// Δ is in the checkout now, so nothing is lost. Only a workspace under
 /// `<state>/workspaces/` recorded at creation is ever removed; a failure is
 /// reported and the workspace kept.
-pub(super) fn release_workspace(state: &State, run: &mut RunRecord) -> Result<()> {
+pub(super) fn release_workspace(state: &State, run: &mut RunRecord, reason: &str) -> Result<()> {
     let Some(attachment) = run.attachment.as_ref() else {
         return Ok(());
     };
@@ -549,12 +549,85 @@ pub(super) fn release_workspace(state: &State, run: &mut RunRecord) -> Result<()
             candidate_label: None,
             event_type: "workspace.released".into(),
             timestamp: Utc::now(),
-            payload: serde_json::json!({"workspace": workspace}),
+            payload: serde_json::json!({"workspace": workspace, "reason": reason}),
             ..EventRecord::default()
         },
         run,
     )?;
     Ok(())
+}
+
+/// A workspace `dispatch clean` may remove: Dispatch made it, it is still
+/// there, and its Work is over (rejected, closed, or applied and not yet
+/// released). Never one of Work in progress or waiting for review.
+pub struct Cleanable {
+    pub run_id: String,
+    pub workspace: PathBuf,
+    pub branch: Option<String>,
+    pub why: &'static str,
+}
+
+pub fn cleanable(state: &State) -> Result<Vec<Cleanable>> {
+    let mut found = Vec::new();
+    for path in state.list_metadata_paths()? {
+        let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("invalid metadata at {}", path.display()))?;
+        let Some(made) = projected
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.managed.as_ref())
+            .filter(|made| !made.removed)
+        else {
+            continue;
+        };
+        let run = state.load_run(&projected.id)?;
+        if run.outcome.lifecycle != LifecycleState::Finished {
+            continue;
+        }
+        let why = if run.outcome.application == ApplicationState::Applied {
+            "applied"
+        } else if run.outcome.review == ReviewState::Rejected {
+            "rejected"
+        } else if run.outcome.work_result != WorkResult::Ready {
+            "closed"
+        } else {
+            continue; // waiting for review
+        };
+        let workspace = run.attachment.as_ref().expect("managed").workspace.clone();
+        if !workspace.exists() {
+            continue;
+        }
+        found.push(Cleanable {
+            run_id: run.id.clone(),
+            workspace,
+            branch: made.branch.clone(),
+            why,
+        });
+    }
+    Ok(found)
+}
+
+/// Remove what `cleanable` listed, each under its run's lock and only if it
+/// is still cleanable then. Returns how many were removed.
+pub fn clean(state: &State, listed: &[Cleanable]) -> Result<usize> {
+    let mut removed = 0;
+    for item in listed {
+        let _lock = OperationLock::acquire_wait(
+            &state.run_dir(&item.run_id).join(".operation.lock"),
+            "the work is in use",
+            Duration::from_secs(5),
+        )?;
+        let still = cleanable(state)?
+            .into_iter()
+            .any(|now| now.run_id == item.run_id && now.workspace == item.workspace);
+        if !still {
+            continue;
+        }
+        let mut run = state.load_run(&item.run_id)?;
+        release_workspace(state, &mut run, "cleaned")?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// `dispatch attach -- <command...>`: the wrapped form's owner loop (parts

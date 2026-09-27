@@ -169,6 +169,16 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Remove the workspaces Dispatch made for Work that is over (rejected,
+    /// closed, or applied and not yet released), after you confirm.
+    Clean {
+        /// Only list what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove without asking (required without a terminal).
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
+    },
     /// Show a run and its persisted signals.
     #[command(hide = true)]
     Show { run_id: String },
@@ -627,6 +637,19 @@ async fn run() -> Result<()> {
             }
         }
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
+        Command::Clean { dry_run, yes } => {
+            dispatch::presenter::clean(
+                &state,
+                dry_run,
+                yes,
+                dispatch::presenter::Options {
+                    plain: cli.plain,
+                    ascii: cli.ascii,
+                    no_color: cli.no_color,
+                },
+            )
+            .await
+        }
         Command::Hook { provider } => {
             use std::io::Read;
             anyhow::ensure!(provider == "claude", "unknown agent runtime: {provider}");

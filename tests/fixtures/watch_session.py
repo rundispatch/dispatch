@@ -62,4 +62,19 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             ui.send('q');ui.finish()
     finally:
         subprocess.run([binary,'--state-dir',str(state),'stop','--root',str(repo)],capture_output=True)
+    # dispatch clean asks before removing a workspace Dispatch made; Enter alone
+    # removes nothing.
+    subprocess.run([binary,'--state-dir',str(state),'attach','--allow-unsafe-local','--','sh','-c','echo made > lib.txt'],
+        cwd=repo,stdin=subprocess.DEVNULL,check=True,capture_output=True)
+    made=[p.parent.name for p in (state/'runs').glob('*/metadata.json')
+          if (json.loads(p.read_text()).get('attachment') or {}).get('workspace_owner')=='dispatch']
+    assert len(made)==1,made; made=made[0]
+    subprocess.run([binary,'--state-dir',str(state),'reject',made],check=True,capture_output=True)
+    kept=Path(meta(made)['attachment']['workspace']); assert kept.exists()
+    with Session([binary,'--state-dir',str(state),'clean'],repo,captures,'clean-cancel',width=160,height=30) as ui:
+        ui.wait('Cancel');ui.send('\r');ui.wait('Nothing was removed');ui.finish()
+    assert kept.exists(),'Enter alone removed a workspace'
+    with Session([binary,'--state-dir',str(state),'clean'],repo,captures,'clean-remove',width=160,height=30) as ui:
+        ui.wait('Cancel');ui.send('\x1b[A');ui.pump(.3);ui.send('\r');ui.wait('Removed 1');ui.finish()
+    assert not kept.exists()
     print('watch journeys passed')
