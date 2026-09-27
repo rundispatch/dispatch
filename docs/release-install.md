@@ -51,6 +51,21 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.7
+
+No migration; the schema stays at 24. State is forward-only: a run finished by
+check consent records `finish_reason: by_consent`, which 0.4.6 cannot read.
+- The state directory gains `projects/`, one private file per project whose checks
+  you let run by themselves (`dispatch setup --checks`). Each file names the exact
+  `checks.verify` commands approved; a change to them voids the consent until you
+  approve again.
+- New command: `dispatch clean`. Rejected workspaces that 0.4.6 kept under
+  `<state>/workspaces/` are listed by it; nothing is removed without asking.
+- `dispatch watch` on a terminal is now interactive. `watch --json`, `--plain` and
+  output that is not a terminal are unchanged.
+- After upgrading, `dispatch stop && dispatch start` replaces an owner started by
+  the old binary; only a 0.4.7 owner verifies Work by consent.
+
 ### Upgrading to 0.4.6
 
 No migration; the schema stays at 24. State is forward-only: runs written by 0.4.6

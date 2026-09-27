@@ -191,6 +191,7 @@ dispatch finish <run-id> [--allow-unsafe-local]
 dispatch start  [--root <path>]
 dispatch watch  [--root <path>] [--json]
 dispatch stop   [--root <path>]
+dispatch clean  [--dry-run] [--yes]
 dispatch serve  [--root <path>] [--json]
 ```
 
@@ -204,10 +205,11 @@ dispatch serve  [--root <path>] [--json]
 | `--allow-unsafe-local` | explicitly allows `checks.verify` to run on the host at `finish` time |
 | `--auto-apply` | sets `capabilities.integrate`: apply automatically once the work is ready and coherent |
 | `-- <command> [args...]` | selects the **wrapped** form: everything after `--` is the agent command Dispatch spawns and owns for the session |
-| `dispatch finish <run-id> [--allow-unsafe-local]` | foreign work only: freeze Δ, run `checks.verify` in the workspace, become an ordinary Ready result |
+| `dispatch finish <run-id> [--allow-unsafe-local]` | foreign work only: freeze Δ, run `checks.verify` in the workspace, become an ordinary Ready result. The flag is recorded on the run (`attach.authorized {by: "human"}`), so accept's merged-tree checks run too |
 | `dispatch start [--root <path>]` | run the project owner in the background (`serve --background` in its own session) and return |
 | `dispatch watch [--root <path>] [--json]` | the project view, live; holds no lock, records nothing |
 | `dispatch stop [--root <path>]` | stop exactly this root's owner |
+| `dispatch clean [--dry-run] [--yes]` | remove leftover workspaces Dispatch made, after listing them and asking |
 | `dispatch serve [--root <path>] [--json]` | the project owner in the foreground, with the view |
 
 Whether `attach` is wrapped or foreign is decided by whether a command follows `--`:
@@ -334,8 +336,17 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   version).
   - It checks every second for a new event id or a change of watcher, and redraws
     at least every 30 s so finished Work ages out.
-  - It holds no lock and records nothing, so leaving it (Ctrl+C) never stops
-    watching.
+  - It holds no lock and records nothing of its own, so leaving it (`q` or
+    Ctrl+C) never stops watching.
+  - On a terminal, the rows can be selected (↑/↓ or j/k). A key runs exactly the
+    command a person would type, as them, under the same locks and authority:
+    - `f` is `dispatch finish`; without the project's check consent it asks
+      before running checks, which is the same as `--allow-unsafe-local`;
+    - `a` is `dispatch accept`, and a refusal is shown as accept prints it;
+    - `r` is `dispatch reject`, after a confirmation with focus on Cancel;
+    - `d` or Enter opens the review screen.
+
+    `--json`, `--plain` and output that is not a terminal stay passive.
   - `--json` adds a `{"type":"watcher", "watcher"}` object whenever the header
     changes.
   - `dispatch status` ends with the same line (`Project: …`).
@@ -378,7 +389,8 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   - `working`;
   - `question` (the run waits for your `dispatch answer`);
   - `idle` (discovered work with no open session);
-  - `removed` (its workspace is gone and its exact changes are kept, waiting for you);
+  - `removed` (its workspace is gone and its exact changes are kept, waiting for
+    you, or for its checks when the project's check consent holds);
   - `lost` (its workspace vanished unannounced; it cannot be finished);
   - `ready`, `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
     `finished`.
@@ -409,6 +421,15 @@ the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
   is then in the checkout. It is kept after a reject (whose message prints its
   path), after a crash, or when removal fails. `dispatch status <id>` shows where it
   is and what became of it.
+- **Clean:** nothing is deleted on a timer. `dispatch clean` lists the workspaces
+  Dispatch made whose Work is over (rejected, closed, or applied but not
+  released) and that still exist, with path, branch and Work.
+  - On confirmation (focus on Cancel; without a terminal, `--yes`) it removes each
+    one and its branch, under the run's lock, and only if it is still cleanable.
+    It records `workspace.released {reason: "cleaned"}`.
+  - `--dry-run` only lists them.
+  - Work in progress or waiting for review is never listed. A runtime's or your
+    own workspace is never touched. The run's record and Δ stay.
 
 ## Work a runtime registers
 
@@ -429,8 +450,19 @@ runtime's event on stdin):
 - **A fresh session in the checkout itself** is told that Dispatch cannot tell its
   edits from yours. Nothing is tracked. A resumed session gets no notice, because
   Claude Code reports the checkout before re-entering the session's worktree.
-- **Verification:** runtime-registered Work carries no authority to run checks.
-  `dispatch finish <id> --allow-unsafe-local` is a person's decision.
+- **Verification:** runtime-registered Work carries no authority to run checks of
+  its own. It gets that authority in one of two ways:
+  - **A person's `dispatch finish <id> --allow-unsafe-local`**, recorded on the
+    run.
+  - **The project's check consent**, granted in `dispatch setup --checks`.
+    - It is stored at `<state>/projects/<sha256(root)>.json` and names the root
+      and the exact effective `checks.verify` commands. It is never stored in the
+      repository, so a repository cannot grant itself host execution.
+    - Work registered while it holds is created with local authority
+      (`attach.authorized {by: "project consent"}`).
+    - When `checks.verify` changes, it no longer holds until the person approves
+      the new commands.
+    - It authorizes checks only; applying still needs a person's review.
 - **Workspace removal.** Claude Code deletes a worktree in two ways: at session exit,
   which runs `WorktreeRemove`, and through its `ExitWorktree` tool with `action:
   remove`, which does not. For that second path Dispatch hooks `PreToolUse`. Before
@@ -438,12 +470,19 @@ runtime's event on stdin):
   synced into the run, and the removal committed, before the hook returns.
   - If that fails, or takes longer than 240 s, the hook fails and Claude Code keeps
     the worktree (for `ExitWorktree`, the tool call is refused).
-  - Removal is an observation, not an ending: the Work waits for `finish`, which
-    verifies it in a workspace rebuilt from S0 and the kept Δ, or for `reject`.
+  - Removal is an observation, not an ending. The Work waits for `finish`, which
+    verifies it in a workspace rebuilt from S0 and the kept Δ, or for `reject`,
+    which closes it and keeps the Δ in the run.
+  - With the project's check consent still holding, for the same commands the
+    Work was authorized with, the owner does that `finish` on its next tick
+    (`finish_reason: by_consent`). The Work becomes Ready, or shows its failed
+    checks, and waits for review. This happens after the hook returns, so the
+    hook's budget is unchanged.
   - Only an empty Δ closes the Work.
   - If a followed workspace vanishes without the hook, the owner keeps the last Δ it
     followed (`delta-last-seen.patch`). That Work cannot be finished; rejecting it
-    closes it.
+    closes it. If that last Δ was empty, the Work closes by itself with no
+    changes.
 
 ## The gate rule for attached runs
 
@@ -506,6 +545,10 @@ In addition to the existing coherence, application and review events (see
 | `attach.started` | the wrapped form's agent process has been spawned | `{"agent_process": <ProcessIdentity>}` |
 | `attach.finished` | `finish` (either explicit or on agent exit) freezes Δ | `{"reason": <FinishReason>}` |
 | `attach.adopted` | `serve` takes over observation of an orphaned run | `{"owner_state": "adopted"}` |
+| `attach.authorized` | Work gains local authority: from the project's check consent, or from a person's `finish --allow-unsafe-local` | `{"unsafe_local": true, "by": "project consent" \| "human"}` |
+| `workspace.removed` | the workspace is gone: kept exactly by the hook, or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes"}` |
+| `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
+| `work.closed` | a person rejected unfinished Work whose workspace is gone | `{"reason": "workspace_removed", "by": "human"}` |
 
 An attached run also commits the ordinary `run.created`/`run.finished` events, and
 `coherence.checked`/`coherence.invalidated`, `result.applied`/`application.failed`,
@@ -598,8 +641,10 @@ directory, exactly as it already refuses any newer schema.
   plus `flock` files; `serve` discovers new or changed Work on its next tick (at most
   `poll_secs`, default 10 s). This is adequate for work measured in minutes to hours,
   not for sub-second push updates.
-- `serve` never finishes, launches, kills or refreshes anything. Wrapped attach and a
-  human (`dispatch finish`) remain the only things that finish a Work.
+- `serve` never launches, kills or refreshes anything. It finishes Work only when
+  the project's check consent holds and a runtime removed the Work's workspace
+  with its exact Δ kept. Otherwise wrapped attach and a human (`dispatch finish`)
+  are the only things that finish a Work.
 - No foreign process is ever signaled. `--pid` and the wrapper's own child PID are
   liveness-only.
 - `mid_run: stop` does not apply to attached work in this version; a `Stop` verdict on

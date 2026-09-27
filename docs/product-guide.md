@@ -67,6 +67,16 @@ code and is not proof of task-specific correctness. No script or tool is install
 Use `/checks` or `dispatch setup --checks` to do this independently. Advanced
 `checks.verify` configuration remains supported.
 
+`dispatch setup --checks` can also let Work in the project run its checks by
+themselves: Work that a runtime reports then has them run when its worktree is
+removed, and accept runs them on the merged tree.
+- The screen shows the exact commands, and focus starts on Cancel.
+- The permission lives in Dispatch's state, never in the repository, and names
+  those exact commands. If `checks.verify` changes, it no longer holds until you
+  approve the new commands; `dispatch status` and `dispatch watch` say which.
+- It runs checks only. Applying still needs your review.
+- Stop it on the same screen.
+
 Work shows the actual selected resource, committed phase, elapsed time and launch
 accounting. Recorded launches, uncertain spawn and configured limits are distinct;
 counts are read from the committed per-attempt launch record. The elapsed indicator covers
@@ -321,7 +331,14 @@ repository, and returns your shell. The owner:
 **`dispatch watch`** shows a one-line-per-run project view,
 `<id> · agent · CONTINUE/REFRESH/STOP · working/question/ready/applied/blocked · reason`,
 under a line saying who watches. It redraws in place as things change, and leaving
-it does not stop watching. **`dispatch stop`** ends watching. `dispatch serve` is
+it does not stop watching. On a terminal, ↑/↓ select a row and a key acts on it
+as the command would:
+- `f` finishes attached Work, asking first before running checks nobody has
+  allowed;
+- `a` accepts, through the same gate as `dispatch accept`;
+- `r` rejects, after asking, with focus on Cancel;
+- `d` or Enter opens the review;
+- `q` leaves. **`dispatch stop`** ends watching. `dispatch serve` is
 the same owner in the foreground, with the view.
 
 Watching needs no agent profile. It covers:
@@ -341,10 +358,17 @@ Claude Code's hooks into `~/.claude/settings.json`: `SessionStart`, `SessionEnd`
 - **What they do:** in a project you watch, a Claude Code session in its own
   worktree (`claude --worktree`) becomes Work by itself, with S0 taken before its
   first edit. When Claude Code removes the worktree, its exact changes are kept
-  first, and the Work waits for you to `finish` or `reject` it.
+  first. If you allowed the project's checks to run by themselves, Dispatch then
+  runs them and the Work waits for your review. Otherwise it waits for you to
+  `finish` or `reject` it.
 - **Sessions in your checkout:** a fresh one is told that Dispatch cannot follow it.
 - **Other agents:** `dispatch attach -- <agent>` from your checkout gives any agent
-  CLI a workspace of its own.
+  CLI a workspace of its own. It is removed once the work is applied. After a
+  reject it stays until `dispatch clean`:
+  - `clean` lists the leftover workspaces Dispatch made and asks before removing
+    them;
+  - `--dry-run` only lists them;
+  - `--yes` skips the question where there is no terminal.
 
 What shows in the CLI: `dispatch status` and `dispatch check` treat an attached run
 exactly like any other single-result run once it is finished — same `Coherence`

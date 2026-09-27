@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.6 — experimental developer preview**
+**Dispatch 0.4.7 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -59,8 +59,10 @@ verdict of every Work item it knows about current as the code moves:
 - attached work still in progress;
 - attached work it may apply.
 
-`dispatch watch` shows that state live; leaving it does not stop watching.
-`dispatch stop` ends watching for this project. No agent needs to be set up
+`dispatch watch` shows that state live. On a terminal you can act on a row
+without typing its ID: `f` finishes, `a` accepts, `r` rejects (after asking),
+`d` reviews. Leaving it does not stop watching. `dispatch stop` ends watching for
+this project. No agent needs to be set up
 for any of this.
 
 ```text
@@ -77,6 +79,11 @@ itself.
 - Later sessions in the same worktree join the same Work.
 - When Claude Code removes the worktree, Dispatch first keeps its exact
   changes, then waits for you to `finish` or `reject` them.
+- If you have let this project's checks run by themselves (`dispatch setup
+  --checks`), Dispatch runs them on the kept changes instead, and the Work waits
+  for your review. That permission names the exact commands: when
+  `checks.verify` changes, it no longer holds until you approve the new ones. It
+  never lets anything apply.
 - A session running directly in your checkout is told that Dispatch cannot
   tell its edits from yours, and nothing is tracked.
 
@@ -208,7 +215,7 @@ dispatch finish <run-id>                                           # you say whe
 dispatch start                                                     # keeps a foreign attachment observed and applies it
 ```
 
-Dispatch is honest about what it saw: full confidence when S0 is the workspace as the work began (a workspace Dispatch made, or a session's start) or a real Git merge-base commit; partial confidence when it had to snapshot a directory at attach time, or when a session resumed in a worktree it had not seen, since earlier edits are then invisible to the patch. A workspace Dispatch made is removed once its work is applied, and kept otherwise. See [attach.md](docs/attach.md).
+Dispatch is honest about what it saw: full confidence when S0 is the workspace as the work began (a workspace Dispatch made, or a session's start) or a real Git merge-base commit; partial confidence when it had to snapshot a directory at attach time, or when a session resumed in a worktree it had not seen, since earlier edits are then invisible to the patch. A workspace Dispatch made is removed once its work is applied, and kept otherwise until you run `dispatch clean`, which lists what it would remove and asks first. See [attach.md](docs/attach.md).
 
 See the [coherence reference](docs/coherence.md) for the model, rules, events and
 the fixture matrix, and [coherence validation](docs/coherence-validation.md) for
@@ -344,10 +351,11 @@ dispatch refresh [run-id] [--allow-unsafe-local] [--json|--jsonl]
 dispatch answer <run-id> <question-id> --revision n --answer text [--json]
 dispatch cancel <run-id> <question-id> --revision n [--json]
 dispatch attach [--workspace path] [--auto-apply] [-- command...]
-dispatch finish <run-id>
+dispatch finish <run-id> [--allow-unsafe-local]
 dispatch start [--root path]
 dispatch watch [--root path] [--json]
 dispatch stop [--root path]
+dispatch clean [--dry-run] [--yes]
 dispatch serve [--root path] [--json]
 dispatch history [--limit count]
 dispatch version

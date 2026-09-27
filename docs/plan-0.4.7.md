@@ -379,3 +379,9 @@ project's own `.claude/settings.local.json`.
       `managed.removed` is true.
   - Full suite: 497 passed, 0 failed. The trial's state directory held runs and
     workspaces from the 0.4.6 trial; 0.4.7 read, listed and cleaned them.
+- Stage 7. Docs and version 0.4.7.
+  - README, `docs/attach.md`, the product guide, `release-install.md` ("Upgrading
+    to 0.4.7") and the release notes now describe check consent, verification
+    after removal, interactive `watch`, and `dispatch clean`.
+  - `attach.md` gains the event rows `attach.authorized`, `workspace.removed`,
+    `workspace.released` and `work.closed`.
