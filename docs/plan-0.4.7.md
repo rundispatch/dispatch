@@ -255,3 +255,28 @@ project's own `.claude/settings.local.json`.
   - Full suite: 484 passed, 6 failed. The failures were all in `claude_profiles`
     ("Claude CLI version changed": the fake CLI's 5 s version probe timed out
     under machine load). All 10 pass alone.
+- Stage 3. Removal-time verification with consent.
+  - The owner's loop, after each tick, finishes Work whose workspace was removed
+    with its exact Δ kept (`attach::finish_by_consent`), only when:
+    - the run carries authority;
+    - consent is valid now;
+    - the commands the run would execute (its configuration snapshot) equal the
+      consented ones.
+  - The checks run in the workspace rebuilt from S0 and Δ. The result is Ready,
+    with checks passed or failed, review pending and nothing applied, and the new
+    finish reason is `by_consent`.
+  - Verification runs in the owner, not the hook, so the hook's budget and
+    durability invariant are unchanged. A run held by another process is retried
+    on the next tick.
+  - A workspace that vanishes unannounced with an empty last-seen Δ closes as
+    "no changes" (cancelled) instead of lost.
+  - Tests:
+    - consented Work verified by itself, never applied;
+    - a failing check leaves it Ready with checks failed;
+    - consent voided after registration leaves it waiting;
+    - an empty vanished workspace closes.
+  - One run of `runtime_hooks` hung for 15 minutes in-process (no Dispatch
+    process left). It did not recur in three further runs, including this full
+    suite. Watch for it.
+  - Full suite: 493 passed, 1 failed (`claude_refusal_is_sticky_until_reauthorized`,
+    the known timing-sensitive funding test; it passes on rerun).

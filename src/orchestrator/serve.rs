@@ -88,7 +88,22 @@ async fn run(
             _ = ticker.tick() => {}
             _ = &mut shutdown => return Ok(()),
         }
-        let tick = owner.tick(state);
+        let mut tick = owner.tick(state);
+        // Work whose runtime removed its workspace, finished where the person
+        // consented to the project's checks running by themselves.
+        let waiting: Vec<String> = tick
+            .runs
+            .iter()
+            .filter(|run| awaits_finish_by_consent(run))
+            .map(|run| run.id.clone())
+            .collect();
+        for id in waiting {
+            match super::attach::finish_by_consent(state, &id).await {
+                Ok(true) => tick.persisted = true,
+                Ok(false) => {}
+                Err(error) => tick.report(&error),
+            }
+        }
         if tick.cost.idle() && !tick.moved {
             tracing::debug!("tick: {}", tick.cost);
         } else {
@@ -630,6 +645,19 @@ impl Owner {
         }
         self.checked.retain(|id, _| waiting.contains(id));
     }
+}
+
+/// Active attached Work whose workspace was removed with its exact changes
+/// kept and that carries the authority to run checks: a candidate for
+/// `attach::finish_by_consent`, which checks the consent itself.
+fn awaits_finish_by_consent(run: &RunRecord) -> bool {
+    run.outcome.lifecycle == LifecycleState::Working
+        && run.environment.unsafe_local
+        && run
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.workspace_removed.as_ref())
+            .is_some_and(|removal| removal.exact)
 }
 
 /// A Ready result nobody has accepted, rejected or applied yet.

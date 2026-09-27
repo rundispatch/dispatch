@@ -1089,7 +1089,7 @@ pub(super) async fn finish_locked(
     run.candidates[0].duration_ms = (Utc::now() - attached_at).num_milliseconds().max(0) as u64;
     run.candidates[0].exit_code = match &reason {
         FinishReason::ProcessExit { code } => *code,
-        FinishReason::Explicit => None,
+        FinishReason::Explicit | FinishReason::ByConsent => None,
     };
 
     refresh_outcome(&mut run);
@@ -1205,6 +1205,49 @@ pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u6
     Ok(files_changed)
 }
 
+/// Finish Work whose workspace was removed with its exact changes kept, when
+/// the person consented to the project's checks running by themselves: the
+/// checks run in a workspace rebuilt from S0 and those changes, and the Work
+/// becomes an ordinary result awaiting review. Only when the consent still
+/// holds for exactly the commands this Work would run. Returns whether it
+/// finished; a run another process holds is left for the next try.
+pub(super) async fn finish_by_consent(state: &State, run_id: &str) -> Result<bool> {
+    let Ok(_lock) = OperationLock::acquire(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+    ) else {
+        return Ok(false);
+    };
+    let run = state.load_run(run_id)?;
+    let removed_exactly = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_removed.as_ref())
+        .is_some_and(|removal| removal.exact);
+    if run.mode != RunMode::Attached
+        || run.outcome.lifecycle != LifecycleState::Working
+        || !removed_exactly
+        || !run.environment.unsafe_local
+        || run.candidates.len() != 1
+    {
+        return Ok(false);
+    }
+    let project = crate::consent::project_root(&run.source_path)?;
+    let crate::consent::CheckConsent::Valid(consented) = crate::consent::consent(state, &project)?
+    else {
+        return Ok(false);
+    };
+    let runs = crate::coherence::run_config(&state.run_dir(run_id))
+        .map(|config| config.checks.verify)
+        .unwrap_or_default();
+    if runs != consented {
+        return Ok(false);
+    }
+    let mut db = Database::open(state.db_path())?;
+    finish_locked(state, &mut db, run, false, FinishReason::ByConsent).await?;
+    Ok(true)
+}
+
 /// The project owner found the workspace of active Work gone without being
 /// told first: only the Δ it last followed survives, kept beside the run as
 /// `delta-last-seen.patch`. It can be read, never finished.
@@ -1232,11 +1275,29 @@ pub(crate) fn note_workspace_gone(
         at: now,
         exact: false,
     });
-    if let Some(last_seen) = last_seen.filter(|path| path.is_file()) {
-        crate::state::write_durably(
-            &state.run_dir(run_id).join("delta-last-seen.patch"),
-            &fs::read(last_seen)?,
-        )?;
+    let last_seen = match last_seen.filter(|path| path.is_file()) {
+        Some(path) => Some(fs::read(path)?),
+        None => None,
+    };
+    if let Some(bytes) = &last_seen {
+        crate::state::write_durably(&state.run_dir(run_id).join("delta-last-seen.patch"), bytes)?;
+    }
+    // Last seen with no changes at all: nothing was lost, so nothing waits.
+    let empty = last_seen.as_ref().is_some_and(Vec::is_empty);
+    if empty {
+        if let Some(candidate) = run.candidates.first_mut() {
+            candidate.status = CandidateStatus::Cancelled;
+        }
+        run.status = RunStatus::Interrupted;
+        run.completed_at = Some(now);
+        run.outcome.lifecycle = LifecycleState::Finished;
+        run.outcome.work_result = WorkResult::Cancelled;
+        run.outcome.phase = RunPhase::Finished;
+        run.outcome.review = ReviewState::NotRequested;
+        if let Some(attempt) = run.attempts.first_mut() {
+            attempt.completed_at = Some(now);
+            attempt.outcome = "no_changes".into();
+        }
     }
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1248,7 +1309,7 @@ pub(crate) fn note_workspace_gone(
             candidate_label: None,
             event_type: "workspace.removed".into(),
             timestamp: now,
-            payload: serde_json::json!({"exact": false}),
+            payload: serde_json::json!({"exact": false, "no_changes": empty}),
             ..EventRecord::default()
         },
         &mut run,
