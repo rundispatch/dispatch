@@ -12,6 +12,7 @@ mod handoff;
 mod inspection;
 mod setup;
 mod theme;
+mod watch;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, terminal,
@@ -34,6 +35,7 @@ use std::{
 use theme::Theme;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+pub use watch::interactive as watch;
 
 #[derive(Clone, Copy, Default)]
 pub struct Options {

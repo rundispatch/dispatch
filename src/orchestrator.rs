@@ -1801,6 +1801,29 @@ pub fn accept_or_reject_latest(
     reasons: Vec<String>,
     explanation: Option<String>,
 ) -> Result<()> {
+    decide(
+        state,
+        run_id,
+        source_path,
+        decision,
+        reasons,
+        explanation,
+        false,
+    )
+    .map(|_| ())
+}
+
+/// `accept` or `reject`, the same decision wherever the person makes it.
+/// `quiet` prints nothing, for `watch`, which shows the returned line itself.
+pub(crate) fn decide(
+    state: &State,
+    run_id: Option<&str>,
+    source_path: &Path,
+    decision: ReviewDecision,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+    quiet: bool,
+) -> Result<String> {
     let accept = matches!(decision, ReviewDecision::Accept { .. });
     let despite_refresh = matches!(
         decision,
@@ -1828,7 +1851,7 @@ pub fn accept_or_reject_latest(
         .is_some_and(|removal| !removal.exact);
     if !accept && lost && run.outcome.lifecycle == LifecycleState::Working {
         attach::close_lost(state, &run.id)?;
-        println!(
+        let line = format!(
             "Closed {}: its workspace is gone, and the changes last seen stay at {}.",
             run.id,
             state
@@ -1836,7 +1859,10 @@ pub fn accept_or_reject_latest(
                 .join("delta-last-seen.patch")
                 .display()
         );
-        return Ok(());
+        if !quiet {
+            println!("{line}");
+        }
+        return Ok(line);
     }
     let command = ReviewCommand {
         run_id: run.id.clone(),
@@ -1849,18 +1875,44 @@ pub fn accept_or_reject_latest(
     let (run, _lock) = locked_delivery(state, &command, false)?;
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    review_locked(state, run, decision, reasons, explanation, false)?;
-    if accept {
+    let id = run.id.clone();
+    let kept = run
+        .attachment
+        .as_ref()
+        .filter(|attachment| {
+            attachment
+                .managed
+                .as_ref()
+                .is_some_and(|made| !made.removed)
+        })
+        .map(|attachment| attachment.workspace.clone());
+    review_locked(state, run, decision, reasons, explanation, quiet)?;
+    let line = if accept {
         if already_auto_applied {
-            println!("Result was already applied by auto-apply; your review is recorded.");
+            "Result was already applied by auto-apply; your review is recorded.".to_owned()
+        } else {
+            format!("Accepted and applied {id}.")
         }
     } else {
-        println!("Result rejected. The source tree was not changed.");
-        if already_auto_applied {
-            println!("Rejection does not revert the source.");
+        let mut line = format!("Rejected {id}; the source tree was not changed.");
+        if let Some(kept) = kept {
+            line.push_str(&format!(" Its workspace is kept at {}.", kept.display()));
+        }
+        line
+    };
+    if !quiet {
+        if accept {
+            if already_auto_applied {
+                println!("{line}");
+            }
+        } else {
+            println!("Result rejected. The source tree was not changed.");
+            if already_auto_applied {
+                println!("Rejection does not revert the source.");
+            }
         }
     }
-    Ok(())
+    Ok(line)
 }
 
 /// A finished, unapplied result: the only kind `check` and `refresh` act on.

@@ -716,6 +716,18 @@ fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
     rows
 }
 
+/// The project view's rows for `watch`'s interactive form: each Work item's
+/// id and its line, in the view's order.
+pub(crate) fn project_rows(runs: &[RunRecord]) -> Vec<(String, String)> {
+    view_rows(runs)
+        .into_iter()
+        .map(|run| {
+            let id8 = &run.id[..8.min(run.id.len())];
+            (run.id.clone(), format!("{id8} · {}", describe(run).0))
+        })
+        .collect()
+}
+
 /// The project view: what is shown, so each tick prints only what changed.
 /// Shared by `serve` in the foreground and `watch`.
 #[derive(Default)]

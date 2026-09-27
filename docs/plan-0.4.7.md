@@ -280,3 +280,37 @@ project's own `.claude/settings.local.json`.
     suite. Watch for it.
   - Full suite: 493 passed, 1 failed (`claude_refusal_is_sticky_until_reauthorized`,
     the known timing-sensitive funding test; it passes on rerun).
+- Stage 4. Interactive `watch`.
+  - On a terminal, and not with `--json` or `--plain`, `dispatch watch` is
+    `presenter::watch`:
+    - the same rows (`serve::project_rows`) with a selection;
+    - the header shows the project line, including consent;
+    - it refreshes on a new event id or every 2 s.
+  - **Keys:**
+    - ↑/↓ or j/k move;
+    - `f` finish (asks before running checks when the Work carries no authority;
+      Enter cancels);
+    - `a` accept;
+    - `r` reject (a confirmation with focus on Cancel);
+    - `d`/Enter open the existing review screen (`review_goal`);
+    - `q`/Esc/Ctrl+C leave.
+  - Actions go through quiet forms of the commands (`orchestrator::decide`,
+    `attach::finish_quietly`), and the outcome or refusal is shown on a status
+    line. The command-line output of `accept`, `reject` and `finish` is
+    unchanged.
+  - Piped or `--json`, `watch` is the passive view from 0.4.5.
+  - Tests: `tests/watch_ui.rs` (a PTY), passed twice:
+    - Enter cancels a reject, a confirmed reject records the rejection, Work
+      appearing while watching shows up, and `a` applies it;
+    - `f` on hook-registered Work: Enter cancels, and confirming runs the checks
+      and finishes it Ready, checks passed.
+
+    It waits on the recorded state, not on screen text that redraws can split.
+  - **Observation:** the funding preflight's `claude --version` probe has 5 s.
+    Under this machine's load the fake CLI missed it, and the preflight reported
+    "Claude CLI version changed" (a refusal that is sticky for that
+    authorization). On a loaded real machine a slow probe could refuse a valid
+    profile the same way. This is not in 0.4.7's scope; it is noted for a later
+    fix (treat a failed probe as unknown, not changed).
+  - Full suite: 492 passed, 3 failed (all `claude_profiles`, that probe timeout;
+    10/10 pass alone).

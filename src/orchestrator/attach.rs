@@ -937,6 +937,18 @@ pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<
 /// `dispatch finish <id>`: freeze Δ, run verification in the workspace
 /// itself, and become an ordinary Ready result. See part 14.9.
 pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Result<RunRecord> {
+    let run = finish_quietly(state, run_id, allow_unsafe_local).await?;
+    print_finish_summary(&run);
+    println!("Next: dispatch check {}", run.id);
+    Ok(run)
+}
+
+/// `finish` without printing, for `watch`.
+pub(crate) async fn finish_quietly(
+    state: &State,
+    run_id: &str,
+    allow_unsafe_local: bool,
+) -> Result<RunRecord> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
     // A moment's wait: the project owner holds this lock briefly while it
     // checks the Work. A live wrapper holds it for the whole session.
@@ -986,9 +998,6 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
         FinishReason::Explicit,
     )
     .await?;
-
-    print_finish_summary(&run);
-    println!("Next: dispatch check {}", run.id);
 
     Ok(run)
 }

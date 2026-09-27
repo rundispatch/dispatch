@@ -602,7 +602,30 @@ async fn run() -> Result<()> {
         } => orchestrator::serve::serve(&state, root, json, background).await,
         Command::Start { root } => orchestrator::background::start(&state, root, cli.verbose),
         Command::Stop { root } => orchestrator::background::stop(&state, root),
-        Command::Watch { root, json } => orchestrator::serve::watch(&state, root, json).await,
+        Command::Watch { root, json } => {
+            use std::io::IsTerminal;
+            // On a terminal, the view is where the person acts; piped, or
+            // as JSON, or plain, it only reports.
+            if json
+                || cli.plain
+                || !std::io::stdout().is_terminal()
+                || !std::io::stdin().is_terminal()
+            {
+                orchestrator::serve::watch(&state, root, json).await
+            } else {
+                let root = dispatch::source::resolve_source(root.as_deref())?;
+                dispatch::presenter::watch(
+                    &state,
+                    root,
+                    dispatch::presenter::Options {
+                        plain: cli.plain,
+                        ascii: cli.ascii,
+                        no_color: cli.no_color,
+                    },
+                )
+                .await
+            }
+        }
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
         Command::Hook { provider } => {
             use std::io::Read;
