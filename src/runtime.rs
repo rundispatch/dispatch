@@ -166,8 +166,21 @@ fn removed(state: &State, workspace: &Path) -> Result<Reply> {
     };
     let files_changed = attach::freeze_removed_workspace(state, &run_id)?;
     let id = &run_id[..8.min(run_id.len())];
+    // With the person's consent the owner runs the checks next; say so. The
+    // changes are already kept, so nothing here may fail the hook.
+    let consented = state
+        .load_run(&run_id)
+        .is_ok_and(|run| run.environment.unsafe_local)
+        && crate::consent::project_root(workspace)
+            .and_then(|project| crate::consent::consent(state, &project))
+            .is_ok_and(|consent| consent.is_valid());
     Ok(Reply::Notice(if files_changed == 0 {
         format!("Dispatch closed Work {id}: the worktree held no changes.")
+    } else if consented {
+        format!(
+            "Dispatch kept this worktree's changes as Work {id} and will run the project's \
+             checks on them, as you allowed; then it waits for your review."
+        )
     } else {
         format!(
             "Dispatch kept this worktree's changes as Work {id}; \
@@ -201,6 +214,9 @@ fn start(
         return Ok(Reply::Silent);
     }
     let provider = session.provider.clone();
+    // Authority to run the project's checks comes only from the person's
+    // consent for exactly these checks, never from the session.
+    let consented = crate::consent::consent(state, root)?.is_valid();
     let name = workspace
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
@@ -213,7 +229,7 @@ fn start(
             agent: Some(provider),
             pid: None,
             command: None,
-            allow_unsafe_local: false,
+            allow_unsafe_local: consented,
             auto_apply: false,
             runtime: Some(RuntimeStart { session, resumed }),
         },

@@ -656,8 +656,13 @@ pub struct AttachCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
-    ProcessExit { code: Option<i32> },
+    ProcessExit {
+        code: Option<i32>,
+    },
     Explicit,
+    /// Dispatch finished it under the person's consent to run the project's
+    /// checks, once its workspace was removed with its exact changes kept.
+    ByConsent,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -1537,7 +1537,7 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     }
     println!(
         "\nProject: {}",
-        background::describe(state, &run.source_path)
+        background::project_line(state, &run.source_path)
     );
     Ok(())
 }
@@ -1690,7 +1690,7 @@ pub(crate) fn review_target(
     state: &State,
     command: &ReviewCommand,
 ) -> Result<(RunRecord, OperationLock)> {
-    let (run, lock) = locked_delivery(state, command)?;
+    let (run, lock) = locked_delivery(state, command, true)?;
     anyhow::ensure!(
         run.outcome.review == ReviewState::Pending,
         "result has already been reviewed"
@@ -1702,19 +1702,29 @@ pub(crate) fn review_target(
 /// A review judges a delivered result: attached work that is still active has
 /// no patch yet (`dispatch finish` produces it), and a native run waiting on a
 /// question is answered, not reviewed.
-fn locked_delivery(state: &State, command: &ReviewCommand) -> Result<(RunRecord, OperationLock)> {
+/// The run's delivered result, under its lock. A person's command waits a
+/// moment for the lock, which the project owner holds briefly while it checks
+/// the Work. `exact_revision` is for a review of the result as it was shown:
+/// the command line names a run, not a revision, and a verdict the owner
+/// records meanwhile is not a change to the result.
+fn locked_delivery(
+    state: &State,
+    command: &ReviewCommand,
+    exact_revision: bool,
+) -> Result<(RunRecord, OperationLock)> {
     let id = state.resolve_run_id(&command.run_id)?;
     anyhow::ensure!(
         id == command.run_id,
         "review requires the complete run identity"
     );
-    let lock = OperationLock::acquire(
+    let lock = OperationLock::acquire_wait(
         &state.run_dir(&id).join(".operation.lock"),
         "run has a foreground owner",
+        std::time::Duration::from_secs(5),
     )?;
     let run = state.load_run(&id)?;
     anyhow::ensure!(
-        run.state_revision == command.revision,
+        !exact_revision || run.state_revision == command.revision,
         "stale review; the result changed"
     );
     anyhow::ensure!(
@@ -1791,6 +1801,29 @@ pub fn accept_or_reject_latest(
     reasons: Vec<String>,
     explanation: Option<String>,
 ) -> Result<()> {
+    decide(
+        state,
+        run_id,
+        source_path,
+        decision,
+        reasons,
+        explanation,
+        false,
+    )
+    .map(|_| ())
+}
+
+/// `accept` or `reject`, the same decision wherever the person makes it.
+/// `quiet` prints nothing, for `watch`, which shows the returned line itself.
+pub(crate) fn decide(
+    state: &State,
+    run_id: Option<&str>,
+    source_path: &Path,
+    decision: ReviewDecision,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+    quiet: bool,
+) -> Result<String> {
     let accept = matches!(decision, ReviewDecision::Accept { .. });
     let despite_refresh = matches!(
         decision,
@@ -1809,24 +1842,32 @@ pub fn accept_or_reject_latest(
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_unresolved_single(state, source_path)?,
     };
-    // Work whose workspace vanished before its final changes were kept has no
-    // result to review, and rejecting it is how a person closes it.
-    let lost = run
+    // Unfinished Work whose workspace is gone has no result to review yet;
+    // rejecting it is how a person closes it. Its changes stay in the run.
+    let removed = run
         .attachment
         .as_ref()
         .and_then(|attachment| attachment.workspace_removed.as_ref())
-        .is_some_and(|removal| !removal.exact);
-    if !accept && lost && run.outcome.lifecycle == LifecycleState::Working {
-        attach::close_lost(state, &run.id)?;
-        println!(
-            "Closed {}: its workspace is gone, and the changes last seen stay at {}.",
+        .map(|removal| removal.exact);
+    if let Some(exact) =
+        removed.filter(|_| !accept && run.outcome.lifecycle == LifecycleState::Working)
+    {
+        attach::close_removed(state, &run.id)?;
+        let kept = if exact {
+            sole_candidate(&run)?.diff_path.clone()
+        } else {
+            state.run_dir(&run.id).join("delta-last-seen.patch")
+        };
+        let line = format!(
+            "Closed {}: its workspace is gone, and its {} changes stay at {}.",
             run.id,
-            state
-                .run_dir(&run.id)
-                .join("delta-last-seen.patch")
-                .display()
+            if exact { "kept" } else { "last seen" },
+            kept.display()
         );
-        return Ok(());
+        if !quiet {
+            println!("{line}");
+        }
+        return Ok(line);
     }
     let command = ReviewCommand {
         run_id: run.id.clone(),
@@ -1836,21 +1877,47 @@ pub fn accept_or_reject_latest(
     // One lock covers the review and the apply. A result may be reviewed
     // again (the latest revision stands), so this does not require a
     // pending review the way the interactive delivery does.
-    let (run, _lock) = locked_delivery(state, &command)?;
+    let (run, _lock) = locked_delivery(state, &command, false)?;
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    review_locked(state, run, decision, reasons, explanation, false)?;
-    if accept {
+    let id = run.id.clone();
+    let kept = run
+        .attachment
+        .as_ref()
+        .filter(|attachment| {
+            attachment
+                .managed
+                .as_ref()
+                .is_some_and(|made| !made.removed)
+        })
+        .map(|attachment| attachment.workspace.clone());
+    review_locked(state, run, decision, reasons, explanation, quiet)?;
+    let line = if accept {
         if already_auto_applied {
-            println!("Result was already applied by auto-apply; your review is recorded.");
+            "Result was already applied by auto-apply; your review is recorded.".to_owned()
+        } else {
+            format!("Accepted and applied {id}.")
         }
     } else {
-        println!("Result rejected. The source tree was not changed.");
-        if already_auto_applied {
-            println!("Rejection does not revert the source.");
+        let mut line = format!("Rejected {id}; the source tree was not changed.");
+        if let Some(kept) = kept {
+            line.push_str(&format!(" Its workspace is kept at {}.", kept.display()));
+        }
+        line
+    };
+    if !quiet {
+        if accept {
+            if already_auto_applied {
+                println!("{line}");
+            }
+        } else {
+            println!("Result rejected. The source tree was not changed.");
+            if already_auto_applied {
+                println!("Rejection does not revert the source.");
+            }
         }
     }
-    Ok(())
+    Ok(line)
 }
 
 /// A finished, unapplied result: the only kind `check` and `refresh` act on.

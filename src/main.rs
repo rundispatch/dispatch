@@ -169,6 +169,16 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Remove the workspaces Dispatch made for Work that is over (rejected,
+    /// closed, or applied and not yet released), after you confirm.
+    Clean {
+        /// Only list what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove without asking (required without a terminal).
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
+    },
     /// Show a run and its persisted signals.
     #[command(hide = true)]
     Show { run_id: String },
@@ -602,8 +612,44 @@ async fn run() -> Result<()> {
         } => orchestrator::serve::serve(&state, root, json, background).await,
         Command::Start { root } => orchestrator::background::start(&state, root, cli.verbose),
         Command::Stop { root } => orchestrator::background::stop(&state, root),
-        Command::Watch { root, json } => orchestrator::serve::watch(&state, root, json).await,
+        Command::Watch { root, json } => {
+            use std::io::IsTerminal;
+            // On a terminal, the view is where the person acts; piped, or
+            // as JSON, or plain, it only reports.
+            if json
+                || cli.plain
+                || !std::io::stdout().is_terminal()
+                || !std::io::stdin().is_terminal()
+            {
+                orchestrator::serve::watch(&state, root, json).await
+            } else {
+                let root = dispatch::source::resolve_source(root.as_deref())?;
+                dispatch::presenter::watch(
+                    &state,
+                    root,
+                    dispatch::presenter::Options {
+                        plain: cli.plain,
+                        ascii: cli.ascii,
+                        no_color: cli.no_color,
+                    },
+                )
+                .await
+            }
+        }
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
+        Command::Clean { dry_run, yes } => {
+            dispatch::presenter::clean(
+                &state,
+                dry_run,
+                yes,
+                dispatch::presenter::Options {
+                    plain: cli.plain,
+                    ascii: cli.ascii,
+                    no_color: cli.no_color,
+                },
+            )
+            .await
+        }
         Command::Hook { provider } => {
             use std::io::Read;
             anyhow::ensure!(provider == "claude", "unknown agent runtime: {provider}");

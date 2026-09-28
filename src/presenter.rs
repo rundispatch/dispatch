@@ -8,10 +8,13 @@ use crate::{
     *,
 };
 use anyhow::{Context, Result};
+mod clean;
 mod handoff;
 mod inspection;
 mod setup;
 mod theme;
+mod watch;
+pub use clean::clean;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, terminal,
@@ -34,6 +37,7 @@ use std::{
 use theme::Theme;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+pub use watch::interactive as watch;
 
 #[derive(Clone, Copy, Default)]
 pub struct Options {

@@ -506,3 +506,263 @@ fn a_resumed_session_in_the_checkout_is_not_told_it_is_shared() {
     assert_eq!(p.start("s1", "resume", &p.root), "");
     assert!(p.runs().is_empty());
 }
+
+/// A person's `finish --allow-unsafe-local` is the authority the merged-tree
+/// checks need at accept: discovered work must not be accepted on the file and
+/// symbol analysis alone when the project moved under it.
+#[test]
+fn accepting_discovered_work_runs_its_checks_on_the_merged_tree() {
+    let p = Project::new("checks:\n  verify: ['test ! -f forbidden.txt']\n");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let finish = p.dispatch(&["finish", &id, "--allow-unsafe-local"]);
+    assert!(finish.status.success(), "{}", text(&finish));
+    assert_eq!(p.only_run()["outcome"]["verification"], "passed");
+
+    // The project moves in a way only the merged tree's checks can see.
+    fs::write(p.root.join("forbidden.txt"), "added by someone else\n").unwrap();
+    let accept = p.dispatch(&["accept", &id]);
+    assert!(
+        !accept.status.success(),
+        "accepted without its merged-tree checks"
+    );
+    assert!(
+        text(&accept).contains("test ! -f forbidden.txt"),
+        "{}",
+        text(&accept)
+    );
+    assert_eq!(
+        fs::read_to_string(p.root.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    1\n}\n"
+    );
+}
+
+/// The project owner holds a run's lock for a moment while it checks the
+/// Work; a person's finish waits for it rather than failing.
+#[test]
+fn finish_waits_for_the_owner_to_let_go_of_the_run() {
+    use std::os::fd::AsRawFd;
+
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(p.run_dir(&id).join(".operation.lock"))
+        .unwrap();
+    // Held elsewhere for longer than a refusal would take.
+    let held = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(held, 0);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        drop(lock);
+    });
+    let finish = p.dispatch(&["finish", &id]);
+    release.join().unwrap();
+    assert!(finish.status.success(), "{}", text(&finish));
+    assert_eq!(p.only_run()["outcome"]["work_result"], "ready");
+}
+
+/// With the person's consent for exactly the project's checks, Work a runtime
+/// registers may run them; a change to the checks voids that for new Work.
+#[test]
+fn consent_for_the_projects_checks_gives_discovered_work_its_authority() {
+    let p = Project::new("checks:\n  verify: ['true']\n");
+    p.watch();
+    let state = dispatch::state::State::discover(Some(p.state.clone())).unwrap();
+    dispatch::consent::grant(&state, &p.root).unwrap();
+    p.start("s1", "startup", &p.worktree);
+    let run = p.only_run();
+    let id = run["id"].as_str().unwrap().to_owned();
+    assert_eq!(run["environment"]["unsafe_local"], true);
+    assert_eq!(
+        run["attachment"]["capabilities"]["integrate"], false,
+        "never auto-apply"
+    );
+    let db = rusqlite::Connection::open(p.state.join("dispatch.db")).unwrap();
+    let by: String = db
+        .query_row(
+            "SELECT json_extract(payload_json, '$.by') FROM events WHERE run_id = ?1 AND event_type = 'attach.authorized'",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(by, "project consent");
+
+    // The checks change: new Work asks first, and the project says why.
+    fs::write(
+        p.root.join("dispatch.yml"),
+        "coherence:\n  poll_secs: 1\nchecks:\n  verify: ['true', 'sh ./other.sh']\n",
+    )
+    .unwrap();
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "worktree-y",
+            ".claude/worktrees/y",
+        ],
+    );
+    let other = fs::canonicalize(p.root.join(".claude/worktrees/y")).unwrap();
+    p.start("s2", "startup", &other);
+    let second = p
+        .runs()
+        .into_iter()
+        .find(|run| run["id"] != id.as_str())
+        .unwrap();
+    assert_eq!(second["environment"]["unsafe_local"], false);
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(status.contains("check consent no longer holds"), "{status}");
+}
+
+impl Project {
+    fn consent(&self) {
+        let state = dispatch::state::State::discover(Some(self.state.clone())).unwrap();
+        dispatch::consent::grant(&state, &self.root).unwrap();
+    }
+
+    /// Wait for the owner to change the only run until `ready` holds.
+    fn until(&self, what: &str, ready: impl Fn(&Value) -> bool) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let run = self.only_run();
+            if ready(&run) {
+                return run;
+            }
+            assert!(std::time::Instant::now() < deadline, "never {what}: {run}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
+#[test]
+fn consented_work_is_verified_by_itself_when_its_worktree_is_removed() {
+    let p = Project::new("checks:\n  verify: ['test -f src/lib.rs']\n");
+    p.consent();
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let removed = p.remove();
+    assert!(removed.status.success());
+    assert!(
+        text(&removed).contains("will run the project's checks"),
+        "{}",
+        text(&removed)
+    );
+    let run = p.until("verified", |run| run["outcome"]["lifecycle"] == "finished");
+    assert_eq!(run["outcome"]["work_result"], "ready", "{run}");
+    assert_eq!(run["outcome"]["verification"], "passed", "{run}");
+    assert_eq!(run["attachment"]["finish_reason"], "by_consent");
+    // Review stays the person's: nothing was applied.
+    assert_eq!(run["outcome"]["review"], "pending");
+    assert_eq!(run["outcome"]["application"], "not_applied");
+    assert_eq!(
+        fs::read_to_string(p.root.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    1\n}\n"
+    );
+}
+
+#[test]
+fn failing_checks_leave_consented_work_ready_with_its_failure() {
+    let p = Project::new("checks:\n  verify: ['test ! -f src/lib.rs']\n");
+    p.consent();
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    assert!(p.remove().status.success());
+    let run = p.until("verified", |run| run["outcome"]["lifecycle"] == "finished");
+    assert_eq!(run["outcome"]["verification"], "failed", "{run}");
+}
+
+#[test]
+fn consent_voided_after_registration_leaves_the_work_waiting() {
+    let p = Project::new("checks:\n  verify: ['true']\n");
+    p.consent();
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        p.root.join("dispatch.yml"),
+        "coherence:\n  poll_secs: 1\nchecks:\n  verify: ['true', 'sh ./new.sh']\n",
+    )
+    .unwrap();
+    assert!(p.remove().status.success());
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let run = p.only_run();
+    assert_eq!(run["outcome"]["lifecycle"], "working", "{run}");
+    assert_eq!(run["attachment"]["workspace_removed"]["exact"], true);
+}
+
+#[test]
+fn an_empty_worktree_that_vanishes_unannounced_closes_with_no_changes() {
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    // Let the owner follow it once, empty, then delete it behind its back.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    git(
+        &p.root,
+        &["worktree", "remove", "--force", ".claude/worktrees/x"],
+    );
+    let run = p.until("closed", |run| run["outcome"]["lifecycle"] == "finished");
+    assert_eq!(run["outcome"]["work_result"], "cancelled", "{run}");
+    assert_eq!(run["attachment"]["workspace_removed"]["exact"], false);
+}
+
+/// Unfinished Work whose worktree was removed waits for a person: rejecting it
+/// closes it, and its kept changes stay in the run.
+#[test]
+fn rejecting_removed_work_closes_it_and_keeps_its_changes() {
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    assert!(p.remove().status.success());
+    let reject = p.dispatch(&["reject", &id]);
+    assert!(reject.status.success(), "{}", text(&reject));
+    assert!(
+        text(&reject).contains("kept changes stay at"),
+        "{}",
+        text(&reject)
+    );
+    let run = p.only_run();
+    assert_eq!(run["outcome"]["lifecycle"], "finished");
+    assert_eq!(run["outcome"]["work_result"], "cancelled");
+    let patch = fs::read_to_string(p.run_dir(&id).join("delta.patch")).unwrap();
+    assert!(patch.contains("+    2"), "{patch}");
+}

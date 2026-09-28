@@ -15,7 +15,7 @@ pub async fn standalone(
     options.plain |= std::env::var("TERM").is_ok_and(|v| v == "dumb");
     let mut ui = Ui::new(options)?;
     if project_checks {
-        checks(&mut ui, &std::env::current_dir()?).await
+        project_checks_menu(&mut ui, state, &std::env::current_dir()?).await
     } else {
         accounts(&mut ui, state, provider).await
     }
@@ -374,6 +374,64 @@ async fn login(ui: &mut Ui, provider: &str) -> Result<()> {
     .await?;
     anyhow::ensure!(status.success(), "provider login did not complete");
     ui.commit("Login returned. Choose a resource to revalidate its funding.")
+}
+
+/// `dispatch setup --checks`. With checks chosen, also where the person lets
+/// Work in this project run them by themselves, or stops it: consent for
+/// exactly these commands, kept in Dispatch's state, never in the project.
+async fn project_checks_menu(ui: &mut Ui, state: &State, source: &std::path::Path) -> Result<()> {
+    use crate::consent;
+    let root = consent::project_root(source)?;
+    let commands = consent::effective_checks(&root)?;
+    if commands.is_empty() {
+        return checks(ui, source).await;
+    }
+    let current = consent::consent(state, &root)?;
+    let listed = commands
+        .iter()
+        .map(|command| format!("  {command}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let standing = match &current {
+        consent::CheckConsent::Valid(_) => "Work here runs them by themselves.",
+        consent::CheckConsent::Changed { .. } => {
+            "Work here asks first: you allowed other commands, and the checks changed since."
+        }
+        consent::CheckConsent::NotGranted => "Work here asks you before running them.",
+    };
+    let body = format!("Project checks\n{listed}\n{standing}");
+    let toggle = if current.is_valid() {
+        "Stop letting Work run these checks by themselves"
+    } else {
+        "Let Work run these checks by themselves…"
+    };
+    let rows = [
+        Choice::new("Change checks…"),
+        Choice::new(toggle),
+        Choice::new("Back"),
+    ];
+    match ui.select(&body, &rows, 0).await? {
+        Some(0) => checks(ui, source).await,
+        Some(1) if current.is_valid() => {
+            consent::revoke(state, &root)?;
+            ui.commit("Work in this project now asks you before running its checks.")
+        }
+        Some(1) => {
+            let body = format!(
+                "Let Work in this project run these checks by themselves?\n{listed}\n\
+                 They run with your permissions when a runtime registers Work here and when its \
+                 worktree is removed. Nothing is applied by this. If the checks change, Dispatch \
+                 asks again."
+            );
+            let rows = [Choice::new("Allow"), Choice::new("Cancel")];
+            if ui.select(&body, &rows, 1).await? != Some(0) {
+                return ui.commit("Nothing changed.");
+            }
+            consent::grant(state, &root)?;
+            ui.commit("Work in this project will run these checks by themselves.")
+        }
+        _ => Ok(()),
+    }
 }
 
 pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> {

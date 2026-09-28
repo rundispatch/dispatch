@@ -1,73 +1,69 @@
-## Dispatch 0.4.6 — Work that appears on its own
+## Dispatch 0.4.7 — Work you can finish where you see it
 
-Run your agent the way you already do, and Dispatch picks up its work:
+0.4.6 picked up Claude Code sessions as Work by themselves. 0.4.7 lets that Work
+be verified, reviewed and cleaned up without you copying run IDs between commands.
 
-- **Claude Code sessions become Work by themselves.** With Claude Code's hooks
-  installed (`dispatch setup` → Runtime integrations, shown and approved first),
-  a session in its own worktree of a project you watch (`claude --worktree`)
-  becomes Work with no Dispatch command.
-  - S0 is the worktree as the session found it, captured before its first edit.
-  - Later sessions in that worktree join the same Work.
-  - Its verdict follows the project as it moves.
-- **Any agent gets its own workspace.** `dispatch attach -- <agent>` run from your
-  checkout now makes the workspace. It sits outside the checkout, on its own
-  `dispatch/…` branch, and starts as the checkout's exact world, uncommitted
-  files included. The agent needs no worktree support of its own.
-  - The workspace is removed once its work is applied, and kept after a reject
-    or a crash; `dispatch status <id>` says where it is.
-- **Nothing is claimed where it can't be.** A session running directly in your
-  checkout is told that Dispatch cannot tell its edits from yours, and nothing is
-  tracked.
+- **Checks can run by themselves, when you allow it.** `dispatch setup --checks`
+  can let Work in a project run that project's checks by themselves.
+  - When Claude Code removes a session's worktree, Dispatch keeps its exact
+    changes, as before. Then it runs the checks in a workspace rebuilt from S0 and
+    those changes. The Work becomes Ready, or shows its failed checks, and waits
+    for your review.
+  - The permission names the exact `checks.verify` commands you approved. If they
+    change, it no longer holds until you approve the new ones; `dispatch status`
+    and `dispatch watch` say which.
+  - It is stored in Dispatch's private state, never in the repository, so a
+    repository cannot grant itself the right to run commands on your machine.
+  - It runs checks only. Nothing is applied without your review.
+- **Act from `dispatch watch`.** On a terminal, select a row with ↑/↓, then:
+  - `f` finishes attached Work, asking first before running checks nobody allowed;
+  - `a` accepts, through the same gate as `dispatch accept`;
+  - `r` rejects, after asking;
+  - `d` or Enter opens the review.
 
-**A removed worktree keeps its work.** Claude Code can delete a worktree at
-session exit or through its `ExitWorktree` tool.
-- Before either, Dispatch writes the work's exact final changes durably into the
-  run and records the removal. Only then does the hook let the deletion go ahead.
-- If that cannot be done, the hook fails and the worktree stays.
-- Removal never finishes the work for you: `dispatch finish` verifies it in a
-  workspace rebuilt from S0 and the kept changes, or you `reject` it.
-- A worktree with no changes simply closes.
+  Each key is exactly the command you would type. `watch --json` and output that
+  is not a terminal are unchanged.
+- **`dispatch clean`.** Workspaces Dispatch made for `dispatch attach -- <agent>`
+  are kept after a reject. `clean` lists the ones whose Work is over and removes
+  them, with their branches, only after you confirm. `--dry-run` only lists them,
+  and `--yes` confirms where there is no terminal. Nothing is ever deleted on a
+  timer, and each run's record and patch stay.
 
 **Fixed.**
-- **Finishing no longer fails on ignored build output.** `dispatch finish` refused,
-  and marked the work failed, when the workspace held over 4 GiB, 200,000 files, a
-  file over 512 MiB, or a symlink out of the tree. That included ignored `target/`
-  or `node_modules/`. Only paths that can enter the changes count now.
-- **Process identity on macOS no longer drifts.** A process's identity included
-  `kern.boottime`, which the clock adjusts while the machine runs, so live
-  processes gradually looked "reused": `dispatch stop` refused, and a live
-  wrapped attach could have been adopted as orphaned.
-  - The identity now uses the boot session's UUID.
-  - Identities recorded by older versions still match by pid and exact start
-    time, so `dispatch stop` recognises an owner started before upgrading.
-- **The project view tells you more:**
-  - it names where work came from: `native`, `attached`, `discovered` or
-    `isolated`;
-  - it says `idle`, `removed`, `lost` and `rejected` where it said `working` or
-    `ready`;
-  - it stops calling a moved world "unmoved".
+- **Accept now runs the merged-tree checks for discovered Work you finished.**
+  Discovered Work finished with `dispatch finish --allow-unsafe-local` was accepted
+  without its checks running on the merged tree. The flag was not recorded on the
+  run, so a change that only the merged tree catches could apply. The authority
+  is now recorded, and accept runs the checks.
+- **Rejecting Work whose worktree was removed now closes it.** `dispatch reject`
+  refused it ("no delivered result to review"), so it could not be closed without
+  finishing it. Reject now closes it and keeps its patch in the run.
+- **A worktree with no changes that vanished without notice now closes.** It
+  used to show as `lost`; it closes with no changes, since nothing was lost.
+- **`finish` no longer fails on a busy project.** `finish` refused the run when the
+  background owner was busy with it at that moment. It now waits up to 5 s. Accept
+  or reject typed at the command line no longer fails as "stale" because the
+  owner had just recorded a verdict.
 
-**Evidence.** Real-agent trials with Claude Code 2.1.280 and Cursor Agent:
-- A `claude -p --worktree` session registered itself, and its Work was created 6 s
-  before the agent's first edit.
-- A teammate's commit moved its verdict with no command run.
-- Removing the worktree through `ExitWorktree` kept the exact changes. The trial
-  found that this tool does not run `WorktreeRemove`, which is why Dispatch now
-  also hooks it.
-- The work was then finished in a rebuilt workspace and applied.
-- `dispatch attach -- cursor-agent` from the checkout worked in its own workspace
-  while a teammate committed. It was applied, and its workspace released.
-- A wrapper killed mid-run left its workspace intact, and the owner adopted the
-  work.
-- Replayed and resumed sessions never made duplicate work.
+**Evidence.** A real-agent trial with Claude Code and Cursor Agent:
+- **With consent.** A `claude -p --worktree` session registered Work with local
+  authority. Its worktree was removed, and the exact changes were kept before the
+  hook returned. The owner then verified the Work by itself: Ready, checks
+  passed, nothing applied. After a teammate's commit, it was accepted from
+  `dispatch watch` with the merged-tree checks run.
+- **Consent voided.** Changing the project's checks voided the consent. The next
+  session's Work kept its changes on removal and waited. The trial found that
+  rejecting it was refused, which is fixed above.
+- **Clean.** `dispatch attach -- cursor-agent` from the checkout finished Ready and
+  was rejected. `dispatch clean --dry-run` listed its workspace, and `dispatch
+  clean` removed it only after confirmation.
 
-**Not built.** Codex's hooks exist, but every hook definition needs the user's
-trust review and its session end also means "idle", so a Codex adapter waits;
-`dispatch attach -- codex` isolates Codex today. There is no process scanning,
-automatic verification, start at login, or retention cleanup of rejected
-workspaces yet.
+**Not built.** There is no Codex lifecycle integration: Codex's hooks need a trust
+review of every hook definition, and its session end also means "idle".
+`dispatch attach -- codex` remains the supported way to isolate Codex. There is
+also no automatic apply for discovered Work, no retention timer, and no start at
+login.
 
-**Upgrading.** No migration; the schema stays at 24. State is forward-only: 0.4.5
-cannot read runs that use the new attachment fields. Install Claude Code's hooks
-through `dispatch setup`; install them again if you move the binary or the state
-directory.
+**Upgrading.** No migration; the schema stays at 24. State is forward-only: 0.4.6
+cannot read a run finished by consent. After upgrading, run `dispatch stop &&
+dispatch start` so the project owner is 0.4.7.

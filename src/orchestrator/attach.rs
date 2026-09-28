@@ -409,6 +409,21 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         },
         &mut run,
     )?;
+    if runtime.is_some() && unsafe_local {
+        persist_event(
+            state,
+            &db,
+            EventRecord {
+                run_id: run.id.clone(),
+                candidate_label: None,
+                event_type: "attach.authorized".into(),
+                timestamp: Utc::now(),
+                payload: serde_json::json!({"unsafe_local": true, "by": "project consent"}),
+                ..EventRecord::default()
+            },
+            &mut run,
+        )?;
+    }
 
     // The wrapped form writes nothing to the terminal while the agent runs
     // (part 6.7): its owner loop prints its own single line only after the
@@ -501,7 +516,7 @@ fn make_workspace(
 /// Δ is in the checkout now, so nothing is lost. Only a workspace under
 /// `<state>/workspaces/` recorded at creation is ever removed; a failure is
 /// reported and the workspace kept.
-pub(super) fn release_workspace(state: &State, run: &mut RunRecord) -> Result<()> {
+pub(super) fn release_workspace(state: &State, run: &mut RunRecord, reason: &str) -> Result<()> {
     let Some(attachment) = run.attachment.as_ref() else {
         return Ok(());
     };
@@ -534,12 +549,85 @@ pub(super) fn release_workspace(state: &State, run: &mut RunRecord) -> Result<()
             candidate_label: None,
             event_type: "workspace.released".into(),
             timestamp: Utc::now(),
-            payload: serde_json::json!({"workspace": workspace}),
+            payload: serde_json::json!({"workspace": workspace, "reason": reason}),
             ..EventRecord::default()
         },
         run,
     )?;
     Ok(())
+}
+
+/// A workspace `dispatch clean` may remove: Dispatch made it, it is still
+/// there, and its Work is over (rejected, closed, or applied and not yet
+/// released). Never one of Work in progress or waiting for review.
+pub struct Cleanable {
+    pub run_id: String,
+    pub workspace: PathBuf,
+    pub branch: Option<String>,
+    pub why: &'static str,
+}
+
+pub fn cleanable(state: &State) -> Result<Vec<Cleanable>> {
+    let mut found = Vec::new();
+    for path in state.list_metadata_paths()? {
+        let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("invalid metadata at {}", path.display()))?;
+        let Some(made) = projected
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.managed.as_ref())
+            .filter(|made| !made.removed)
+        else {
+            continue;
+        };
+        let run = state.load_run(&projected.id)?;
+        if run.outcome.lifecycle != LifecycleState::Finished {
+            continue;
+        }
+        let why = if run.outcome.application == ApplicationState::Applied {
+            "applied"
+        } else if run.outcome.review == ReviewState::Rejected {
+            "rejected"
+        } else if run.outcome.work_result != WorkResult::Ready {
+            "closed"
+        } else {
+            continue; // waiting for review
+        };
+        let workspace = run.attachment.as_ref().expect("managed").workspace.clone();
+        if !workspace.exists() {
+            continue;
+        }
+        found.push(Cleanable {
+            run_id: run.id.clone(),
+            workspace,
+            branch: made.branch.clone(),
+            why,
+        });
+    }
+    Ok(found)
+}
+
+/// Remove what `cleanable` listed, each under its run's lock and only if it
+/// is still cleanable then. Returns how many were removed.
+pub fn clean(state: &State, listed: &[Cleanable]) -> Result<usize> {
+    let mut removed = 0;
+    for item in listed {
+        let _lock = OperationLock::acquire_wait(
+            &state.run_dir(&item.run_id).join(".operation.lock"),
+            "the work is in use",
+            Duration::from_secs(5),
+        )?;
+        let still = cleanable(state)?
+            .into_iter()
+            .any(|now| now.run_id == item.run_id && now.workspace == item.workspace);
+        if !still {
+            continue;
+        }
+        let mut run = state.load_run(&item.run_id)?;
+        release_workspace(state, &mut run, "cleaned")?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// `dispatch attach -- <command...>`: the wrapped form's owner loop (parts
@@ -922,10 +1010,25 @@ pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<
 /// `dispatch finish <id>`: freeze Δ, run verification in the workspace
 /// itself, and become an ordinary Ready result. See part 14.9.
 pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Result<RunRecord> {
+    let run = finish_quietly(state, run_id, allow_unsafe_local).await?;
+    print_finish_summary(&run);
+    println!("Next: dispatch check {}", run.id);
+    Ok(run)
+}
+
+/// `finish` without printing, for `watch`.
+pub(crate) async fn finish_quietly(
+    state: &State,
+    run_id: &str,
+    allow_unsafe_local: bool,
+) -> Result<RunRecord> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
+    // A moment's wait: the project owner holds this lock briefly while it
+    // checks the Work. A live wrapper holds it for the whole session.
+    let _run_lock = OperationLock::acquire_wait(
         &state.run_dir(&resolved_run_id).join(".operation.lock"),
         "attached work has a foreground owner",
+        Duration::from_secs(5),
     )?;
     let run = state.load_run(&resolved_run_id)?;
     anyhow::ensure!(
@@ -940,6 +1043,26 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
     );
 
     let mut db = Database::open(state.db_path())?;
+    let mut run = run;
+    if allow_unsafe_local && !run.environment.unsafe_local {
+        // The person's acknowledgement is the run's from now on, so the checks
+        // on the merged tree run at accept too, as for work attached with it.
+        run.environment.unsafe_local = true;
+        db.sync_run(&run)?;
+        persist_event(
+            state,
+            &db,
+            EventRecord {
+                run_id: run.id.clone(),
+                candidate_label: None,
+                event_type: "attach.authorized".into(),
+                timestamp: Utc::now(),
+                payload: serde_json::json!({"unsafe_local": true, "by": "human"}),
+                ..EventRecord::default()
+            },
+            &mut run,
+        )?;
+    }
     let run = finish_locked(
         state,
         &mut db,
@@ -948,9 +1071,6 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
         FinishReason::Explicit,
     )
     .await?;
-
-    print_finish_summary(&run);
-    println!("Next: dispatch check {}", run.id);
 
     Ok(run)
 }
@@ -1051,7 +1171,7 @@ pub(super) async fn finish_locked(
     run.candidates[0].duration_ms = (Utc::now() - attached_at).num_milliseconds().max(0) as u64;
     run.candidates[0].exit_code = match &reason {
         FinishReason::ProcessExit { code } => *code,
-        FinishReason::Explicit => None,
+        FinishReason::Explicit | FinishReason::ByConsent => None,
     };
 
     refresh_outcome(&mut run);
@@ -1167,6 +1287,49 @@ pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u6
     Ok(files_changed)
 }
 
+/// Finish Work whose workspace was removed with its exact changes kept, when
+/// the person consented to the project's checks running by themselves: the
+/// checks run in a workspace rebuilt from S0 and those changes, and the Work
+/// becomes an ordinary result awaiting review. Only when the consent still
+/// holds for exactly the commands this Work would run. Returns whether it
+/// finished; a run another process holds is left for the next try.
+pub(super) async fn finish_by_consent(state: &State, run_id: &str) -> Result<bool> {
+    let Ok(_lock) = OperationLock::acquire(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+    ) else {
+        return Ok(false);
+    };
+    let run = state.load_run(run_id)?;
+    let removed_exactly = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_removed.as_ref())
+        .is_some_and(|removal| removal.exact);
+    if run.mode != RunMode::Attached
+        || run.outcome.lifecycle != LifecycleState::Working
+        || !removed_exactly
+        || !run.environment.unsafe_local
+        || run.candidates.len() != 1
+    {
+        return Ok(false);
+    }
+    let project = crate::consent::project_root(&run.source_path)?;
+    let crate::consent::CheckConsent::Valid(consented) = crate::consent::consent(state, &project)?
+    else {
+        return Ok(false);
+    };
+    let runs = crate::coherence::run_config(&state.run_dir(run_id))
+        .map(|config| config.checks.verify)
+        .unwrap_or_default();
+    if runs != consented {
+        return Ok(false);
+    }
+    let mut db = Database::open(state.db_path())?;
+    finish_locked(state, &mut db, run, false, FinishReason::ByConsent).await?;
+    Ok(true)
+}
+
 /// The project owner found the workspace of active Work gone without being
 /// told first: only the Δ it last followed survives, kept beside the run as
 /// `delta-last-seen.patch`. It can be read, never finished.
@@ -1194,11 +1357,29 @@ pub(crate) fn note_workspace_gone(
         at: now,
         exact: false,
     });
-    if let Some(last_seen) = last_seen.filter(|path| path.is_file()) {
-        crate::state::write_durably(
-            &state.run_dir(run_id).join("delta-last-seen.patch"),
-            &fs::read(last_seen)?,
-        )?;
+    let last_seen = match last_seen.filter(|path| path.is_file()) {
+        Some(path) => Some(fs::read(path)?),
+        None => None,
+    };
+    if let Some(bytes) = &last_seen {
+        crate::state::write_durably(&state.run_dir(run_id).join("delta-last-seen.patch"), bytes)?;
+    }
+    // Last seen with no changes at all: nothing was lost, so nothing waits.
+    let empty = last_seen.as_ref().is_some_and(Vec::is_empty);
+    if empty {
+        if let Some(candidate) = run.candidates.first_mut() {
+            candidate.status = CandidateStatus::Cancelled;
+        }
+        run.status = RunStatus::Interrupted;
+        run.completed_at = Some(now);
+        run.outcome.lifecycle = LifecycleState::Finished;
+        run.outcome.work_result = WorkResult::Cancelled;
+        run.outcome.phase = RunPhase::Finished;
+        run.outcome.review = ReviewState::NotRequested;
+        if let Some(attempt) = run.attempts.first_mut() {
+            attempt.completed_at = Some(now);
+            attempt.outcome = "no_changes".into();
+        }
     }
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1210,17 +1391,17 @@ pub(crate) fn note_workspace_gone(
             candidate_label: None,
             event_type: "workspace.removed".into(),
             timestamp: now,
-            payload: serde_json::json!({"exact": false}),
+            payload: serde_json::json!({"exact": false, "no_changes": empty}),
             ..EventRecord::default()
         },
         &mut run,
     )
 }
 
-/// Close Work whose workspace vanished before its final changes were kept: a
-/// person's decision (`dispatch reject`), as it can never be finished. The
-/// changes last seen stay beside the run.
-pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
+/// Close unfinished Work whose workspace is gone: the person's decision
+/// (`dispatch reject`) not to keep it. Its changes stay beside the run: the
+/// exact ones kept at removal, or those last seen when it vanished.
+pub(crate) fn close_removed(state: &State, run_id: &str) -> Result<()> {
     let _lock = OperationLock::acquire_wait(
         &state.run_dir(run_id).join(".operation.lock"),
         "attached work has a foreground owner",
@@ -1232,9 +1413,8 @@ pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
             && run
                 .attachment
                 .as_ref()
-                .and_then(|attachment| attachment.workspace_removed.as_ref())
-                .is_some_and(|removal| !removal.exact),
-        "work {run_id} is not work whose workspace was lost"
+                .is_some_and(|attachment| attachment.workspace_removed.is_some()),
+        "work {run_id} is not unfinished work whose workspace is gone"
     );
     let now = Utc::now();
     if let Some(candidate) = run.candidates.first_mut() {
@@ -1248,7 +1428,7 @@ pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
     run.outcome.review = ReviewState::NotRequested;
     if let Some(attempt) = run.attempts.first_mut() {
         attempt.completed_at = Some(now);
-        attempt.outcome = "workspace_lost".into();
+        attempt.outcome = "workspace_removed".into();
     }
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1260,7 +1440,7 @@ pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
             candidate_label: None,
             event_type: "work.closed".into(),
             timestamp: now,
-            payload: serde_json::json!({"reason": "workspace_lost", "by": "human"}),
+            payload: serde_json::json!({"reason": "workspace_removed", "by": "human"}),
             ..EventRecord::default()
         },
         &mut run,

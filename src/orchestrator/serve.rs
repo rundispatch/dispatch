@@ -88,7 +88,22 @@ async fn run(
             _ = ticker.tick() => {}
             _ = &mut shutdown => return Ok(()),
         }
-        let tick = owner.tick(state);
+        let mut tick = owner.tick(state);
+        // Work whose runtime removed its workspace, finished where the person
+        // consented to the project's checks running by themselves.
+        let waiting: Vec<String> = tick
+            .runs
+            .iter()
+            .filter(|run| awaits_finish_by_consent(run))
+            .map(|run| run.id.clone())
+            .collect();
+        for id in waiting {
+            match super::attach::finish_by_consent(state, &id).await {
+                Ok(true) => tick.persisted = true,
+                Ok(false) => {}
+                Err(error) => tick.report(&error),
+            }
+        }
         if tick.cost.idle() && !tick.moved {
             tracing::debug!("tick: {}", tick.cost);
         } else {
@@ -143,7 +158,7 @@ pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
         let header = format!(
             "{} · {}",
             root.display(),
-            super::background::describe(state, &root)
+            super::background::project_line(state, &root)
         );
         let journal = Database::open_read_only(state.db_path())
             .and_then(|db| db.latest_event_id())
@@ -632,6 +647,19 @@ impl Owner {
     }
 }
 
+/// Active attached Work whose workspace was removed with its exact changes
+/// kept and that carries the authority to run checks: a candidate for
+/// `attach::finish_by_consent`, which checks the consent itself.
+fn awaits_finish_by_consent(run: &RunRecord) -> bool {
+    run.outcome.lifecycle == LifecycleState::Working
+        && run.environment.unsafe_local
+        && run
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.workspace_removed.as_ref())
+            .is_some_and(|removal| removal.exact)
+}
+
 /// A Ready result nobody has accepted, rejected or applied yet.
 fn awaits_review(run: &RunRecord) -> bool {
     run.outcome.review == ReviewState::Pending && coherence::is_ready_unapplied(run)
@@ -686,6 +714,18 @@ fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows
+}
+
+/// The project view's rows for `watch`'s interactive form: each Work item's
+/// id and its line, in the view's order.
+pub(crate) fn project_rows(runs: &[RunRecord]) -> Vec<(String, String)> {
+    view_rows(runs)
+        .into_iter()
+        .map(|run| {
+            let id8 = &run.id[..8.min(run.id.len())];
+            (run.id.clone(), format!("{id8} · {}", describe(run).0))
+        })
+        .collect()
 }
 
 /// The project view: what is shown, so each tick prints only what changed.
