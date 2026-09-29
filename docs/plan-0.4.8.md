@@ -558,3 +558,34 @@ verdicts after A lands, and the timing from edit to edge.
     `hook_raw` now reuses `hook_output`.
   - Eight `serve --background` owners left from a `runtime_hooks` run killed on
     2026-09-27 (its `Drop` cleanup never ran) were stopped.
+- Stage 2. `Footprint` (`src/coherence/interactions.rs`), derived from the
+  facts layer. Nothing about the facts or verdicts changes.
+  - **`facts.rs`** gains outputs only:
+    - `DeltaFile.old_blob` (from `index <old>..`) and `DeltaFile::spans()` (hunk
+      S0 spans, context included);
+    - `changed_paths(patch)`: every path the patch changes, with its status,
+      including the binary, symlink and mode-only files `parse_patch` skips;
+    - on `Derived`: `introduced` (qualified names new in the post-image);
+      `contracts` (for each Modified declaration with a clean post-image:
+      `Kept`, `Changed` or `Removed`, by the same test a `Referenced` fact
+      uses: `sig_fp`, or `python_call_compatible`); and `unparsed` (supported
+      files whose post-image does not parse, while the baseline did).
+  - **`interactions::footprint(work)`:**
+    - symbol writes: Modified declarations, as `Changes { contract }` or
+      `Removes`, and introduced declarations, as `Adds`;
+    - symbol reads: `Referenced` facts;
+    - file reads: files the code names;
+    - file writes: added and deleted files, and modified files without
+      declaration-level analysis (an unsupported language, skipped by the
+      parser, or an unreadable baseline);
+    - text edits: blob, removed lines, insertions and spans, for supported
+      modified files.
+  - **`interactions::settle(fresh, frozen, last)`:** a clean footprint stands.
+    With an unparsed file, frozen Work makes that file file-level, and live
+    Work keeps its last clean footprint (`LastSeen`) or claims nothing
+    (`Pending`).
+  - Tests: 5 footprint cases (body versus signature versus removal, a
+    compatible Python signature, reads and adds, whole-file cases including
+    binary, the unparsed live and frozen cases) and `changed_paths` (a quoted
+    path with a space, binary, deleted, added). The coherence unit and
+    integration suites are unchanged and green.
