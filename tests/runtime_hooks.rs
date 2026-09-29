@@ -321,6 +321,12 @@ fn removing_the_worktree_keeps_its_exact_changes_before_the_hook_returns() {
         "{}",
         text(&output)
     );
+    // The command it suggests works however many runs share a prefix.
+    assert!(
+        text(&output).contains(&format!("dispatch finish {id}")),
+        "{}",
+        text(&output)
+    );
     // Once the hook has returned, the exact Δ and the removal are durable.
     let patch = fs::read_to_string(p.run_dir(&id).join("delta.patch")).unwrap();
     assert!(patch.contains("+    2"), "{patch}");

@@ -718,3 +718,59 @@ verdicts after A lands, and the timing from edit to edge.
       is new is the same snapshot for native and live-wrapped Work.
     - At 50 pieces, the first tick takes about a minute in total, most of it
       the existing coherence evaluation.
+- Stage 7. Real-agent trial: Claude Code 2.1.280 and Cursor Agent
+  2026.09.28, on 2026-09-29, in a fresh trial project with its own state
+  directory. The hooks were only in its `.claude/settings.local.json`.
+  - **Why a fresh trial project.** The earlier one under the system temporary
+    directory had lost `.git/HEAD` and other files to macOS's routine clean-up
+    of old temporary files, so it was no longer a repository.
+  - **The project:** Python. `auth.py` has `validate` and, well apart from
+    it, `refresh`; `api.py`; `report.py`. `checks.verify` imports the
+    modules.
+  - **Five pieces of Work, launched together:**
+    - **A** (`claude -p --worktree`): make `validate(token)` into
+      `validate(token, scope)`;
+    - **C** (`claude -p --worktree`): change only the body of `validate`;
+    - **E** (`claude -p --worktree`): change only the body of `refresh`;
+    - **B** (`dispatch attach -- cursor-agent`): add `login` calling
+      `auth.validate`;
+    - **D** (`dispatch attach -- cursor-agent`): change `report.summarize`.
+
+    All five agents finished within 64 s. A, C and E stayed as live discovered
+    Work; B and D finished Ready, checks passed.
+  - **Before anything landed** (the projection; all five were CONTINUE and
+    `analyzed`):
+    - A and C: `same_declaration` on `auth.py` `validate`. It already showed
+      while the agents were still running.
+    - A to B: `uses`, A the writer, `signature`, on `validate`. It was computed
+      at 23:53:11, before B's wrapper had even exited (23:53:19).
+    - No interaction between C and B (a change to the body only), none for E
+      against A or C (the same file, another declaration, hunks apart), and
+      none for D.
+    - `status` for B read "Coherence: CONTINUE — world unchanged" and,
+      separately, "Concurrent: with 01M3QJF0: it changes the signature of
+      validate (auth.py), which this Work uses".
+  - **A landed.** The `WorktreeRemove` event went to the hook (exact Δ kept),
+    then the worktree was removed, then `finish --allow-unsafe-local`, then
+    `accept`, at 23:54:06 to 23:54:08. At 23:54:10, A had left the comparison
+    and no edges remained. The existing coherence check then gave:
+    - B: REFRESH, `fact_broken`, `def validate(token): => def
+      validate(token, scope):`;
+    - C: REFRESH, `patch_conflict` in `auth.py`;
+    - D and E: CONTINUE.
+  - **Found and fixed:** an ID cut to 8 characters did not tell apart Work
+    launched together. A, C and E are ULIDs made within 256 ms, and all showed
+    as `01M3QJF0`. So "with 01M3QJF0" named no one, and the hook's suggestion
+    "dispatch finish 01M3QJF0" matched three runs.
+    - `state::short_ids` gives each ID its first 8 characters, or more when
+      another shares them. It is used for other Work named in interactions
+      (unique among the participants) and for the view's rows (unique among
+      the rows shown).
+    - The removal notice's commands now carry the full run ID.
+    - The same view after the fix showed `01M3QJF0JQ`, `01M3QJF0JV` and
+      `01M3QJF0JZ`.
+    - Tests: `short_ids_grow_only_as_far_as_needed_to_tell_runs_apart`, and
+      the removal test asserts `dispatch finish <full id>`.
+  - **Not repeated here:** the owner was run without `-vv`, so footprints were
+    not logged. The participants' analysis and the edges above are from the
+    projection.

@@ -910,17 +910,22 @@ pub(crate) fn project_rows(
     runs: &[RunRecord],
     interactions: Option<&Projection>,
 ) -> Vec<(String, String)> {
-    view_rows(runs)
-        .into_iter()
-        .map(|run| (run.id.clone(), row(run, interactions)))
+    let rows = view_rows(runs);
+    let ids = short_ids(&rows);
+    rows.into_iter()
+        .map(|run| (run.id.clone(), row(run, ids[run.id.as_str()], interactions)))
         .collect()
+}
+
+fn short_ids<'a>(rows: &[&'a RunRecord]) -> HashMap<&'a str, &'a str> {
+    let ids: Vec<&str> = rows.iter().map(|run| run.id.as_str()).collect();
+    crate::state::short_ids(&ids)
 }
 
 /// One row of the project view: the Work line, then whom it interacts with,
 /// kept apart from the verdict.
-fn row(run: &RunRecord, interactions: Option<&Projection>) -> String {
-    let id8 = &run.id[..8.min(run.id.len())];
-    let mut line = format!("{id8} · {}", describe(run).0);
+fn row(run: &RunRecord, id: &str, interactions: Option<&Projection>) -> String {
+    let mut line = format!("{id} · {}", describe(run).0);
     if let Some(summary) = interactions.and_then(|p| p.summary(&run.id)) {
         line.push_str(" · ");
         line.push_str(&summary);
@@ -995,7 +1000,12 @@ impl View {
         let lines: Vec<String> = header
             .map(str::to_owned)
             .into_iter()
-            .chain(rows.iter().map(|run| row(run, interactions)))
+            .chain({
+                let ids = short_ids(&rows);
+                rows.iter()
+                    .map(move |run| row(run, ids[run.id.as_str()], interactions))
+                    .collect::<Vec<_>>()
+            })
             .chain(empty.then(|| "no Work in the last hour".to_owned()))
             .collect();
 

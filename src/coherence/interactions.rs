@@ -461,6 +461,18 @@ impl Projection {
         self.participants.iter().find(|p| p.run_id == run_id)
     }
 
+    /// How other Work is named: long enough to tell every participant apart.
+    fn label(&self, run_id: &str) -> String {
+        let ids: Vec<&str> = self
+            .participants
+            .iter()
+            .map(|p| p.run_id.as_str())
+            .collect();
+        crate::state::short_ids(&ids)
+            .get(run_id)
+            .map_or_else(|| run_id.to_owned(), |short| (*short).to_owned())
+    }
+
     /// The project view's segment for `run_id`: whom it interacts with.
     pub fn summary(&self, run_id: &str) -> Option<String> {
         let mut others: Vec<String> = self.of(run_id).into_iter().map(|(id, _)| id).collect();
@@ -468,7 +480,7 @@ impl Projection {
         others.dedup();
         match others.as_slice() {
             [] => None,
-            [one] => Some(format!("interacts with {}", short(one))),
+            [one] => Some(format!("interacts with {}", self.label(one))),
             many => Some(format!("interacts with {} Work", many.len())),
         }
     }
@@ -485,7 +497,9 @@ impl Projection {
         let mut lines: Vec<String> = self
             .of(run_id)
             .iter()
-            .map(|(other, interaction)| format!("with {}: {}", short(other), explain(interaction)))
+            .map(|(other, interaction)| {
+                format!("with {}: {}", self.label(other), explain(interaction))
+            })
             .collect();
         if lines.is_empty() {
             lines.push("no interaction with other Work in progress".into());
@@ -533,10 +547,6 @@ impl Projection {
             })
             .collect()
     }
-}
-
-fn short(id: &str) -> &str {
-    &id[..8.min(id.len())]
 }
 
 /// One interaction in words, from this Work's side (`Side::A`); "it" is the

@@ -217,6 +217,28 @@ impl State {
 /// `load_run` reader repairing a stale copy), and a shared temporary name let
 /// one rename consume the other's file. Every writer produces the committed
 /// projection, so whichever rename lands last leaves a complete, current file.
+/// How each of `ids` is shown: its first 8 characters, or more when another
+/// of `ids` shares them. Run IDs made within the same quarter second share
+/// their first 8, and Work launched together is exactly what gets compared.
+pub(crate) fn short_ids<'a>(ids: &[&'a str]) -> std::collections::HashMap<&'a str, &'a str> {
+    ids.iter()
+        .map(|&id| {
+            let shared = ids
+                .iter()
+                .filter(|&&other| other != id)
+                .map(|other| {
+                    id.bytes()
+                        .zip(other.bytes())
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            (id, &id[..(shared + 1).max(8).min(id.len())])
+        })
+        .collect()
+}
+
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("projection path has no parent")?;
     fs::create_dir_all(parent)?;
@@ -262,4 +284,25 @@ pub fn write_text(path: &Path, value: &str) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, value).with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod short_id_tests {
+    use super::short_ids;
+
+    #[test]
+    fn short_ids_grow_only_as_far_as_needed_to_tell_runs_apart() {
+        let ids = [
+            "01M3QJF0JQ3W5G6T6KGGAG2DXT",
+            "01M3QJF0JZEXYGR88J1BKR10H4",
+            "01M3QJEXS32PNWDWKW006JZ6N7",
+            "01M4AAAAAAAAAAAAAAAAAAAAAA",
+        ];
+        let short = short_ids(&ids);
+        assert_eq!(short[ids[0]], "01M3QJF0JQ");
+        assert_eq!(short[ids[1]], "01M3QJF0JZ");
+        assert_eq!(short[ids[2]], "01M3QJEX");
+        assert_eq!(short[ids[3]], "01M4AAAA");
+        assert_eq!(short_ids(&[ids[0]])[ids[0]], "01M3QJF0");
+    }
 }
