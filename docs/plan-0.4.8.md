@@ -589,3 +589,29 @@ verdicts after A lands, and the timing from edit to edge.
     binary, the unparsed live and frozen cases) and `changed_paths` (a quoted
     path with a space, binary, deleted, added). The coherence unit and
     integration suites are unchanged and green.
+- Stage 3. The rules and the pairwise comparison (`interactions::between`,
+  `interactions::edges`), with the matrix as unit tests.
+  - **Rule 3 (file) runs first.** A path either side judges as a whole is
+    explained there, so no symbol or text evidence is repeated for it. When
+    both sides write the path, the entry is symmetric ("both add" or "both
+    delete" when that is what they do); otherwise it names the writer and what
+    it does.
+  - **Rule 1 (same declaration):** any symbol written by both.
+  - **Rule 2 (uses):** a `Changes { contract: true }` or `Removes` on a
+    declaration the other reads and does not itself write.
+  - **Rule 4 (textual overlap):** the same path from the same S0 blob, with no
+    rule 1 on that path. It fires on a removed line inside the other's hunk
+    span, an insertion strictly inside it, or an insertion at the same place
+    the other inserts.
+  - **Found while writing the matrix:** two insertions at the same S0 point
+    (both at the top of a file, or both at its end) fall strictly inside
+    neither hunk. The shared insertion point was added as evidence.
+  - **Matrix (unit tests):** m1, m2/m3 (both directions), m2b (removal), m4,
+    m5, m6, m7, m8 (a deleted file against a change and a use), m9, m9b
+    (imports at the top), m9c (adjacent declarations, text only), m9d (body
+    only: none), m9f (compatible Python: none), m9g (no line evidence beside a
+    shared declaration), m14 (different S0s: by name, never by line), and
+    `edges` (only pairs that interact).
+  - **Checked by breaking the rules on purpose:** without the shared insertion
+    point, m9b fails; treating every write as breaking a contract fails m9d
+    and m9f.

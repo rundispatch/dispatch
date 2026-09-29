@@ -208,6 +208,187 @@ pub fn settle(
     }
 }
 
+/// The rule that found an interaction, strongest evidence first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rule {
+    /// Both change the same declaration.
+    SameDeclaration,
+    /// One changes the contract of, or removes, a declaration the other uses.
+    Uses,
+    /// Both touch a file at least one of them is judged on as a whole.
+    File,
+    /// Both edit the same S0 text: one's changed lines fall inside a hunk of
+    /// the other's, context included. Evidence of overlap, not a prediction
+    /// that `git apply` will fail.
+    TextualOverlap,
+}
+
+/// What the writing side does, when only one side writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    Signature,
+    Removes,
+    Adds,
+    Deletes,
+    Changes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    A,
+    B,
+}
+
+/// One piece of evidence that two pieces of Work touch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Interaction {
+    pub rule: Rule,
+    /// The side whose write the other relies on; `None` when both write.
+    pub writer: Option<Side>,
+    pub target: Target,
+    /// What the writer does; for both sides, set only when both add or both
+    /// delete.
+    pub change: Option<Change>,
+    /// The S0 lines where the text overlaps.
+    pub lines: Option<(u32, u32)>,
+}
+
+/// Every interaction between `a` and `b`. Read/read never interacts, nor do
+/// different declarations of one file whose hunks keep apart, nor a change to
+/// a body alone that the other only uses.
+pub fn between(a: &Footprint, b: &Footprint) -> Vec<Interaction> {
+    let mut found = Vec::new();
+    // Rule 3 first: a path judged as a whole needs no finer evidence there.
+    let touches = |fp: &Footprint, path: &str| {
+        fp.writes.keys().any(|t| t.path() == path) || fp.reads.iter().any(|t| t.path() == path)
+    };
+    let mut coarse = BTreeSet::new();
+    for (side, writer, other) in [(Side::A, a, b), (Side::B, b, a)] {
+        for (target, write) in &writer.writes {
+            let Target::File { path } = target else {
+                continue;
+            };
+            if !touches(other, path) || coarse.contains(path.as_str()) {
+                continue;
+            }
+            let both = other.writes.keys().any(|t| t.path() == path);
+            let change = if both {
+                match (write, other.writes.get(target)) {
+                    (Write::Adds, Some(Write::Adds)) => Some(Change::Adds),
+                    (Write::Deletes, Some(Write::Deletes)) => Some(Change::Deletes),
+                    _ => None,
+                }
+            } else {
+                Some(change_of(*write))
+            };
+            found.push(Interaction {
+                rule: Rule::File,
+                writer: (!both).then_some(side),
+                target: target.clone(),
+                change,
+                lines: None,
+            });
+            coarse.insert(path.as_str());
+        }
+    }
+    let mut declared = BTreeSet::new();
+    for (target, write) in &a.writes {
+        if !matches!(target, Target::Symbol { .. }) || coarse.contains(target.path()) {
+            continue;
+        }
+        if let Some(other) = b.writes.get(target) {
+            found.push(Interaction {
+                rule: Rule::SameDeclaration,
+                writer: None,
+                target: target.clone(),
+                change: (*write == Write::Adds && *other == Write::Adds).then_some(Change::Adds),
+                lines: None,
+            });
+            declared.insert(target.path());
+        }
+    }
+    for (side, writer, reader) in [(Side::A, a, b), (Side::B, b, a)] {
+        for (target, write) in &writer.writes {
+            let breaks = matches!(write, Write::Changes { contract: true } | Write::Removes);
+            if breaks
+                && matches!(target, Target::Symbol { .. })
+                && !coarse.contains(target.path())
+                && reader.reads.contains(target)
+                && !reader.writes.contains_key(target)
+            {
+                found.push(Interaction {
+                    rule: Rule::Uses,
+                    writer: Some(side),
+                    target: target.clone(),
+                    change: Some(change_of(*write)),
+                    lines: None,
+                });
+            }
+        }
+    }
+    for (path, edits) in &a.text {
+        if coarse.contains(path.as_str()) || declared.contains(path.as_str()) {
+            continue;
+        }
+        let Some(other) = b.text.get(path).filter(|other| other.blob == edits.blob) else {
+            continue;
+        };
+        if let Some(lines) = overlap(edits, other).or_else(|| overlap(other, edits)) {
+            found.push(Interaction {
+                rule: Rule::TextualOverlap,
+                writer: None,
+                target: Target::File { path: path.clone() },
+                change: None,
+                lines: Some(lines),
+            });
+        }
+    }
+    found.sort_by(|x, y| (x.rule, &x.target).cmp(&(y.rule, &y.target)));
+    found
+}
+
+fn change_of(write: Write) -> Change {
+    match write {
+        Write::Changes { contract: true } => Change::Signature,
+        Write::Changes { contract: false } => Change::Changes,
+        Write::Removes => Change::Removes,
+        Write::Adds => Change::Adds,
+        Write::Deletes => Change::Deletes,
+    }
+}
+
+/// The S0 lines where `edits` change text inside one of `other`'s hunks: a
+/// removed line within the hunk, an insertion strictly between two of its
+/// lines, or an insertion at the very place `other` inserts too.
+fn overlap(edits: &TextEdits, other: &TextEdits) -> Option<(u32, u32)> {
+    other.spans.iter().find_map(|&(start, end)| {
+        let removed = edits
+            .removed
+            .iter()
+            .any(|&(low, high)| low <= end && start <= high);
+        let inserted = edits.insertions.iter().any(|&after| {
+            (start <= after && after < end)
+                || (other.insertions.contains(&after) && start <= after + 1 && after <= end)
+        });
+        (removed || inserted).then_some((start, end))
+    })
+}
+
+/// The interactions of every pair among `works`, each footprint compared once
+/// with every other: O(n²) pairs, each a few set lookups.
+pub fn edges(works: &[(String, Footprint)]) -> Vec<(&str, &str, Vec<Interaction>)> {
+    let mut edges = Vec::new();
+    for (i, (a, fa)) in works.iter().enumerate() {
+        for (b, fb) in &works[i + 1..] {
+            let found = between(fa, fb);
+            if !found.is_empty() {
+                edges.push((a.as_str(), b.as_str(), found));
+            }
+        }
+    }
+    edges
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -432,5 +613,392 @@ mod tests {
             shown.writes.get(&file("src/auth.rs")),
             Some(&Write::Changes { contract: true })
         );
+    }
+
+    // ---- the interaction matrix ------------------------------------------
+
+    /// A Rust library: `validate` and `refresh` far apart, `first` and
+    /// `second` side by side, plus an API and a CLI module that call nothing.
+    fn library() -> String {
+        let filler: String = (1..=8)
+            .map(|n| format!("pub fn filler_{n}() {{}}\n"))
+            .collect();
+        format!(
+            "use std::fmt;\n\npub fn validate(token: &str) -> bool {{\n    !token.is_empty()\n}}\n\n\
+             {filler}\npub fn refresh(token: &str) -> String {{\n    token.to_owned()\n}}\n\n\
+             {filler}\npub fn first() -> i32 {{\n    1\n}}\npub fn second() -> i32 {{\n    2\n}}\n"
+        )
+    }
+
+    fn project() -> Base {
+        let lib = library();
+        Base::new(&[
+            ("src/auth.rs", lib.as_str()),
+            ("src/api.rs", "pub fn serve() {}\n"),
+            ("src/cli.rs", "pub fn main() {}\n"),
+            ("config.yml", "a: 1\nb: 2\n"),
+        ])
+    }
+
+    fn edit(from: &str, to: &str) -> String {
+        let lib = library();
+        assert!(lib.contains(from), "{from}");
+        lib.replacen(from, to, 1)
+    }
+
+    fn rules(found: &[Interaction]) -> Vec<(Rule, Option<Side>, String)> {
+        found
+            .iter()
+            .map(|i| (i.rule, i.writer, format!("{:?}", i.target)))
+            .collect()
+    }
+
+    fn pair(
+        base: &Base,
+        a: &[(&str, Option<&[u8]>)],
+        b: &[(&str, Option<&[u8]>)],
+    ) -> Vec<Interaction> {
+        between(&base.work(a).footprint(), &base.work(b).footprint())
+    }
+
+    const CALLER: &[u8] =
+        b"pub fn serve() {}\n\npub fn login(t: &str) -> bool {\n    validate(t)\n}\n";
+    const CLI_CALLER: &[u8] =
+        b"pub fn main() {}\n\npub fn check(t: &str) -> bool {\n    validate(t)\n}\n";
+
+    #[test]
+    fn m1_both_change_the_same_declaration() {
+        let base = project();
+        let a = edit("!token.is_empty()", "token.len() > 1");
+        let b = edit("!token.is_empty()", "token.len() > 2");
+        let found = pair(
+            &base,
+            &[("src/auth.rs", Some(a.as_bytes()))],
+            &[("src/auth.rs", Some(b.as_bytes()))],
+        );
+        assert_eq!(
+            rules(&found),
+            vec![(
+                Rule::SameDeclaration,
+                None,
+                format!("{:?}", symbol("src/auth.rs", "validate"))
+            )]
+        );
+    }
+
+    #[test]
+    fn m2_m3_a_signature_change_meets_its_callers_in_either_direction() {
+        let base = project();
+        let a = edit(
+            "validate(token: &str)",
+            "validate(token: &str, strict: bool)",
+        );
+        let a = base
+            .work(&[("src/auth.rs", Some(a.as_bytes()))])
+            .footprint();
+        let b = base.work(&[("src/api.rs", Some(CALLER))]).footprint();
+        let found = between(&a, &b);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            (found[0].rule, found[0].writer, found[0].change),
+            (Rule::Uses, Some(Side::A), Some(Change::Signature))
+        );
+        let found = between(&b, &a);
+        assert_eq!(
+            (found[0].rule, found[0].writer),
+            (Rule::Uses, Some(Side::B))
+        );
+    }
+
+    #[test]
+    fn m2b_removing_a_used_declaration_interacts() {
+        let base = project();
+        let a = edit(
+            "pub fn validate(token: &str) -> bool {\n    !token.is_empty()\n}\n",
+            "",
+        );
+        let found = pair(
+            &base,
+            &[("src/auth.rs", Some(a.as_bytes()))],
+            &[("src/api.rs", Some(CALLER))],
+        );
+        assert_eq!(
+            (found[0].rule, found[0].change),
+            (Rule::Uses, Some(Change::Removes)),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn m4_both_only_calling_the_same_declaration_is_no_interaction() {
+        let base = project();
+        assert_eq!(
+            pair(
+                &base,
+                &[("src/api.rs", Some(CALLER))],
+                &[("src/cli.rs", Some(CLI_CALLER))]
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn m5_different_declarations_of_one_file_apart_do_not_interact() {
+        let base = project();
+        let a = edit("!token.is_empty()", "token.len() > 1");
+        let b = edit("token.to_owned()", "token.to_string()");
+        assert_eq!(
+            pair(
+                &base,
+                &[("src/auth.rs", Some(a.as_bytes()))],
+                &[("src/auth.rs", Some(b.as_bytes()))]
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn m6_unrelated_files_do_not_interact() {
+        let base = project();
+        assert_eq!(
+            pair(
+                &base,
+                &[("src/api.rs", Some(b"pub fn serve() { }\n"))],
+                &[("src/cli.rs", Some(b"pub fn main() { }\n"))]
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn m7_the_same_file_without_declarations_interacts_as_a_whole_file() {
+        let base = project();
+        let found = pair(
+            &base,
+            &[("config.yml", Some(b"a: 3\nb: 2\n"))],
+            &[("config.yml", Some(b"a: 1\nb: 4\n"))],
+        );
+        assert_eq!(
+            rules(&found),
+            vec![(Rule::File, None, format!("{:?}", file("config.yml")))]
+        );
+    }
+
+    #[test]
+    fn m8_deleting_a_file_meets_whoever_changes_or_uses_it() {
+        let base = Base::new(&[
+            ("util.py", "def helper(x):\n    return x\n"),
+            ("main.py", "def run():\n    pass\n"),
+        ]);
+        let changed = pair(
+            &base,
+            &[("util.py", None)],
+            &[("util.py", Some(b"def helper(x):\n    return x + 1\n"))],
+        );
+        assert_eq!(
+            rules(&changed),
+            vec![(Rule::File, None, format!("{:?}", file("util.py")))]
+        );
+        let used = pair(
+            &base,
+            &[("util.py", None)],
+            &[("main.py", Some(b"def run():\n    return helper(1)\n"))],
+        );
+        assert_eq!(
+            (used[0].rule, used[0].writer, used[0].change),
+            (Rule::File, Some(Side::A), Some(Change::Deletes)),
+            "{used:?}"
+        );
+    }
+
+    #[test]
+    fn m9_both_adding_the_same_path_interacts_once() {
+        let base = project();
+        let found = pair(
+            &base,
+            &[("src/new.rs", Some(b"pub fn made() {}\n"))],
+            &[("src/new.rs", Some(b"pub fn made() {}\npub fn other() {}\n"))],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            (found[0].rule, found[0].change),
+            (Rule::File, Some(Change::Adds))
+        );
+    }
+
+    #[test]
+    fn m9b_both_adding_imports_at_the_top_overlap_as_text() {
+        let base = project();
+        let a = format!("use std::io;\n{}", library());
+        let b = format!("use std::fs;\n{}", library());
+        let found = pair(
+            &base,
+            &[("src/auth.rs", Some(a.as_bytes()))],
+            &[("src/auth.rs", Some(b.as_bytes()))],
+        );
+        assert_eq!(
+            rules(&found),
+            vec![(
+                Rule::TextualOverlap,
+                None,
+                format!("{:?}", file("src/auth.rs"))
+            )]
+        );
+    }
+
+    #[test]
+    fn m9c_adjacent_edits_of_different_declarations_overlap_as_text_only() {
+        let base = project();
+        let a = edit("    1\n", "    10\n");
+        let b = edit("    2\n", "    20\n");
+        let found = pair(
+            &base,
+            &[("src/auth.rs", Some(a.as_bytes()))],
+            &[("src/auth.rs", Some(b.as_bytes()))],
+        );
+        assert_eq!(
+            rules(&found),
+            vec![(
+                Rule::TextualOverlap,
+                None,
+                format!("{:?}", file("src/auth.rs"))
+            )],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn m9d_a_body_change_does_not_meet_its_callers() {
+        let base = project();
+        let a = edit("!token.is_empty()", "token.len() > 1");
+        assert_eq!(
+            pair(
+                &base,
+                &[("src/auth.rs", Some(a.as_bytes()))],
+                &[("src/api.rs", Some(CALLER))]
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn m9f_a_compatible_python_signature_does_not_meet_its_callers() {
+        let base = Base::new(&[
+            ("auth.py", "def validate(token):\n    return bool(token)\n"),
+            ("app.py", "def run():\n    pass\n"),
+        ]);
+        let found = pair(
+            &base,
+            &[(
+                "auth.py",
+                Some(b"def validate(token, strict=False):\n    return bool(token)\n"),
+            )],
+            &[("app.py", Some(b"def run():\n    return validate('x')\n"))],
+        );
+        assert_eq!(found, vec![]);
+    }
+
+    #[test]
+    fn m9g_a_shared_declaration_explains_the_file_without_line_evidence() {
+        let base = project();
+        let a = format!(
+            "use std::io;\n{}",
+            edit("!token.is_empty()", "token.len() > 1")
+        );
+        let b = format!(
+            "use std::fs;\n{}",
+            edit("!token.is_empty()", "token.len() > 2")
+        );
+        let found = pair(
+            &base,
+            &[("src/auth.rs", Some(a.as_bytes()))],
+            &[("src/auth.rs", Some(b.as_bytes()))],
+        );
+        assert_eq!(
+            rules(&found),
+            vec![(
+                Rule::SameDeclaration,
+                None,
+                format!("{:?}", symbol("src/auth.rs", "validate"))
+            )]
+        );
+    }
+
+    #[test]
+    fn m14_work_from_different_s0s_is_compared_by_name_and_never_by_line() {
+        let before = project();
+        let moved = library().replace("token.to_owned()", "String::from(token)");
+        let after = Base::new(&[
+            ("src/auth.rs", moved.as_str()),
+            ("src/api.rs", "pub fn serve() {}\n"),
+        ]);
+        let a = edit("!token.is_empty()", "token.len() > 1");
+        let a = before
+            .work(&[("src/auth.rs", Some(a.as_bytes()))])
+            .footprint();
+        let b = moved.replace("!token.is_empty()", "token.len() > 2");
+        let b = after
+            .work(&[("src/auth.rs", Some(b.as_bytes()))])
+            .footprint();
+        let found = between(&a, &b);
+        assert_eq!(
+            rules(&found),
+            vec![(
+                Rule::SameDeclaration,
+                None,
+                format!("{:?}", symbol("src/auth.rs", "validate"))
+            )]
+        );
+
+        // Adjacent edits that would overlap as text from one S0 claim nothing
+        // across two: their line numbers are not comparable.
+        let a = before
+            .work(&[("src/auth.rs", Some(edit("    1\n", "    10\n").as_bytes()))])
+            .footprint();
+        let b = after
+            .work(&[(
+                "src/auth.rs",
+                Some(moved.replacen("    2\n", "    20\n", 1).as_bytes()),
+            )])
+            .footprint();
+        assert_eq!(between(&a, &b), vec![]);
+
+        let signature = edit(
+            "validate(token: &str)",
+            "validate(token: &str, strict: bool)",
+        );
+        let a = before
+            .work(&[("src/auth.rs", Some(signature.as_bytes()))])
+            .footprint();
+        let b = after.work(&[("src/api.rs", Some(CALLER))]).footprint();
+        assert_eq!(between(&a, &b)[0].rule, Rule::Uses);
+    }
+
+    #[test]
+    fn edges_lists_only_pairs_that_interact() {
+        let base = project();
+        let signature = edit(
+            "validate(token: &str)",
+            "validate(token: &str, strict: bool)",
+        );
+        let works = vec![
+            (
+                "A".to_owned(),
+                base.work(&[("src/auth.rs", Some(signature.as_bytes()))])
+                    .footprint(),
+            ),
+            (
+                "B".to_owned(),
+                base.work(&[("src/api.rs", Some(CALLER))]).footprint(),
+            ),
+            (
+                "D".to_owned(),
+                base.work(&[("src/cli.rs", Some(b"pub fn main() { }\n"))])
+                    .footprint(),
+            ),
+        ];
+        let found = edges(&works);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].0, found[0].1), ("A", "B"));
     }
 }
