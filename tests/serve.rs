@@ -750,3 +750,70 @@ fn serve_tick_cost() {
         println!("{items} items, moved: {moved}");
     }
 }
+
+/// What comparing Work costs the owner: `n` attached Work items on the
+/// 2,000-file fixture, each changing its own module and calling one shared
+/// function whose signature every fifth item changes. Prints the owner's tick
+/// lines: the first derives every footprint, idle ticks reuse them, and a tick
+/// after one item edits derives only that one again.
+/// `cargo test --test serve interactions_cost -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn interactions_cost() {
+    let sizes: Vec<usize> = std::env::var("DISPATCH_COST_ITEMS")
+        .map(|items| items.split(',').map(|n| n.parse().unwrap()).collect())
+        .unwrap_or_else(|_| vec![1, 5, 20, 50]);
+    for items in sizes {
+        let fixture = Fixture::new();
+        for n in 0..2000 {
+            let dir = fixture.root.join(format!("pkg{}", n / 100));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("m{n}.rs")),
+                format!("pub fn f{n}(x: u32) -> u32 {{\n    x + {n}\n}}\n"),
+            )
+            .unwrap();
+        }
+        git(&fixture.root, &["add", "-A"]);
+        git(&fixture.root, &["commit", "--quiet", "-m", "grow"]);
+        let mut first_workspace = None;
+        for item in 0..items {
+            let workspace = fixture.extra_worktree(&format!("w{item}"));
+            fixture.attach_workspace(&workspace, &[]);
+            fs::write(
+                workspace.join(format!("pkg1/m{}.rs", 100 + item)),
+                format!(
+                    "pub fn f{}(x: u32) -> u32 {{\n    f1999(x) + 1\n}}\n",
+                    100 + item
+                ),
+            )
+            .unwrap();
+            if item % 5 == 0 {
+                fs::write(
+                    workspace.join("pkg19/m1999.rs"),
+                    "pub fn f1999(x: u32, y: u32) -> u32 {\n    x + y\n}\n",
+                )
+                .unwrap();
+            }
+            first_workspace.get_or_insert(workspace);
+        }
+        let owner = Diagnosed::spawn(&fixture);
+        // The first tick derives everything, which at 50 items takes longer
+        // than the usual wait for a tick.
+        let first = owner.ticks.recv_timeout(Duration::from_secs(300)).unwrap();
+        let idle: Vec<String> = (0..2).map(|_| owner.next()).collect();
+        fs::write(
+            first_workspace.unwrap().join("pkg2/m200.rs"),
+            "pub fn f200(x: u32) -> u32 {\n    x\n}\n",
+        )
+        .unwrap();
+        let edited: Vec<String> = (0..2).map(|_| owner.next()).collect();
+        println!("{items} items, first:  {first}");
+        for line in idle {
+            println!("{items} items, idle:   {line}");
+        }
+        for line in edited {
+            println!("{items} items, edited: {line}");
+        }
+    }
+}

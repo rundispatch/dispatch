@@ -692,3 +692,29 @@ verdicts after A lands, and the timing from edit to edge.
     piped output only after the child exited could block. The same cause was
     behind the racing-follow hang above; `e2e`'s interrupt test now drains its
     pipes while it waits.
+- Stage 6. Measurement (`cargo test --test serve interactions_cost -- --ignored
+  --nocapture`; `DISPATCH_COST_ITEMS=50` picks sizes).
+  - **The setup:** the 2,000-file fixture on this Mac, load 3–5. Each piece of
+    attached Work changes its own function and calls one shared function whose
+    signature every fifth piece changes. The owner's `-v` tick line now splits
+    the cost into "footprinted in" and "pairs in".
+  - **Numbers:**
+
+    | Work | first tick: follow / evaluate / footprints / pairs | idle tick: follow / footprints / pairs | after one edit: footprints |
+    |---|---|---|---|
+    | 1 | 233 / 388 / 185 / 0 ms | 53 / 0 / 0 ms | 189 ms (1) |
+    | 5 | 1,415 / 1,817 / 839 / 0 ms | 280 / 0 / 0 ms | 227 ms (1) |
+    | 20 | 5,616 / 6,696 / 3,026 / 0 ms | 980 / 0 / 0 ms | 188 ms (1) |
+    | 50 | 21,534 / 24,052 / 12,862 / 1 ms | 3,000–3,800 / 0 / 1 ms | 242 ms (1) |
+
+  - **What they say:**
+    - The pair phase is negligible, at 1 ms for 50 pieces (1,225 pairs), so
+      no index is warranted.
+    - A footprint costs about 150–260 ms (the facts layer's `git cat-file` and
+      `git grep` on S0), and is paid only when that piece's Δ changes: an edit
+      re-derives exactly one.
+    - Idle ticks are dominated by following workspaces, about 50–75 ms per
+      piece. That was already the owner's cost for unowned attached Work. What
+      is new is the same snapshot for native and live-wrapped Work.
+    - At 50 pieces, the first tick takes about a minute in total, most of it
+      the existing coherence evaluation.

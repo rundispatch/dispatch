@@ -236,7 +236,8 @@ pub(crate) struct Cost {
     pub evaluate: Duration,
     pub recheck: Duration,
     pub apply: Duration,
-    pub interact: Duration,
+    pub footprint: Duration,
+    pub pairs: Duration,
     pub runs: usize,
     pub followed: usize,
     pub evaluated: usize,
@@ -255,7 +256,7 @@ impl std::fmt::Display for Cost {
         let ms = |d: Duration| d.as_millis();
         write!(
             f,
-            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted, interactions in {} ms",
+            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted in {} ms · pairs in {} ms",
             ms(self.signal),
             self.runs,
             ms(self.load),
@@ -267,7 +268,8 @@ impl std::fmt::Display for Cost {
             ms(self.recheck),
             ms(self.apply),
             self.footprinted,
-            ms(self.interact)
+            ms(self.footprint),
+            ms(self.pairs)
         )
     }
 }
@@ -620,7 +622,6 @@ impl Owner {
     /// Advisory only: nothing here changes a verdict, a lock or a decision. A
     /// footprint is derived again only when its Δ changed.
     fn interact(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
-        let started = Instant::now();
         let mut works = Vec::new();
         let mut participants = Vec::new();
         for run in runs {
@@ -642,6 +643,7 @@ impl Owner {
             let (footprint, analysis) = match known {
                 Some(known) => known,
                 None => {
+                    let started = Instant::now();
                     let fresh = match interactions::footprint(&WorkView {
                         source: &self.root,
                         delta_patch: &patch,
@@ -673,6 +675,7 @@ impl Owner {
                         ((digest.clone(), frozen), footprint.clone(), analysis),
                     );
                     tick.cost.footprinted += 1;
+                    tick.cost.footprint += started.elapsed();
                     (footprint, analysis)
                 }
             };
@@ -687,6 +690,7 @@ impl Owner {
         let ids: HashSet<String> = participants.iter().map(|p| p.run_id.clone()).collect();
         self.footprints.retain(|id, _| ids.contains(id));
         self.clean.retain(|id, _| ids.contains(id));
+        let started = Instant::now();
         let edges: Vec<Edge> = interactions::edges(&works)
             .into_iter()
             .map(|(a, b, interactions)| Edge {
@@ -695,7 +699,7 @@ impl Owner {
                 interactions,
             })
             .collect();
-        tick.cost.interact = started.elapsed();
+        tick.cost.pairs = started.elapsed();
         if self
             .shown
             .as_ref()
