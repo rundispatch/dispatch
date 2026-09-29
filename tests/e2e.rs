@@ -108,6 +108,13 @@ fn non_git_native_run_applies_safely_end_to_end() {
 }
 
 #[cfg(unix)]
+fn drain(mut pipe: impl std::io::Read + Send + 'static) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+    })
+}
+
+#[cfg(unix)]
 #[test]
 fn interrupt_cancels_children_and_persists_terminal_status() {
     let temp = tempfile::tempdir().unwrap();
@@ -136,6 +143,12 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drained while waiting: a child blocked writing into a full pipe nobody
+    // reads would never exit (pipes can be as small as 512 bytes).
+    let drains = [
+        drain(child.stdout.take().unwrap()),
+        drain(child.stderr.take().unwrap()),
+    ];
 
     let deadline = Instant::now() + Duration::from_secs(8);
     let metadata_path = loop {
@@ -166,6 +179,9 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
         thread::sleep(Duration::from_millis(20));
     };
     assert!(!status.success());
+    for drain in drains {
+        drain.join().unwrap();
+    }
 
     let metadata: Value = serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
     // The native engine records a user interrupt as cancelled work.
