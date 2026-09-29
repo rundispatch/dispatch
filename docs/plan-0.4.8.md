@@ -545,3 +545,16 @@ verdicts after A lands, and the timing from edit to edge.
 
     Before the fix, the first and third fail with the reported bug ("Claude CLI
     version changed", "authentication status unavailable").
+- Test hardening found while running the suite on a loaded machine (Defender and
+  a macOS update at over 150% CPU between them, under memory pressure):
+  - `phase4_follow_registration_racing_completion_cannot_lose_it` hung for a
+    day. The test waited for the worker before reading its piped stdout, and the
+    worker was blocked printing its `--json` result into the full pipe. The
+    follower, read only after the worker, was blocked the same way. Both pipes
+    are now drained while waiting.
+  - `malformed_hook_input_is_refused_whole_…` wrote a 70 KiB event. The hook
+    stops reading at its 64 KiB bound, so the write can find the pipe closed.
+    The helper accepts a closed pipe, and asserts on the reply as before.
+    `hook_raw` now reuses `hook_output`.
+  - Eight `serve --background` owners left from a `runtime_hooks` run killed on
+    2026-09-27 (its `Drop` cleanup never ran) were stopped.

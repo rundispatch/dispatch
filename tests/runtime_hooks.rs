@@ -102,7 +102,11 @@ impl Project {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
+        // The hook stops reading at its input bound, so writing an oversized
+        // event may find the pipe closed; what it replies is what counts.
+        if let Err(error) = child.stdin.take().unwrap().write_all(input) {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+        }
         child.wait_with_output().unwrap()
     }
 
@@ -123,17 +127,7 @@ impl Project {
 
     /// Run the hook with raw input; the hook itself must always succeed.
     fn hook_raw(&self, input: &[u8]) -> String {
-        let mut child = Command::new(assert_cmd::cargo_bin!("dispatch"))
-            .arg("--state-dir")
-            .arg(&self.state)
-            .args(["hook", "claude"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
-        let output = child.wait_with_output().unwrap();
+        let output = self.hook_output(input);
         assert!(
             output.status.success(),
             "{}",
