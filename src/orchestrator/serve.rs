@@ -24,7 +24,11 @@ use super::{ApplyOutcome, WorkLine, apply, auto_apply, persist_event, work_line}
 use crate::{
     ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReviewState,
     RunMode, RunRecord, SourceKind, Validity, WorkResult,
-    coherence::{self, WorkView, world},
+    coherence::{
+        self, WorkView,
+        interactions::{self, Analysis, Edge, Footprint, Participant, Projection},
+        world,
+    },
     db::Database,
     lock::{OperationLock, shutdown_signal},
     process::{IdentityState, ProcessIdentity, identity_state},
@@ -190,6 +194,13 @@ pub(crate) struct Owner {
     work: HashMap<String, String>,
     /// Each Ready result's world signal when it was last checked.
     checked: HashMap<String, world::Signal>,
+    /// Each unintegrated Work's footprint, with the digest of the Δ it was
+    /// derived from, whether that Δ was frozen, and how far it can be trusted.
+    footprints: HashMap<String, ((String, bool), Footprint, Analysis)>,
+    /// Each live Work's last cleanly parsed footprint.
+    clean: HashMap<String, Footprint>,
+    /// What the interaction view says now; `None` until it is first written.
+    shown: Option<(Vec<Participant>, Vec<Edge>)>,
     scratch: tempfile::TempDir,
 }
 
@@ -202,6 +213,10 @@ pub(crate) struct Tick {
     pub applied: bool,
     pub digest: Option<String>,
     pub runs: Vec<RunRecord>,
+    /// Runs whose patch so far was snapshotted into the scratch this tick.
+    pub followed: HashSet<String>,
+    /// The interaction view changed.
+    pub interactions: bool,
     /// The first error of the tick. SQLite busy and other transient
     /// failures are retried on the next tick rather than ending the loop.
     pub error: Option<String>,
@@ -219,15 +234,17 @@ pub(crate) struct Cost {
     pub evaluate: Duration,
     pub recheck: Duration,
     pub apply: Duration,
+    pub interact: Duration,
     pub runs: usize,
     pub followed: usize,
     pub evaluated: usize,
     pub rechecked: usize,
+    pub footprinted: usize,
 }
 
 impl Cost {
     fn idle(&self) -> bool {
-        self.evaluated == 0 && self.rechecked == 0
+        self.evaluated == 0 && self.rechecked == 0 && self.footprinted == 0
     }
 }
 
@@ -236,7 +253,7 @@ impl std::fmt::Display for Cost {
         let ms = |d: Duration| d.as_millis();
         write!(
             f,
-            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms",
+            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted, interactions in {} ms",
             ms(self.signal),
             self.runs,
             ms(self.load),
@@ -246,7 +263,9 @@ impl std::fmt::Display for Cost {
             ms(self.evaluate),
             self.rechecked,
             ms(self.recheck),
-            ms(self.apply)
+            ms(self.apply),
+            self.footprinted,
+            ms(self.interact)
         )
     }
 }
@@ -265,6 +284,9 @@ impl Owner {
             last_signal: None,
             work: HashMap::new(),
             checked: HashMap::new(),
+            footprints: HashMap::new(),
+            clean: HashMap::new(),
+            shown: None,
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -324,6 +346,9 @@ impl Owner {
         } else {
             runs
         };
+        let runs = std::mem::take(&mut tick.runs);
+        self.interact(state, &runs, &mut tick);
+        tick.runs = runs;
         tick
     }
 
@@ -493,7 +518,10 @@ impl Owner {
             tick.cost.follow += started.elapsed();
             tick.cost.followed += 1;
             let work = match work {
-                Ok(work) => work,
+                Ok(work) => {
+                    tick.followed.insert(candidate.id.clone());
+                    work
+                }
                 Err(error) => {
                     tick.report(&error);
                     continue;
@@ -585,6 +613,155 @@ impl Owner {
 }
 
 impl Owner {
+    /// Derive each unintegrated Work's footprint from its own (S0, Δ), compare
+    /// every pair, and publish where they interact for `watch` and `status`.
+    /// Advisory only: nothing here changes a verdict, a lock or a decision. A
+    /// footprint is derived again only when its Δ changed.
+    fn interact(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+        let started = Instant::now();
+        let mut works = Vec::new();
+        let mut participants = Vec::new();
+        for run in runs {
+            let Some((patch, frozen)) = self.delta_of(run, tick) else {
+                continue;
+            };
+            let digest = match fs::read(&patch) {
+                Ok(bytes) => hex::encode(Sha256::digest(&bytes)),
+                Err(error) => {
+                    tick.report(&error.into());
+                    continue;
+                }
+            };
+            let known = self
+                .footprints
+                .get(&run.id)
+                .filter(|(derived_from, _, _)| *derived_from == (digest.clone(), frozen))
+                .map(|(_, footprint, analysis)| (footprint.clone(), *analysis));
+            let (footprint, analysis) = match known {
+                Some(known) => known,
+                None => {
+                    let fresh = match interactions::footprint(&WorkView {
+                        source: &self.root,
+                        delta_patch: &patch,
+                        baseline: &run.baseline_path,
+                        baseline_commit: &run.baseline_commit,
+                    }) {
+                        Ok(fresh) => fresh,
+                        Err(error) => {
+                            tick.report(&error);
+                            continue;
+                        }
+                    };
+                    if fresh.unparsed.is_empty() {
+                        self.clean.insert(run.id.clone(), fresh.clone());
+                    }
+                    let (footprint, analysis) =
+                        interactions::settle(fresh, frozen, self.clean.get(&run.id));
+                    tracing::trace!(
+                        "footprint {}: {:?}, writes {:?}, reads {:?}, text {:?}, {} unresolved",
+                        run.id,
+                        analysis,
+                        footprint.writes,
+                        footprint.reads,
+                        footprint.text.keys().collect::<Vec<_>>(),
+                        footprint.unresolved
+                    );
+                    self.footprints.insert(
+                        run.id.clone(),
+                        ((digest.clone(), frozen), footprint.clone(), analysis),
+                    );
+                    tick.cost.footprinted += 1;
+                    (footprint, analysis)
+                }
+            };
+            participants.push(Participant {
+                run_id: run.id.clone(),
+                delta_sha256: digest,
+                analysis,
+                unresolved: footprint.unresolved,
+            });
+            works.push((run.id.clone(), footprint));
+        }
+        let ids: HashSet<String> = participants.iter().map(|p| p.run_id.clone()).collect();
+        self.footprints.retain(|id, _| ids.contains(id));
+        self.clean.retain(|id, _| ids.contains(id));
+        let edges: Vec<Edge> = interactions::edges(&works)
+            .into_iter()
+            .map(|(a, b, interactions)| Edge {
+                a: a.to_owned(),
+                b: b.to_owned(),
+                interactions,
+            })
+            .collect();
+        tick.cost.interact = started.elapsed();
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|(shown, shown_edges)| *shown == participants && *shown_edges == edges)
+        {
+            return;
+        }
+        let projection = Projection {
+            version: 1,
+            computed_at: Utc::now(),
+            participants: participants.clone(),
+            edges: edges.clone(),
+        };
+        match super::background::write_interactions(state, &self.root, &projection) {
+            Ok(()) => {
+                self.shown = Some((participants, edges));
+                tick.interactions = true;
+            }
+            Err(error) => tick.report(&error),
+        }
+    }
+
+    /// The Δ that stands for `run` among Work not yet integrated, and whether
+    /// it is frozen: the kept patch of a delivered result or of a workspace
+    /// removed with its exact changes; the workspace as it is now for live
+    /// Work, snapshotted into the owner's scratch unless this tick already
+    /// did. Applied, closed and lost Work never lands, so it has none.
+    fn delta_of(&self, run: &RunRecord, tick: &mut Tick) -> Option<(PathBuf, bool)> {
+        let [candidate] = run.candidates.as_slice() else {
+            return None;
+        };
+        if coherence::is_ready_unapplied(run) && run.outcome.review == ReviewState::Pending {
+            return Some((candidate.diff_path.clone(), true));
+        }
+        if run.outcome.lifecycle != LifecycleState::Working {
+            return None;
+        }
+        let workspace = match (&run.mode, &run.attachment) {
+            (RunMode::Attached, Some(attachment)) => match &attachment.workspace_removed {
+                Some(removal) if removal.exact => return Some((candidate.diff_path.clone(), true)),
+                Some(_) => return None,
+                None => attachment.workspace.clone(),
+            },
+            (RunMode::Attached, None) => return None,
+            (RunMode::Native, _) => candidate.workspace_path.clone(),
+        };
+        let scratch = self.scratch.path().join(format!("{}.patch", run.id));
+        if !tick.followed.contains(&run.id) {
+            if !workspace.exists() {
+                return None;
+            }
+            let started = Instant::now();
+            if let Err(error) = source::snapshot_delta_indexed(
+                &run.baseline_path,
+                &workspace,
+                &scratch,
+                &scratch.with_extension("index"),
+            ) {
+                tick.report(&error);
+                return None;
+            }
+            tick.cost.follow += started.elapsed();
+            tick.cost.followed += 1;
+            tick.followed.insert(run.id.clone());
+        }
+        Some((scratch, false))
+    }
+
     /// Keep the stored verdict of every Ready result awaiting review, native
     /// or attached, what `check` would show: `coherence::live_validity`, which
     /// keeps a refusal by the merged-tree checks for as long as the world has

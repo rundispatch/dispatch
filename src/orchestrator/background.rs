@@ -100,6 +100,28 @@ pub(crate) fn write_record(state: &State, root: &Path, background: bool) -> Resu
 
 pub(crate) fn remove_record(state: &State, root: &Path) {
     let _ = fs::remove_file(record_path(state, root));
+    let _ = fs::remove_file(interactions_path(state, root));
+}
+
+/// Where the owner keeps its disposable view of how the project's Work
+/// interacts (`coherence::interactions::Projection`), next to its record.
+fn interactions_path(state: &State, root: &Path) -> PathBuf {
+    state
+        .root
+        .join("watchers")
+        .join(format!("{}.interactions.json", key(root)))
+}
+
+pub(crate) fn write_interactions(
+    state: &State,
+    root: &Path,
+    projection: &crate::coherence::interactions::Projection,
+) -> Result<()> {
+    watchers_dir(state)?;
+    write_atomically(
+        &interactions_path(state, root),
+        &serde_json::to_vec_pretty(projection)?,
+    )
 }
 
 fn read_record(state: &State, root: &Path) -> Option<WatcherRecord> {

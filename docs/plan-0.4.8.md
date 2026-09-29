@@ -615,3 +615,36 @@ verdicts after A lands, and the timing from edit to edge.
   - **Checked by breaking the rules on purpose:** without the shared insertion
     point, m9b fails; treating every write as breaking a contract fails m9d
     and m9f.
+- Stage 4. The owner compares its project's unintegrated Work every tick
+  (`Owner::interact` in `serve.rs`).
+  - **Participants and their Δ** (`Owner::delta_of`):
+    - a delivered result awaiting review, or attached Work whose workspace was
+      removed with its exact Δ kept: the kept patch (frozen);
+    - live Work, native or attached, whatever its owner: its workspace now,
+      snapshotted into the owner's scratch with a stat-cached index, unless
+      following it already did so this tick (`Tick.followed`);
+    - applied, reviewed, closed and lost Work does not participate.
+  - **Cache.** A footprint is derived again only when its Δ digest, or whether
+    it is frozen, changes. `settle` keeps the last clean footprint of live Work
+    mid-edit. The owner logs each derived footprint at `-vv` (trace).
+  - **Projection.** `watchers/<key>.interactions.json` holds `{version,
+    computed_at, participants: [{run_id, delta_sha256, analysis, unresolved}],
+    edges: [{a, b, interactions}]}`. It is written atomically only when the
+    participants or edges change, and removed with the watcher record when the
+    owner exits.
+  - **Cost** is in the `-v` tick line: "N footprinted, interactions in M ms".
+  - **Found by the tests:** a finished Work's kept patch is byte-identical to
+    its last live snapshot, so a cache keyed on the digest alone kept a
+    mid-edit `last_seen` footprint after freezing. The key is now (digest,
+    frozen).
+  - Tests (`tests/interactions.rs`, through the owner and the projection):
+    - an edit into an overlap appears (A changes the signature B uses, D
+      unrelated) and disappears when B reverts (matrix 10 and 11);
+    - applied A leaves, and B's stored verdict becomes REFRESH through the
+      existing coherence check; rejected and lost Work leave; and the view goes
+      with its owner (12 and 13);
+    - live Work mid-edit keeps its last footprint with no file-level edge, and
+      the same Work frozen like that is judged file-level.
+
+    The serve, background, attach, runtime-hook, coherence-watch and watch-UI
+    suites are green.

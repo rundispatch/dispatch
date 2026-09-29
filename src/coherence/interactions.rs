@@ -13,6 +13,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     FactKind, FactOrigin,
@@ -25,7 +27,8 @@ use crate::{
 
 /// Something Work reads or writes: a declaration, or a whole file where no
 /// declaration-level analysis is possible.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Target {
     Symbol { path: String, name: String },
     File { path: String },
@@ -77,7 +80,8 @@ pub struct Footprint {
 }
 
 /// How far a footprint can be trusted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Analysis {
     Analyzed,
     /// Live Work is mid-edit; this is its last cleanly parsed footprint.
@@ -209,7 +213,8 @@ pub fn settle(
 }
 
 /// The rule that found an interaction, strongest evidence first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Rule {
     /// Both change the same declaration.
     SameDeclaration,
@@ -224,7 +229,8 @@ pub enum Rule {
 }
 
 /// What the writing side does, when only one side writes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Change {
     Signature,
     Removes,
@@ -233,14 +239,15 @@ pub enum Change {
     Changes,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Side {
     A,
     B,
 }
 
 /// One piece of evidence that two pieces of Work touch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interaction {
     pub rule: Rule,
     /// The side whose write the other relies on; `None` when both write.
@@ -387,6 +394,62 @@ pub fn edges(works: &[(String, Footprint)]) -> Vec<(&str, &str, Vec<Interaction>
         }
     }
     edges
+}
+
+/// The owner's view of the project's unintegrated Work and where it
+/// interacts: derived, disposable and recomputable from each Work's (S0, Δ).
+/// It is written only by the project owner and read only while that owner
+/// holds the project; nothing about it is canonical.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Projection {
+    pub version: u32,
+    pub computed_at: DateTime<Utc>,
+    pub participants: Vec<Participant>,
+    pub edges: Vec<Edge>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Participant {
+    pub run_id: String,
+    pub delta_sha256: String,
+    pub analysis: Analysis,
+    pub unresolved: u32,
+}
+
+/// The interactions between Work `a` and Work `b`; `Side::A` is `a`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edge {
+    pub a: String,
+    pub b: String,
+    pub interactions: Vec<Interaction>,
+}
+
+impl Projection {
+    /// The interactions of `run_id`, each with the other Work's id, seen from
+    /// `run_id`'s side: its `writer` is `Side::A` when `run_id` writes.
+    pub fn of(&self, run_id: &str) -> Vec<(String, Interaction)> {
+        let mut found = Vec::new();
+        for edge in &self.edges {
+            let (other, flip) = if edge.a == run_id {
+                (&edge.b, false)
+            } else if edge.b == run_id {
+                (&edge.a, true)
+            } else {
+                continue;
+            };
+            for interaction in &edge.interactions {
+                let mut interaction = interaction.clone();
+                if flip {
+                    interaction.writer = interaction.writer.map(|side| match side {
+                        Side::A => Side::B,
+                        Side::B => Side::A,
+                    });
+                }
+                found.push((other.clone(), interaction));
+            }
+        }
+        found
+    }
 }
 
 #[cfg(test)]
