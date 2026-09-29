@@ -221,6 +221,21 @@ impl std::fmt::Display for PreflightRefused {
 
 impl std::error::Error for PreflightRefused {}
 
+/// The adapter's preflight could not observe what it checks, for example a
+/// probe that did not answer in time. Nothing was spawned, but nothing was
+/// seen to change either, so unlike `PreflightRefused` this is never recorded
+/// as a refusal of the profile.
+#[derive(Debug)]
+pub struct PreflightInconclusive(pub String);
+
+impl std::fmt::Display for PreflightInconclusive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PreflightInconclusive {}
+
 pub async fn run_harness(
     adapter: &dyn HarnessAdapter,
     executor: &Executor,
@@ -251,6 +266,9 @@ pub async fn run_harness(
     if let Err(error) = adapter.preflight(executor, &request).await {
         if let Some(observer) = &request.observer {
             observer.preflight_failed()?;
+        }
+        if error.downcast_ref::<PreflightInconclusive>().is_some() {
+            return Err(error);
         }
         return Err(PreflightRefused(format!("{error:#}")).into());
     }

@@ -960,6 +960,14 @@ async fn select_available_resource(
                     .await
                 {
                     Ok(()) => None,
+                    // A check that could not observe refuses this launch only.
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::harness::PreflightInconclusive>()
+                            .is_some() =>
+                    {
+                        Some(error.to_string())
+                    }
                     Err(error) => {
                         db.record_funding_refusal(
                             &profile.funding_key(),

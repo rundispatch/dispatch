@@ -331,10 +331,16 @@ pub async fn preflight(
         "Claude included-only execution excludes forwarded environment variables"
     );
     validate_executable(executable, evidence)?;
-    ensure!(
-        super::probe_version(executable).await?.as_deref() == Some(evidence.cli_version.as_str()),
-        "Claude CLI version changed; revalidate the invocation contract"
-    );
+    // Only a version actually observed can differ. A probe that gives no answer
+    // (for example it timed out under load) leaves the version unknown, and the
+    // executable's bytes, checked above, already fix what it would report.
+    let version = super::probe_version(executable).await.ok().flatten();
+    if let Some(version) = &version {
+        ensure!(
+            version == &evidence.cli_version,
+            "Claude CLI version changed; revalidate the invocation contract"
+        );
+    }
     let identity = discover_account(executable, executor, request).await?;
     ensure!(
         identity == evidence.account_sha256,
@@ -343,7 +349,7 @@ pub async fn preflight(
 
     // Retain only normalized nonsecret fields, never the private auth response.
     Ok(
-        json!({"version":1,"auth_method":"claude.ai","account_sha256":identity,
+        json!({"version":1,"auth_method":"claude.ai","account_sha256":identity,"cli_version":version,
         "quota":"unknown","funding_basis":"time_bound_user_assertion",
         "checked_at":evidence.checked_at,"valid_until":evidence.valid_until}),
     )
@@ -377,10 +383,13 @@ pub(crate) async fn discover_account(
     let result = executor
         .execute_with_cancel(probe, request.cancellation.clone())
         .await?;
-    ensure!(
-        result.status == ExecutionStatus::Succeeded,
-        "Claude authentication status unavailable; no model invocation launched"
-    );
+    if result.status != ExecutionStatus::Succeeded {
+        // No answer is no evidence about the account: refuse this launch only.
+        return Err(super::PreflightInconclusive(
+            "Claude did not confirm its account in time; nothing was launched; try again".into(),
+        )
+        .into());
+    }
     let auth: Value = serde_json::from_str(&result.raw_stdout_lossy())
         .context("unsupported Claude auth-status protocol")?;
     ensure!(

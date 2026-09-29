@@ -520,3 +520,28 @@ verdicts after A lands, and the timing from edit to edge.
   a body alone does not interact); transient parse failures of live Work keep
   the last footprint; rule 4 is textual overlap, and the projection stays
   minimal.
+- Stage 1. Only contradicting evidence makes a preflight refusal sticky.
+  - **Version.** `claude::preflight` compares the version only when the probe
+    observed one. A probe that times out, fails or prints nothing leaves it
+    unknown. The launch goes ahead, because `validate_executable` already
+    matched the executable's SHA-256. The preflight evidence records
+    `cli_version` (null when unknown).
+  - **Account.** When `claude auth status` does not succeed (a timeout or a
+    non-zero exit), the preflight returns the new `PreflightInconclusive`.
+    `run_harness` passes it through instead of wrapping it in
+    `PreflightRefused`, and profile selection does not record it as a funding
+    refusal. The launch is refused with "Claude did not confirm its account in
+    time; nothing was launched; try again". An observed different account is
+    still refused and sticky, as are an executable change and expiry.
+  - **Tests** (`funding_safety`, driven by fixture switches `version-sleep`,
+    `version-text` and `auth-sleep`):
+    - `claude_version_probe_timeout_is_not_a_change`: `--version` sleeps 7 s;
+      the run launches and no refusal is recorded;
+    - `claude_observed_version_change_is_refused_and_sticky`: another version
+      is refused, recorded, and still refused once it is back;
+    - `claude_unanswered_account_probe_refuses_that_launch_only`: `auth status`
+      sleeps 7 s; that launch is refused and nothing is recorded, and the next
+      launch runs.
+
+    Before the fix, the first and third fail with the reported bug ("Claude CLI
+    version changed", "authentication status unavailable").
