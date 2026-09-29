@@ -13,6 +13,7 @@ const HINT: &str = "↑↓ move · f finish · a accept · r reject · d or Ente
 pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Result<()> {
     let mut ui = Ui::new(options)?;
     let mut rows: Vec<(String, String)> = Vec::new();
+    let mut interactions = None;
     let mut header = String::new();
     let mut focus = 0_usize;
     let mut notice = String::new();
@@ -26,7 +27,11 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
             .flatten();
         if loaded.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) || now != journal {
             header = background::project_line(state, &root);
-            rows = serve::project_rows(&serve::load_source_runs(state, &root)?);
+            interactions = background::interactions(state, &root);
+            rows = serve::project_rows(
+                &serve::load_source_runs(state, &root)?,
+                interactions.as_ref(),
+            );
             focus = focus.min(rows.len().saturating_sub(1));
             journal = now;
             loaded = Some(std::time::Instant::now());
@@ -41,7 +46,19 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let body = format!("{} · {header}\n{listed}\n\n{notice}", root.display());
+        // Where the selected Work touches other Work, kept apart from its verdict.
+        let concurrent = rows
+            .get(focus)
+            .and_then(|(id, _)| interactions.as_ref()?.details(id))
+            .map(|lines| {
+                let shown: Vec<String> = lines.iter().map(|line| format!("  {line}")).collect();
+                format!("\nConcurrent\n{}\n", shown.join("\n"))
+            })
+            .unwrap_or_default();
+        let body = format!(
+            "{} · {header}\n{listed}\n{concurrent}\n{notice}",
+            root.display()
+        );
         ui.draw(&body, None, HINT)?;
         let Some(event) = ui.next().await? else {
             return Ok(());

@@ -131,6 +131,19 @@ fn read_record(state: &State, root: &Path) -> Option<WatcherRecord> {
         .filter(|record| record.root == root)
 }
 
+/// The owner's interaction view, only while an owner holds the project: a
+/// file left by an owner that is gone says nothing about Work now.
+pub(crate) fn interactions(
+    state: &State,
+    root: &Path,
+) -> Option<crate::coherence::interactions::Projection> {
+    if !matches!(watcher(state, root), Ok(Watcher::Watched(_))) {
+        return None;
+    }
+    let bytes = fs::read(interactions_path(state, root)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Whether `root` is watched now: whether another process holds its serve
 /// lock. Anything else that goes wrong probing the lock is an error.
 pub(crate) fn watcher(state: &State, root: &Path) -> Result<Watcher> {

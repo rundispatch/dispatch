@@ -648,3 +648,47 @@ verdicts after A lands, and the timing from edit to edge.
 
     The serve, background, attach, runtime-hook, coherence-watch and watch-UI
     suites are green.
+- Stage 5. Where interactions show, always apart from the verdict.
+  - **Project view** (`watch`, `serve`): a row ends with `· interacts with
+    01DEF456` (or `· interacts with N Work`) and says nothing without
+    interactions. `watch --json` work objects gain `interactions`: `null`
+    while the project is not watched, else a list of `{with, direction
+    (this_affects_theirs | theirs_affects_this | both), rule, path, symbol,
+    change, evidence (symbol | file | text), lines}`. Foreground `serve` uses
+    its own owner's view; `watch` reads the projection only while an owner
+    holds the project (`background::interactions`), and redraws when it
+    changes.
+  - **Interactive `watch`:** the selected row's details show under the list in
+    a `Concurrent` section, for example "with 01DEF456: it changes the
+    signature of validate (src/auth.rs), which this Work uses". This is a
+    change from the plan, which put them in the review screen `d` opens: they
+    now sit where the person already looks, without opening anything.
+  - **`status <run>`:** a `Concurrent` section before `Project:`, for Work
+    that may still land:
+    - its interactions, or "no interaction with other Work in progress";
+    - "not known yet" while it never parsed mid-edit;
+    - "as last seen …" for a last-seen footprint;
+    - how many names could not be tied to one declaration;
+    - "not known: the project is not watched · dispatch start" without an
+      owner.
+
+    `status --json` gains `interactions` only while watched and taking part.
+  - **Wording** (`interactions::explain`): "both change X (path)"; "it changes
+    the signature of X (path), which this Work uses"; "this Work removes X
+    (path), which it uses"; "both change config.yml (whole file)"; "it deletes
+    util.py, which this Work relies on (whole file)"; "the edits overlap as
+    text at lines 12–18 of src/auth.rs". A whole file has no signature: its
+    one-sided change is "changes".
+  - **Tests:**
+    - unit: both sides' wording, the summary, pending, and the JSON fields; a
+      one-sided whole-file change;
+    - integration (`tests/interactions.rs`): `status` before watching ("not
+      known") and after; `status --json`; and `watch --json` showing CONTINUE
+      beside an interaction;
+    - PTY (`watch_session.py`): the row says "interacts with", and the
+      `Concurrent` details name the signature change.
+  - **Found on this machine, not in Dispatch:** the kernel's pipe memory was
+    exhausted, so new pipes held 512 bytes. Every test that read a child's
+    piped output only after the child exited could block. The same cause was
+    behind the racing-follow hang above; `e2e`'s interrupt test now drains its
+    pipes while it waits.

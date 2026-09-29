@@ -286,7 +286,11 @@ pub fn between(a: &Footprint, b: &Footprint) -> Vec<Interaction> {
                     _ => None,
                 }
             } else {
-                Some(change_of(*write))
+                // A file has no signature: judged whole, it simply changes.
+                Some(match write {
+                    Write::Changes { .. } => Change::Changes,
+                    other => change_of(*other),
+                })
             };
             found.push(Interaction {
                 rule: Rule::File,
@@ -449,6 +453,132 @@ impl Projection {
             }
         }
         found
+    }
+}
+
+impl Projection {
+    fn participant(&self, run_id: &str) -> Option<&Participant> {
+        self.participants.iter().find(|p| p.run_id == run_id)
+    }
+
+    /// The project view's segment for `run_id`: whom it interacts with.
+    pub fn summary(&self, run_id: &str) -> Option<String> {
+        let mut others: Vec<String> = self.of(run_id).into_iter().map(|(id, _)| id).collect();
+        others.sort();
+        others.dedup();
+        match others.as_slice() {
+            [] => None,
+            [one] => Some(format!("interacts with {}", short(one))),
+            many => Some(format!("interacts with {} Work", many.len())),
+        }
+    }
+
+    /// What `status` and `watch` say about `run_id` among the project's Work
+    /// in progress; `None` when it takes no part (applied, closed, lost).
+    pub fn details(&self, run_id: &str) -> Option<Vec<String>> {
+        let participant = self.participant(run_id)?;
+        if participant.analysis == Analysis::Pending {
+            return Some(vec![
+                "not known yet: its files do not parse while it is being edited".into(),
+            ]);
+        }
+        let mut lines: Vec<String> = self
+            .of(run_id)
+            .iter()
+            .map(|(other, interaction)| format!("with {}: {}", short(other), explain(interaction)))
+            .collect();
+        if lines.is_empty() {
+            lines.push("no interaction with other Work in progress".into());
+        }
+        if participant.analysis == Analysis::LastSeen {
+            lines.push("as last seen while its files parsed; it is being edited".into());
+        }
+        if participant.unresolved > 0 {
+            lines.push(format!(
+                "{} name{} it uses could not be tied to one declaration",
+                participant.unresolved,
+                if participant.unresolved == 1 { "" } else { "s" }
+            ));
+        }
+        Some(lines)
+    }
+
+    /// The stable JSON form of `run_id`'s interactions.
+    pub fn json(&self, run_id: &str) -> Vec<serde_json::Value> {
+        self.of(run_id)
+            .iter()
+            .map(|(other, i)| {
+                let (path, symbol) = match &i.target {
+                    Target::Symbol { path, name } => (path, Some(name)),
+                    Target::File { path } => (path, None),
+                };
+                serde_json::json!({
+                    "with": other,
+                    "direction": match i.writer {
+                        None => "both",
+                        Some(Side::A) => "this_affects_theirs",
+                        Some(Side::B) => "theirs_affects_this",
+                    },
+                    "rule": i.rule,
+                    "path": path,
+                    "symbol": symbol,
+                    "change": i.change,
+                    "evidence": match i.rule {
+                        Rule::SameDeclaration | Rule::Uses => "symbol",
+                        Rule::File => "file",
+                        Rule::TextualOverlap => "text",
+                    },
+                    "lines": i.lines,
+                })
+            })
+            .collect()
+    }
+}
+
+fn short(id: &str) -> &str {
+    &id[..8.min(id.len())]
+}
+
+/// One interaction in words, from this Work's side (`Side::A`); "it" is the
+/// other Work.
+pub fn explain(i: &Interaction) -> String {
+    let what = match &i.target {
+        Target::Symbol { path, name } => format!("{name} ({path})"),
+        Target::File { path } => path.clone(),
+    };
+    let verb = |change: Option<Change>| match change {
+        Some(Change::Signature) => "changes the signature of",
+        Some(Change::Removes) => "removes",
+        Some(Change::Adds) => "adds",
+        Some(Change::Deletes) => "deletes",
+        Some(Change::Changes) | None => "changes",
+    };
+    let both = |change: Option<Change>| match change {
+        Some(Change::Adds) => "both add",
+        Some(Change::Deletes) => "both delete",
+        _ => "both change",
+    };
+    match (i.rule, i.writer) {
+        (Rule::SameDeclaration, _) => format!("{} {what}", both(i.change)),
+        (Rule::Uses, Some(Side::B)) => {
+            format!("it {} {what}, which this Work uses", verb(i.change))
+        }
+        (Rule::Uses, _) => format!("this Work {} {what}, which it uses", verb(i.change)),
+        (Rule::File, None) => format!("{} {what} (whole file)", both(i.change)),
+        (Rule::File, Some(Side::B)) => format!(
+            "it {} {what}, which this Work relies on (whole file)",
+            verb(i.change)
+        ),
+        (Rule::File, Some(Side::A)) => format!(
+            "this Work {} {what}, which it relies on (whole file)",
+            verb(i.change)
+        ),
+        (Rule::TextualOverlap, _) => match i.lines {
+            Some((start, end)) => {
+                format!("the edits overlap as text at lines {start}–{end} of {what}")
+            }
+            None => format!("the edits overlap as text in {what}"),
+        },
     }
 }
 
@@ -1063,5 +1193,92 @@ mod tests {
         let found = edges(&works);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!((found[0].0, found[0].1), ("A", "B"));
+    }
+
+    #[test]
+    fn a_projection_speaks_from_each_side() {
+        let uses = Interaction {
+            rule: Rule::Uses,
+            writer: Some(Side::A),
+            target: symbol("src/auth.rs", "validate"),
+            change: Some(Change::Signature),
+            lines: None,
+        };
+        let text = Interaction {
+            rule: Rule::TextualOverlap,
+            writer: None,
+            target: file("src/api.rs"),
+            change: None,
+            lines: Some((1, 4)),
+        };
+        let participant = |id: &str, analysis| Participant {
+            run_id: id.into(),
+            delta_sha256: String::new(),
+            analysis,
+            unresolved: 0,
+        };
+        let projection = Projection {
+            version: 1,
+            computed_at: Utc::now(),
+            participants: vec![
+                participant("AAAAAAAAAA", Analysis::Analyzed),
+                participant("BBBBBBBBBB", Analysis::Analyzed),
+                participant("CCCCCCCCCC", Analysis::Pending),
+            ],
+            edges: vec![Edge {
+                a: "AAAAAAAAAA".into(),
+                b: "BBBBBBBBBB".into(),
+                interactions: vec![uses, text],
+            }],
+        };
+        assert_eq!(
+            projection.details("AAAAAAAAAA").unwrap(),
+            vec![
+                "with BBBBBBBB: this Work changes the signature of validate (src/auth.rs), which it uses",
+                "with BBBBBBBB: the edits overlap as text at lines 1–4 of src/api.rs",
+            ]
+        );
+        assert_eq!(
+            projection.details("BBBBBBBB"),
+            None,
+            "only a full id takes part"
+        );
+        assert_eq!(
+            projection.details("BBBBBBBBBB").unwrap()[0],
+            "with AAAAAAAA: it changes the signature of validate (src/auth.rs), which this Work uses"
+        );
+        assert_eq!(
+            projection.summary("BBBBBBBBBB").as_deref(),
+            Some("interacts with AAAAAAAA")
+        );
+        assert_eq!(projection.summary("CCCCCCCCCC"), None);
+        assert!(projection.details("CCCCCCCCCC").unwrap()[0].starts_with("not known yet"));
+        let json = projection.json("BBBBBBBBBB");
+        assert_eq!(json[0]["direction"], "theirs_affects_this");
+        assert_eq!(json[0]["rule"], "uses");
+        assert_eq!(json[0]["symbol"], "validate");
+        assert_eq!(json[0]["change"], "signature");
+        assert_eq!(json[0]["evidence"], "symbol");
+        assert_eq!(json[1]["evidence"], "text");
+        assert_eq!(json[1]["lines"], serde_json::json!([1, 4]));
+    }
+
+    #[test]
+    fn a_whole_file_changes_and_has_no_signature() {
+        let base = project();
+        let found = pair(
+            &base,
+            &[("config.yml", Some(b"a: 3\nb: 2\n"))],
+            &[(
+                "src/api.rs",
+                Some(b"pub fn serve() {\n    let _ = \"config.yml\";\n}\n"),
+            )],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].change, Some(Change::Changes));
+        assert_eq!(
+            explain(&found[0]),
+            "this Work changes config.yml, which it relies on (whole file)"
+        );
     }
 }

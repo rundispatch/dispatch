@@ -293,3 +293,61 @@ fn live_work_mid_edit_keeps_its_last_footprint_and_frozen_work_is_whole_file() {
     p.ok(&["finish", &a]);
     p.until("frozen A is whole-file", |v| rules(v, &a, &b) == ["file"]);
 }
+
+#[test]
+fn status_and_watch_show_interactions_apart_from_the_verdict() {
+    let p = Project::new();
+    let (wa, a) = p.work("wt-a");
+    let (wb, b) = p.work("wt-b");
+    let before = p.ok(&["status", &b]);
+    assert!(
+        before.contains("Concurrent\n  not known: the project is not watched"),
+        "{before}"
+    );
+
+    fs::write(
+        wa.join("src/auth.rs"),
+        AUTH.replacen(SIGNATURE.0, SIGNATURE.1, 1),
+    )
+    .unwrap();
+    fs::write(wb.join("src/api.rs"), CALLER).unwrap();
+    p.ok(&["start"]);
+    p.until("A changes what B uses", |v| rules(v, &a, &b) == ["uses"]);
+
+    let status = p.ok(&["status", &b]);
+    let expected = format!(
+        "Concurrent\n  with {}: it changes the signature of validate (src/auth.rs), which this Work uses",
+        &a[..8]
+    );
+    assert!(status.contains(&expected), "{status}");
+    let json: Value = serde_json::from_str(&p.ok(&["status", &b, "--json"])).unwrap();
+    let entry = &json["interactions"][0];
+    assert_eq!(entry["with"], a.as_str(), "{json}");
+    assert_eq!(entry["direction"], "theirs_affects_this");
+    assert_eq!(entry["rule"], "uses");
+
+    // `watch --json`: the work object carries its interactions next to, not
+    // inside, its verdict.
+    let mut watch = Command::new(assert_cmd::cargo_bin!("dispatch"))
+        .arg("--state-dir")
+        .arg(&p.state)
+        .args(["watch", "--json"])
+        .current_dir(&p.root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(watch.stdout.take().unwrap()));
+    let work = loop {
+        let line: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        if line["type"] == "work" && line["run_id"] == a.as_str() {
+            break line;
+        }
+    };
+    let _ = watch.kill();
+    let _ = watch.wait();
+    // Valid against the project, and still touching other Work: both hold.
+    assert_eq!(work["verdict"], "continue", "{work}");
+    assert_eq!(work["interactions"][0]["with"], b.as_str(), "{work}");
+    assert_eq!(work["interactions"][0]["direction"], "this_affects_theirs");
+}

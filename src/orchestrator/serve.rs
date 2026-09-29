@@ -136,7 +136,7 @@ async fn run(
         // Render every tick: a run attached, finished or applied by another
         // process changes the view without any verdict or apply of our own.
         // `render` prints only what differs from what is already shown.
-        view.render(None, &tick.runs, json);
+        view.render(None, &tick.runs, json, owner.projection());
         let _ = io::stdout().flush();
     }
 }
@@ -152,7 +152,7 @@ pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut view = View::default();
-    let mut shown: Option<(Option<i64>, String)> = None;
+    let mut shown: Option<(Option<i64>, String, Option<chrono::DateTime<Utc>>)> = None;
     let mut rendered_at = Instant::now();
     loop {
         tokio::select! {
@@ -168,12 +168,14 @@ pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
             .and_then(|db| db.latest_event_id())
             .ok()
             .flatten();
-        let now = (journal, header);
+        let interactions = super::background::interactions(state, &root);
+        let computed = interactions.as_ref().map(|p| p.computed_at);
+        let now = (journal, header, computed);
         if shown.as_ref() == Some(&now) && rendered_at.elapsed() < Duration::from_secs(30) {
             continue;
         }
         match load_source_runs(state, &root) {
-            Ok(runs) => view.render(Some(&now.1), &runs, json),
+            Ok(runs) => view.render(Some(&now.1), &runs, json, interactions.as_ref()),
             Err(error) => eprintln!("watch: {error:#}"),
         }
         let _ = io::stdout().flush();
@@ -200,7 +202,7 @@ pub(crate) struct Owner {
     /// Each live Work's last cleanly parsed footprint.
     clean: HashMap<String, Footprint>,
     /// What the interaction view says now; `None` until it is first written.
-    shown: Option<(Vec<Participant>, Vec<Edge>)>,
+    shown: Option<Projection>,
     scratch: tempfile::TempDir,
 }
 
@@ -697,23 +699,28 @@ impl Owner {
         if self
             .shown
             .as_ref()
-            .is_some_and(|(shown, shown_edges)| *shown == participants && *shown_edges == edges)
+            .is_some_and(|shown| shown.participants == participants && shown.edges == edges)
         {
             return;
         }
         let projection = Projection {
             version: 1,
             computed_at: Utc::now(),
-            participants: participants.clone(),
-            edges: edges.clone(),
+            participants,
+            edges,
         };
         match super::background::write_interactions(state, &self.root, &projection) {
             Ok(()) => {
-                self.shown = Some((participants, edges));
+                self.shown = Some(projection);
                 tick.interactions = true;
             }
             Err(error) => tick.report(&error),
         }
+    }
+
+    /// The interaction view as this owner last published it.
+    pub(crate) fn projection(&self) -> Option<&Projection> {
+        self.shown.as_ref()
     }
 
     /// The Δ that stands for `run` among Work not yet integrated, and whether
@@ -895,14 +902,26 @@ fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
 
 /// The project view's rows for `watch`'s interactive form: each Work item's
 /// id and its line, in the view's order.
-pub(crate) fn project_rows(runs: &[RunRecord]) -> Vec<(String, String)> {
+pub(crate) fn project_rows(
+    runs: &[RunRecord],
+    interactions: Option<&Projection>,
+) -> Vec<(String, String)> {
     view_rows(runs)
         .into_iter()
-        .map(|run| {
-            let id8 = &run.id[..8.min(run.id.len())];
-            (run.id.clone(), format!("{id8} · {}", describe(run).0))
-        })
+        .map(|run| (run.id.clone(), row(run, interactions)))
         .collect()
+}
+
+/// One row of the project view: the Work line, then whom it interacts with,
+/// kept apart from the verdict.
+fn row(run: &RunRecord, interactions: Option<&Projection>) -> String {
+    let id8 = &run.id[..8.min(run.id.len())];
+    let mut line = format!("{id8} · {}", describe(run).0);
+    if let Some(summary) = interactions.and_then(|p| p.summary(&run.id)) {
+        line.push_str(" · ");
+        line.push_str(&summary);
+    }
+    line
 }
 
 /// The project view: what is shown, so each tick prints only what changed.
@@ -920,7 +939,13 @@ impl View {
     /// changed since the last tick, and a `{"type":"watcher",...}` object
     /// when the header changed; otherwise the whole block is printed,
     /// redrawn in place on a TTY and appended as lines otherwise.
-    pub(crate) fn render(&mut self, header: Option<&str>, runs: &[RunRecord], json: bool) {
+    pub(crate) fn render(
+        &mut self,
+        header: Option<&str>,
+        runs: &[RunRecord],
+        json: bool,
+        interactions: Option<&Projection>,
+    ) {
         if json && header.is_some() && self.last_header.as_deref() != header {
             println!(
                 "{}",
@@ -934,7 +959,9 @@ impl View {
         if json {
             for run in rows {
                 let (line, decision) = describe(run);
-                let key = line.to_string();
+                // `null` while nothing watches the project: not known.
+                let concurrent = interactions.map(|p| p.json(&run.id));
+                let key = format!("{line} {concurrent:?}");
                 if shown.get(&run.id) != Some(&key) {
                     println!(
                         "{}",
@@ -951,6 +978,7 @@ impl View {
                             "review": line.review,
                             "applied_by": line.applied_by,
                             "overridden": line.verdict == "overridden",
+                            "interactions": concurrent,
                         })
                     );
                     shown.insert(run.id.clone(), key);
@@ -963,10 +991,7 @@ impl View {
         let lines: Vec<String> = header
             .map(str::to_owned)
             .into_iter()
-            .chain(rows.iter().map(|run| {
-                let id8 = &run.id[..8.min(run.id.len())];
-                format!("{id8} · {}", describe(run).0)
-            }))
+            .chain(rows.iter().map(|run| row(run, interactions)))
             .chain(empty.then(|| "no Work in the last hour".to_owned()))
             .collect();
 
