@@ -315,9 +315,12 @@ fn status_and_watch_show_interactions_apart_from_the_verdict() {
     p.until("A changes what B uses", |v| rules(v, &a, &b) == ["uses"]);
 
     let status = p.ok(&["status", &b]);
+    // Work attached within the same quarter second shares its first 8
+    // characters; A is then named by as much as tells it from B.
+    let shared = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
     let expected = format!(
         "Concurrent\n  with {}: it changes the signature of validate (src/auth.rs), which this Work uses",
-        &a[..8]
+        &a[..(shared + 1).max(8)]
     );
     assert!(status.contains(&expected), "{status}");
     let json: Value = serde_json::from_str(&p.ok(&["status", &b, "--json"])).unwrap();
