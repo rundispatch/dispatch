@@ -774,3 +774,17 @@ verdicts after A lands, and the timing from edit to edge.
   - **Not repeated here:** the owner was run without `-vv`, so footprints were
     not logged. The participants' analysis and the edges above are from the
     projection.
+- Stage 8. Docs and version 0.4.8.
+  - `docs/coherence.md` has a new section, "Work against Work: interactions",
+    covering participants, footprint, rules, mid-edit handling, cost and where
+    it shows. It also has entries in "Persisted or recomputed" and "Known
+    limits".
+  - The README gains "Work that notices Work". `docs/attach.md` gains the
+    owner's comparison, the JSON fields and the projection file. The product
+    guide gains the watch rows and the `Concurrent` lines.
+  - `release-install.md` gains "Upgrading to 0.4.8", and the release notes are
+    for 0.4.8.
+  - `AGENTS.md` is unchanged. Its paragraph on public claims still describes the
+    verdicts, which interactions do not change.
+  - Full suite on the final tree: 529 passed, 0 failed, with fmt and clippy
+    clean. Pipe capacity was back to 64 KiB.

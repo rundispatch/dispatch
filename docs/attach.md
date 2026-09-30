@@ -349,6 +349,23 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
     `--json`, `--plain` and output that is not a terminal stay passive.
   - `--json` adds a `{"type":"watcher", "watcher"}` object whenever the header
     changes.
+  - **Interactions between Work.** Each tick the owner also compares every piece
+    of Work not yet integrated. How is in
+    [coherence.md](coherence.md#work-against-work-interactions-interactionsrs).
+    - A row ends with `· interacts with <id>`.
+    - The interactive view shows the selected row's `Concurrent` lines.
+    - `dispatch status` has a `Concurrent` section, and "not known" when the
+      project is not watched.
+    - A `--json` work object carries `interactions`: `null` while the project
+      is not watched, else a list of `{with, direction (this_affects_theirs |
+      theirs_affects_this | both), rule (same_declaration | uses | file |
+      textual_overlap), path, symbol, change, evidence (symbol | file | text),
+      lines}`. `status --json` carries the same list while watched.
+    - Where another Work is named, its ID is shortened only as far as it stays
+      distinct.
+    - The owner keeps its view in `watchers/<key>.interactions.json`, written
+      atomically and removed when it exits. Readers ignore it unless an owner
+      holds the project.
   - `dispatch status` ends with the same line (`Project: …`).
 - **Adoption.** An active attached run whose stored `owner_state` is `Live` but whose
   owner process (`attachment.owner`, the wrapper) is now gone (`identity_state`:
@@ -641,6 +658,8 @@ directory, exactly as it already refuses any newer schema.
   plus `flock` files; `serve` discovers new or changed Work on its next tick (at most
   `poll_secs`, default 10 s). This is adequate for work measured in minutes to hours,
   not for sub-second push updates.
+- Interactions between Work are advisory, exist only while an owner watches the
+  project, and never change a verdict or block anything.
 - `serve` never launches, kills or refreshes anything. It finishes Work only when
   the project's check consent holds and a runtime removed the Work's workspace
   with its exact Δ kept. Otherwise wrapped attach and a human (`dispatch finish`)

@@ -338,7 +338,14 @@ as the command would:
 - `a` accepts, through the same gate as `dispatch accept`;
 - `r` rejects, after asking, with focus on Cancel;
 - `d` or Enter opens the review;
-- `q` leaves. **`dispatch stop`** ends watching. `dispatch serve` is
+- `q` leaves.
+
+A row ends with `interacts with <id>` when that Work already touches other Work
+not yet integrated, and the selected row's `Concurrent` lines say how, for
+example "it changes the signature of validate (auth.py), which this Work uses".
+`dispatch status` shows the same section. This is advisory and separate from
+the verdict: it blocks nothing, and once one piece lands the other is judged
+against the project as before. **`dispatch stop`** ends watching. `dispatch serve` is
 the same owner in the foreground, with the view.
 
 Watching needs no agent profile. It covers:

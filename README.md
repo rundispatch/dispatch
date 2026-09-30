@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.7 — experimental developer preview**
+**Dispatch 0.4.8 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -86,6 +86,19 @@ itself.
   never lets anything apply.
 - A session running directly in your checkout is told that Dispatch cannot
   tell its edits from yours, and nothing is tracked.
+
+**Work that notices Work.** While a project is watched, Dispatch also compares
+the Work that is not yet integrated, and says where two pieces already touch:
+- both change the same declaration or whole file, or edit overlapping lines;
+- one changes the signature of, or removes, a declaration the other uses;
+- one changes or deletes a file the other relies on.
+
+A row in `dispatch watch` then ends with `interacts with <id>`. The selected
+row, and `dispatch status`, say how, apart from the verdict: Work can be
+`CONTINUE` and still interact. This is exact to the declaration for Rust and
+Python, and to the file elsewhere. It is advisory: nothing is blocked,
+reordered or refreshed, and once one piece lands the other is judged by the
+coherence check as before.
 
 Watching covers Work Dispatch launched, that you attached, and sessions whose
 runtime reports them. It does not scan for agent processes. After a reboot, run
