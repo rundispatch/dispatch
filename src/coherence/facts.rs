@@ -69,7 +69,23 @@ pub struct DeltaFile {
     /// Pure insertions (added lines with nothing removed beside them), as the
     /// S0 line after which the text goes; 0 means before line 1.
     pub insertions: Vec<u32>,
+    /// The S0 blob the delta was taken against (`index <old>..`), when given.
+    pub old_blob: Option<String>,
     hunks: Vec<Hunk>,
+}
+
+impl DeltaFile {
+    /// The S0 lines each hunk covers, context included: what must still be
+    /// there, unchanged and together, for the hunk to apply as written.
+    pub fn spans(&self) -> Vec<(u32, u32)> {
+        self.hunks
+            .iter()
+            .map(|hunk| {
+                let end = hunk.old_start + hunk.old_len.max(1) - 1;
+                (hunk.old_start, end)
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +113,23 @@ pub struct Derived {
     pub unbound: u32,
     /// Delta files whose S0 or post-image could not be analyzed.
     pub uncertain: Vec<String>,
+    /// Supported delta files whose post-image does not parse cleanly, so what
+    /// the work declares there is not known.
+    pub unparsed: Vec<String>,
+    /// Declarations the work adds, as (path, qualified name).
+    pub introduced: Vec<(String, String)>,
+    /// For each Modified declaration whose post-image parsed cleanly, whether
+    /// what its users rely on still holds, keyed by (path, qualified name).
+    pub contracts: BTreeMap<(String, String), Contract>,
+}
+
+/// What a change does to a declaration's contract: the part a `Referenced`
+/// fact on it relies on (its signature, or for Python a compatible call).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contract {
+    Kept,
+    Changed,
+    Removed,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +149,7 @@ pub fn parse_patch(patch: &[u8]) -> Vec<DeltaFile> {
         index += 1;
         let (mut old_path, mut new_path) = (None, None);
         let (mut added, mut skip) = (false, false);
+        let mut old_blob = None;
         while index < lines.len()
             && !lines[index].starts_with(b"diff --git ")
             && !lines[index].starts_with(b"@@ ")
@@ -127,6 +161,11 @@ pub fn parse_patch(patch: &[u8]) -> Vec<DeltaFile> {
                 new_path = header_path(rest, b"b/");
             } else if line.starts_with(b"new file mode") {
                 added = true;
+            } else if let Some(rest) = line.strip_prefix(b"index ") {
+                old_blob = rest
+                    .split(|byte| *byte == b'.')
+                    .next()
+                    .map(|blob| String::from_utf8_lossy(blob).into_owned());
             } else if line.starts_with(b"GIT binary patch")
                 || line.starts_with(b"Binary files")
                 || line.ends_with(b"mode 120000")
@@ -168,10 +207,42 @@ pub fn parse_patch(patch: &[u8]) -> Vec<DeltaFile> {
             old_ranges,
             new_ranges,
             insertions,
+            old_blob,
             hunks,
         });
     }
     files
+}
+
+/// Every path the patch changes, with its status, including the binary,
+/// symlink and mode-only files `parse_patch` skips. With `--no-renames` both
+/// sides of a `diff --git` line name the same path.
+pub fn changed_paths(patch: &[u8]) -> Vec<(String, DeltaStatus)> {
+    let mut paths: Vec<(String, DeltaStatus)> = Vec::new();
+    for line in patch.split(|byte| *byte == b'\n') {
+        if let Some(rest) = line.strip_prefix(b"diff --git ") {
+            let path = if rest.starts_with(b"\"") {
+                let end = (1..rest.len())
+                    .find(|&at| rest[at] == b'"' && rest[at - 1] != b'\\')
+                    .unwrap_or(rest.len() - 1);
+                unquote(&rest[..=end])
+            } else {
+                rest[..rest.len().saturating_sub(1) / 2].to_vec()
+            };
+            let path = path.strip_prefix(b"a/").unwrap_or(&path);
+            paths.push((
+                String::from_utf8_lossy(path).into_owned(),
+                DeltaStatus::Modified,
+            ));
+        } else if let Some((_, status)) = paths.last_mut() {
+            if line.starts_with(b"new file mode") {
+                *status = DeltaStatus::Added;
+            } else if line.starts_with(b"deleted file mode") {
+                *status = DeltaStatus::Deleted;
+            }
+        }
+    }
+    paths
 }
 
 type Ranges = Vec<(u32, u32)>;
@@ -535,6 +606,7 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
         } else {
             extract(lang, &s0).ok()
         };
+        let mut after: Option<FileSymbols> = None;
         if file.status != DeltaStatus::Deleted {
             let post = post_image(&s0, &file.hunks);
             // What the new code uses: identifiers on the lines it adds.
@@ -547,18 +619,35 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
             }
             // Names the work declares itself are not the baseline's to bind.
             if let (Some(post), Some(before)) = (&post, &before)
-                && let Ok(after) = extract(lang, post)
+                && let Ok(parsed) = extract(lang, post)
             {
                 let known: HashSet<&str> =
                     before.decls.iter().map(|d| base_name(&d.name)).collect();
                 introduced.extend(
-                    after
+                    parsed
                         .decls
                         .iter()
                         .map(|decl| base_name(&decl.name))
                         .filter(|name| !known.contains(name))
                         .map(str::to_owned),
                 );
+                if !parsed.has_error {
+                    let existing: HashSet<&str> =
+                        before.decls.iter().map(|d| d.name.as_str()).collect();
+                    derived.introduced.extend(
+                        parsed
+                            .decls
+                            .iter()
+                            .filter(|decl| !existing.contains(decl.name.as_str()))
+                            .map(|decl| (file.path.clone(), decl.name.clone())),
+                    );
+                    after = Some(parsed);
+                }
+            }
+            // Only the post-image can be at fault here: a baseline that does
+            // not parse makes the file file-level below, whatever the work does.
+            if after.is_none() && before.as_ref().is_some_and(|b| !b.has_error) {
+                derived.unparsed.push(file.path.clone());
             }
         }
         if file.status != DeltaStatus::Modified {
@@ -568,6 +657,25 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
             Some(symbols) if !symbols.has_error => {
                 for decl in &symbols.decls {
                     if touches(file, decl, &symbols.decls) {
+                        if let Some(after) = &after {
+                            let contract = match after.decls.iter().find(|d| d.name == decl.name) {
+                                None => Contract::Removed,
+                                Some(now)
+                                    if now.sig_fp == decl.sig_fp
+                                        || (lang == Lang::Python
+                                            && python_call_compatible(
+                                                &decl.display,
+                                                &now.display,
+                                            )) =>
+                                {
+                                    Contract::Kept
+                                }
+                                Some(_) => Contract::Changed,
+                            };
+                            derived
+                                .contracts
+                                .insert((file.path.clone(), decl.name.clone()), contract);
+                        }
                         // A container is checked by its header alone.
                         let full_fp = (!is_container(decl)).then(|| decl.full_fp.clone());
                         modified.push(make_fact(
@@ -1150,6 +1258,40 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn changed_paths_names_every_file_including_those_without_hunks() {
+        let repo = Repo::new(&[
+            ("a b.txt", "one\n"),
+            ("logo.bin", "\0\x01"),
+            ("gone.txt", "bye\n"),
+        ]);
+        let patch = repo.delta(&[
+            ("a b.txt", Some("two\n")),
+            ("logo.bin", Some("\0\x02")),
+            ("gone.txt", None),
+            ("new.txt", Some("hello\n")),
+        ]);
+        let mut paths = changed_paths(&patch);
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            paths,
+            vec![
+                ("a b.txt".to_owned(), DeltaStatus::Modified),
+                ("gone.txt".to_owned(), DeltaStatus::Deleted),
+                ("logo.bin".to_owned(), DeltaStatus::Modified),
+                ("new.txt".to_owned(), DeltaStatus::Added),
+            ]
+        );
+        let parsed: Vec<String> = parse_patch(&patch).into_iter().map(|f| f.path).collect();
+        assert!(!parsed.contains(&"logo.bin".to_owned()), "{parsed:?}");
+        let quoted =
+            b"diff --git \"a/sp\\303\\251c.txt\" \"b/sp\\303\\251c.txt\"\nindex 1..2 100644\n";
+        assert_eq!(
+            changed_paths(quoted),
+            vec![("sp\u{e9}c.txt".to_owned(), DeltaStatus::Modified)]
+        );
     }
 
     #[test]

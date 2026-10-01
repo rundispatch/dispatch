@@ -382,6 +382,76 @@ implements `mid_run: stop`, and it never applies to attached work. See
   patch is kept; no review is recorded (asserted by `tests/coherence_watch.rs`). A verdict that arrives after the attempt has
   ended is recorded but can no longer stop anything.
 
+## Work against Work: interactions (`interactions.rs`)
+
+Coherence judges Work against the World. While a project is watched, the owner
+also compares every piece of Work that is not yet integrated with every other,
+and reports where they already touch. It is advisory: it changes no verdict,
+and it blocks, reorders, refreshes or stops nothing. When one piece lands, the
+others are judged by coherence as before.
+
+**Who takes part** (`serve.rs` `Owner::delta_of`), with the Δ that stands for
+each:
+- a delivered result awaiting review: its kept patch (frozen);
+- attached Work whose workspace a runtime removed with its exact Δ kept: the
+  kept patch (frozen);
+- live Work, native or attached: its workspace now, snapshotted into the
+  owner's scratch with a stat-cached index.
+
+Applied, reviewed, closed and lost Work never lands, so it takes no part.
+
+**Footprint** (`interactions::footprint`). Derived from each Work's own (S0, Δ)
+through the facts layer; there is no second parser.
+- **Symbol writes:** the declarations the Δ modifies, and whether each keeps its
+  contract. The contract is what a `Referenced` fact relies on: the signature,
+  or for Python a compatible call. A declaration can also be removed.
+- **Symbol adds:** the declarations it introduces.
+- **Symbol reads:** its `Referenced` facts.
+- **File writes:** added and deleted files, and modified files without
+  declaration-level analysis (an unsupported language, binary, symlink or
+  mode-only, or an unreadable baseline).
+- **File reads:** files its code names.
+- **Text edits:** removed lines, insertions and hunk spans, against the S0 blob
+  (`index <old>..`) of each supported file.
+
+Identities are the root-relative path plus the qualified declaration name, so
+Work with different S0s is compared by what it names.
+
+**Rules** (`interactions::between`), strongest first:
+1. **File:** a path either side judges as a whole, which the other touches in
+   any way. When both write it, the entry is symmetric.
+2. **Same declaration:** both write it.
+3. **Uses:** one changes the contract of, or removes, a declaration the other
+   reads. A change to a body alone is not reported: the other relies on the
+   signature only, so the World check would not act on it either. Behaviour
+   is the checks' business.
+4. **Textual overlap:** the same file from the same S0 blob, where one's
+   changed lines fall inside the other's hunk, context included, or both insert
+   at one place. It is evidence of overlap, not a prediction that `git apply`
+   fails. It is not evaluated across different S0 blobs, and it is not shown
+   for a path where both change the same declaration.
+
+Read/read never interacts, and neither do different declarations of one file
+whose hunks keep apart.
+
+**Mid-edit.** Live Work often has a file that does not parse for a moment.
+Such a file never becomes a file-level interaction: the Work keeps its last
+clean footprint (`last_seen`), or claims nothing yet (`pending`). Once the Work
+is frozen, a file that does not parse is judged as a whole, as the facts layer
+does.
+
+**Cost.** Pairs are compared each tick: O(n²), and 1 ms for 50 pieces of Work
+on this machine. A footprint is derived again only when that Work's Δ, or
+whether it is frozen, changes; that costs about 150–260 ms on a 2,000-file
+repository.
+
+**Where it shows.** The view's rows, the interactive `watch`, `status`, and
+`watch --json`/`status --json`: see
+[attach.md](attach.md#the-project-owner-start-stop-serve-and-watch). The
+owner's view of it (`watchers/<key>.interactions.json`) is disposable: it is
+written only by the owner, trusted only while the owner holds the project, and
+removed when it exits.
+
 ## Human override (`dispatch accept --despite-refresh`)
 
 The file and symbol analysis can be more cautious than the work requires. A human who
@@ -454,6 +524,9 @@ every value is default. Unknown keys are ignored. The block is frozen with each 
 
 Recomputed on every use: the world, symbol tables, facts and the verdict shown by
 `status`, `check`, `explain` and the control `result`. Accept never trusts a stored verdict.
+Interactions between Work are derived by the project owner from each Work's (S0, Δ).
+The file it keeps them in is disposable and removed when it stops; nothing about them
+is stored in the database or the run.
 
 Stored: `RunRecord.coherence` in the run projection JSON (`runs.run_projection_json`
 and `run.json`): `refreshed_from`, the latest stored `validity` (with its world
@@ -544,4 +617,10 @@ How to read it:
 - The mid-run watcher covers native runs and wrapped attach, and observes by default. Every `poll_secs` it builds the work-in-progress patch with a temporary Git index (taken with the trusted baseline repository, so ignored build output never counts) and evaluates again when either the source's signal or that patch changed. A change that landed before the agent touched the same code is therefore reported once the agent touches it.
 - Agent time after invalid is wall-clock time from attempt timestamps; it is not cost, and it is only meaningful for a run whose watcher stored an invalid verdict during the attempt.
 - Apply is not crash-atomic: a crash between `git apply` and the database update leaves patched source and an unapplied run (pre-existing).
+- Interactions between Work are advisory. They exist only while the project is
+  watched, and they are exact to the declaration only for Rust and Python;
+  other files interact as whole files. A change to a body alone is never an
+  interaction, even when behaviour its callers rely on changes. Referenced
+  declarations bind by unique base name, so a wrong binding can report a use
+  that is not one. Their precision on real repositories is not measured yet.
 - Evidence is from fixtures and a small number of runs. False-refresh and false-continue rates on real repositories are not measured. What is claimed today, what is recorded during real use, and what would falsify the thesis are in [coherence-validation.md](coherence-validation.md).

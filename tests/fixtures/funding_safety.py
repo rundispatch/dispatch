@@ -116,6 +116,27 @@ def scenario(binary, name):
             output = run(f)
             assert b'was refused' not in output.stderr, output.stderr
             assert [r for (r, _) in refusals(f)] == [1], refusals(f)
+        elif name == 'claude_slow_version':
+            # A version probe that times out observes nothing: the executable's
+            # bytes and the account are unchanged, so the run launches and no
+            # refusal is recorded.
+            (f.root / 'version-sleep').write_text('7')
+            launched(f, run(f))
+            assert refusals(f) == [], refusals(f)
+        elif name == 'claude_version_changed':
+            # An observed different version is a change: refused, and sticky.
+            (f.root / 'version-text').write_text('claude 9.9.9 (Claude Code)')
+            refused(f, run(f), 'Claude CLI version changed')
+            assert [r for (r, _) in refusals(f)] == [1], refusals(f)
+            (f.root / 'version-text').unlink()
+            refused(f, run(f), 'was refused')
+        elif name == 'claude_slow_account':
+            # An account probe that does not answer refuses that launch only.
+            (f.root / 'auth-sleep').write_text('7')
+            refused(f, run(f), 'did not confirm its account')
+            assert refusals(f) == [], refusals(f)
+            (f.root / 'auth-sleep').unlink()
+            launched(f, run(f))
         else:
             raise SystemExit(f'unknown scenario {name}')
     finally:

@@ -100,6 +100,28 @@ pub(crate) fn write_record(state: &State, root: &Path, background: bool) -> Resu
 
 pub(crate) fn remove_record(state: &State, root: &Path) {
     let _ = fs::remove_file(record_path(state, root));
+    let _ = fs::remove_file(interactions_path(state, root));
+}
+
+/// Where the owner keeps its disposable view of how the project's Work
+/// interacts (`coherence::interactions::Projection`), next to its record.
+fn interactions_path(state: &State, root: &Path) -> PathBuf {
+    state
+        .root
+        .join("watchers")
+        .join(format!("{}.interactions.json", key(root)))
+}
+
+pub(crate) fn write_interactions(
+    state: &State,
+    root: &Path,
+    projection: &crate::coherence::interactions::Projection,
+) -> Result<()> {
+    watchers_dir(state)?;
+    write_atomically(
+        &interactions_path(state, root),
+        &serde_json::to_vec_pretty(projection)?,
+    )
 }
 
 fn read_record(state: &State, root: &Path) -> Option<WatcherRecord> {
@@ -107,6 +129,19 @@ fn read_record(state: &State, root: &Path) -> Option<WatcherRecord> {
     serde_json::from_slice::<WatcherRecord>(&bytes)
         .ok()
         .filter(|record| record.root == root)
+}
+
+/// The owner's interaction view, only while an owner holds the project: a
+/// file left by an owner that is gone says nothing about Work now.
+pub(crate) fn interactions(
+    state: &State,
+    root: &Path,
+) -> Option<crate::coherence::interactions::Projection> {
+    if !matches!(watcher(state, root), Ok(Watcher::Watched(_))) {
+        return None;
+    }
+    let bytes = fs::read(interactions_path(state, root)).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Whether `root` is watched now: whether another process holds its serve

@@ -95,13 +95,19 @@ else:
 ''')
         if self.provider == 'claude':
             os.environ.setdefault('USER', 'dispatch-fixture-user')
-            script = agent.read_text().replace("print('codex phase5 fixture');sys.exit()", "print('claude phase6 fixture');sys.exit()")
+            # version-sleep delays the version answer by that many seconds and
+            # version-text replaces it; auth-sleep delays auth status.
+            script = agent.read_text().replace("print('codex phase5 fixture');sys.exit()", """import time
+    if (root/'version-sleep').exists(): time.sleep(float((root/'version-sleep').read_text()))
+    print((root/'version-text').read_text() if (root/'version-text').exists() else 'claude phase6 fixture');sys.exit()""")
             script = script.replace('prompt=sys.stdin.read()', """if 'auth' in sys.argv and 'status' in sys.argv:
     assert sys.argv[-4:]==['--no-chrome','auth','status','--json']
     assert os.environ.get('USER'), 'Keychain lookup needs username metadata'
     count_path=root/'auth-count'
     n=int(count_path.read_text())+1 if count_path.exists() else 1
     count_path.write_text(str(n))
+    if (root/'auth-sleep').exists():
+        import time; time.sleep(float((root/'auth-sleep').read_text()))
     boundary=root/'auth-boundary'
     if boundary.exists() and n==int(boundary.read_text()):
         auth=json.loads((root/'auth.json').read_text());auth['email']='changed@example.invalid'

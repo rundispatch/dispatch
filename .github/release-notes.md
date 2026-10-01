@@ -1,69 +1,75 @@
-## Dispatch 0.4.7 — Work you can finish where you see it
+## Dispatch 0.4.8 — Work that notices Work
 
-0.4.6 picked up Claude Code sessions as Work by themselves. 0.4.7 lets that Work
-be verified, reviewed and cleaned up without you copying run IDs between commands.
+Dispatch has checked whether Work still holds against the project as it moves.
+0.4.8 also shows where two pieces of Work that are not yet integrated already
+touch each other, before either lands.
 
-- **Checks can run by themselves, when you allow it.** `dispatch setup --checks`
-  can let Work in a project run that project's checks by themselves.
-  - When Claude Code removes a session's worktree, Dispatch keeps its exact
-    changes, as before. Then it runs the checks in a workspace rebuilt from S0 and
-    those changes. The Work becomes Ready, or shows its failed checks, and waits
-    for your review.
-  - The permission names the exact `checks.verify` commands you approved. If they
-    change, it no longer holds until you approve the new ones; `dispatch status`
-    and `dispatch watch` say which.
-  - It is stored in Dispatch's private state, never in the repository, so a
-    repository cannot grant itself the right to run commands on your machine.
-  - It runs checks only. Nothing is applied without your review.
-- **Act from `dispatch watch`.** On a terminal, select a row with ↑/↓, then:
-  - `f` finishes attached Work, asking first before running checks nobody allowed;
-  - `a` accepts, through the same gate as `dispatch accept`;
-  - `r` rejects, after asking;
-  - `d` or Enter opens the review.
+- **Where Work touches Work.** While a project is watched (`dispatch start`),
+  Dispatch compares every piece of Work not yet integrated and reports when:
+  - both change the same declaration or whole file, or edit overlapping lines;
+  - one changes the signature of, or removes, a declaration the other uses;
+  - one changes or deletes a file the other relies on.
 
-  Each key is exactly the command you would type. `watch --json` and output that
-  is not a terminal are unchanged.
-- **`dispatch clean`.** Workspaces Dispatch made for `dispatch attach -- <agent>`
-  are kept after a reject. `clean` lists the ones whose Work is over and removes
-  them, with their branches, only after you confirm. `--dry-run` only lists them,
-  and `--yes` confirms where there is no terminal. Nothing is ever deleted on a
-  timer, and each run's record and patch stay.
+  This is exact to the declaration for Rust and Python, and to the file
+  elsewhere, and it says which.
+- **What is not reported:** reading the same thing; different declarations of
+  one file whose edits keep apart; and a change to a body alone that the other
+  only calls. Work mid-edit whose file does not parse for a moment keeps its
+  last clean analysis instead of raising a whole-file warning.
+- **Where it shows:**
+  - a `dispatch watch` row ends with `interacts with <id>`;
+  - the selected row's `Concurrent` lines say how, for example "it changes the
+    signature of validate (auth.py), which this Work uses";
+  - `dispatch status` has a `Concurrent` section;
+  - `watch --json` and `status --json` carry a structured `interactions` list.
+
+  It sits apart from the verdict: Work can be `CONTINUE` and still interact.
+- **Advisory only.** Nothing is blocked, reordered, refreshed or stopped. When
+  one piece lands, it leaves the comparison and the other is judged by the
+  coherence check, as before.
 
 **Fixed.**
-- **Accept now runs the merged-tree checks for discovered Work you finished.**
-  Discovered Work finished with `dispatch finish --allow-unsafe-local` was accepted
-  without its checks running on the merged tree. The flag was not recorded on the
-  run, so a change that only the merged tree catches could apply. The authority
-  is now recorded, and accept runs the checks.
-- **Rejecting Work whose worktree was removed now closes it.** `dispatch reject`
-  refused it ("no delivered result to review"), so it could not be closed without
-  finishing it. Reject now closes it and keeps its patch in the run.
-- **A worktree with no changes that vanished without notice now closes.** It
-  used to show as `lost`; it closes with no changes, since nothing was lost.
-- **`finish` no longer fails on a busy project.** `finish` refused the run when the
-  background owner was busy with it at that moment. It now waits up to 5 s. Accept
-  or reject typed at the command line no longer fails as "stale" because the
-  owner had just recorded a verdict.
+- **A Claude check that timed out no longer refuses the profile for good.**
+  Under load, `claude --version` could take longer than its 5 s. Dispatch read
+  the missing answer as "Claude CLI version changed" and refused the profile
+  until you authorized it again. A `claude auth status` that did not answer
+  was recorded the same way.
+  - Now only a contradicting observation is a lasting refusal: a different
+    version, a different account, a changed executable, or an expired
+    approval.
+  - A version check that gives no answer lets the run go ahead: the
+    executable's hash, checked first, already fixes its version.
+  - An account check that gives no answer refuses that one launch.
+- **Work launched together is told apart.** IDs are shortened to 8 characters,
+  which Work created within a quarter of a second shares. The view and
+  interactions now show as much of each ID as tells them apart, and the removal
+  hook's suggested commands carry the full ID.
 
-**Evidence.** A real-agent trial with Claude Code and Cursor Agent:
-- **With consent.** A `claude -p --worktree` session registered Work with local
-  authority. Its worktree was removed, and the exact changes were kept before the
-  hook returned. The owner then verified the Work by itself: Ready, checks
-  passed, nothing applied. After a teammate's commit, it was accepted from
-  `dispatch watch` with the merged-tree checks run.
-- **Consent voided.** Changing the project's checks voided the consent. The next
-  session's Work kept its changes on removal and waited. The trial found that
-  rejecting it was refused, which is fixed above.
-- **Clean.** `dispatch attach -- cursor-agent` from the checkout finished Ready and
-  was rejected. `dispatch clean --dry-run` listed its workspace, and `dispatch
-  clean` removed it only after confirmation.
+**Evidence.** A real-agent trial with Claude Code 2.1.280 and Cursor Agent
+started five pieces of Work together on one small Python project:
+- A changed the signature of `auth.validate`;
+- B added a caller of it;
+- C changed only its body;
+- E changed another function in the same file;
+- D changed an unrelated module.
 
-**Not built.** There is no Codex lifecycle integration: Codex's hooks need a trust
-review of every hook definition, and its session end also means "idle".
-`dispatch attach -- codex` remains the supported way to isolate Codex. There is
-also no automatic apply for discovered Work, no retention timer, and no start at
-login.
+Before anything landed, Dispatch reported A and C changing the same
+declaration, and A's signature change against B's new caller. The A-to-B
+interaction was already there while B was still running under `dispatch
+attach`. It reported nothing for C against B, E, or D.
 
-**Upgrading.** No migration; the schema stays at 24. State is forward-only: 0.4.6
-cannot read a run finished by consent. After upgrading, run `dispatch stop &&
-dispatch start` so the project owner is 0.4.7.
+After A was accepted, it left the comparison within two seconds. The
+coherence check then refreshed B (its call no longer matches the signature)
+and C (its patch no longer applies), and kept D and E at CONTINUE.
+
+On a 2,000-file repository, comparing 50 pieces of Work costs 1 ms a tick.
+Analysing one piece's changes costs about 150–260 ms, and is repeated only
+when those changes do.
+
+**Not built.** Interactions are not stored, not used by any policy, and not
+known without a watching owner. There is no ordering advice, no automatic
+refresh or stop, no transitive analysis, and no measured precision yet on real
+repositories.
+
+**Upgrading.** No migration; the schema stays at 24. Run `dispatch stop &&
+dispatch start` so the project owner is 0.4.8.

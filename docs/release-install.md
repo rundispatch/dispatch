@@ -51,6 +51,23 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.8
+
+No migration; the schema stays at 24, and 0.4.7 reads everything 0.4.8
+writes.
+- **The owner compares Work.** While it watches a project, it compares the Work
+  not yet integrated. It keeps that view in
+  `watchers/<key>.interactions.json`, which is removed when the owner stops.
+  After upgrading, run `dispatch stop && dispatch start` so the owner is 0.4.8;
+  an older owner writes no interactions.
+- **New output fields.** `watch --json` work objects gain `interactions`
+  (`null` while not watched). `status --json` gains it while watched. `status`
+  gains a `Concurrent` section.
+- **Claude preflight.** A `claude --version` that gives no answer no longer
+  refuses the profile, and an `auth status` that gives none refuses that launch
+  only. A refusal recorded before upgrading still holds until you authorize
+  again in `dispatch setup`.
+
 ### Upgrading to 0.4.7
 
 No migration; the schema stays at 24. State is forward-only: a run finished by

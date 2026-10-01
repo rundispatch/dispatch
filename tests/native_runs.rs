@@ -1239,7 +1239,7 @@ async fn phase4_wait_timeout_does_not_answer_or_launch() -> Result<()> {
 fn phase4_follow_registration_racing_completion_cannot_lose_it() -> Result<()> {
     let f = Fixture::new("both-fail")?;
     fs::write(f.root.join("gate"), "")?;
-    let mut worker = f
+    let worker = f
         .run_command(&[])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1270,7 +1270,9 @@ fn phase4_follow_registration_racing_completion_cannot_lose_it() -> Result<()> {
         .spawn()?;
     // Completion may commit before the follower even opens SQLite.
     fs::write(f.root.join("continue"), "")?;
-    worker.wait()?;
+    // Both pipes are drained while waiting: a child blocked writing into a
+    // full pipe nobody reads would never exit.
+    worker.wait_with_output()?;
     let output = follower.wait_with_output()?;
     anyhow::ensure!(
         output.status.success(),

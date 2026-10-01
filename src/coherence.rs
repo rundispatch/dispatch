@@ -21,6 +21,7 @@ use crate::{
 
 pub mod facts;
 pub mod integration;
+pub mod interactions;
 pub mod symbols;
 pub mod watch;
 pub mod world;

@@ -77,4 +77,26 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
     with Session([binary,'--state-dir',str(state),'clean'],repo,captures,'clean-remove',width=160,height=30) as ui:
         ui.wait('Cancel');ui.send('\x1b[A');ui.pump(.3);ui.send('\r');ui.wait('Removed 1');ui.finish()
     assert not kept.exists()
+    # Work that touches other Work says so on its row, and the selected row's
+    # details say how, apart from its verdict.
+    proj=root/'interacting'; proj.mkdir(); (proj/'src').mkdir()
+    (proj/'dispatch.yml').write_text('coherence:\n  poll_secs: 1\n')
+    (proj/'src/auth.rs').write_text('pub fn validate(token: &str) -> bool {\n    !token.is_empty()\n}\n')
+    (proj/'src/api.rs').write_text('pub fn serve() {}\n')
+    pgit=lambda *a:subprocess.run(['git','-C',str(proj),'-c','user.name=T','-c','user.email=t@e.invalid',*a],check=True,capture_output=True)
+    pgit('init','-q');pgit('add','-A');pgit('commit','-qm','init')
+    ids=[]
+    for name in ('wt-a','wt-b'):
+        pgit('worktree','add','-q','-b',name,str(root/name))
+        out=subprocess.run([binary,'--state-dir',str(state),'attach','--workspace',str(root/name),'--agent',name],cwd=proj,check=True,capture_output=True).stdout.decode()
+        ids.append(next(l.split()[1] for l in out.splitlines() if l.startswith('ATTACHED ')))
+    (root/'wt-a/src/auth.rs').write_text('pub fn validate(token: &str, strict: bool) -> bool {\n    !token.is_empty()\n}\n')
+    (root/'wt-b/src/api.rs').write_text('pub fn serve() {}\n\npub fn login(t: &str) -> bool {\n    validate(t)\n}\n')
+    subprocess.run([binary,'--state-dir',str(state),'start','--root',str(proj)],check=True,capture_output=True)
+    try:
+        with Session([binary,'--state-dir',str(state),'watch','--root',str(proj)],proj,captures,'watch-interactions',width=200,height=30) as ui:
+            ui.wait('interacts with');ui.wait('Concurrent');ui.wait('signature')
+            ui.send('q');ui.finish()
+    finally:
+        subprocess.run([binary,'--state-dir',str(state),'stop','--root',str(proj)],capture_output=True)
     print('watch journeys passed')

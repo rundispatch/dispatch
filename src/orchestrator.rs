@@ -960,6 +960,14 @@ async fn select_available_resource(
                     .await
                 {
                     Ok(()) => None,
+                    // A check that could not observe refuses this launch only.
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::harness::PreflightInconclusive>()
+                            .is_some() =>
+                    {
+                        Some(error.to_string())
+                    }
                     Err(error) => {
                         db.record_funding_refusal(
                             &profile.funding_key(),
@@ -1535,11 +1543,35 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
             println!("{line}");
         }
     }
+    if let Some(lines) = concurrent(state, &run) {
+        println!("\nConcurrent");
+        for line in lines {
+            println!("  {line}");
+        }
+    }
     println!(
         "\nProject: {}",
         background::project_line(state, &run.source_path)
     );
     Ok(())
+}
+
+/// Where `run` touches other Work in progress, from the project owner's view:
+/// advisory and separate from its verdict. Only Work that may still land has
+/// a say, and without an owner nothing is known.
+fn concurrent(state: &State, run: &RunRecord) -> Option<Vec<String>> {
+    let unintegrated = run.outcome.lifecycle == LifecycleState::Working
+        || (crate::coherence::is_ready_unapplied(run)
+            && run.outcome.review == ReviewState::Pending);
+    if !unintegrated {
+        return None;
+    }
+    match background::interactions(state, &run.source_path) {
+        Some(projection) => projection.details(&run.id),
+        None => Some(vec![
+            "not known: the project is not watched · dispatch start".into(),
+        ]),
+    }
 }
 
 pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
@@ -1548,7 +1580,15 @@ pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Resul
         None => load_latest_for_source(state, source_path, false)?,
     };
     let run = crate::coherence::with_live_validity(&run);
-    println!("{}", serde_json::to_string(&run_result(&run))?);
+    let mut result = serde_json::to_value(run_result(&run))?;
+    // Only while an owner watches the project is anything known about how
+    // this Work interacts with other Work.
+    if let Some(projection) = background::interactions(state, &run.source_path)
+        && projection.participants.iter().any(|p| p.run_id == run.id)
+    {
+        result["interactions"] = serde_json::Value::Array(projection.json(&run.id));
+    }
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
