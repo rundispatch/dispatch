@@ -79,6 +79,55 @@ snapshot and the verdict.
   `owner_state: adopted`) occurs versus a live wrapper finishing its own Work, and the
   S0 confidence (`full`/`partial`) attached results were judged under.
 
+## Measuring interactions (0.4.9)
+
+When Work lands, Dispatch records the interactions the owner had reported
+between it and every other piece of unintegrated Work (`interaction.landed`).
+It then records Dispatch's own next evaluation of each of those pieces
+(`interaction.outcome`). Both are events on the landed run; the payloads are in
+`src/coherence/measure.rs`. The documented queries read them, read-only:
+
+```bash
+sqlite3 -readonly -header -column <state>/dispatch.db < docs/queries/interactions-measured.sql
+```
+
+`<state>` is the state directory: `~/.dispatch`, or `--state-dir` or
+`DISPATCH_HOME`. Each row starts with the label of its result set:
+
+1. `landings_by_status`: landings by the status of the owner's view.
+2. `outcomes_by_class`: outcomes by class.
+3. `scorable_predicted_by_invalidated`: among scorable outcomes, predicted
+   (at least one interaction) by invalidated, with precision (invalidated among
+   predicted) and misses (invalidated, not predicted).
+4. `scorable_predicted_by_rule`: the predicted outcomes of 3, by interaction
+   rule. An outcome with interactions under two rules counts under both.
+5. `landings_without_outcomes`: landings whose counterparts have no outcome.
+
+`tests/measurement_queries.rs` checks every result set against counts derived
+by hand from `tests/fixtures/measurement/events.jsonl`.
+
+What these numbers can support, and what they cannot:
+
+- **Invalidated is Dispatch's own later verdict.** It means the next
+  evaluation of the counterpart said REFRESH or STOP. It is not a confirmed
+  conflict and not a human judgment, so precision measures agreement between
+  two parts of Dispatch, not whether the interaction was real. Human agreement
+  stays the quality signal.
+- **Only scorable outcomes count.** An outcome whose landing was not observed,
+  whose counterpart was gone, unanalyzed or already invalid, whose evaluation
+  failed, or whose world or Δ moved before it was evaluated, is reported by
+  class in result set 2 and never scored.
+- **Correlational, not causal.** An invalidation after a landing is not shown
+  to come from that landing. The counterpart's prior verdict can predate other
+  changes that reached the source before the landing; the landing keeps
+  `prior.world_digest` and `world_before` so that this can be checked.
+- **Small samples are reported as counts.** Quote precision with its numerator
+  and denominator ("3 of 4 predicted"), and quote misses as a count. Do not
+  turn a handful of outcomes into a percentage or a trend.
+- **Unknown stays unknown.** A counterpart without an outcome (result set 5) is
+  neither a hit nor a miss, and a precision with no predicted outcome is NULL,
+  not zero. No composite score is computed.
+
 ## What would falsify the positioning
 
 1. L1 adds no verdict beyond L0 on real repositories over a meaningful sample.
