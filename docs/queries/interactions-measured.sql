@@ -1,8 +1,12 @@
 -- Interactions, measured (0.4.9): precision and misses of interactions.
 --
--- Read-only. Run it against a Dispatch state database:
+-- It only reads. Run it against a Dispatch state database:
 --
---   sqlite3 -readonly <state>/dispatch.db < docs/queries/interactions-measured.sql
+--   sqlite3 <state>/dispatch.db < docs/queries/interactions-measured.sql
+--
+-- Every statement only reads. Do not add -readonly: the database uses a
+-- write-ahead log, and a read-only connection fails when no process has the
+-- database open, because it cannot create the log's shared-memory file.
 --
 -- Add `-header -column` for aligned output. Every row starts with its result
 -- set's label. The events are described in `docs/plan-0.4.9.md` §3 and

@@ -1,75 +1,76 @@
-## Dispatch 0.4.8 — Work that notices Work
+## Dispatch 0.4.9 — Interactions, measured
 
-Dispatch has checked whether Work still holds against the project as it moves.
-0.4.8 also shows where two pieces of Work that are not yet integrated already
-touch each other, before either lands.
+0.4.8 began reporting where pieces of unintegrated Work touch each other. 0.4.9
+records, from real use, how often those reports turn out right, so that nothing
+is built on them before that is known.
 
-- **Where Work touches Work.** While a project is watched (`dispatch start`),
-  Dispatch compares every piece of Work not yet integrated and reports when:
-  - both change the same declaration or whole file, or edit overlapping lines;
-  - one changes the signature of, or removes, a declaration the other uses;
-  - one changes or deletes a file the other relies on.
+- **Every landing records what was known.** When Work is applied, by `accept`
+  or by auto-apply, Dispatch records the interactions its watching owner had
+  reported between it and every other piece of Work in progress
+  (`interaction.landed`). Pieces with no reported interaction are listed too,
+  so misses can be counted.
+- **The owner records what happened next.** The watching owner records its
+  next verdict on each of those other pieces (`interaction.outcome`): CONTINUE
+  or not, interaction or not.
+  - An outcome is scored only when nothing else could explain it. The landing
+    must have been observed, and the other piece analysed and valid before. If
+    another change reached the project, or the piece itself changed before it
+    was evaluated, the outcome is kept but labelled with why it cannot be
+    scored.
+  - Each outcome is recorded once, across owner restarts.
+- **Documented queries read it.** `docs/queries/interactions-measured.sql`
+  gives, from your own state directory:
+  - landings by status;
+  - outcomes by class;
+  - precision (invalidated among predicted) and misses, with their counts;
+  - the same by rule;
+  - landings whose outcomes are missing.
 
-  This is exact to the declaration for Rust and Python, and to the file
-  elsewhere, and it says which.
-- **What is not reported:** reading the same thing; different declarations of
-  one file whose edits keep apart; and a change to a body alone that the other
-  only calls. Work mid-edit whose file does not parse for a moment keeps its
-  last clean analysis instead of raising a whole-file warning.
-- **Where it shows:**
-  - a `dispatch watch` row ends with `interacts with <id>`;
-  - the selected row's `Concurrent` lines say how, for example "it changes the
-    signature of validate (auth.py), which this Work uses";
-  - `dispatch status` has a `Concurrent` section;
-  - `watch --json` and `status --json` carry a structured `interactions` list.
+  `docs/coherence-validation.md` says what the numbers can support.
+  "Invalidated" means Dispatch's own later verdict, not a confirmed conflict.
+  Nothing leaves your machine.
+- **Live patches are published atomically.** A watcher or the owner could read
+  a work-in-progress patch while it was being rewritten. Patches are now
+  written to a temporary file and renamed.
+- **No policy changes.** Interactions stay advisory: no verdict, accept or
+  auto-apply decision depends on them.
 
-  It sits apart from the verdict: Work can be `CONTINUE` and still interact.
-- **Advisory only.** Nothing is blocked, reordered, refreshed or stopped. When
-  one piece lands, it leaves the comparison and the other is judged by the
-  coherence check, as before.
+**Fixed.** A landing auto-applied by an owner on its first tick after a restart
+would have seen no interaction view. The owner now compares Work before it
+auto-applies.
 
-**Fixed.**
-- **A Claude check that timed out no longer refuses the profile for good.**
-  Under load, `claude --version` could take longer than its 5 s. Dispatch read
-  the missing answer as "Claude CLI version changed" and refused the profile
-  until you authorized it again. A `claude auth status` that did not answer
-  was recorded the same way.
-  - Now only a contradicting observation is a lasting refusal: a different
-    version, a different account, a changed executable, or an expired
-    approval.
-  - A version check that gives no answer lets the run go ahead: the
-    executable's hash, checked first, already fixes its version.
-  - An account check that gives no answer refuses that one launch.
-- **Work launched together is told apart.** IDs are shortened to 8 characters,
-  which Work created within a quarter of a second shares. The view and
-  interactions now show as much of each ID as tells them apart, and the removal
-  hook's suggested commands carry the full ID.
-
-**Evidence.** A real-agent trial with Claude Code 2.1.280 and Cursor Agent
-started five pieces of Work together on one small Python project:
+**Evidence.** A real-agent trial on a small Python project ran five Claude Code
+sessions at once:
 - A changed the signature of `auth.validate`;
 - B added a caller of it;
-- C changed only its body;
-- E changed another function in the same file;
-- D changed an unrelated module.
+- C changed its body;
+- D changed an unrelated module;
+- E changed another function in the same file.
 
-Before anything landed, Dispatch reported A and C changing the same
-declaration, and A's signature change against B's new caller. The A-to-B
-interaction was already there while B was still running under `dispatch
-attach`. It reported nothing for C against B, E, or D.
+Before anything landed, Dispatch reported A against B (B uses the signature A
+changes) and A against C (both change `validate`), and nothing else.
 
-After A was accepted, it left the comparison within two seconds. The
-coherence check then refreshed B (its call no longer matches the signature)
-and C (its patch no longer applies), and kept D and E at CONTINUE.
+D landed first. Its landing was observed, and within 5 s the owner recorded
+four outcomes: all scorable, none predicted, all CONTINUE. Then A landed:
+- B: predicted, and REFRESH (`fact_broken`);
+- C: predicted, and REFRESH (`patch_conflict`);
+- E: not predicted, and CONTINUE.
 
-On a 2,000-file repository, comparing 50 pieces of Work costs 1 ms a tick.
-Analysing one piece's changes costs about 150–260 ms, and is repeated only
-when those changes do.
+The documented queries over that state report 2 landings and 7 scorable
+outcomes. Precision was 2 of 2 predicted, with 0 misses among 5 that were not
+predicted. That is one small trial, not a rate.
 
-**Not built.** Interactions are not stored, not used by any policy, and not
-known without a watching owner. There is no ordering advice, no automatic
-refresh or stop, no transitive analysis, and no measured precision yet on real
-repositories.
+**How it was built.** This release was built by four Claude Code sessions
+working in parallel, each on one packet in its own worktree. Dispatch 0.4.8
+watched them, and every packet was integrated through `dispatch accept` after
+review. Dispatch reported no interactions between the packets, which was
+correct: none of them shared a file.
+
+The process found two 0.4.8 defects, both still open:
+- a `SessionStart` hook can be killed by Claude Code's 60 s timeout while
+  Dispatch registers the Work under heavy load, leaving the session untracked;
+- `dispatch attach --workspace` walks ignored build output, and can fail on a
+  file that disappears mid-walk.
 
 **Upgrading.** No migration; the schema stays at 24. Run `dispatch stop &&
-dispatch start` so the project owner is 0.4.8.
+dispatch start` so the project owner is 0.4.9.

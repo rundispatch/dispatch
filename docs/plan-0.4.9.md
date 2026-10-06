@@ -271,3 +271,76 @@ preference data.
     - `work_auto_applied_by_the_owner_lands_with_the_owners_current_view`:
       `observed`. Without the reordering it gets `unavailable`, checked by
       removing it.
+- 2026-10-06: R.
+  - **The candidate:** version 0.4.9, a release build of `8d73952` plus the
+    version bump, copied to `~/dispatch-dev/dispatch-0.4.9-candidate/`.
+  - **The measurement trial.** A fresh Python project and state directory under
+    `~/dispatch-dev/trial-049` (not the system temporary directory), with hooks
+    only in its `.claude/settings.local.json`, and five `claude -p --worktree`
+    sessions launched together:
+    - A: the signature of `auth.validate`;
+    - B: a caller of it;
+    - C: its body only;
+    - D: `report.py`;
+    - E: `refresh` in the same file.
+
+    All five registered through the hooks, at low load.
+    - **Before any landing:** A against B (`uses`, A writes, `signature`) and A
+      against C (`same_declaration`); nothing for C against B, for E, or for D.
+    - **D landed:** observed, 4 counterparts, none with an interaction. Within
+      5 s, 4 outcomes: scorable, not predicted, CONTINUE.
+    - **A landed:** observed. Within 2 s, B: scorable, predicted, REFRESH
+      `fact_broken`; C: scorable, predicted, REFRESH `patch_conflict`; E:
+      scorable, not predicted, CONTINUE. All three were evaluated in the world
+      right after the landing (`5cc10ff3…`).
+    - **The documented queries:** 2 landings observed, 7 outcomes all
+      scorable, precision 2 of 2 (`uses` 1 of 1, `same_declaration` 1 of 1), 0
+      misses among 5 not predicted, no landing missing outcomes.
+  - **Corrective work on D, found by the trial.** The documented command
+    `sqlite3 -readonly …` failed on the live state ("unable to open database
+    file", error 14). The database uses a write-ahead log, and with no process
+    holding it open, a read-only connection cannot create the shared-memory
+    file. D had run its command only on a scratch copy, and the integrator's
+    review missed it.
+    - The documented command now omits `-readonly`. The file only reads, and
+      its test asserts every statement is read-only.
+    - The docs and the SQL header say why, and give a `.backup` copy as the
+      alternative.
+  - **Docs:**
+    - the README gains measured interactions;
+    - `docs/coherence.md` gains "Measuring interactions (`measure.rs`)";
+    - `docs/attach.md` gains the two events;
+    - `AGENTS.md`'s public claims add advisory interactions, and precision
+      only from recorded outcomes, as counts, as agreement with Dispatch's own
+      later verdict;
+    - `release-install.md` gains "Upgrading to 0.4.9";
+    - the release notes are for 0.4.9.
+
+## Evaluation of the contributions
+
+The packets differ in size and kind, so this is not a model comparison, and the
+integrator's review is not human preference data. Usage was not reported by any
+session and stays unknown. The wall times are the workers' own.
+
+| | A: atomic live patches | B: landing capture | C: classifier | D: queries |
+|---|---|---|---|---|
+| Work | `01M493Z3…` (attached by hand) | `01M492SB…` (discovered) | `01M492ST…` (discovered) | `01M493RX…` (attached by hand) |
+| Scope | its file only | its 3 files | its file only | its 3 files |
+| Contract | respected | respected; reported 2 recorded-behaviour choices | respected; no fixture contradictions | respected |
+| Correctness | concurrency test fails 3/3 on the old code, passes with the fix | apply unchanged; 5 CLI tests and a unit test; raised a real owner-ordering gap | all 16 fixture cases and the precedence boundaries | counts checked by hand; NULL precision with nothing predicted |
+| Found beyond its scope | misplaced doc comment in `state.rs` (integrator's 0.4.8 bug) | auto-apply before the view was refreshed (fixed in W) | none | none |
+| Corrective work after review | none | none | none | the documented command failed on a live state (`-readonly`); fixed by the integrator in R |
+| Wall time (reported) | ~20 min | ~25 min | ~15 min | ~20 min |
+| Usage | unknown | unknown | unknown | unknown |
+
+**How Dispatch handled the work:**
+- **Interactions:** none reported between the packets, which was correct (no
+  shared files). The view was current to within 8 s of the last edit.
+- **Coherence:** every remaining packet stayed CONTINUE as each one landed.
+- **Merged-tree checks:** they ran on every accept after the first.
+- **Defects found** (0.4.8, open):
+  - a `SessionStart` hook killed mid-registration under load (A and D);
+  - `attach` walking ignored build output.
+- **Integrator setup defect:** a shared `CARGO_TARGET_DIR` made the recorded
+  checks of C and B unreliable. It is fixed for new Work.
+- **Misses or false warnings:** none observed during the build.

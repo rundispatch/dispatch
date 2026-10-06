@@ -51,6 +51,19 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.9
+
+No migration; the schema stays at 24.
+- **New events.** Two event types are written to the existing events table:
+  `interaction.landed`, once on each applied run, and `interaction.outcome`,
+  recorded by the watching owner. 0.4.8 reads a state directory that contains
+  them and ignores them.
+- **Restart the owner.** Run `dispatch stop && dispatch start` so the project
+  owner is 0.4.9. A 0.4.8 owner records no outcomes, so its landings would show
+  as having no outcome in the queries.
+- **Live patches are now written by rename.** `delta-live.patch` and the
+  owner's scratch patches are published atomically, as files of mode 0600.
+
 ### Upgrading to 0.4.8
 
 No migration; the schema stays at 24, and 0.4.7 reads everything 0.4.8

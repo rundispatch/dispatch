@@ -29,7 +29,10 @@ explicit `--agent`, fed into the same execution core.
 
 Public claims about coherence must match what is shipped and measured. Today
 that is an accept-time gate with symbol-level facts for Rust and Python, file-level
-facts elsewhere, and an advisory mid-run watcher on native runs. Do not claim
+facts elsewhere, an advisory mid-run watcher on native runs, and advisory
+interactions between unintegrated Work while a project is watched. Claim
+precision for interactions only from recorded outcomes (the documented queries),
+quoted as counts, and only as agreement with Dispatch's own later verdict. Do not claim
 tokens, minutes or money saved until a real run was stopped and the attempt
 timestamps show it. The metrics that decide whether the thesis holds, and what
 would falsify it, are in `docs/coherence-validation.md`.

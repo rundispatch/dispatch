@@ -452,6 +452,39 @@ owner's view of it (`watchers/<key>.interactions.json`) is disposable: it is
 written only by the owner, trusted only while the owner holds the project, and
 removed when it exits.
 
+## Measuring interactions (`measure.rs`)
+
+Interactions are advisory, so whether they are right is measured from real use
+before anything relies on them. Both measurements are events on the landed run.
+The contract and its fixtures are in `docs/plan-0.4.9.md` and
+`tests/fixtures/measurement/`.
+
+- **`interaction.landed`** is recorded once, after `result.applied`, by
+  whatever applied the Work: `accept` or the owner's auto-apply.
+  - It is captured under the apply locks, before the patch is applied. The
+    owner's view at that moment gives the status: `observed`, `stale` (the
+    view lists no Work or an older patch for it), `unwatched` or
+    `unavailable`.
+  - It lists every other participant with its S0, Δ digest, analysis, stored
+    verdict, and the interactions reported between them.
+  - It also records the world digests before and after applying.
+  - A measurement error is printed and never changes the apply.
+- **`interaction.outcome`** is recorded once per counterpart by the watching
+  owner, at its first tick after the landing: the verdict `check` would give,
+  against the source then.
+  - It is classified, never attributed: `scorable` only when the landing was
+    observed, the counterpart was analysed and not already invalid, and
+    neither the world nor its Δ moved since the landing. Otherwise the class
+    names why it cannot be scored.
+  - CONTINUE is recorded like any verdict, whatever the usual suppression of
+    unchanged coherence events.
+  - A counterpart with no Δ left is `counterpart_gone`.
+  - The owner looks back one day, and writes each (landing, counterpart) once,
+    across restarts.
+- **The queries** (`docs/queries/interactions-measured.sql`) read these events.
+  [coherence-validation.md](coherence-validation.md#measuring-interactions-049)
+  says how to run them and what the numbers can and cannot support.
+
 ## Human override (`dispatch accept --despite-refresh`)
 
 The file and symbol analysis can be more cautious than the work requires. A human who

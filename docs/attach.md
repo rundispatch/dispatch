@@ -566,6 +566,8 @@ In addition to the existing coherence, application and review events (see
 | `workspace.removed` | the workspace is gone: kept exactly by the hook, or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes"}` |
 | `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
 | `work.closed` | a person rejected unfinished Work whose workspace is gone | `{"reason": "workspace_removed", "by": "human"}` |
+| `interaction.landed` | after `result.applied`: what the owner's view said about this Work and the others in progress | `measure::Landing` (see [coherence.md](coherence.md#measuring-interactions-measurers)) |
+| `interaction.outcome` | the owner's first verdict on one of those others after this Work landed | `measure::Outcome` |
 
 An attached run also commits the ordinary `run.created`/`run.finished` events, and
 `coherence.checked`/`coherence.invalidated`, `result.applied`/`application.failed`,

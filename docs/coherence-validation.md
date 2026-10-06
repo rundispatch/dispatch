@@ -88,8 +88,14 @@ It then records Dispatch's own next evaluation of each of those pieces
 `src/coherence/measure.rs`. The documented queries read them, read-only:
 
 ```bash
-sqlite3 -readonly -header -column <state>/dispatch.db < docs/queries/interactions-measured.sql
+sqlite3 -header -column <state>/dispatch.db < docs/queries/interactions-measured.sql
 ```
+
+The file only reads: every statement is a `SELECT`. Do not add `-readonly`. The
+database uses a write-ahead log, and when no process has it open, a read-only
+connection cannot create the log's shared-memory file, so it fails with "unable
+to open database file". To query a copy instead, make one with
+`sqlite3 <state>/dispatch.db ".backup measure.db"`.
 
 `<state>` is the state directory: `~/.dispatch`, or `--state-dir` or
 `DISPATCH_HOME`. Each row starts with the label of its result set:
