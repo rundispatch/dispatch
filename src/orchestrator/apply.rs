@@ -16,12 +16,19 @@ use anyhow::Result;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::{persist_event, sole_candidate, transition};
+use super::{
+    background::{self, Watcher},
+    persist_event, sole_candidate, transition,
+};
 use crate::{
     AnalysisLevel, ApplicationState, AppliedBy, CoherenceRecord, Decision, EventRecord,
     LifecycleState, ReviewState, RunPhase, RunRecord, RunStatus, Validity, VerificationState,
     WorkResult,
-    coherence::{AcceptGate, CoherenceBlocked, run_config},
+    coherence::{
+        AcceptGate, CoherenceBlocked,
+        measure::{self, Landing, OwnerView, landing},
+        run_config, world,
+    },
     db::Database,
     lock::OperationLock,
     source::{self, ApplyReport},
@@ -177,6 +184,7 @@ fn persist_applied(
     report: &ApplyReport,
     validity: Option<&Validity>,
     authority: ApplyAuthority,
+    landing: Option<Landing>,
 ) -> Result<RunRecord> {
     if let Some(validity) = validity {
         remember_validity(&mut run, validity);
@@ -211,12 +219,93 @@ fn persist_applied(
         },
         &mut run,
     )?;
+    if let Some(landing) = landing
+        && let Err(error) = record_landing(state, &db, &mut run, landing)
+    {
+        eprintln!("Could not record how this Work landed: {error:#}");
+    }
     // Applied, so a workspace Dispatch made for this Work holds nothing the
     // checkout lacks. Keeping it when removal fails loses nothing.
     if let Err(error) = super::attach::release_workspace(state, &mut run, "applied") {
         eprintln!("Kept the workspace Dispatch made for this work: {error:#}");
     }
     Ok(run)
+}
+
+/// The landing observation for `run`, about to apply its sole candidate
+/// (`docs/plan-0.4.9.md` §3.2). Gathered under the apply locks, before the
+/// patch is applied; `gated` is the validity the gate produced, if any, whose
+/// digest is the world before. Measurement never changes the apply, so a
+/// failure is printed and nothing is recorded.
+fn observe_landing(
+    state: &State,
+    run: &RunRecord,
+    authority: ApplyAuthority,
+    gated: Option<&Validity>,
+) -> Option<Landing> {
+    let gathered = || -> Result<Landing> {
+        let view = match background::watcher(state, &run.source_path)? {
+            Watcher::NotWatched => OwnerView::Unwatched,
+            Watcher::Watched(_) => match background::interactions(state, &run.source_path) {
+                Some(projection) => OwnerView::Watched(projection),
+                None => {
+                    OwnerView::Unavailable("the owner's interaction view could not be read".into())
+                }
+            },
+        };
+        let counterparts: Vec<RunRecord> = match &view {
+            OwnerView::Watched(projection) => projection
+                .participants
+                .iter()
+                .filter(|participant| participant.run_id != run.id)
+                .filter_map(|participant| state.load_run(&participant.run_id).ok())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let patch = fs::read(&sole_candidate(run)?.diff_path)?;
+        Ok(landing::capture(
+            run,
+            authority.applied_by(),
+            &patch,
+            gated.map(|validity| validity.world_digest.as_str()),
+            view,
+            &counterparts,
+        ))
+    };
+    gathered()
+        .inspect_err(|error| eprintln!("Could not observe how this Work landed: {error:#}"))
+        .ok()
+}
+
+/// Commit `interaction.landed` on the applied `run`, with the world as it is
+/// right after applying (`None` when it cannot be observed).
+fn record_landing(
+    state: &State,
+    db: &Database,
+    run: &mut RunRecord,
+    mut landing: Landing,
+) -> Result<()> {
+    landing.world_after = world::observe(
+        &run.source_path,
+        &run.baseline_path,
+        &run.baseline_commit,
+        &run.source_kind,
+    )
+    .ok()
+    .map(|world| world.digest);
+    persist_event(
+        state,
+        db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: run.applied_candidate.clone(),
+            event_type: measure::LANDED.into(),
+            timestamp: Utc::now(),
+            payload: serde_json::to_value(&landing)?,
+            ..EventRecord::default()
+        },
+        run,
+    )
 }
 
 /// Set `application` and commit `application.failed` with `payload`. Shared
@@ -315,33 +404,37 @@ pub(super) fn apply_locked(
         &state.run_dir(&run.id),
         despite_refresh,
     )
-    .and_then(|gate| match gate {
-        AcceptGate::Legacy => Ok((source::safe_apply(&run, &normalized_label)?, None, None)),
-        AcceptGate::Compatible(validity) => Ok((
-            source::apply_validated(&run, &normalized_label, &validity.world_digest)?,
-            Some(validity),
-            None,
-        )),
-        AcceptGate::Overridden {
-            overridden,
-            verified,
-        } => Ok((
-            source::apply_validated(&run, &normalized_label, &verified.world_digest)?,
-            Some(verified),
-            Some(overridden),
-        )),
-        AcceptGate::Blocked(validity) => Err(CoherenceBlocked {
-            run_id: run.id.clone(),
-            landed_by: (validity.decision == Decision::Stop)
-                .then(|| landed_by(state, &run))
-                .flatten(),
-            validity,
-            attached: run.mode == crate::RunMode::Attached,
-            despite_refresh,
-        }
-        .into()),
+    .and_then(|gate| {
+        let (validity, overridden) = match gate {
+            AcceptGate::Legacy => (None, None),
+            AcceptGate::Compatible(validity) => (Some(validity), None),
+            AcceptGate::Overridden {
+                overridden,
+                verified,
+            } => (Some(verified), Some(overridden)),
+            AcceptGate::Blocked(validity) => {
+                return Err(CoherenceBlocked {
+                    run_id: run.id.clone(),
+                    landed_by: (validity.decision == Decision::Stop)
+                        .then(|| landed_by(state, &run))
+                        .flatten(),
+                    validity,
+                    attached: run.mode == crate::RunMode::Attached,
+                    despite_refresh,
+                }
+                .into());
+            }
+        };
+        let landing = observe_landing(state, &run, authority, validity.as_ref());
+        let report = match &validity {
+            None => source::safe_apply(&run, &normalized_label)?,
+            Some(validity) => {
+                source::apply_validated(&run, &normalized_label, &validity.world_digest)?
+            }
+        };
+        Ok((report, validity, overridden, landing))
     });
-    let (report, validity, overridden) = match applied {
+    let (report, validity, overridden, landing) = match applied {
         Ok(applied) => applied,
         Err(error) => {
             let message = format!("{error:#}");
@@ -385,6 +478,7 @@ pub(super) fn apply_locked(
         &report,
         validity.as_ref(),
         authority,
+        landing,
     )?;
     if !quiet {
         println!(
@@ -647,6 +741,7 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
             Authorization::Fingerprint => None,
             Authorization::Digest(validity) => Some(validity.clone()),
         };
+        let landing = observe_landing(state, &run, ApplyAuthority::AutoApply, validity.as_ref());
         let applied = match &authorization {
             Authorization::Fingerprint => source::safe_apply(&run, &candidate_label),
             Authorization::Digest(validity) => {
@@ -662,6 +757,7 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
                     &report,
                     validity.as_ref(),
                     ApplyAuthority::AutoApply,
+                    landing,
                 )?;
                 return Ok(ApplyOutcome::Applied { report, validity });
             }

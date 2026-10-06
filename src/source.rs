@@ -18,6 +18,7 @@ use walkdir::{DirEntry, WalkDir};
 use crate::{
     DiffStats, RunRecord, SourceKind,
     executor::{trusted_host_executable, trusted_host_path},
+    state::write_atomically,
 };
 
 const BASELINE_DIRECTORY: &str = "baseline";
@@ -680,7 +681,9 @@ pub fn snapshot_delta_indexed(
         "--",
     ]);
     let patch = checked_output(diff, "failed to collect the work in progress")?.stdout;
-    fs::write(out_patch, patch).with_context(|| format!("failed to write {}", out_patch.display()))
+    // Watchers and the owner read this file while it is rewritten, so publish
+    // it by rename. No fsync: it is advisory evidence, not durable state.
+    write_atomically(out_patch, &patch)
 }
 
 /// Hash the complete logical source tree, excluding Git and Dispatch state.
@@ -2667,6 +2670,96 @@ mod tests {
         let patch = same();
         assert!(!patch.contains("src/lib.rs") && !patch.contains("new.txt"));
         assert!(patch.contains("deleted file mode"));
+    }
+
+    #[test]
+    fn a_live_patch_is_never_seen_half_written() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("README.md"), "readme\n");
+        initialize_user_repository(&source);
+        let snapshot = create_snapshot(&source, &temp.path().join("run")).unwrap();
+        // Two workspaces whose patches are large and different, each with its
+        // own kept index, published alternately into one live patch.
+        let workspaces = ["a", "b"].map(|name| {
+            let workspace = temp.path().join(name);
+            create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+            let lines = (0..80_000).map(|line| format!("{name} line {line}\n"));
+            write(&workspace.join("big.txt"), lines.collect::<String>());
+            let index = temp.path().join(format!("{name}.index"));
+            let patch = temp.path().join(format!("{name}.patch"));
+            snapshot_delta_indexed(&snapshot.baseline_path, &workspace, &patch, &index).unwrap();
+            (workspace, index, fs::read(&patch).unwrap())
+        });
+        assert!(
+            workspaces
+                .iter()
+                .all(|(_, _, patch)| patch.len() >= 1 << 20)
+        );
+        let live = temp.path().join("live/delta-live.patch");
+        write(&live, &workspaces[0].2);
+
+        let done = AtomicBool::new(false);
+        let (reads, torn) = thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let (mut reads, mut torn) = (0, 0);
+                while !done.load(Ordering::Relaxed) {
+                    let Ok(seen) = fs::read(&live) else { continue };
+                    reads += 1;
+                    if workspaces.iter().all(|(_, _, patch)| *patch != seen) {
+                        torn += 1;
+                    }
+                }
+                (reads, torn)
+            });
+            for (workspace, index, _) in workspaces.iter().cycle().take(60) {
+                snapshot_delta_indexed(&snapshot.baseline_path, workspace, &live, index).unwrap();
+            }
+            done.store(true, Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        assert!(reads > 0);
+        assert_eq!(torn, 0, "{torn} of {reads} reads saw a partial patch");
+    }
+
+    #[test]
+    fn a_failed_live_snapshot_keeps_the_last_patch() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("README.md"), "readme\n");
+        initialize_user_repository(&source);
+        let snapshot = create_snapshot(&source, &temp.path().join("run")).unwrap();
+        let live = temp.path().join("live/delta-live.patch");
+        write(&live, "last patch\n");
+
+        let missing = temp.path().join("missing");
+        let index = temp.path().join("missing.index");
+        assert!(snapshot_delta_indexed(&snapshot.baseline_path, &missing, &live, &index).is_err());
+        assert!(snapshot_delta(&snapshot.baseline_path, &missing, &live).is_err());
+
+        assert_eq!(fs::read_to_string(&live).unwrap(), "last patch\n");
+        let names = |directory: &Path| {
+            fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(live.parent().unwrap()), ["delta-live.patch"]);
+
+        // A publish that fails after staging (here the rename, onto a
+        // directory) leaves no temporary file behind either.
+        let workspace = temp.path().join("candidate");
+        create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+        write(&workspace.join("new.txt"), "new\n");
+        let blocked = temp.path().join("blocked/delta-live.patch");
+        fs::create_dir_all(blocked.join("kept")).unwrap();
+        assert!(snapshot_delta(&snapshot.baseline_path, &workspace, &blocked).is_err());
+        assert_eq!(names(blocked.parent().unwrap()), ["delta-live.patch"]);
+        assert_eq!(names(&blocked), ["kept"]);
     }
 
     #[test]

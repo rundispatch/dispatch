@@ -27,6 +27,7 @@ use crate::{
     coherence::{
         self, WorkView,
         interactions::{self, Analysis, Edge, Footprint, Participant, Projection},
+        measure::{self, Counterpart, Evaluation, Landing, Outcome},
         world,
     },
     db::Database,
@@ -203,6 +204,9 @@ pub(crate) struct Owner {
     clean: HashMap<String, Footprint>,
     /// What the interaction view says now; `None` until it is first written.
     shown: Option<Projection>,
+    /// Landed runs whose every counterpart has its outcome recorded, or that
+    /// are too old to measure: never looked at again by this owner.
+    measured: HashSet<String>,
     scratch: tempfile::TempDir,
 }
 
@@ -291,6 +295,7 @@ impl Owner {
             footprints: HashMap::new(),
             clean: HashMap::new(),
             shown: None,
+            measured: HashSet::new(),
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -328,6 +333,9 @@ impl Owner {
         let started = Instant::now();
         self.recheck_ready(state, &runs, &mut tick);
         tick.cost.recheck = started.elapsed();
+        // The view must be current before anything lands: an application
+        // records what it showed (`measure::landing`).
+        self.interact(state, &runs, &mut tick);
         let started = Instant::now();
         for run in ready_for_auto_apply(&runs) {
             match auto_apply(state, &run.id) {
@@ -351,7 +359,10 @@ impl Owner {
             runs
         };
         let runs = std::mem::take(&mut tick.runs);
-        self.interact(state, &runs, &mut tick);
+        if tick.adopted || tick.persisted || tick.applied {
+            self.interact(state, &runs, &mut tick);
+        }
+        self.measure(state, &runs, &mut tick);
         tick.runs = runs;
         tick
     }
@@ -727,6 +738,154 @@ impl Owner {
         self.shown.as_ref()
     }
 
+    /// For each recent landing in this project, record Dispatch's first
+    /// evaluation of every counterpart the landing listed, once
+    /// (`interaction.outcome`, `docs/plan-0.4.9.md` §3.3). The evaluation is the
+    /// one `check` makes, against the source now, and never stored as the
+    /// counterpart's verdict. Whatever it finds is recorded, CONTINUE or an
+    /// unscorable class alike; nothing waits for a better moment. Outcomes are
+    /// written on the landed run alone, under its lock, so live runs keep a
+    /// single writer. A busy lock is tried again on the next tick.
+    fn measure(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+        let landed: Vec<&RunRecord> = runs
+            .iter()
+            .filter(|run| {
+                run.outcome.application == ApplicationState::Applied
+                    && !self.measured.contains(&run.id)
+            })
+            .collect();
+        if landed.is_empty() {
+            return;
+        }
+        let database = match Database::open(state.db_path()) {
+            Ok(database) => database,
+            Err(error) => return tick.report(&error),
+        };
+        for run in landed {
+            match self.measure_landing(state, &database, run, runs, tick) {
+                Ok(true) => {
+                    self.measured.insert(run.id.clone());
+                }
+                Ok(false) => {}
+                Err(error) => tick.report(&error),
+            }
+        }
+    }
+
+    /// Record the missing outcomes of `landed`'s landing; `true` once none is
+    /// missing, or the landing is older than a day, or there is none.
+    fn measure_landing(
+        &mut self,
+        state: &State,
+        database: &Database,
+        landed: &RunRecord,
+        runs: &[RunRecord],
+        tick: &mut Tick,
+    ) -> Result<bool> {
+        let events = database.events_for_run(&landed.id)?;
+        let Some(event) = events.iter().find(|e| e.event_type == measure::LANDED) else {
+            return Ok(true);
+        };
+        if Utc::now() - event.timestamp > chrono::Duration::hours(24) {
+            return Ok(true);
+        }
+        let landing: Landing = serde_json::from_value(event.payload.clone())?;
+        let recorded = recorded_outcomes(&events);
+        let missing: Vec<&Counterpart> = landing
+            .counterparts
+            .iter()
+            .filter(|c| !recorded.contains(&c.identity.run_id))
+            .collect();
+        if missing.is_empty() {
+            return Ok(true);
+        }
+        let outcomes: Vec<Outcome> = missing
+            .into_iter()
+            .map(|counterpart| {
+                let current = runs.iter().find(|r| r.id == counterpart.identity.run_id);
+                let evaluation = match current
+                    .and_then(|run| self.delta_of(run, tick).map(|(patch, _)| (run, patch)))
+                {
+                    None => Evaluation::Gone,
+                    Some((run, patch)) => self.evaluate_counterpart(run, &patch),
+                };
+                measure::outcome::outcome(&landing, counterpart, evaluation, Utc::now())
+            })
+            .collect();
+        let Ok(_lock) = OperationLock::acquire(
+            &run_lock_path(state, &landed.id),
+            "run has a foreground owner",
+        ) else {
+            return Ok(false); // busy: try again on the next tick
+        };
+        let mut run = state.load_run(&landed.id)?;
+        // Read again under the lock: another writer may have recorded some.
+        let recorded = recorded_outcomes(&database.events_for_run(&landed.id)?);
+        for outcome in outcomes {
+            if recorded.contains(&outcome.counterpart_run_id) {
+                continue;
+            }
+            persist_event(
+                state,
+                database,
+                EventRecord {
+                    run_id: run.id.clone(),
+                    candidate_label: run.applied_candidate.clone(),
+                    event_type: measure::OUTCOME.into(),
+                    timestamp: Utc::now(),
+                    payload: serde_json::to_value(&outcome)?,
+                    ..EventRecord::default()
+                },
+                &mut run,
+            )?;
+            tick.persisted = true;
+        }
+        Ok(true)
+    }
+
+    /// The coherence verdict on a counterpart's Δ against the source now.
+    fn evaluate_counterpart(&self, run: &RunRecord, patch: &Path) -> Evaluation {
+        let delta_sha256 = fs::read(patch)
+            .ok()
+            .map(|bytes| hex::encode(Sha256::digest(&bytes)));
+        let world = world::observe(
+            &self.root,
+            &run.baseline_path,
+            &run.baseline_commit,
+            &self.kind,
+        );
+        let evaluated = world
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
+            .and_then(|world| {
+                coherence::evaluate(
+                    world,
+                    &WorkView {
+                        source: &self.root,
+                        delta_patch: patch,
+                        baseline: &run.baseline_path,
+                        baseline_commit: &run.baseline_commit,
+                    },
+                )
+            });
+        match (evaluated, delta_sha256) {
+            (Ok(validity), Some(delta_sha256)) => Evaluation::Evaluated {
+                world_digest: validity.world_digest,
+                delta_sha256,
+                decision: validity.decision,
+                reasons: validity.reasons.iter().map(|reason| reason.code).collect(),
+            },
+            (evaluated, delta_sha256) => Evaluation::Failed {
+                error: evaluated.err().map_or_else(
+                    || "its patch could not be read".into(),
+                    |e| format!("{e:#}"),
+                ),
+                world_digest: world.ok().map(|world| world.digest),
+                delta_sha256,
+            },
+        }
+    }
+
     /// The Δ that stands for `run` among Work not yet integrated, and whether
     /// it is frozen: the kept patch of a delivered result or of a workspace
     /// removed with its exact changes; the workspace as it is now for live
@@ -857,6 +1016,19 @@ fn awaits_review(run: &RunRecord) -> bool {
 /// new (`worth_recording`), the first time the Work is checked at all, and
 /// when the world first moves under it, so the view never says "not checked"
 /// or "unmoved" about something it has seen move.
+/// The counterparts whose outcome a landed run already records.
+fn recorded_outcomes(events: &[EventRecord]) -> HashSet<String> {
+    events
+        .iter()
+        .filter(|event| event.event_type == measure::OUTCOME)
+        .filter_map(|event| {
+            event.payload["counterpart_run_id"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn worth_storing(stored: Option<&Validity>, validity: &Validity) -> bool {
     stored.is_none_or(|stored| stored.world_changed != validity.world_changed)
         || coherence::watch::worth_recording(stored, validity)

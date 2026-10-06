@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "status": "observed",
+  "detail": null,
+  "landed": {
+    "run_id": "01J9LANDA10000000000000000",
+    "s0": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "delta_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "applied_by": "human"
+  },
+  "world_before": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "world_after": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "projection_computed_at": "2026-10-06T09:00:00Z",
+  "counterparts": [
+    {
+      "run_id": "01J9CPB0000000000000000000",
+      "s0": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "delta_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "analysis": "analyzed",
+      "unresolved": 0,
+      "prior": {
+        "decision": "continue",
+        "world_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "interactions": [
+        {
+          "rule": "uses",
+          "writer": "a",
+          "target": {
+            "kind": "symbol",
+            "path": "src/auth.rs",
+            "name": "validate"
+          },
+          "change": "signature",
+          "lines": null
+        }
+      ]
+    },
+    {
+      "run_id": "01J9CPC0000000000000000000",
+      "s0": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "delta_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "analysis": "analyzed",
+      "unresolved": 0,
+      "prior": {
+        "decision": "continue",
+        "world_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "interactions": []
+    },
+    {
+      "run_id": "01J9CPD0000000000000000000",
+      "s0": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "delta_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "analysis": "pending",
+      "unresolved": 0,
+      "prior": null,
+      "interactions": []
+    },
+    {
+      "run_id": "01J9CPE0000000000000000000",
+      "s0": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "delta_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "analysis": "analyzed",
+      "unresolved": 0,
+      "prior": {
+        "decision": "refresh",
+        "world_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "interactions": [
+        {
+          "rule": "same_declaration",
+          "writer": null,
+          "target": {
+            "kind": "symbol",
+            "path": "src/auth.rs",
+            "name": "validate"
+          },
+          "change": null,
+          "lines": null
+        }
+      ]
+    },
+    {
+      "run_id": "01J9CPF0000000000000000000",
+      "s0": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "delta_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "analysis": "last_seen",
+      "unresolved": 2,
+      "prior": null,
+      "interactions": [
+        {
+          "rule": "textual_overlap",
+          "writer": null,
+          "target": {
+            "kind": "file",
+            "path": "src/api.rs"
+          },
+          "change": null,
+          "lines": [
+            1,
+            6
+          ]
+        }
+      ]
+    }
+  ]
+}

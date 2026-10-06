@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "status": "observed",
+  "detail": null,
+  "landed": {
+    "run_id": "01J9LANDA20000000000000000",
+    "s0": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "delta_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "applied_by": "human"
+  },
+  "world_before": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "world_after": null,
+  "projection_computed_at": "2026-10-06T09:00:00Z",
+  "counterparts": [
+    {
+      "run_id": "01J9CPG0000000000000000000",
+      "s0": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "delta_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "analysis": "analyzed",
+      "unresolved": 0,
+      "prior": {
+        "decision": "continue",
+        "world_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "interactions": [
+        {
+          "rule": "file",
+          "writer": "a",
+          "target": {
+            "kind": "file",
+            "path": "config.yml"
+          },
+          "change": "changes",
+          "lines": null
+        }
+      ]
+    }
+  ]
+}

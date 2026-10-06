@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "status": "stale",
+  "detail": "the view lists an older patch of the landed run",
+  "landed": {
+    "run_id": "01J9LANDA30000000000000000",
+    "s0": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "delta_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "applied_by": "human"
+  },
+  "world_before": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "world_after": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "projection_computed_at": "2026-10-06T09:00:00Z",
+  "counterparts": [
+    {
+      "run_id": "01J9CPH0000000000000000000",
+      "s0": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "delta_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "analysis": "analyzed",
+      "unresolved": 0,
+      "prior": {
+        "decision": "continue",
+        "world_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "interactions": [
+        {
+          "rule": "uses",
+          "writer": "a",
+          "target": {
+            "kind": "symbol",
+            "path": "src/auth.rs",
+            "name": "validate"
+          },
+          "change": "signature",
+          "lines": null
+        }
+      ]
+    }
+  ]
+}

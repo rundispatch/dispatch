@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.8 — experimental developer preview**
+**Dispatch 0.4.9 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -99,6 +99,15 @@ row, and `dispatch status`, say how, apart from the verdict: Work can be
 Python, and to the file elsewhere. It is advisory: nothing is blocked,
 reordered or refreshed, and once one piece lands the other is judged by the
 coherence check as before.
+
+**How often interactions are right is measured.** When Work lands, Dispatch
+records the interactions it had with the other Work in progress
+(`interaction.landed`). The watching owner then records its next verdict on
+each of those other pieces (`interaction.outcome`), whether or not an
+interaction was reported. Documented queries in
+`docs/queries/interactions-measured.sql` read the precision and misses from
+your own state directory. Nothing leaves your machine. "Invalidated" there
+means Dispatch's own later verdict, not a confirmed conflict.
 
 Watching covers Work Dispatch launched, that you attached, and sessions whose
 runtime reports them. It does not scan for agent processes. After a reboot, run
