@@ -1,0 +1,267 @@
+[
+  {
+    "name": "predicted and invalidated",
+    "landing": "landed-observed.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "decision": "refresh",
+      "reasons": [
+        "fact_broken"
+      ]
+    },
+    "expected": {
+      "class": "scorable",
+      "predicted": true
+    }
+  },
+  {
+    "name": "predicted and still valid",
+    "landing": "landed-observed.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "decision": "continue",
+      "reasons": []
+    },
+    "expected": {
+      "class": "scorable",
+      "predicted": true
+    }
+  },
+  {
+    "name": "a miss: invalidated with nothing predicted",
+    "landing": "landed-observed.json",
+    "counterpart": 1,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "decision": "refresh",
+      "reasons": [
+        "patch_conflict"
+      ]
+    },
+    "expected": {
+      "class": "scorable",
+      "predicted": false
+    }
+  },
+  {
+    "name": "nothing predicted and still valid",
+    "landing": "landed-observed.json",
+    "counterpart": 1,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "decision": "continue",
+      "reasons": []
+    },
+    "expected": {
+      "class": "scorable",
+      "predicted": false
+    }
+  },
+  {
+    "name": "STOP counts as an evaluation like any other",
+    "landing": "landed-observed.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "decision": "stop",
+      "reasons": [
+        "already_applied"
+      ]
+    },
+    "expected": {
+      "class": "scorable",
+      "predicted": true
+    }
+  },
+  {
+    "name": "the counterpart was gone",
+    "landing": "landed-observed.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "gone"
+    },
+    "expected": {
+      "class": "counterpart_gone",
+      "predicted": true
+    }
+  },
+  {
+    "name": "the evaluation failed",
+    "landing": "landed-observed.json",
+    "counterpart": 1,
+    "evaluation": {
+      "kind": "failed",
+      "error": "baseline unreadable",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": null
+    },
+    "expected": {
+      "class": "evaluation_failed",
+      "predicted": false
+    }
+  },
+  {
+    "name": "never analyzed at the landing",
+    "landing": "landed-observed.json",
+    "counterpart": 2,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "decision": "refresh",
+      "reasons": [
+        "fact_broken"
+      ]
+    },
+    "expected": {
+      "class": "counterpart_unanalyzed",
+      "predicted": false
+    }
+  },
+  {
+    "name": "already invalid before the landing",
+    "landing": "landed-observed.json",
+    "counterpart": 3,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "decision": "refresh",
+      "reasons": [
+        "same_symbol_edited"
+      ]
+    },
+    "expected": {
+      "class": "already_invalid",
+      "predicted": true
+    }
+  },
+  {
+    "name": "already invalid wins over a moved world",
+    "landing": "landed-observed.json",
+    "counterpart": 3,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "delta_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "decision": "refresh",
+      "reasons": []
+    },
+    "expected": {
+      "class": "already_invalid",
+      "predicted": true
+    }
+  },
+  {
+    "name": "the world moved on after the landing",
+    "landing": "landed-observed.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "delta_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "decision": "refresh",
+      "reasons": [
+        "fact_broken"
+      ]
+    },
+    "expected": {
+      "class": "world_moved_on",
+      "predicted": true
+    }
+  },
+  {
+    "name": "the counterpart's own \u0394 moved",
+    "landing": "landed-observed.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+      "decision": "refresh",
+      "reasons": [
+        "fact_broken"
+      ]
+    },
+    "expected": {
+      "class": "counterpart_moved",
+      "predicted": true
+    }
+  },
+  {
+    "name": "a last-seen footprint is still scorable",
+    "landing": "landed-observed.json",
+    "counterpart": 4,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "decision": "continue",
+      "reasons": []
+    },
+    "expected": {
+      "class": "scorable",
+      "predicted": true
+    }
+  },
+  {
+    "name": "the world after the landing is unknown",
+    "landing": "landed-observed-no-world.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "decision": "refresh",
+      "reasons": [
+        "fact_broken"
+      ]
+    },
+    "expected": {
+      "class": "world_moved_on",
+      "predicted": true
+    }
+  },
+  {
+    "name": "a stale landing is never scored",
+    "landing": "landed-stale.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "evaluated",
+      "world_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "delta_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "decision": "refresh",
+      "reasons": [
+        "fact_broken"
+      ]
+    },
+    "expected": {
+      "class": "landing_unobserved",
+      "predicted": true
+    }
+  },
+  {
+    "name": "a stale landing wins over a gone counterpart",
+    "landing": "landed-stale.json",
+    "counterpart": 0,
+    "evaluation": {
+      "kind": "gone"
+    },
+    "expected": {
+      "class": "landing_unobserved",
+      "predicted": true
+    }
+  }
+]

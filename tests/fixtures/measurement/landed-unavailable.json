@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "status": "unavailable",
+  "detail": "the interactions file could not be parsed",
+  "landed": {
+    "run_id": "01J9LANDA50000000000000000",
+    "s0": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "delta_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "applied_by": "human"
+  },
+  "world_before": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "world_after": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "projection_computed_at": null,
+  "counterparts": []
+}
