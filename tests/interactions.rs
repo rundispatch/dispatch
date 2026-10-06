@@ -51,13 +51,17 @@ struct Project {
 
 impl Project {
     fn new() -> Self {
+        Self::with_config("coherence:\n  poll_secs: 1\n")
+    }
+
+    fn with_config(config: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("project");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/auth.rs"), AUTH).unwrap();
         fs::write(root.join("src/api.rs"), "pub fn serve() {}\n").unwrap();
         fs::write(root.join("src/cli.rs"), "pub fn main() {}\n").unwrap();
-        fs::write(root.join("dispatch.yml"), "coherence:\n  poll_secs: 1\n").unwrap();
+        fs::write(root.join("dispatch.yml"), config).unwrap();
         git(&root, &["init", "--quiet"]);
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "--quiet", "-m", "initial"]);
@@ -90,6 +94,10 @@ impl Project {
 
     /// A linked worktree attached as foreign Work; returns (workspace, id).
     fn work(&self, name: &str) -> (PathBuf, String) {
+        self.work_with(name, &[])
+    }
+
+    fn work_with(&self, name: &str, extra: &[&str]) -> (PathBuf, String) {
         let workspace = self.temp.path().join(name);
         git(
             &self.root,
@@ -102,19 +110,46 @@ impl Project {
                 workspace.to_str().unwrap(),
             ],
         );
-        let out = self.ok(&[
+        let mut args = vec![
             "attach",
             "--workspace",
             workspace.to_str().unwrap(),
             "--agent",
             name,
-        ]);
+        ];
+        args.extend_from_slice(extra);
+        let out = self.ok(&args);
         let id = out
             .lines()
             .find_map(|line| line.strip_prefix("ATTACHED "))
             .unwrap()
             .to_owned();
         (fs::canonicalize(workspace).unwrap(), id)
+    }
+
+    /// The payloads of `id`'s events of `kind`, through `dispatch events`.
+    fn payloads(&self, id: &str, kind: &str) -> Vec<Value> {
+        self.ok(&["events", id])
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["type"] == "event" && record["event"]["event_type"] == kind)
+            .map(|record| record["event"]["payload"].clone())
+            .collect()
+    }
+
+    /// Whether the owner's view lists `id` with its kept patch.
+    fn lists_frozen(&self, projection: &Value, id: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        let patch = self.run(id)["candidates"][0]["diff_path"]
+            .as_str()
+            .map(|path| fs::read(path).unwrap_or_default())
+            .unwrap_or_default();
+        let sha = hex::encode(Sha256::digest(patch));
+        projection["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["run_id"] == id && p["delta_sha256"] == sha.as_str())
     }
 
     fn projection(&self) -> Option<Value> {
@@ -353,4 +388,94 @@ fn status_and_watch_show_interactions_apart_from_the_verdict() {
     assert_eq!(work["verdict"], "continue", "{work}");
     assert_eq!(work["interactions"][0]["with"], b.as_str(), "{work}");
     assert_eq!(work["interactions"][0]["direction"], "this_affects_theirs");
+}
+
+/// The outcome recorded for `counterpart` on the landed run's events.
+fn outcome<'a>(outcomes: &'a [Value], counterpart: &str) -> &'a Value {
+    outcomes
+        .iter()
+        .find(|o| o["counterpart_run_id"] == counterpart)
+        .unwrap_or_else(|| panic!("no outcome for {counterpart}: {outcomes:?}"))
+}
+
+#[test]
+fn a_landing_records_the_next_verdict_on_every_other_work_once() {
+    let p = Project::new();
+    let (wa, a) = p.work("wt-a");
+    let (wb, b) = p.work("wt-b");
+    let (wd, d) = p.work("wt-d");
+    fs::write(
+        wa.join("src/auth.rs"),
+        AUTH.replacen(SIGNATURE.0, SIGNATURE.1, 1),
+    )
+    .unwrap();
+    fs::write(wb.join("src/api.rs"), CALLER).unwrap();
+    fs::write(wd.join("src/cli.rs"), "pub fn main() { }\n").unwrap();
+    p.ok(&["finish", &a]);
+    p.ok(&["start"]);
+    p.until("A frozen, and A uses-B", |v| {
+        p.lists_frozen(v, &a) && rules(v, &a, &b) == ["uses"]
+    });
+    p.ok(&["accept", &a]);
+
+    let landing = &p.payloads(&a, "interaction.landed")[0];
+    assert_eq!(landing["status"], "observed", "{landing}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcomes = loop {
+        let outcomes = p.payloads(&a, "interaction.outcome");
+        if outcomes.len() == 2 {
+            break outcomes;
+        }
+        assert!(Instant::now() < deadline, "{outcomes:?}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // B relied on A's old signature: predicted, and invalidated by A landing.
+    let with_b = outcome(&outcomes, &b);
+    assert_eq!(with_b["class"], "scorable", "{with_b}");
+    assert_eq!(with_b["predicted"], true);
+    assert_eq!(with_b["decision"], "refresh");
+    assert_eq!(with_b["reasons"], serde_json::json!(["fact_broken"]));
+    assert_eq!(with_b["world_evaluated"], landing["world_after"]);
+    // D touched nothing of A's: not predicted, and still valid. Recorded all
+    // the same, which is what makes misses measurable.
+    let with_d = outcome(&outcomes, &d);
+    assert_eq!(with_d["class"], "scorable", "{with_d}");
+    assert_eq!(with_d["predicted"], false);
+    assert_eq!(with_d["decision"], "continue");
+
+    // Once per counterpart: more ticks, and an owner restart, add nothing.
+    std::thread::sleep(Duration::from_secs(3));
+    p.ok(&["stop"]);
+    p.ok(&["start"]);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(p.payloads(&a, "interaction.outcome").len(), 2);
+}
+
+#[test]
+fn work_auto_applied_by_the_owner_lands_with_the_owners_current_view() {
+    let p = Project::with_config("coherence:\n  poll_secs: 1\nchecks:\n  verify: ['true']\n");
+    let (wa, a) = p.work_with("wt-a", &["--auto-apply", "--allow-unsafe-local"]);
+    let (wb, b) = p.work_with("wt-b", &["--allow-unsafe-local"]);
+    fs::write(
+        wa.join("src/auth.rs"),
+        AUTH.replacen(SIGNATURE.0, SIGNATURE.1, 1),
+    )
+    .unwrap();
+    fs::write(wb.join("src/api.rs"), CALLER).unwrap();
+    p.ok(&["start"]);
+    p.until("A uses-B while A is live", |v| rules(v, &a, &b) == ["uses"]);
+    // A restarted owner applies A on its very first tick. Its view must be
+    // written before that apply, or the landing could not see it.
+    p.ok(&["stop"]);
+    p.ok(&["finish", &a, "--allow-unsafe-local"]);
+    p.ok(&["start"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while p.payloads(&a, "interaction.landed").is_empty() {
+        assert!(Instant::now() < deadline, "{}", p.run(&a)["outcome"]);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let landing = &p.payloads(&a, "interaction.landed")[0];
+    assert_eq!(landing["landed"]["applied_by"], "auto_apply");
+    assert_eq!(landing["status"], "observed", "{landing}");
+    assert_eq!(landing["counterparts"][0]["run_id"], b.as_str());
 }

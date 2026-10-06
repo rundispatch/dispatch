@@ -209,3 +209,65 @@ preference data.
   - The contract module, stubs for B and C (`unimplemented!`, never called),
     the fixtures and this plan.
   - `cargo fmt`, clippy and the fixture test pass.
+- 2026-10-06: Workers.
+  - All four packets ran as Claude Code sessions (`claude --worktree 049-a` to
+    `049-d`); Cursor was not used. So the evaluation compares packets, not
+    agents.
+  - B and C registered through the hooks. A's and D's `SessionStart` hooks were
+    killed by Claude Code's 60 s timeout at load 14–21, mid-registration: each
+    left a run directory with no record, and no Work. The integrator attached
+    both with `attach --workspace … --allow-unsafe-local` (S0 the merge base,
+    P0, full confidence). A's first attach failed on a build file cargo removed
+    while `attach` walked the ignored `target/`; a retry worked. Both are
+    Dispatch 0.4.8 defects, kept for the evaluation.
+  - Every worker stayed within its files, and Dispatch reported no
+    interactions between them. That was right: the view was current to within
+    8 s of the last edit.
+- 2026-10-06: Integration, in the order A (`9d3e68e`), C (`62c6181`), B
+  (`8ba1b17`), D (`e4cf6ce`).
+  - The integrator reviewed each diff. An independent full suite on all four
+    together passed (554), and A's concurrency test failed 3/3 on the old
+    write and passed with the fix. Each packet was accepted through Dispatch
+    after the human's approval, then committed.
+  - B's finish checks failed spuriously, because of the integrator's setup:
+    `dispatch.yml` shared a `CARGO_TARGET_DIR` across check workspaces, and
+    cargo reused a test binary built for C's merged tree, whose deleted path
+    was compiled in. C's checks may have run stale binaries too.
+    - The shared directory is gone for new Work; B and D ran on a cleared
+      cache.
+    - B was double-checked on HEAD plus B: fmt and clippy clean, full suite
+      552/0, its tests 5/5 five times.
+    - Its merged-tree checks at accept passed.
+  - Recorded behaviour from B:
+    - an unreadable view is `unavailable` with "the owner's interaction view
+      could not be read";
+    - a stale landing's detail is "the view does not list the landed run" or
+      "the view lists an older patch of the landed run";
+    - if probing the owner's lock itself fails, a successful apply records no
+      landing (printed, never affecting the apply).
+  - From D: result set 5 lists missing counterparts in no fixed order.
+- 2026-10-06: W, by the integrator.
+  - `Owner::measure` (`serve.rs`) records, for each landing of the last 24 h in
+    its project, the first evaluation of every counterpart the landing listed:
+    - the counterpart's Δ is the one `delta_of` gives (live snapshot or kept
+      patch), evaluated with `coherence::evaluate` against the source now;
+    - if it has none left, it is `Gone`;
+    - each outcome is classified by `measure::outcome` and written on the
+      landed run under that run's lock;
+    - recorded counterparts are read again under the lock, so each is written
+      once, across ticks and restarts;
+    - a fully measured landing is not looked at again.
+  - The owner now compares Work before its auto-apply loop as well as after
+    any apply. A landing it applies itself then sees the current view (B's
+    concern): without this, an owner's first tick after a restart recorded
+    `unavailable`.
+  - The doc comment of `state::write_atomically` is joined to it again (A
+    found it; `short_ids` had been inserted between them in 0.4.8).
+  - Tests (`tests/interactions.rs`):
+    - `a_landing_records_the_next_verdict_on_every_other_work_once`: B's
+      outcome is scorable, predicted, `refresh` and `fact_broken`, evaluated in
+      the world right after the landing; D's is scorable, not predicted, and
+      `continue`; more ticks and an owner restart add nothing.
+    - `work_auto_applied_by_the_owner_lands_with_the_owners_current_view`:
+      `observed`. Without the reordering it gets `unavailable`, checked by
+      removing it.

@@ -217,6 +217,26 @@ impl State {
 /// `load_run` reader repairing a stale copy), and a shared temporary name let
 /// one rename consume the other's file. Every writer produces the committed
 /// projection, so whichever rename lands last leaves a complete, current file.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("projection path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("projection");
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to stage {}", path.display()))?;
+    temporary.write_all(bytes)?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
+}
+
 /// How each of `ids` is shown: its first 8 characters, or more when another
 /// of `ids` shares them. Run IDs made within the same quarter second share
 /// their first 8, and Work launched together is exactly what gets compared.
@@ -237,26 +257,6 @@ pub(crate) fn short_ids<'a>(ids: &[&'a str]) -> std::collections::HashMap<&'a st
             (id, &id[..(shared + 1).max(8).min(id.len())])
         })
         .collect()
-}
-
-pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("projection path has no parent")?;
-    fs::create_dir_all(parent)?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("projection");
-    let mut temporary = tempfile::Builder::new()
-        .prefix(&format!(".{name}."))
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .with_context(|| format!("failed to stage {}", path.display()))?;
-    temporary.write_all(bytes)?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
 }
 
 /// `write_atomically`, and durable before it returns: the bytes are synced
