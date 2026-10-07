@@ -701,7 +701,7 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
         .iter()
         .map(|fact| (fact.path.clone(), fact.subject.clone()))
         .collect();
-    let (referenced, unbound) = bind_names(work, &names, &skip)?;
+    let (referenced, unbound) = bind_names(work, &names, &skip, None)?;
     derived.unbound = unbound;
     file_facts.extend(mentioned_files(work, delta)?);
 
@@ -796,12 +796,19 @@ struct Candidate {
 /// there is exactly one. Names are looked up in groups with one `git grep`;
 /// a group that matches too many files is split until each is small enough to
 /// read completely, so uniqueness is judged over every file that could declare
-/// the name. Returns the facts and the number of names left unbound.
+/// the name. Returns the facts and the number of names left unbound; `causes`,
+/// when given, receives each name's outcome for `audit_names`.
 fn bind_names(
     work: &WorkView,
     names: &BTreeSet<String>,
     skip: &HashSet<(String, String)>,
+    mut causes: Option<&mut BTreeMap<String, NameCause>>,
 ) -> Result<(Vec<MustHold>, u32)> {
+    let mut record = |name: &str, cause| {
+        if let Some(causes) = causes.as_deref_mut() {
+            causes.insert(name.to_owned(), cause);
+        }
+    };
     let names: Vec<String> = names.iter().cloned().collect();
     let mut pending: Vec<Vec<String>> = names.chunks(GREP_CHUNK).map(<[String]>::to_vec).collect();
     let mut cache: HashMap<String, Option<Candidate>> = HashMap::new();
@@ -812,6 +819,7 @@ fn bind_names(
         if files.len() > MAX_GROUP_FILES {
             if group.len() == 1 {
                 unbound += 1;
+                record(&group[0], NameCause::Widespread);
             } else {
                 let (left, right) = group.split_at(group.len() / 2);
                 pending.push(left.to_vec());
@@ -839,6 +847,7 @@ fn bind_names(
                 .collect();
             if holding.len() > MAX_FILES_PER_NAME {
                 unbound += 1;
+                record(name, NameCause::Widespread);
                 continue;
             }
             let decls: Vec<_> = holding
@@ -853,8 +862,9 @@ fn bind_names(
                 })
                 .collect();
             match decls.as_slice() {
-                [] => {}
+                [] => record(name, NameCause::NotFound),
                 [(path, decl)] => {
+                    record(name, NameCause::Bound);
                     let key = ((*path).clone(), decl.name.clone());
                     if !skip.contains(&key) {
                         let fact = make_fact(
@@ -869,11 +879,107 @@ fn bind_names(
                         bound.insert(key, fact);
                     }
                 }
-                _ => unbound += 1,
+                _ => {
+                    unbound += 1;
+                    record(name, NameCause::Ambiguous);
+                }
             }
         }
     }
     Ok((bound.into_values().collect(), unbound))
+}
+
+/// Why a name the added lines use did or did not bind (see `audit_names`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NameCause {
+    /// Exactly one declaration of its base name in the baseline.
+    Bound,
+    /// Several declarations of its base name in the baseline.
+    Ambiguous,
+    /// In more baseline files than binding reads, so never looked up.
+    Widespread,
+    /// Too short, or on the denylist.
+    Denied,
+    /// Declared by the work itself.
+    Introduced,
+    /// No declaration of its base name in the baseline.
+    NotFound,
+    /// Only on added lines of a file whose post-image could not be analyzed.
+    Unsupported,
+}
+
+/// Measurement only: the cause for each name the delta's added lines use, by
+/// the rules `derive_facts` binds with. `Ambiguous` plus `Widespread` names
+/// are its `unbound`. Nothing here feeds a fact or a verdict.
+pub fn audit_names(work: &WorkView, delta: &[DeltaFile]) -> Result<BTreeMap<String, NameCause>> {
+    let (mut used, mut unsupported, mut introduced) =
+        (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    for file in delta {
+        let Some(lang) = lang_for_path(&file.path) else {
+            continue;
+        };
+        if file.status == DeltaStatus::Deleted {
+            continue;
+        }
+        let s0 = match file.status {
+            DeltaStatus::Added => Some(Vec::new()),
+            _ => read_s0(work, &file.path),
+        };
+        let post = s0.as_ref().and_then(|s0| post_image(s0, &file.hunks));
+        match post
+            .as_ref()
+            .and_then(|post| identifiers_in(lang, post, &file.new_ranges).ok())
+        {
+            Some(found) => used.extend(found),
+            None => {
+                // `derive_facts` reads no names here; the added lines alone
+                // still say which ones went unexamined.
+                let mut added = Vec::new();
+                for line in file.hunks.iter().flat_map(|hunk| &hunk.lines) {
+                    if line.tag == b'+' {
+                        added.extend_from_slice(&line.text);
+                        added.push(b'\n');
+                    }
+                }
+                let count = added.iter().filter(|byte| **byte == b'\n').count() as u32;
+                unsupported.extend(identifiers_in(lang, &added, &[(1, count)]).unwrap_or_default());
+            }
+        }
+        let before = match file.status {
+            DeltaStatus::Added => Some(FileSymbols::default()),
+            _ => s0.as_ref().and_then(|s0| extract(lang, s0).ok()),
+        };
+        if let (Some(post), Some(before)) = (&post, &before)
+            && let Ok(parsed) = extract(lang, post)
+        {
+            let known: HashSet<&str> = before.decls.iter().map(|d| base_name(&d.name)).collect();
+            introduced.extend(
+                parsed
+                    .decls
+                    .iter()
+                    .map(|decl| base_name(&decl.name))
+                    .filter(|name| !known.contains(name))
+                    .map(str::to_owned),
+            );
+        }
+    }
+    let mut causes = BTreeMap::new();
+    let mut names = BTreeSet::new();
+    for name in used.iter().chain(&unsupported) {
+        let cause = if !bindable(name) {
+            NameCause::Denied
+        } else if introduced.contains(name) {
+            NameCause::Introduced
+        } else if used.contains(name) {
+            names.insert(name.clone());
+            continue;
+        } else {
+            NameCause::Unsupported
+        };
+        causes.insert(name.clone(), cause);
+    }
+    bind_names(work, &names, &HashSet::new(), Some(&mut causes))?;
+    Ok(causes)
 }
 
 /// Path-like tokens (`name.ext`) in `line`, without trailing punctuation.
@@ -1964,5 +2070,114 @@ diff --git a/y.rs b/y.rs\nindex 1..2 100644\n--- a/y.rs\n+++ b/y.rs\n\
             ),
         )]);
         assert!(subjects(&derived.facts, FactOrigin::Referenced).is_empty());
+    }
+
+    // ---- name audit --------------------------------------------------------
+
+    /// The audit and the derived facts for one patch, after checking that the
+    /// audit's unbound causes are exactly `derive_facts`'s `unbound`.
+    fn audit(repo: &Repo, patch: &[u8]) -> (BTreeMap<String, NameCause>, Derived) {
+        let delta = parse_patch(patch);
+        let causes = audit_names(&repo.work(), &delta).unwrap();
+        let derived = derive_facts(&repo.work(), &delta).unwrap();
+        let unbound = causes
+            .values()
+            .filter(|cause| matches!(cause, NameCause::Ambiguous | NameCause::Widespread))
+            .count();
+        assert_eq!(unbound, derived.unbound as usize, "{causes:?}");
+        (causes, derived)
+    }
+
+    #[test]
+    fn the_audit_gives_each_used_name_its_binding_cause() {
+        let mut files: Vec<(String, String)> = (0..10)
+            .map(|n| {
+                (
+                    format!("src/m{n}.rs"),
+                    format!("pub fn user_{n}() {{\n    common_helper();\n}}\n"),
+                )
+            })
+            .collect();
+        files.extend(
+            [
+                ("src/lib.rs", "pub fn common_helper() {}\n"),
+                ("src/auth.rs", AUTH),
+                ("src/other.rs", "pub fn check(x: u8) -> u8 {\n    x\n}\n"),
+                ("src/more.rs", "pub fn check() {}\n"),
+                ("src/handler.rs", HANDLER),
+            ]
+            .map(|(path, text)| (path.to_owned(), text.to_owned())),
+        );
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let repo = Repo::new(&refs);
+        let delta = "pub fn handle(request: &str) -> bool {\n    \
+            let ok = validate(request) && check(1) == 1 && get(ab(1));\n    \
+            common_helper();\n    let table = HashMap::new();\n    fresh(ok)\n}\n\n\
+            fn fresh(ok: bool) -> bool {\n    ok\n}\n";
+        let patch = repo.delta(&[("src/handler.rs", Some(delta))]);
+        let (causes, derived) = audit(&repo, &patch);
+        for (name, cause) in [
+            ("validate", NameCause::Bound),
+            ("check", NameCause::Ambiguous),
+            ("common_helper", NameCause::Widespread),
+            ("get", NameCause::Denied),
+            ("ab", NameCause::Denied),
+            ("new", NameCause::Denied),
+            ("fresh", NameCause::Introduced),
+            ("HashMap", NameCause::NotFound),
+            ("table", NameCause::NotFound),
+        ] {
+            assert_eq!(causes.get(name), Some(&cause), "{name}: {causes:?}");
+        }
+        assert_eq!(derived.unbound, 2);
+        // Binding itself is unchanged by the audit.
+        assert_eq!(
+            subjects(&derived.facts, FactOrigin::Referenced),
+            ["src/auth.rs:validate"]
+        );
+    }
+
+    #[test]
+    fn the_audit_counts_names_in_a_file_it_could_not_analyze_as_unsupported() {
+        let repo = Repo::new(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", AUTH)]);
+        // The context does not match the baseline, so there is no post-image.
+        let patch = b"diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n\
+--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,2 @@\n fn zzz() {}\n\
++fn b() { lookup_table(); validate(\"x\"); }\n";
+        let (causes, derived) = audit(&repo, patch);
+        assert_eq!(derived.uncertain, ["src/a.rs"]);
+        assert_eq!(causes.get("lookup_table"), Some(&NameCause::Unsupported));
+        // Not bound by `derive_facts`, so unsupported too, however unique.
+        assert_eq!(causes.get("validate"), Some(&NameCause::Unsupported));
+        assert_eq!(causes.get("b"), Some(&NameCause::Denied));
+        assert!(subjects(&derived.facts, FactOrigin::Referenced).is_empty());
+    }
+
+    #[test]
+    fn the_audit_matches_unbound_on_existing_binding_fixtures() {
+        let repo = Repo::new(&[
+            ("src/auth.rs", AUTH),
+            ("src/other.rs", "pub fn validate(x: u8) -> u8 {\n    x\n}\n"),
+            ("src/handler.rs", HANDLER),
+        ]);
+        let patch = repo.delta(&[("src/handler.rs", Some(HANDLER_DELTA))]);
+        let (causes, derived) = audit(&repo, &patch);
+        assert_eq!(causes.get("validate"), Some(&NameCause::Ambiguous));
+        assert_eq!(derived.unbound, 1);
+        // A deleted file uses no names; an added one's own declarations are introduced.
+        let patch = repo.delta(&[
+            ("src/other.rs", None),
+            (
+                "src/extra.rs",
+                Some("pub fn run_extra() -> bool {\n    refresh(\"\") == \"\"\n}\n"),
+            ),
+        ]);
+        let (causes, _) = audit(&repo, &patch);
+        assert_eq!(causes.get("run_extra"), Some(&NameCause::Introduced));
+        assert_eq!(causes.get("refresh"), Some(&NameCause::Bound));
+        assert!(!causes.contains_key("x"), "{causes:?}");
     }
 }
