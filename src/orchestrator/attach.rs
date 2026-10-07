@@ -19,11 +19,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ulid::Ulid;
 
 use super::{
-    ApplyOutcome, apply, auto_apply, persist_event, publish_event, refresh_outcome,
+    ApplyOutcome, apply, auto_apply, persist_event, refresh_outcome, registration,
     result_verification,
 };
 use crate::{
@@ -36,7 +36,7 @@ use crate::{
     db::Database,
     lock::OperationLock,
     process, source,
-    state::{State, write_text},
+    state::{State, write_atomically, write_text},
 };
 
 /// Request to attach external work Dispatch did not launch. See part 14.3.
@@ -59,19 +59,80 @@ pub struct AttachRequest {
     pub runtime: Option<RuntimeStart>,
 }
 
-/// Work a runtime's session start registers: S0 is the workspace's exact
-/// world now, before the session's first turn. A resume into a workspace
-/// Dispatch has not seen may follow edits made before it, so it is partial.
+/// Work a runtime's session start registers (`registration`): S0 is `commit`,
+/// the workspace's exact world captured before the session's first turn. A
+/// resume into a workspace Dispatch has not seen may follow edits made before
+/// it, so it is partial.
 pub struct RuntimeStart {
     pub session: RuntimeSession,
     pub resumed: bool,
+    /// The commit `source::world_commit` made of the workspace.
+    pub commit: String,
 }
+
+/// The `source_fingerprint` of attached Work outside strict mode: not a
+/// SHA-256, so it never equals a fingerprint of any tree.
+pub(crate) const NOT_FINGERPRINTED: &str = "not fingerprinted (attached work outside strict mode)";
 
 /// `dispatch attach --workspace <path> ...` (foreign form): create a
 /// `RunMode::Attached` run observing an already-running agent, without
 /// spawning anything or touching the workspace. See part 14.8 for the
-/// refusal order and exact messages.
+/// refusal order and exact messages. The run is built in
+/// `registrations/<id>/` and published whole into `runs/<id>/`, or removed.
 pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
+    let prepared = prepare(state, request)?;
+    let run_id = Ulid::new().to_string();
+    let building = registration::begin(state, &run_id)?;
+    let run = match build(state, &prepared, &run_id)
+        .and_then(|built| publish(state, &run_id, Some(built), None))
+    {
+        Ok(run) => run,
+        Err(error) => {
+            building.remove();
+            return Err(error);
+        }
+    };
+
+    // The wrapped form writes nothing to the terminal while the agent runs
+    // (part 6.7): its owner loop prints its own single line only after the
+    // child exits. The foreign form prints this banner immediately, as
+    // before.
+    if prepared.request.command.is_none() && prepared.request.runtime.is_none() {
+        let provenance_text = match &run.attachment.as_ref().unwrap().provenance {
+            BaselineProvenance::GitMergeBase { commit } => format!("commit {commit} (merge base)"),
+            BaselineProvenance::SnapshotAtAttach => "snapshot at attach".to_owned(),
+            BaselineProvenance::WorkspaceAtStart { commit } => {
+                format!("commit {commit} (the workspace at start)")
+            }
+        };
+        let confidence_text = match run.attachment.as_ref().unwrap().confidence {
+            AttachConfidence::Full => "full",
+            AttachConfidence::Partial => "partial",
+        };
+        println!("ATTACHED {}", run.id);
+        println!("Workspace  {}", prepared.workspace.display());
+        println!("Root       {}", prepared.root.display());
+        println!("S0         {provenance_text}, {confidence_text} confidence");
+        println!("Next: dispatch finish {} when the agent is done", run.id);
+    }
+
+    Ok(run)
+}
+
+/// An attach request that passed the refusals of part 14.8, before anything
+/// is written.
+pub(crate) struct Prepared {
+    request: AttachRequest,
+    workspace: PathBuf,
+    root: PathBuf,
+    managed: bool,
+    merge_base: Option<String>,
+    repo_key: Option<String>,
+    config: Config,
+    config_path: Option<PathBuf>,
+}
+
+pub(crate) fn prepare(state: &State, request: AttachRequest) -> Result<Prepared> {
     let is_wrapped = request.command.is_some();
 
     let workspace = source::resolve_source(Some(&request.workspace))?;
@@ -98,7 +159,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     );
 
     let workspace_identity = source::repo_identity(&workspace)?;
-    let commit = match &workspace_identity {
+    let merge_base = match &workspace_identity {
         _ if managed || runtime.is_some() => None,
         Some(workspace_repo) => {
             let root_identity = source::repo_identity(&root)?;
@@ -131,23 +192,52 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         config.checks.verify.is_empty() || request.allow_unsafe_local || runtime.is_some(),
         "finish runs your checks.verify on the host; pass --allow-unsafe-local"
     );
-    let unsafe_local = request.allow_unsafe_local;
 
     if !managed && let Some(existing_id) = find_active_attachment(state, &workspace)? {
         bail!("workspace already attached as {existing_id}");
     }
 
-    state.initialize()?;
-    let mut db = Database::open(state.db_path())?;
-    let run_id = Ulid::new().to_string();
-    let run_dir = state.run_dir(&run_id);
-    fs::create_dir(&run_dir)
-        .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))?;
-    }
+    Ok(Prepared {
+        request,
+        workspace,
+        root,
+        managed,
+        merge_base,
+        repo_key: workspace_identity.map(|identity| identity.key),
+        config,
+        config_path,
+    })
+}
+
+/// A run assembled in its registration directory, not yet recorded.
+pub(crate) struct Built {
+    run: RunRecord,
+    created: EventRecord,
+}
+
+/// Assemble run `run_id` in `registrations/<run_id>/`, which the caller made
+/// and holds. Every path recorded names `runs/<run_id>/`, where `publish`
+/// moves it. Whoever removes a failed build removes this directory.
+pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<Built> {
+    let Prepared {
+        request,
+        workspace,
+        root,
+        managed,
+        merge_base,
+        repo_key,
+        config,
+        config_path,
+    } = prepared;
+    let is_wrapped = request.command.is_some();
+    let runtime = request.runtime.as_ref();
+    let unsafe_local = request.allow_unsafe_local;
+    let dir = registration::directory(state, run_id);
+    let run_dir = state.run_dir(run_id);
+    let published = |path: PathBuf| match path.strip_prefix(&dir) {
+        Ok(inside) => run_dir.join(inside),
+        Err(_) => path,
+    };
 
     let task = request.task.clone().unwrap_or_else(|| {
         let basename = workspace
@@ -156,18 +246,15 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
             .unwrap_or_else(|| workspace.display().to_string());
         format!("attached work in {basename}")
     });
-    write_text(&run_dir.join("task.md"), &task)?;
+    write_text(&dir.join("task.md"), &task)?;
     write_text(
-        &run_dir.join("config.snapshot.yml"),
+        &dir.join("config.snapshot.yml"),
         &serde_yaml::to_string(&config).context("failed to serialize effective configuration")?,
     )?;
 
-    let (snapshot, provenance, confidence, workspace, managed_workspace) = if managed {
-        let (snapshot, provenance, workspace, made) =
-            make_workspace(state, &root, &run_id, &run_dir).map_err(|error| {
-                let _ = fs::remove_dir_all(&run_dir);
-                error.context("could not make a workspace; incomplete run state was removed")
-            })?;
+    let (snapshot, provenance, confidence, workspace, managed_workspace) = if *managed {
+        let (snapshot, provenance, workspace, made) = make_workspace(state, root, run_id, &dir)
+            .map_err(|error| error.context("could not make a workspace"))?;
         (
             snapshot,
             provenance,
@@ -176,15 +263,8 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
             Some(made),
         )
     } else if let Some(runtime) = runtime {
-        let (snapshot, commit) = source::world_commit(&workspace)
-            .and_then(|commit| {
-                source::materialize_baseline_from_commit(&workspace, &commit, &run_dir)
-                    .map(|snapshot| (snapshot, commit))
-            })
-            .map_err(|error| {
-                let _ = fs::remove_dir_all(&run_dir);
-                error.context("could not record S0; incomplete run state was removed")
-            })?;
+        let snapshot = source::materialize_baseline_from_commit(workspace, &runtime.commit, &dir)
+            .map_err(|error| error.context("could not record S0"))?;
         let confidence = if runtime.resumed {
             AttachConfidence::Partial
         } else {
@@ -192,19 +272,18 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         };
         (
             snapshot,
-            BaselineProvenance::WorkspaceAtStart { commit },
+            BaselineProvenance::WorkspaceAtStart {
+                commit: runtime.commit.clone(),
+            },
             confidence,
             workspace.clone(),
             None,
         )
     } else {
-        let (snapshot, provenance, confidence) = match &commit {
+        let (snapshot, provenance, confidence) = match merge_base {
             Some(commit) => {
-                let snapshot = source::materialize_baseline_from_commit(&root, commit, &run_dir)
-                    .map_err(|error| {
-                        let _ = fs::remove_dir_all(&run_dir);
-                        error.context("baseline creation failed; incomplete run state was removed")
-                    })?;
+                let snapshot = source::materialize_baseline_from_commit(root, commit, &dir)
+                    .map_err(|error| error.context("baseline creation failed"))?;
                 (
                     snapshot,
                     BaselineProvenance::GitMergeBase {
@@ -214,10 +293,8 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
                 )
             }
             None => {
-                let snapshot = source::create_snapshot(&workspace, &run_dir).map_err(|error| {
-                    let _ = fs::remove_dir_all(&run_dir);
-                    error.context("baseline creation failed; incomplete run state was removed")
-                })?;
+                let snapshot = source::create_snapshot(workspace, &dir)
+                    .map_err(|error| error.context("baseline creation failed"))?;
                 (
                     snapshot,
                     BaselineProvenance::SnapshotAtAttach,
@@ -225,21 +302,32 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
                 )
             }
         };
-        (snapshot, provenance, confidence, workspace, None)
+        (snapshot, provenance, confidence, workspace.clone(), None)
     };
 
-    let (source_kind, source_git_head) = source::inspect_source(&root)?;
-    let source_fingerprint = source::fingerprint_tree(&root)?;
+    let (source_kind, source_git_head) = source::inspect_source(root)?;
+    // Attached runs consult the root's whole-tree fingerprint only in strict
+    // mode (`coherence::gate`). Walking the root otherwise costs the most of
+    // anything here: it hashes ignored build output, including that of
+    // runtime worktrees inside the root, and races its deletion. In any other
+    // mode the value can never match, so every reader fails closed.
+    let source_fingerprint = if config.coherence.accept == crate::config::AcceptMode::Strict {
+        source::fingerprint_tree(root)?
+    } else {
+        NOT_FINGERPRINTED.to_owned()
+    };
 
-    let now = Utc::now();
+    // Runtime Work began when its session did, even when published later.
+    let now = runtime.map_or_else(Utc::now, |runtime| runtime.session.started_at);
     let candidate_id = Ulid::new().to_string();
     let harness_id = request.agent.clone().unwrap_or_else(|| "external".into());
-    let diff_path = run_dir.join("delta.patch");
-    let stdout_path = run_dir.join("attach-stdout.log");
-    let stderr_path = run_dir.join("attach-stderr.log");
-    let raw_telemetry_path = run_dir.join("harness.jsonl");
-    for path in [&diff_path, &stdout_path, &stderr_path, &raw_telemetry_path] {
-        write_text(path, "")?;
+    for name in [
+        "delta.patch",
+        "attach-stdout.log",
+        "attach-stderr.log",
+        "harness.jsonl",
+    ] {
+        write_text(&dir.join(name), "")?;
     }
 
     let candidate = CandidateRecord {
@@ -251,9 +339,9 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         status: CandidateStatus::Running,
         workspace_path: workspace.clone(),
         prompt_path: run_dir.join("task.md"),
-        stdout_path,
-        stderr_path,
-        diff_path,
+        stdout_path: run_dir.join("attach-stdout.log"),
+        stderr_path: run_dir.join("attach-stderr.log"),
+        diff_path: run_dir.join("delta.patch"),
         duration_ms: 0,
         exit_code: None,
         timed_out: false,
@@ -268,7 +356,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     let attempt = AttemptRecord {
         detail: AttemptDetail::default(),
         id: Ulid::new().to_string(),
-        run_id: run_id.clone(),
+        run_id: run_id.to_owned(),
         candidate_id: candidate_id.clone(),
         role: "attached".into(),
         ordinal: 1,
@@ -284,7 +372,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         started_at: now,
         completed_at: None,
         outcome: "running".into(),
-        raw_telemetry_path,
+        raw_telemetry_path: run_dir.join("harness.jsonl"),
         resource: None,
     };
 
@@ -292,7 +380,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         version: 1,
         workspace: workspace.clone(),
         integration_root: root.clone(),
-        repo_key: workspace_identity.map(|identity| identity.key),
+        repo_key: repo_key.clone(),
         provenance,
         confidence,
         agent: request.agent.clone(),
@@ -329,16 +417,16 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         workspace_removed: None,
     };
 
-    let mut run = RunRecord {
+    let run = RunRecord {
         execution: None,
-        id: run_id.clone(),
+        id: run_id.to_owned(),
         task: task.clone(),
         exact_prompt: task,
         source_path: root.clone(),
         source_kind,
         source_git_head,
         source_fingerprint,
-        baseline_path: snapshot.baseline_path,
+        baseline_path: published(snapshot.baseline_path),
         baseline_commit: snapshot.baseline_commit,
         status: RunStatus::Running,
         mode: RunMode::Attached,
@@ -380,7 +468,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         historical: Default::default(),
     };
 
-    let created_event = EventRecord {
+    let created = EventRecord {
         run_id: run.id.clone(),
         candidate_label: None,
         event_type: "run.created".into(),
@@ -393,61 +481,96 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         }),
         ..EventRecord::default()
     };
-    let created = db.commit_run_transition(&mut run, created_event)?;
-    publish_event(state, created, &run)?;
+    Ok(Built { run, created })
+}
 
-    persist_event(
-        state,
-        &db,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: None,
-            event_type: "attach.created".into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({"attachment": run.attachment}),
-            ..EventRecord::default()
-        },
-        &mut run,
-    )?;
-    if runtime.is_some() && unsafe_local {
-        persist_event(
-            state,
-            &db,
+/// Who published runtime-registered Work, and when its hook started.
+pub(crate) struct Registered {
+    pub started_at: DateTime<Utc>,
+    /// `hook` or `owner`.
+    pub via: &'static str,
+}
+
+/// Publish run `run_id` from its registration directory: record it in the
+/// database, then rename the directory into `runs/<run_id>/`. Idempotent: a
+/// record already there is completed, not repeated, and a rename already
+/// done is the published run. `built` is needed only when nothing is
+/// recorded yet. The caller holds the registration directory.
+pub(crate) fn publish(
+    state: &State,
+    run_id: &str,
+    built: Option<Built>,
+    registered: Option<Registered>,
+) -> Result<RunRecord> {
+    let dir = registration::directory(state, run_id);
+    let run_dir = state.run_dir(run_id);
+    if !dir.is_dir() {
+        anyhow::ensure!(
+            run_dir.is_dir(),
+            "registration {run_id} is gone and was never published"
+        );
+        return state.load_run(run_id);
+    }
+    let mut db = Database::open(state.db_path())?;
+    let mut run = match db.committed_run_projection(run_id)? {
+        Some(run) => run,
+        None => {
+            let Built { mut run, created } = built.context("the Work was not built")?;
+            db.commit_run_transition(&mut run, created)?;
+            run
+        }
+    };
+    registration::fault("after_db_insert");
+    let recorded = db.events_for_run(run_id)?;
+    let has = |kind: &str| recorded.iter().any(|event| event.event_type == kind);
+    if !has("attach.created") {
+        let mut payload = serde_json::json!({"attachment": run.attachment});
+        if let Some(registered) = &registered {
+            payload["registration_ms"] = (Utc::now() - registered.started_at)
+                .num_milliseconds()
+                .max(0)
+                .into();
+            payload["via"] = registered.via.into();
+        }
+        db.commit_transition(
+            &mut run,
             EventRecord {
-                run_id: run.id.clone(),
+                run_id: run_id.to_owned(),
+                candidate_label: None,
+                event_type: "attach.created".into(),
+                timestamp: Utc::now(),
+                payload,
+                ..EventRecord::default()
+            },
+        )?;
+    }
+    if registered.is_some() && run.environment.unsafe_local && !has("attach.authorized") {
+        db.commit_transition(
+            &mut run,
+            EventRecord {
+                run_id: run_id.to_owned(),
                 candidate_label: None,
                 event_type: "attach.authorized".into(),
                 timestamp: Utc::now(),
                 payload: serde_json::json!({"unsafe_local": true, "by": "project consent"}),
                 ..EventRecord::default()
             },
-            &mut run,
         )?;
     }
-
-    // The wrapped form writes nothing to the terminal while the agent runs
-    // (part 6.7): its owner loop prints its own single line only after the
-    // child exits. The foreign form prints this banner immediately, as
-    // before.
-    if !is_wrapped && runtime.is_none() {
-        let provenance_text = match &run.attachment.as_ref().unwrap().provenance {
-            BaselineProvenance::GitMergeBase { commit } => format!("commit {commit} (merge base)"),
-            BaselineProvenance::SnapshotAtAttach => "snapshot at attach".to_owned(),
-            BaselineProvenance::WorkspaceAtStart { commit } => {
-                format!("commit {commit} (the workspace at start)")
-            }
-        };
-        let confidence_text = match run.attachment.as_ref().unwrap().confidence {
-            AttachConfidence::Full => "full",
-            AttachConfidence::Partial => "partial",
-        };
-        println!("ATTACHED {}", run.id);
-        println!("Workspace  {}", workspace.display());
-        println!("Root       {}", root.display());
-        println!("S0         {provenance_text}, {confidence_text} confidence");
-        println!("Next: dispatch finish {} when the agent is done", run.id);
+    // The projections go in before the rename: `runs/` lists only runs whose
+    // metadata is there.
+    let mut events = Vec::new();
+    for event in db.events_for_run(run_id)? {
+        serde_json::to_writer(&mut events, &event)?;
+        events.push(b'\n');
     }
-
+    write_atomically(&dir.join("events.jsonl"), &events)?;
+    write_atomically(
+        &dir.join("metadata.json"),
+        &serde_json::to_vec_pretty(&run)?,
+    )?;
+    fs::rename(&dir, &run_dir)
+        .with_context(|| format!("failed to publish {} into runs/", dir.display()))?;
     Ok(run)
 }
 
@@ -1053,7 +1176,7 @@ pub(crate) async fn finish_quietly(
             state,
             &db,
             EventRecord {
-                run_id: run.id.clone(),
+                run_id: run_id.to_owned(),
                 candidate_label: None,
                 event_type: "attach.authorized".into(),
                 timestamp: Utc::now(),

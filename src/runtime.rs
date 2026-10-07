@@ -13,18 +13,20 @@
 
 pub mod claude;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
-use sha2::{Digest, Sha256};
+use chrono::{DateTime, Utc};
 
 use crate::{
     RuntimeSession,
-    lock::OperationLock,
     orchestrator::{
-        attach::{self, AttachRequest, RuntimeStart},
+        attach,
         background::{self, Watcher},
+        registration::{self, Outcome, Registration},
     },
     source,
     state::State,
@@ -107,6 +109,7 @@ pub fn validate(event: &RuntimeEvent) -> Result<()> {
 /// Apply one event. Sessions are followed only in a watched project; a
 /// workspace about to be deleted keeps its Work's Δ either way.
 pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
+    let began = process_started();
     validate(&event)?;
     let cwd = source::resolve_source(Some(&event.cwd)).context("the working directory")?;
     let Some(workspace) = source::checkout_top(&cwd)? else {
@@ -133,7 +136,7 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
                 end_reason: None,
                 model: event.model,
             };
-            start(state, &root, &workspace, session, resumed)
+            start(state, &root, &workspace, session, resumed, began)
         }
         // Only a fresh start is known to stay in the checkout: a resumed
         // session reports it before re-entering its worktree.
@@ -142,6 +145,8 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
         }
         EventKind::Start { .. } => Ok(Reply::Silent),
         EventKind::End { reason } => {
+            // Within the 5 s `SessionEnd` timeout setup installs.
+            registration::publish_first(state, &workspace, Duration::from_secs(3))?;
             if let Some(run_id) = attach::find_active_attachment(state, &workspace)? {
                 attach::record_session_end(
                     state,
@@ -161,11 +166,12 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
 /// Work's Δ, whether or not the project is still watched. An error here must
 /// stop the deletion (the adapter's job).
 fn removed(state: &State, workspace: &Path) -> Result<Reply> {
+    registration::publish_first(state, workspace, Duration::from_secs(60))?;
     let Some(run_id) = attach::find_active_attachment(state, workspace)? else {
         return Ok(Reply::Silent);
     };
     let files_changed = attach::freeze_removed_workspace(state, &run_id)?;
-    let id = &run_id[..8.min(run_id.len())];
+    let id = &run_id;
     // With the person's consent the owner runs the checks next; say so. The
     // changes are already kept, so nothing here may fail the hook.
     let consented = state
@@ -191,51 +197,52 @@ fn removed(state: &State, workspace: &Path) -> Result<Reply> {
 
 /// A session starting in a separate workspace: new Work the first time, with
 /// S0 taken now, before the session's first turn; another session on the same
-/// Work afterwards. One lock per workspace makes duplicate or concurrent starts
-/// land on one Work.
+/// Work afterwards. Registration decides within its budget from `began`.
 fn start(
     state: &State,
     root: &Path,
     workspace: &Path,
     session: RuntimeSession,
     resumed: bool,
+    began: (Instant, DateTime<Utc>),
 ) -> Result<Reply> {
-    let key = hex::encode(Sha256::digest(workspace.to_string_lossy().as_bytes()));
-    let _lock = OperationLock::acquire_wait(
-        &state
-            .root
-            .join("locks")
-            .join(format!("workspace-{key}.lock")),
-        "another session is registering this workspace",
-        std::time::Duration::from_secs(10),
-    )?;
-    if let Some(run_id) = attach::find_active_attachment(state, workspace)? {
-        attach::record_session_start(state, &run_id, session)?;
-        return Ok(Reply::Silent);
-    }
-    let provider = session.provider.clone();
-    // Authority to run the project's checks comes only from the person's
-    // consent for exactly these checks, never from the session.
-    let consented = crate::consent::consent(state, root)?.is_valid();
-    let name = workspace
-        .file_name()
-        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    let run = attach::create(
-        state,
-        AttachRequest {
-            workspace: workspace.to_owned(),
-            root: Some(root.to_owned()),
-            task: Some(format!("{provider} session in {name}")),
-            agent: Some(provider),
-            pid: None,
-            command: None,
-            allow_unsafe_local: consented,
-            auto_apply: false,
-            runtime: Some(RuntimeStart { session, resumed }),
+    let registration = Registration {
+        version: 1,
+        run_id: ulid::Ulid::new().to_string(),
+        workspace: workspace.to_owned(),
+        root: root.to_owned(),
+        s0_commit: String::new(),
+        session,
+        resumed,
+        consented: false,
+        started_at: began.1,
+    };
+    // The full id: sessions started together share their first characters.
+    Ok(
+        match registration::register(state, registration, began.0)? {
+            None => Reply::Silent,
+            Some(Outcome::Registered { run_id }) => Reply::Notice(format!(
+                "Dispatch is tracking this worktree as Work {}; see it with dispatch watch.",
+                run_id
+            )),
+            Some(Outcome::Pending { run_id }) => {
+                Reply::Notice(registration::notice_pending(&run_id))
+            }
+            Some(Outcome::Untracked) => Reply::Notice(registration::NOTICE_UNTRACKED.into()),
         },
-    )?;
-    Ok(Reply::Notice(format!(
-        "Dispatch is tracking this worktree as Work {}; see it with dispatch watch.",
-        &run.id[..8.min(run.id.len())]
-    )))
+    )
+}
+
+/// When this process started: `main` records it before anything else, and a
+/// hook's deadline counts from it. Exec and runtime start-up before `main` are
+/// not counted; the budget's margin under the runtime's timeout covers them.
+static STARTED: std::sync::OnceLock<(Instant, DateTime<Utc>)> = std::sync::OnceLock::new();
+
+/// Record this process's start; called first thing in `main`.
+pub fn mark_process_start() {
+    let _ = STARTED.set((Instant::now(), Utc::now()));
+}
+
+fn process_started() -> (Instant, DateTime<Utc>) {
+    *STARTED.get_or_init(|| (Instant::now(), Utc::now()))
 }

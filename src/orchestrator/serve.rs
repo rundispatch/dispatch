@@ -363,6 +363,10 @@ impl Owner {
             self.interact(state, &runs, &mut tick);
         }
         self.measure(state, &runs, &mut tick);
+        // Registrations whose S0 is durable become Work; failed ones go.
+        if let Err(error) = super::registration::reconcile(state, &self.root) {
+            tick.report(&error);
+        }
         tick.runs = runs;
         tick
     }

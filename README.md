@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.9 — experimental developer preview**
+**Dispatch 0.4.10 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -86,6 +86,18 @@ itself.
   never lets anything apply.
 - A session running directly in your checkout is told that Dispatch cannot
   tell its edits from yours, and nothing is tracked.
+- No session in its own worktree is lost silently, even on a busy machine. It
+  ends one of three ways, and the session is told which:
+  - **tracked:** its Work is created before the hook returns;
+  - **pending:** its starting state is saved, and the watching owner finishes
+    creating the Work moments later;
+  - **not tracked:** its starting state could not be captured in time, or the
+    worktree kept changing while it was being captured.
+
+  Work is never left half-created.
+
+To build Dispatch with Dispatch, as its own releases are built, see
+[docs/self-hosting.md](docs/self-hosting.md).
 
 **Work that notices Work.** While a project is watched, Dispatch also compares
 the Work that is not yet integrated, and says where two pieces already touch:

@@ -2,6 +2,7 @@ mod apply;
 pub mod attach;
 pub mod background;
 pub(crate) mod native;
+pub mod registration;
 pub mod serve;
 pub use apply::{ApplyAuthority, ApplyOutcome, auto_apply};
 pub use native::{QuestionCommand, answer_question, cancel_question};

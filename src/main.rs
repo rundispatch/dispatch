@@ -375,6 +375,7 @@ struct AcceptArgs {
 
 #[tokio::main]
 async fn main() {
+    dispatch::runtime::mark_process_start();
     if let Err(error) = run().await {
         eprintln!("error: {error:#}");
         std::process::exit(1);

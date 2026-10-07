@@ -361,16 +361,47 @@ pub fn materialize_baseline_from_commit(
 /// the checkout's own index (so Git's stat cache spares unchanged files),
 /// never its real index. Untracked nested repositories are left out, as the
 /// world leaves them out. The commit's objects live in the checkout's own
-/// repository; `materialize_baseline_from_commit` turns it into a baseline.
+/// repository, written durably; `materialize_baseline_from_commit` turns it
+/// into a baseline.
+///
+/// A capture during which the checkout moved is never accepted, since it may
+/// mix files from before and after a change: the checkout's change signal
+/// (`world::signal`) is taken before and after it. If it moved, the capture is
+/// made once more; if that one moves too, this is an error.
 pub fn world_commit(checkout: &Path) -> Result<String> {
     let checkout = resolve_source(Some(checkout))?;
+    capture_settled(&checkout, || capture_world(&checkout))
+}
+
+fn capture_settled(checkout: &Path, mut capture: impl FnMut() -> Result<String>) -> Result<String> {
+    let signal = || crate::coherence::world::signal(checkout, &SourceKind::Git);
+    let mut before = signal()?;
+    for _ in 0..2 {
+        let commit = capture()?;
+        let after = signal()?;
+        if after == before {
+            return Ok(commit);
+        }
+        before = after;
+    }
+    bail!(
+        "the workspace changed while its starting state was being captured ({}); \
+         try again once it is quiet",
+        checkout.display()
+    )
+}
+
+/// Objects S0 is made of are fsynced as they are written.
+const FSYNC_OBJECTS: [&str; 2] = ["-c", "core.fsync=loose-object"];
+
+fn capture_world(checkout: &Path) -> Result<String> {
     let scratch = Builder::new()
         .prefix("dispatch-world-")
         .tempdir()
         .context("failed to create a temporary Git index")?;
     let index = scratch.path().join("index");
 
-    let mut index_path = git_command(&checkout);
+    let mut index_path = git_command(checkout);
     index_path.args(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
     let real_index = PathBuf::from(
         String::from_utf8_lossy(
@@ -382,9 +413,9 @@ pub fn world_commit(checkout: &Path) -> Result<String> {
         fs::copy(&real_index, &index)
             .with_context(|| format!("failed to copy {}", real_index.display()))?;
     }
-    let head = git_head_at(&checkout)?;
+    let head = git_head_at(checkout)?;
     if !real_index.is_file() && head.is_some() {
-        let mut read_tree = git_command(&checkout);
+        let mut read_tree = git_command(checkout);
         read_tree
             .env("GIT_INDEX_FILE", &index)
             .args(["read-tree", "HEAD"]);
@@ -392,7 +423,7 @@ pub fn world_commit(checkout: &Path) -> Result<String> {
     }
 
     // Untracked nested repositories are listed as `dir/`; the world skips them.
-    let mut list = git_command(&checkout);
+    let mut list = git_command(checkout);
     list.env("GIT_INDEX_FILE", &index)
         .args(["ls-files", "--others", "--exclude-standard", "-z"]);
     let listed = checked_output(list, "failed to list the checkout's untracked files")?;
@@ -403,24 +434,29 @@ pub fn world_commit(checkout: &Path) -> Result<String> {
         .map(|directory| format!(":(exclude,literal){}", String::from_utf8_lossy(directory)))
         .collect();
 
-    let mut add = git_command(&checkout);
+    let mut add = git_command(checkout);
     add.env("GIT_INDEX_FILE", &index)
+        .args(FSYNC_OBJECTS)
         .args(["add", "-A", "--", "."])
         .args(dispatch_exclusion_pathspecs())
         .args(&nested);
     checked_output(add, "failed to stage the checkout's world")?;
 
-    let mut write_tree = git_command(&checkout);
-    write_tree.env("GIT_INDEX_FILE", &index).arg("write-tree");
+    let mut write_tree = git_command(checkout);
+    write_tree
+        .env("GIT_INDEX_FILE", &index)
+        .args(FSYNC_OBJECTS)
+        .arg("write-tree");
     let tree = checked_output(write_tree, "failed to write the checkout's world")?.stdout;
     let tree = String::from_utf8_lossy(&tree).trim().to_owned();
 
-    let mut commit = git_command(&checkout);
+    let mut commit = git_command(checkout);
     commit
         .env("GIT_AUTHOR_NAME", "Dispatch")
         .env("GIT_AUTHOR_EMAIL", "dispatch@localhost")
         .env("GIT_COMMITTER_NAME", "Dispatch")
         .env("GIT_COMMITTER_EMAIL", "dispatch@localhost")
+        .args(FSYNC_OBJECTS)
         .args(["commit-tree", &tree, "-m", "Dispatch S0"]);
     if let Some(head) = &head {
         commit.args(["-p", head]);
@@ -688,54 +724,112 @@ pub fn snapshot_delta_indexed(
 
 /// Hash the complete logical source tree, excluding Git and Dispatch state.
 /// Content, paths, symlink targets, file kinds, and permission bits are covered;
-/// timestamps are intentionally ignored.
+/// timestamps are intentionally ignored. An entry that disappears during the
+/// walk (a build deleting its output) is a difference, never an error: it is
+/// hashed as `VANISHED`, so the value equals no tree that held the entry.
 pub fn fingerprint_tree(root: &Path) -> Result<String> {
     let root = resolve_source(Some(root))?;
+    let entries = list_tree(&root)?;
+    hash_tree(&root, entries)
+}
+
+/// Hashed in place of an entry's kind (`l`, `d` or `f`) when it vanished.
+const VANISHED: &[u8] = b"x";
+
+/// Every path under `root` but Git and Dispatch state, in fingerprint order,
+/// each with whether it could be listed: a directory that vanished before the
+/// walk read it is kept, as not listed.
+fn list_tree(root: &Path) -> Result<Vec<(PathBuf, bool)>> {
     let mut entries = Vec::new();
-    for entry in WalkDir::new(&root)
+    for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_entry(include_entry)
     {
-        let entry = entry.with_context(|| format!("failed to walk {}", root.display()))?;
-        if entry.depth() > 0 {
-            entries.push(entry.into_path());
+        match entry {
+            Ok(entry) if entry.depth() > 0 => entries.push((entry.into_path(), true)),
+            Ok(_) => {}
+            Err(error) => {
+                let vanished = error.depth() > 0
+                    && error
+                        .io_error()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                match error.path() {
+                    Some(path) if vanished => entries.push((path.to_owned(), false)),
+                    _ => {
+                        return Err(error)
+                            .with_context(|| format!("failed to walk {}", root.display()));
+                    }
+                }
+            }
         }
     }
-    entries.sort_by(|left, right| {
-        path_bytes(left.strip_prefix(&root).expect("walked path is under root")).cmp(&path_bytes(
-            right
-                .strip_prefix(&root)
-                .expect("walked path is under root"),
+    entries.sort_by(|(left, _), (right, _)| {
+        path_bytes(left.strip_prefix(root).expect("walked path is under root")).cmp(&path_bytes(
+            right.strip_prefix(root).expect("walked path is under root"),
         ))
     });
+    Ok(entries)
+}
 
+/// `Ok(None)` when the entry was not found: it vanished since it was listed.
+fn unless_vanished<T>(
+    result: std::io::Result<T>,
+    context: impl FnOnce() -> String,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(context),
+    }
+}
+
+fn hash_tree(root: &Path, entries: Vec<(PathBuf, bool)>) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"dispatch-tree-v1\0");
     let mut buffer = vec![0_u8; 64 * 1024];
-    for path in entries {
-        let relative = path.strip_prefix(&root).expect("walked path is under root");
+    for (path, listed) in entries {
+        let relative = path.strip_prefix(root).expect("walked path is under root");
         let path_key = path_bytes(relative);
         hash_sized_bytes(&mut hasher, &path_key);
 
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        let metadata = if listed {
+            unless_vanished(fs::symlink_metadata(&path), || {
+                format!("failed to inspect {}", path.display())
+            })?
+        } else {
+            None
+        };
+        let Some(metadata) = metadata else {
+            hasher.update(VANISHED);
+            continue;
+        };
         if metadata.file_type().is_symlink() {
+            let Some(target) = unless_vanished(fs::read_link(&path), || {
+                format!("failed to read symlink {}", path.display())
+            })?
+            else {
+                hasher.update(VANISHED);
+                continue;
+            };
+            ensure_symlink_stays_within(root, &path, &target)?;
             hasher.update(b"l");
             hash_mode(&mut hasher, &metadata);
-            let target = fs::read_link(&path)
-                .with_context(|| format!("failed to read symlink {}", path.display()))?;
-            ensure_symlink_stays_within(&root, &path, &target)?;
             hash_sized_bytes(&mut hasher, &path_bytes(&target));
         } else if metadata.is_dir() {
             hasher.update(b"d");
             hash_mode(&mut hasher, &metadata);
         } else if metadata.is_file() {
+            let Some(mut file) = unless_vanished(File::open(&path), || {
+                format!("failed to read {}", path.display())
+            })?
+            else {
+                hasher.update(VANISHED);
+                continue;
+            };
             hasher.update(b"f");
             hash_mode(&mut hasher, &metadata);
             hasher.update(metadata.len().to_le_bytes());
-            let mut file =
-                File::open(&path).with_context(|| format!("failed to read {}", path.display()))?;
             loop {
                 let read = file
                     .read(&mut buffer)
@@ -2339,6 +2433,180 @@ mod tests {
             symlink("other", source.join("link")).unwrap();
             assert_ne!(fingerprint_tree(&source).unwrap(), first_link);
         }
+    }
+
+    #[test]
+    fn an_entry_deleted_mid_walk_is_a_difference_not_an_error() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        write(&source.join("src/lib.rs"), "pub fn f() {}\n");
+        write(&source.join("target/debug/a.o"), "object\n");
+        write(&source.join("target/debug/b.o"), "object\n");
+        let root = resolve_source(Some(&source)).unwrap();
+        let before = fingerprint_tree(&root).unwrap();
+
+        // Listed while present, gone by the time it is read.
+        let listed = list_tree(&root).unwrap();
+        fs::remove_file(root.join("target/debug/a.o")).unwrap();
+        let moving = hash_tree(&root, listed).unwrap();
+        let after = fingerprint_tree(&root).unwrap();
+
+        assert_ne!(moving, before);
+        assert_ne!(moving, after);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn world_commit_never_accepts_a_pair_rewritten_during_capture() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let staging = temp.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let generation = |value: u64| format!("generation {value}\n").repeat(10_000);
+        write(&source.join("a.txt"), generation(0));
+        write(&source.join("b.txt"), generation(0));
+        initialize_user_repository(&source);
+
+        // The writer replaces a.txt, then b.txt, each whole by rename, so the
+        // pair is mixed only between the two renames. It records each such
+        // window: if it is descheduled there, the workspace itself holds the
+        // mixed pair for that long, and a capture inside the window is honest.
+        let stop = Arc::new(AtomicBool::new(false));
+        let windows = Arc::new(Mutex::new(Vec::new()));
+        let writer = thread::spawn({
+            let (stop, windows) = (Arc::clone(&stop), Arc::clone(&windows));
+            let source = source.clone();
+            move || {
+                let mut value = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    value += 1;
+                    for file in ["a.txt", "b.txt"] {
+                        fs::write(staging.join(file), generation(value)).unwrap();
+                    }
+                    fs::rename(staging.join("a.txt"), source.join("a.txt")).unwrap();
+                    let opened = Instant::now();
+                    let closed = Instant::now();
+                    fs::rename(staging.join("b.txt"), source.join("b.txt")).unwrap();
+                    windows.lock().unwrap().push((opened, closed));
+                    // Quiet now and then for long enough to capture.
+                    let pause = if value % 4 == 0 { 200 } else { value % 3 };
+                    thread::sleep(Duration::from_millis(pause));
+                }
+                value
+            }
+        });
+
+        let mut accepted = Vec::new();
+        let mut refused = 0;
+        for _ in 0..40 {
+            let started = Instant::now();
+            let result = world_commit(&source);
+            let finished = Instant::now();
+            match result {
+                Ok(commit) => accepted.push((commit, started, finished)),
+                Err(error) => {
+                    assert!(
+                        error.to_string().contains(
+                            "the workspace changed while its starting state was being captured"
+                        ),
+                        "{error:#}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let last = writer.join().unwrap();
+        let windows = windows.lock().unwrap();
+
+        // A file's generation, which must also be the whole of it.
+        let read = |commit: &str, file: &str| -> u64 {
+            let text = run_git(&source, &["show", &format!("{commit}:{file}")]);
+            let value = text
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("generation "))
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("{file} was captured torn"));
+            assert_eq!(
+                text,
+                generation(value).trim_end(),
+                "{file} was captured torn"
+            );
+            value
+        };
+        let mut stalled = 0;
+        for (commit, started, finished) in &accepted {
+            let (a, b) = (read(commit, "a.txt"), read(commit, "b.txt"));
+            if a == b {
+                continue;
+            }
+            let held_throughout = a == b + 1 && {
+                let (opened, closed) = windows[a as usize - 1];
+                opened <= *started && *finished <= closed
+            };
+            assert!(held_throughout, "a mixed pair was accepted: a {a}, b {b}");
+            stalled += 1;
+        }
+        eprintln!(
+            "accepted {} ({stalled} inside a stalled writer's window), refused {refused}",
+            accepted.len()
+        );
+
+        // Quiet again: the capture is the last generation in both files.
+        let commit = world_commit(&source).unwrap();
+        assert_eq!(
+            (read(&commit, "a.txt"), read(&commit, "b.txt")),
+            (last, last)
+        );
+    }
+
+    #[test]
+    fn a_capture_that_moved_is_made_once_more_then_refused() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        write(&source.join("a.txt"), "0\n");
+        initialize_user_repository(&source);
+        let source = resolve_source(Some(&source)).unwrap();
+
+        // Moved during the first capture only: the second is accepted.
+        let mut captures = 0;
+        let commit = capture_settled(&source, || {
+            captures += 1;
+            let commit = capture_world(&source)?;
+            if captures == 1 {
+                write(&source.join("a.txt"), "moved\n");
+            }
+            Ok(commit)
+        })
+        .unwrap();
+        assert_eq!(captures, 2);
+        assert_eq!(
+            run_git(&source, &["show", &format!("{commit}:a.txt")]),
+            "moved"
+        );
+
+        // Moved during both: refused, and no third capture.
+        let mut captures = 0;
+        let error = capture_settled(&source, || {
+            captures += 1;
+            let commit = capture_world(&source)?;
+            write(&source.join("a.txt"), "moved\n".repeat(captures + 1));
+            Ok(commit)
+        })
+        .unwrap_err();
+        assert_eq!(captures, 2);
+        assert!(
+            error
+                .to_string()
+                .contains("the workspace changed while its starting state was being captured"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
