@@ -71,6 +71,10 @@ pub struct RuntimeStart {
 /// `RunMode::Attached` run observing an already-running agent, without
 /// spawning anything or touching the workspace. See part 14.8 for the
 /// refusal order and exact messages.
+/// The `source_fingerprint` of attached Work outside strict mode: not a
+/// SHA-256, so it never equals a fingerprint of any tree.
+pub(crate) const NOT_FINGERPRINTED: &str = "not fingerprinted (attached work outside strict mode)";
+
 pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     let is_wrapped = request.command.is_some();
 
@@ -229,7 +233,16 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     };
 
     let (source_kind, source_git_head) = source::inspect_source(&root)?;
-    let source_fingerprint = source::fingerprint_tree(&root)?;
+    // Attached runs consult the root's whole-tree fingerprint only in strict
+    // mode (`coherence::gate`). Walking the root otherwise costs the most of
+    // anything here: it hashes ignored build output, including that of
+    // runtime worktrees inside the root, and races its deletion. In any other
+    // mode the value can never match, so every reader fails closed.
+    let source_fingerprint = if config.coherence.accept == crate::config::AcceptMode::Strict {
+        source::fingerprint_tree(&root)?
+    } else {
+        NOT_FINGERPRINTED.to_owned()
+    };
 
     let now = Utc::now();
     let candidate_id = Ulid::new().to_string();

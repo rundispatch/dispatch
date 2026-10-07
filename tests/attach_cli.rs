@@ -576,3 +576,53 @@ fn finish_without_local_authority_is_refused_when_checks_are_configured() {
     let metadata = f.metadata(&id);
     assert_eq!(metadata["outcome"]["lifecycle"], "working");
 }
+
+/// Outside strict mode, attaching never walks the root's ignored build
+/// output: its whole-tree fingerprint is not taken, because nothing reads it.
+/// An unreadable ignored directory, which a walk could not get through, proves
+/// it. Strict mode still fingerprints the root (`docs/plan-0.4.10.md` §15).
+#[test]
+fn attach_outside_strict_mode_never_walks_ignored_build_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(true);
+    let sealed = fixture.root.join("build/sealed");
+    fs::create_dir_all(&sealed).unwrap();
+    fs::write(sealed.join("artifact.o"), b"object\n").unwrap();
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let id = fixture.attach(&[]);
+    assert_eq!(
+        fixture.metadata(&id)["source_fingerprint"],
+        "not fingerprinted (attached work outside strict mode)"
+    );
+
+    fs::write(
+        fixture.root.join("dispatch.yml"),
+        "checks:\n  verify: ['true']\ncoherence:\n  accept: strict\n",
+    )
+    .unwrap();
+    git(&fixture.root, &["commit", "--quiet", "-am", "strict"]);
+    let strict = fixture.workspace.parent().unwrap().join("wt-strict");
+    git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "strict",
+            strict.to_str().unwrap(),
+        ],
+    );
+    fixture
+        .dispatch(&[
+            "attach",
+            "--workspace",
+            strict.to_str().unwrap(),
+            "--root",
+            fixture.root.to_str().unwrap(),
+            "--allow-unsafe-local",
+        ])
+        .failure();
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)).unwrap();
+}
