@@ -233,67 +233,16 @@ fn start(
     )
 }
 
-/// When this process started, on both clocks: the kernel's record where
-/// Dispatch can read it, else now. A hook's deadline counts from it.
+/// When this process started: `main` records it before anything else, and a
+/// hook's deadline counts from it. Exec and runtime start-up before `main` are
+/// not counted; the budget's margin under the runtime's timeout covers them.
+static STARTED: std::sync::OnceLock<(Instant, DateTime<Utc>)> = std::sync::OnceLock::new();
+
+/// Record this process's start; called first thing in `main`.
+pub fn mark_process_start() {
+    let _ = STARTED.set((Instant::now(), Utc::now()));
+}
+
 fn process_started() -> (Instant, DateTime<Utc>) {
-    let (now, instant) = (Utc::now(), Instant::now());
-    let age = kernel_start()
-        .and_then(|start| (now - start).to_std().ok())
-        .filter(|age| *age < Duration::from_secs(3600))
-        .unwrap_or_default();
-    (
-        instant.checked_sub(age).unwrap_or(instant),
-        now - chrono::Duration::from_std(age).unwrap_or_default(),
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn kernel_start() -> Option<DateTime<Utc>> {
-    // SAFETY: an all-zero `proc_bsdinfo` is a valid value of a plain C struct.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            libc::getpid(),
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        )
-    };
-    (written == size).then_some(())?;
-    DateTime::from_timestamp(
-        i64::try_from(info.pbi_start_tvsec).ok()?,
-        u32::try_from(info.pbi_start_tvusec).ok()? * 1000,
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn kernel_start() -> Option<DateTime<Utc>> {
-    // Field 22 of /proc/self/stat is the start in clock ticks after boot;
-    // /proc/uptime is seconds since boot.
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let ticks: f64 = stat
-        .rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()?;
-    let uptime: f64 = std::fs::read_to_string("/proc/uptime")
-        .ok()?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
-    // SAFETY: sysconf has no preconditions.
-    let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
-    let age = chrono::Duration::milliseconds(((uptime - ticks / hertz) * 1000.0) as i64);
-    Some(Utc::now() - age)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn kernel_start() -> Option<DateTime<Utc>> {
-    None
+    *STARTED.get_or_init(|| (Instant::now(), Utc::now()))
 }
