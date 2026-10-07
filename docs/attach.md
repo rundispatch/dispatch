@@ -459,6 +459,22 @@ runtime's event on stdin):
   anything malformed is refused whole.
 - **A session starting in a separate worktree** registers Work the first time:
   - S0 is the worktree's exact world then, before the session's first turn;
+  - registration finishes within a 40 s budget, counted from the hook process
+    starting, well inside the 60 s timeout `dispatch setup` installs. It is
+    assembled in `<state>/registrations/<id>/`, and becomes Work only by a
+    database insert and a rename into `runs/<id>/`, so Work is never half-made.
+    A single decision file, created exclusively, settles each registration:
+    - **registered:** published before the hook returned;
+    - **pending:** S0 is durable (`registration.json`) but not yet published.
+      The watching owner, or the next hook for that worktree, publishes it.
+    - **untracked:** S0 was not durable by the deadline, or the worktree kept
+      changing while it was captured. The session is told so, and nothing
+      publishes it afterwards.
+
+    The owner removes the leftovers of failed registrations once their budget
+    has passed, and logs each one. `attach.created` records `registration_ms`
+    and `via` (`hook` or `owner`). The plan with the full rules is
+    `docs/plan-0.4.10.md` §3.
   - later sessions in that worktree (resume, clear, compact, a fork into it, a
     replayed event) are recorded on the same Work;
   - an ended session never ends the Work;

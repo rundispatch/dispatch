@@ -51,6 +51,22 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.10
+
+No migration; the schema stays at 24.
+- **Registration in progress.** Work being registered is assembled in
+  `<state>/registrations/` and moved into `runs/` only when complete. The
+  watching owner publishes pending registrations and removes failed ones.
+- **Old partial runs stay.** Partial run directories that 0.4.9 or earlier left
+  in `runs/` (no `metadata.json`) are not touched.
+- **Attach is cheaper outside strict mode.** Attaching Work no longer
+  fingerprints the integration root's whole tree; the fingerprint was read only
+  in strict mode. With `coherence.accept: strict`, attach still walks the root,
+  but a file that disappears during that walk now counts as a difference, not an
+  error.
+- **Restart the owner.** Run `dispatch stop && dispatch start` so the project
+  owner is 0.4.10. Only a 0.4.10 owner publishes pending registrations.
+
 ### Upgrading to 0.4.9
 
 No migration; the schema stays at 24.

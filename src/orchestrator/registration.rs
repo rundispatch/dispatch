@@ -57,7 +57,7 @@ pub const DECISION: &str = "decision";
 pub const NOTICE_UNTRACKED: &str = "Dispatch could not capture this session's starting state in \
      time. This session is not being tracked.";
 
-/// What a pending session is told; `id` is the short Work id.
+/// What a pending session is told; `id` is the full Work id.
 pub fn notice_pending(id: &str) -> String {
     format!(
         "Dispatch captured this session's starting state and will finish tracking it as \

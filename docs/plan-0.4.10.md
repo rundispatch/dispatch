@@ -233,3 +233,124 @@ and Dispatch's interactions and coherence changes. No aggregate score.
   - `src/orchestrator/registration.rs`: the contract types, constants and
     notices, plus a no-op `reconcile`, which the owner already calls each tick.
   - This plan.
+- 2026-10-07: Workers.
+  - Four `claude --worktree 0410-a` to `0410-d` sessions were launched within a
+    minute, before any build. Each worker built in its own target directory
+    outside the root. All four registered through their hooks under the
+    supervising 0.4.9, at a load average of about 10. None were dropped, and no
+    run directory was left incomplete.
+  - The handoffs of A, B and D were written into their worktrees at the user's
+    request. Untracked files there would have entered their Δ, so the
+    integrator moved them to `~/dispatch-dev/handoffs-0410/` before `finish`.
+  - Dispatch reported no interactions between the packets. That was correct: A
+    calls B's `world_commit`, but B kept its signature and changed only its
+    body.
+- 2026-10-07: Integration, in the order B (`e6fc651`), D (`6536e6f`), C
+  (`55a233e`), A (`652d539`), each after the human's approval.
+  - Before integrating, the integrator ran all four together, independently:
+    fmt and clippy clean, the full suite 578/0, A's registration tests 3/3 and
+    B's churn tests 2/2.
+  - Each packet was finished (checks passed in its workspace), accepted (C, D
+    and A ran the merged-tree checks, which passed), then committed.
+  - After every landing, the remaining Work was rechecked: all CONTINUE, no
+    interactions.
+  - **Corrective work on D (`5f6d2f5`), approved:** `audit_names` and
+    `NameCause` are no longer public. The real-data audit is an ignored unit
+    test, `coherence::facts::tests::real_runs`, and reproduces D's counts.
+    Approved deviations from the contract: the cause `Widespread`, the
+    invariant `Ambiguous + Widespread == unbound` (the plan's own invariant was
+    wrong), and a recorder parameter on `bind_names` that leaves binding
+    unchanged.
+  - **Corrective work on A, approved:** the hook's deadline counts from a
+    timestamp `main` records, instead of the kernel's process start, which took
+    about 60 lines of unsafe, platform-specific code: −61/+11 lines.
+  - **D's report.** Six real runs and about 1,000 names:
+    - per run, unbound A 46, B 156, C 51, D 40;
+    - about 96% of unbound names are widespread (used in more files than
+      binding reads), not ambiguous;
+    - two cross-run hits, both judged harmless: `capture` counted itself
+      within one commit range, and `outcome` was a real reliance on a stub
+      whose signature did not change.
+    - Recommendation: no change to binding. If a miss is ever observed,
+      disambiguate qualified paths (`a::b::name` binds the declaration in
+      `b.rs`).
+- 2026-10-07: R.
+  - **The release candidate:** version 0.4.10, a release build of `a23ff12` plus
+    the version bump, copied to `~/dispatch-dev/dispatch-0.4.10-candidate/`. The
+    full suite on the integrated tree: 578 passed, 0 failed.
+  - **The stress trial** (`~/dispatch-dev/stress-0410`, a clone of Dispatch at
+    `35d7f61`, its own state, hooks only in its `.claude/settings.local.json`,
+    driver `trial.py`).
+    - **Pressure:** three `cargo build` runs in worktrees inside the root, which
+      put 1.5 GB of churning build output there; 10 CPU spinners; a 1 GiB disk
+      write loop; load average 19–25.
+    - **Six `claude -p --worktree` sessions started at once:** all six were
+      registered by their hooks in 8.0–8.3 s, with one Work each.
+    - **Hooks killed at 0.05, 0.2, 0.5, 1, 2 and 4 s** while the owner ran:
+      - the first four had no durable S0; they left registration directories
+        (some held only the lock), which the owner removed after the budget;
+      - the last two had `registration.json`; the owner published them
+        (`via: owner`), about 45–48 s after the hook started;
+      - no incomplete run in `runs/`.
+    - **A hook killed after `registration.json`, then the owner killed with
+      SIGKILL and restarted:** the restarted owner published it, once.
+    - **A repeated `SessionStart` (resume, then a new session):** one Work, the
+      same S0, sessions recorded: 2.
+    - **Attach while an ignored `target/` churned under the root** in three
+      worktrees: 5 of 5 `attach --workspace` and 5 of 5 `attach --` succeeded,
+      and no build output entered any S0 or Δ.
+    - **Two tracked files rewritten together, continuously, during capture:** 6
+      of 6 sessions were told "Dispatch could not track this session: the
+      workspace changed while its starting state was being captured…". No mixed
+      S0 was accepted. A workspace that never stops changing is not tracked; the
+      honest outcome.
+    - **Totals:**
+      - 23 registration attempts: 7 registered by the hook (latency 6.2–8.3 s),
+        3 published by the owner, 6 told untracked because of source movement,
+        4 killed before a durable S0 (no Work, cleaned up);
+      - 10 attaches during churn, all succeeded;
+      - no incomplete runs, and no leftover registrations;
+      - the owner's log keeps only the time since its last start, because the
+        SIGKILL test restarted it.
+  - **Found by the trial, fixed:** the registered, pending and removal notices
+    named Work by its first 8 characters. All six simultaneous sessions read
+    "Work 01M4BRE4". Every runtime notice now names the full Work ID.
+  - **Production lines** since `35d7f61`: about 870. `registration.rs` is 616,
+    about half doc comments and the contract types. `attach.rs` +123,
+    `source.rs` +94, `facts.rs` about +25 (the recorder and `NameCause`), and
+    `runtime.rs`, `main.rs` and `serve.rs` a handful each.
+  - **Docs:**
+    - the README gains the three registration outcomes and links
+      `docs/self-hosting.md`;
+    - `docs/attach.md` gains the registration rules;
+    - `release-install.md` gains "Upgrading to 0.4.10";
+    - the self-hosting guide gains what 0.4.10 changes;
+    - the release notes are for 0.4.10.
+
+## Evaluation of the contributions
+
+The packets differ in size and kind, so this is not a model comparison, and the
+integrator's review is not human preference data. No session reported usage,
+so usage stays unknown.
+
+| | A: registration | B: build output and S0 capture | C: self-hosting guide | D: name audit |
+|---|---|---|---|---|
+| Work | `01M4B5RP…` (discovered) | `01M4B5S2…` (discovered) | `01M4B5SA…` (discovered) | `01M4B5SJ…` (discovered) |
+| Scope | its 4 files | its 2 files | its 1 file | its 2 files |
+| Contract | followed; no change needed | followed (`world_commit` signature kept) | n/a | reported two needed deviations, both approved |
+| Correctness | 13 tests over every boundary; reproduced the half-made `runs/` directory on the old code | reproduced the 0.4.9 field error; honest about what before/after evidence cannot see | every command run live against real state | invariant asserted on six real runs |
+| Found beyond its scope | none needed | none | the check builds' `target/` inside the root under a 0.4.9 supervisor | the plan's invariant was wrong; the W range included B's commit |
+| Corrective work | the kernel process-start reading replaced by a timestamp `main` records (−61/+11) | none | one line added on 0.4.10 (R) | the audit made test-only (`5f6d2f5`) |
+| Duration (reported) | unknown | unknown | about 45 min (estimated) | unknown |
+| Usage | unknown | unknown | unknown | unknown |
+| Handoff | saved in its worktree (moved out by the integrator) | saved in its worktree (moved out) | saved outside the repository | saved in its worktree (moved out) |
+
+**How Dispatch handled the work** (supervisor 0.4.9):
+- **Registration:** all four workers registered through their hooks, with no
+  drop. The launch before any build, and build output kept outside the root,
+  avoided the bug this release fixes.
+- **Interactions:** none reported between the packets, which was correct. A
+  calls B's `world_commit`, but B changed only its body.
+- **Coherence:** every remaining packet stayed CONTINUE after each landing, and
+  the merged-tree checks passed on C, D and A.
+- **Defects seen:** none new in 0.4.9 during this build.

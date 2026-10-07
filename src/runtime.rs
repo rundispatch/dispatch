@@ -171,7 +171,7 @@ fn removed(state: &State, workspace: &Path) -> Result<Reply> {
         return Ok(Reply::Silent);
     };
     let files_changed = attach::freeze_removed_workspace(state, &run_id)?;
-    let id = &run_id[..8.min(run_id.len())];
+    let id = &run_id;
     // With the person's consent the owner runs the checks next; say so. The
     // changes are already kept, so nothing here may fail the hook.
     let consented = state
@@ -217,16 +217,16 @@ fn start(
         consented: false,
         started_at: began.1,
     };
-    let short = |id: &str| id[..8.min(id.len())].to_owned();
+    // The full id: sessions started together share their first characters.
     Ok(
         match registration::register(state, registration, began.0)? {
             None => Reply::Silent,
             Some(Outcome::Registered { run_id }) => Reply::Notice(format!(
                 "Dispatch is tracking this worktree as Work {}; see it with dispatch watch.",
-                short(&run_id)
+                run_id
             )),
             Some(Outcome::Pending { run_id }) => {
-                Reply::Notice(registration::notice_pending(&short(&run_id)))
+                Reply::Notice(registration::notice_pending(&run_id))
             }
             Some(Outcome::Untracked) => Reply::Notice(registration::NOTICE_UNTRACKED.into()),
         },

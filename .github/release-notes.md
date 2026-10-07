@@ -1,76 +1,81 @@
-## Dispatch 0.4.9 — Interactions, measured
+## Dispatch 0.4.10 — No silent gaps
 
-0.4.8 began reporting where pieces of unintegrated Work touch each other. 0.4.9
-records, from real use, how often those reports turn out right, so that nothing
-is built on them before that is known.
+Building 0.4.9 with Dispatch itself, four agents working at once, exposed two
+gaps on a busy machine:
+- a Claude Code session's start hook was killed while Dispatch was still
+  registering it, leaving the session untracked and half-made run state behind;
+- `dispatch attach` failed when a build tool deleted a file while Dispatch was
+  reading it.
 
-- **Every landing records what was known.** When Work is applied, by `accept`
-  or by auto-apply, Dispatch records the interactions its watching owner had
-  reported between it and every other piece of Work in progress
-  (`interaction.landed`). Pieces with no reported interaction are listed too,
-  so misses can be counted.
-- **The owner records what happened next.** The watching owner records its
-  next verdict on each of those other pieces (`interaction.outcome`): CONTINUE
-  or not, interaction or not.
-  - An outcome is scored only when nothing else could explain it. The landing
-    must have been observed, and the other piece analysed and valid before. If
-    another change reached the project, or the piece itself changed before it
-    was evaluated, the outcome is kept but labelled with why it cannot be
-    scored.
-  - Each outcome is recorded once, across owner restarts.
-- **Documented queries read it.** `docs/queries/interactions-measured.sql`
-  gives, from your own state directory:
-  - landings by status;
-  - outcomes by class;
-  - precision (invalidated among predicted) and misses, with their counts;
-  - the same by rule;
-  - landings whose outcomes are missing.
+0.4.10 closes both.
 
-  `docs/coherence-validation.md` says what the numbers can support.
-  "Invalidated" means Dispatch's own later verdict, not a confirmed conflict.
-  Nothing leaves your machine.
-- **Live patches are published atomically.** A watcher or the owner could read
-  a work-in-progress patch while it was being rewritten. Patches are now
-  written to a temporary file and renamed.
-- **No policy changes.** Interactions stay advisory: no verdict, accept or
-  auto-apply decision depends on them.
+- **A session is tracked, pending, or told it isn't.** For a session in its own
+  worktree of a watched project, Dispatch finishes registering within 40 s, well
+  inside the hook's 60 s timeout. The session is told which of three outcomes it
+  got:
+  - **tracked:** its Work exists before the hook returns;
+  - **pending:** its starting state is saved, and the watching owner creates the
+    Work moments later;
+  - **not tracked:** its starting state could not be captured in time, or the
+    worktree kept changing while it was captured.
 
-**Fixed.** A landing auto-applied by an owner on its first tick after a restart
-would have seen no interaction view. The owner now compares Work before it
-auto-applies.
+  Work is assembled outside `runs/` and moved in only when complete, so a
+  killed hook never leaves a half-made run behind. A repeated session start
+  lands on the same Work.
+- **Registration ignores build output.** Attaching Work no longer reads the
+  integration root's whole tree. Outside strict mode nothing used that walk,
+  and it was what made registration slow and fragile: Claude Code worktrees,
+  each with its own build directory, live inside the root. Where a walk remains
+  (strict mode), a file that disappears mid-walk counts as a difference, not a
+  failure.
+- **A moving workspace never gives a mixed starting state.** If the worktree
+  changes while its starting state is captured, Dispatch captures it once more,
+  and otherwise refuses rather than record a baseline mixing two moments.
+- **Running Dispatch on Dispatch.** `docs/self-hosting.md` is the setup that
+  built this release:
+  - a pinned, verified release binary;
+  - a dedicated state directory outside `/tmp`;
+  - a dedicated integration clone, with project-local hooks;
+  - one isolated workspace per worker;
+  - landing one contribution at a time.
 
-**Evidence.** A real-agent trial on a small Python project ran five Claude Code
-sessions at once:
-- A changed the signature of `auth.validate`;
-- B added a caller of it;
-- C changed its body;
-- D changed an unrelated module;
-- E changed another function in the same file.
+  It also sets the rule for build caches in checks: a cache may be reused only
+  when one workspace's build can never stand in for another's.
 
-Before anything landed, Dispatch reported A against B (B uses the signature A
-changes) and A against C (both change `validate`), and nothing else.
+**Fixed.**
+- **Notices name the full Work ID.** Sessions that started together all read
+  "Work 01M4BRE4" in their notice; Work created in the same quarter second
+  shares its first 8 characters.
 
-D landed first. Its landing was observed, and within 5 s the owner recorded
-four outcomes: all scorable, none predicted, all CONTINUE. Then A landed:
-- B: predicted, and REFRESH (`fact_broken`);
-- C: predicted, and REFRESH (`patch_conflict`);
-- E: not predicted, and CONTINUE.
+**Evidence.** A stress trial on a clone of Dispatch, with three cargo builds
+putting 1.5 GB of churning build output under the root, every core busy, a
+disk write loop, and load averages of 19–25:
+- **Six Claude Code sessions started at once:** all six were registered by their
+  own hooks in 8.0–8.3 s, with exactly one Work each.
+- **Hooks killed at 0.05–4 s:** those killed before their starting state was
+  saved left no Work, and the owner removed their leftovers. Those killed after
+  it was saved were published by the owner.
+- **The owner killed with SIGKILL while a registration was pending:** the
+  restarted owner published it.
+- **A repeated session start:** one Work, the same starting state, both sessions
+  recorded.
+- **`dispatch attach` while build output churned:** 10 of 10 succeeded, and no
+  build output entered any starting state or patch.
+- **Two files rewritten continuously during capture:** all 6 sessions were told
+  they were not tracked. No mixed starting state was accepted.
 
-The documented queries over that state report 2 landings and 7 scorable
-outcomes. Precision was 2 of 2 predicted, with 0 misses among 5 that were not
-predicted. That is one small trial, not a rate.
+Building 0.4.10 itself, four workers under Dispatch 0.4.9 all registered by
+their hooks. Dispatch reported no interactions between them, which was
+correct.
 
-**How it was built.** This release was built by four Claude Code sessions
-working in parallel, each on one packet in its own worktree. Dispatch 0.4.8
-watched them, and every packet was integrated through `dispatch accept` after
-review. Dispatch reported no interactions between the packets, which was
-correct: none of them shared a file.
+An audit of names the facts layer could not resolve covered about 1,000 names
+over six real runs. It found none that hid a meaningful interaction, so binding
+is unchanged.
 
-The process found two 0.4.8 defects, both still open:
-- a `SessionStart` hook can be killed by Claude Code's 60 s timeout while
-  Dispatch registers the Work under heavy load, leaving the session untracked;
-- `dispatch attach --workspace` walks ignored build output, and can fail on a
-  file that disappears mid-walk.
+**Not built.**
+- **Strict mode** still walks the root's whole tree when attaching.
+- **Partial run directories left by older versions** are not cleaned up.
+- **The hook budget** assumes the 60 s timeout `dispatch setup` installs.
 
 **Upgrading.** No migration; the schema stays at 24. Run `dispatch stop &&
-dispatch start` so the project owner is 0.4.9.
+dispatch start` so the project owner is 0.4.10.

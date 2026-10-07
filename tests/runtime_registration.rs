@@ -182,7 +182,7 @@ impl Project {
         ));
         assert!(began.elapsed() < Duration::from_secs(10));
         let [(id, files)] = self.registrations().try_into().unwrap();
-        assert_eq!(notice, registration::notice_pending(&id[..8]));
+        assert_eq!(notice, registration::notice_pending(&id));
         assert!(files.contains(&"registration.json".to_owned()), "{files:?}");
         assert_eq!(self.decision(&id).as_deref(), Some("pending"));
         assert!(self.runs().is_empty());
@@ -369,7 +369,7 @@ fn a_session_registers_within_its_budget_and_says_so() {
         notice,
         format!(
             "Dispatch is tracking this worktree as Work {}; see it with dispatch watch.",
-            &id[..8]
+            id
         )
     );
     published_once(&p, id, "hook");
@@ -541,10 +541,7 @@ fn removing_the_worktree_while_pending_publishes_then_keeps_the_exact_changes() 
         &[],
     ));
     assert!(
-        notice.contains(&format!(
-            "kept this worktree's changes as Work {}",
-            &id[..8]
-        )),
+        notice.contains(&format!("kept this worktree's changes as Work {id}")),
         "{notice}"
     );
     let run = published_once(&p, &id, "hook");
@@ -580,7 +577,7 @@ fn a_deadline_that_finds_the_publish_under_way_waits_for_it_then_says_pending() 
     assert!(began.elapsed() >= Duration::from_millis(3750));
     assert!(began.elapsed() < Duration::from_secs(10));
     let [(id, _)] = p.registrations().try_into().unwrap();
-    assert_eq!(notice, registration::notice_pending(&id[..8]));
+    assert_eq!(notice, registration::notice_pending(&id));
     assert_eq!(p.decision(&id).as_deref(), Some("publishing"));
     assert!(p.runs().is_empty());
     p.owner("published it", |p| !p.runs().is_empty());

@@ -313,3 +313,6 @@ workspace be used for another without being rebuilt?
   S0 is then the merge base with the clone, which is the worktree's start
   when it began from `head`.
 - **Leftovers.** Leave the half-made directories under `<state>/runs/` alone.
+- **What changed.** From 0.4.10, a session in its own worktree is tracked,
+  pending, or told it is not tracked, and a killed hook leaves no half-made run
+  behind (`docs/attach.md`, "Work a runtime registers").
