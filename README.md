@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.10 — experimental developer preview**
+**Dispatch 0.4.11 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -59,9 +59,12 @@ verdict of every Work item it knows about current as the code moves:
 - attached work still in progress;
 - attached work it may apply.
 
-`dispatch watch` shows that state live. On a terminal you can act on a row
-without typing its ID: `f` finishes, `a` accepts, `r` rejects (after asking),
-`d` reviews. Leaving it does not stop watching. `dispatch stop` ends watching for
+`dispatch watch` shows that state live. On a terminal it is a table of Work,
+named by its worktree folder or its task, with Work that needs you first; the
+selected Work's details say why its verdict is what it is and what to do next.
+You act on the selected Work without typing its ID: `f` finishes, `a` accepts,
+`r` rejects (after asking, naming the Work), `d` reviews. Below 90 columns
+each Work is a two-line card. Leaving it does not stop watching. `dispatch stop` ends watching for
 this project. No agent needs to be set up
 for any of this.
 
@@ -105,8 +108,9 @@ the Work that is not yet integrated, and says where two pieces already touch:
 - one changes the signature of, or removes, a declaration the other uses;
 - one changes or deletes a file the other relies on.
 
-A row in `dispatch watch` then ends with `interacts with <id>`. The selected
-row, and `dispatch status`, say how, apart from the verdict: Work can be
+A row in `dispatch watch` then names the other Work under TOUCHES (piped, it
+ends with `interacts with <id>`). The selected Work's details, and `dispatch
+status`, say how, apart from the verdict: Work can be
 `CONTINUE` and still interact. This is exact to the declaration for Rust and
 Python, and to the file elsewhere. It is advisory: nothing is blocked,
 reordered or refreshed, and once one piece lands the other is judged by the

@@ -961,6 +961,9 @@ struct Ui {
     /// Session-scoped only: off at every start, never persisted. See
     /// `docs/plan-0.3-auto-apply-and-attach.md` part 5.5.
     auto_apply: bool,
+    /// Whether this session has an auto-apply mode at all: the goal session
+    /// does; `watch` does not, so it shows no mode and ignores Shift+Tab.
+    auto_apply_mode: bool,
     reviewed: Option<RunRecord>,
     #[cfg(unix)]
     term: tokio::signal::unix::Signal,
@@ -1017,6 +1020,7 @@ impl Ui {
             launch_line: String::new(),
             render_key: String::new(),
             auto_apply: false,
+            auto_apply_mode: true,
             reviewed: None,
             #[cfg(unix)]
             term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
@@ -1030,11 +1034,16 @@ impl Ui {
     /// Session-scoped auto-apply indicator, always the hint row's first
     /// segment. See `docs/plan-0.3-auto-apply-and-attach.md` part 5.5.
     fn mode_hint(&self) -> String {
+        if !self.auto_apply_mode {
+            return String::new();
+        }
         mode_hint_text(self.options.ascii, self.auto_apply)
     }
     fn hint_with_mode(&self, hint: &str) -> String {
         let mode = self.mode_hint();
-        if hint.is_empty() {
+        if mode.is_empty() {
+            hint.to_owned()
+        } else if hint.is_empty() {
             mode
         } else if self.options.ascii {
             format!("{mode} - {hint}")
@@ -1065,9 +1074,28 @@ impl Ui {
                 &hint,
                 &self.palette,
                 self.options.ascii,
-                self.auto_apply,
+                self.auto_apply && self.auto_apply_mode,
             );
         })?;
+        Ok(())
+    }
+    /// Draw a frame the caller builds, coalesced like `draw`: nothing is
+    /// drawn while `key` (the caller's content) and the terminal size stay
+    /// the same.
+    fn draw_frame(
+        &mut self,
+        key: &str,
+        render: impl FnOnce(&mut ratatui::Frame, &Theme),
+    ) -> Result<()> {
+        let key = format!("{key}\0{:?}", terminal::size());
+        if key == self.render_key {
+            return Ok(());
+        }
+        self.render_key = key;
+        let Some(screen) = &mut self.screen else {
+            return Ok(());
+        };
+        screen.terminal.draw(|frame| render(frame, &self.palette))?;
         Ok(())
     }
     fn display_text(&self, text: &str) -> String {
@@ -1360,7 +1388,10 @@ impl Ui {
                     return Ok(Input::Eof);
                 }
                 // Never submits or edits the draft; redraw shows the new hint.
-                Input::ToggleAutoApply => self.auto_apply = !self.auto_apply,
+                Input::ToggleAutoApply if self.auto_apply_mode => {
+                    self.auto_apply = !self.auto_apply
+                }
+                Input::ToggleAutoApply => {}
                 input => return Ok(input),
             }
         }
@@ -1496,7 +1527,7 @@ impl Ui {
                         }
                         // Never submits or edits anything; the next redraw
                         // shows the flipped hint while the agent keeps running.
-                        Ok(Some(Event::Key(k))) if k.code == KeyCode::BackTab => {
+                        Ok(Some(Event::Key(k))) if k.code == KeyCode::BackTab && self.auto_apply_mode => {
                             self.auto_apply = !self.auto_apply;
                         }
                         _ => {}
@@ -1934,6 +1965,9 @@ async fn review_goal(
                 }
             }
             "i" | "details" => ui.diagnostics(&run).await?,
+            "aa" if !ui.auto_apply_mode => {
+                notice = "watch has no auto-apply mode; nothing changed.".into();
+            }
             "a" | "accept" | "aa" | "r" | "reject" => {
                 bundle.verify()?;
                 // "aa" is a real human accept, recorded exactly like "a"; the

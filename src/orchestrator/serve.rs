@@ -1080,17 +1080,18 @@ fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
     rows
 }
 
-/// The project view's rows for `watch`'s interactive form: each Work item's
-/// id and its line, in the view's order.
-pub(crate) fn project_rows(
-    runs: &[RunRecord],
-    interactions: Option<&Projection>,
-) -> Vec<(String, String)> {
-    let rows = view_rows(runs);
-    let ids = short_ids(&rows);
-    rows.into_iter()
-        .map(|run| (run.id.clone(), row(run, ids[run.id.as_str()], interactions)))
-        .collect()
+/// What `watch`'s interactive form shows: the runs in the project view and,
+/// while an owner watches the project, how they interact.
+pub(crate) fn watch_view(
+    state: &State,
+    root: &Path,
+) -> Result<(Vec<RunRecord>, Option<Projection>)> {
+    let interactions = super::background::interactions(state, root);
+    let runs = load_source_runs(state, root)?;
+    Ok((
+        view_rows(&runs).into_iter().cloned().collect(),
+        interactions,
+    ))
 }
 
 fn short_ids<'a>(rows: &[&'a RunRecord]) -> HashMap<&'a str, &'a str> {
