@@ -349,7 +349,7 @@ keys that apply:
 - `f` finishes attached Work, asking first, naming it, before running checks
   nobody has allowed;
 - `a` accepts, through the same gate as `dispatch accept`; a refusal names the
-  Work, its verdict's reason and what to do instead;
+  Work and what to do instead, and its details show the reason;
 - `r` rejects, after asking, naming it, with focus on Cancel;
 - `d` or Enter opens the review;
 - `q` leaves.

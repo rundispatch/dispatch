@@ -453,8 +453,67 @@ pass unmodified. Stage R also diffs piped `watch` and `watch --json` between the
 - Scrolling and full display of long details.
 - Group headings, and a `?` key for help.
 
+## 8. Amendments after review (A2)
+
+The independent review (B) and the integrator's demo changed the contract in these places:
+
+- **§3.3 TOUCHES:** `?` also when no projection exists (the project is not watched, or the owner
+  has not written one yet), never `–` for unknown. Done Work keeps `–`.
+  - Details: `Touches  not known: the project is not watched` when not watched;
+    `Touches  not known yet` when watched with no projection.
+- **§3.4 and §3.5–3.7 height:** the selected Work is never off screen. Height goes in this order:
+  1. header, rule, notice, hint;
+  2. column titles plus the selected row (wide), or its card (narrow);
+  3. details line 1, Verdict, Next;
+  4. the other list rows;
+  5. optional details (Checks, Touches, Began).
+
+  Under extreme height, wrapped detail lines are cut from the bottom, never the selected row.
+- **§3.7 line 1:** always ends with `Work <short id>`. The place is dropped first, then the origin
+  is cut, then the name.
+- **§3.8 hint:** always ends with `q leave`. Offered keys are dropped from the end first, then
+  `↑↓`.
+- **§3.9 refusal notice:** the reason is not repeated, because the Verdict line shows it:
+  `not applied: stale (REFRESH). The source is unchanged. Next: r reject it.` and
+  `not applied: STOP, its changes are already in the source. Next: r reject it.`
+- **§2 `background.rs`:** one accessor, `watcher_line(&watcher, pid)`, shared by `describe` and
+  the header. `describe`'s text is byte-identical, and a unit test proves it.
+
+## Evaluation of the contributions
+
+| Packet | Worker | Delivered | Integrator findings | Rounds |
+|---|---|---|---|---|
+| A | Claude Code, `0411-a` | The full contract; 18 unit tests; PTY journeys updated and extended; README and guide | Accept refusal used a stored verdict whatever caused the refusal (fixed in round 2). Auto-apply `aa` and Shift+Tab still worked in watch's review screen (A's own out-of-scope finding, fixed in round 2). Production `watch.rs` 177 → ~1,714 lines | 2 |
+| B | Claude Code, `0411-b` | 18 PTY acceptance tests written from the contract, a VT100 screen model, and a ranked review: 1 medium and 4 low findings plus an info note, 3 shown by `#[ignore]` tests | One test flaked under load (1 in 5 runs) | 1 |
+| A2 | Claude Code, `0411-a2` | Fixes for B's findings and the demo's refusal-wording finding, B's tests un-ignored, a shared header accessor | A fixture flake in another scenario, from reading a half-drawn frame; fixed centrally in round 2 | 2 |
+
+Every packet was verified by the integrator in a separate worktree with its own target
+directory (fmt, clippy, full suite, repeated acceptance runs), then finished, compared with the
+frozen patch, accepted and committed after human approval.
+
 ## Progress log
 
 - 2026-10-08: P0. Plan written. Pinned 0.4.10 verified (archive and binary
   hashes). `integration-0411` cloned on `release-0.4.11` from `main` `7c2074a`
   (includes #16). Supervisor started.
+- 2026-10-08: A. One Claude Code worker (`0411-a`, Work 01M4DWG1), 2 rounds. The integrator found
+  the accept refusal misdescribing refusals that did not come from the coherence gate; A found the
+  auto-apply `aa`/Shift+Tab still live in watch's review screen. Both were fixed in round 2. Verified
+  independently (fmt, clippy, full suite 597/0, watch_ui; non-interactive output byte-identical to
+  0.4.10 on 11 outputs). Finished, frozen patch compared with the reviewed tree, accepted after
+  human approval: `eaf78cd`.
+- 2026-10-08: B. One Claude Code worker (`0411-b`, Work 01M4E1GV): 18 PTY acceptance tests written
+  from the contract, and a ranked review (1 medium, 4 low, 1 info). Integrator runs showed one flake
+  (1 of 5). Accepted after human approval: `e515925`.
+- 2026-10-08: A2. One Claude Code worker (`0411-a2`, Work 01M4EAFB), 2 rounds: B's findings, the
+  demo's refusal-wording finding, and the flakes. Round 2 made every fixture screen read wait for a
+  settled frame, and found that B's `"S0" not in screen` assertion matched ULID text. Integrator
+  verification: full suite 622/0, ten consecutive acceptance runs green, non-interactive output
+  byte-identical. Accepted after human approval: `569d5f7`. Part of A2's run was in Claude Code's
+  auto permission mode, switched on by an integrator menu selection and switched back. Its changes
+  stayed within its files.
+- 2026-10-08: Demo. The herdr fleet scenario (auth-ctx, me-endpoint, slugify) was re-recorded with
+  the candidate build. It shows named Work, the named interaction, auth-ctx landing, me-endpoint
+  turning REFRESH, slugify staying CONTINUE, and the stale accept refused with its next action.
+  Plus 60-column screenshots.
+- 2026-10-08: R. Version 0.4.11, release and upgrade notes, product-guide wording.

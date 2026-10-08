@@ -51,6 +51,18 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.11
+
+No migration; the schema stays at 24, and nothing on disk changes.
+- **`dispatch watch` on a terminal looks different.** It now shows a table of named Work,
+  with the selected Work's details below, or two-line cards below 90 columns. Piped `watch`,
+  `watch --plain`, `watch --json`, `serve`, `status` and every JSON contract are unchanged. A
+  script that reads the interactive screen should read `watch --json` instead.
+- **No auto-apply mode in `watch`.** It no longer shows the `Shift+Tab` mode hint or reacts to
+  it. Auto-apply for attached Work is still set per Work (`attach --auto-apply`).
+- **Restart the owner.** Run `dispatch stop && dispatch start` so the project owner is 0.4.11.
+  Otherwise `watch`'s header reports the version mismatch, as `status` does.
+
 ### Upgrading to 0.4.10
 
 No migration; the schema stays at 24.
