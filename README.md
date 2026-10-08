@@ -498,8 +498,9 @@ Answers are authorized by the local run owner's OS identity and accepted once.
 The answer command runs one continuation from the original baseline with the
 answer; a second question cannot start a third invocation. `--timeout` is one
 goal-wide deadline covering baseline checks, the invocations, verification and
-human waiting. There is no automatic retry, daemon, crash replay or separate
-`resume` command. Pending questions and all attempt evidence survive process
+human waiting. There is no automatic retry, crash replay or separate `resume`
+command, and the background watcher (`dispatch start`) never answers a question
+or continues a goal. Pending questions and all attempt evidence survive process
 exit and reload, and every launch is recorded durably, so a run is never closed
 while an agent it launched may still be alive.
 

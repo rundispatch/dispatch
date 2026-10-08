@@ -270,7 +270,8 @@ inspection. Use an explicit private `reviewer.json` preference as documented in
 file arguments. Repository-supplied shell reviewer commands are never automatic.
 
 One-shot JSON/JSONL uses the same foreground core independently of the renderer.
-No daemon or detached work is introduced.
+It runs in the foreground and starts no background process; watching a project is
+the separate, explicit `dispatch start`.
 
 ## Using your own agent
 
