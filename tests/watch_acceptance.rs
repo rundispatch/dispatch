@@ -131,24 +131,25 @@ fn plain_piped_and_json_watch_are_unchanged() {
 
 /// §3.7: details line 1 "ends with `Work <short id>`".
 #[test]
-#[ignore = "defect in packet A: at 90 columns an 80-character name pushes the ID off \
-            details line 1, which ends `· Work` (first_detail never truncates the name)"]
 fn details_line_one_ends_with_the_work_id_however_long_the_name() {
     scenario("long-name-detail");
 }
 
 /// §3.4: the list "never scrolls the selection off screen".
 #[test]
-#[ignore = "defect in packet A: at 100x10 the required details take the whole room and \
-            the table shows its titles but no row, so the selected Work is not on screen"]
 fn a_short_terminal_still_shows_the_selected_work() {
     scenario("short-terminal");
 }
 
-/// §3.8: the hint is the offered keys, then `↑↓ · q leave` below 90 columns.
+/// §3.8: the hint is the offered keys, then `↑↓ · q leave` below 90 columns;
+/// what does not fit goes from the end of the keys, never `q leave`.
 #[test]
-#[ignore = "defect in packet A: at 40 columns a ready Work's hint is cut to \
-            `a accept · d review · r reject · ↑↓ ·…`, losing `q leave`"]
 fn the_hint_keeps_q_leave_at_forty_columns() {
     scenario("narrowest-hint");
+}
+
+/// Every Work is listed before the optional details: six cards at 60x30.
+#[test]
+fn six_work_at_sixty_columns_show_all_six_cards() {
+    scenario("six-cards");
 }

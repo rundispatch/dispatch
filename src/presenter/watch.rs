@@ -77,8 +77,8 @@ impl Detail {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Touches {
-    /// Its files don't parse yet; nothing is claimed.
-    Pending,
+    /// Not known: nothing is claimed.
+    Unknown,
     Names(Vec<String>),
 }
 
@@ -112,6 +112,9 @@ struct Item {
 struct Context<'a> {
     root: &'a Path,
     home: Option<&'a Path>,
+    /// Whether an owner watches the project: without one, nothing writes
+    /// the projection.
+    watched: bool,
     projection: Option<&'a Projection>,
     /// Each run's configured checks, and whether accept runs them on the
     /// merged result (`coherence.integration_checks`).
@@ -266,7 +269,12 @@ fn item(
         },
         2,
     ));
-    let (touches, lines) = touches(run, &name, named, context.projection);
+    // Done Work takes no part in interactions, watched or not.
+    let (touches, lines) = if group == Group::Done {
+        (Touches::Names(Vec::new()), Vec::new())
+    } else {
+        touches(run, &name, named, context)
+    };
     if !lines.is_empty() {
         details.push(Detail {
             label: "Touches",
@@ -450,20 +458,23 @@ fn touches(
     run: &RunRecord,
     this: &str,
     named: &HashMap<&str, &str>,
-    projection: Option<&Projection>,
+    context: &Context,
 ) -> (Touches, Vec<String>) {
-    let Some((projection, participant)) = projection.and_then(|projection| {
-        let participant = projection
-            .participants
-            .iter()
-            .find(|p| p.run_id == run.id)?;
-        Some((projection, participant))
-    }) else {
+    let Some(projection) = context.projection else {
+        let why = if context.watched {
+            "not known yet"
+        } else {
+            "not known: the project is not watched"
+        };
+        return (Touches::Unknown, vec![why.into()]);
+    };
+    // Work that takes no part, such as lost Work, touches nothing.
+    let Some(participant) = projection.participants.iter().find(|p| p.run_id == run.id) else {
         return (Touches::Names(Vec::new()), Vec::new());
     };
     if participant.analysis == Analysis::Pending {
         return (
-            Touches::Pending,
+            Touches::Unknown,
             vec!["not known yet: its files don't parse while it's being edited".into()],
         );
     }
@@ -604,54 +615,27 @@ struct Header {
     /// The status in a word or two, for narrow terminals.
     short: &'static str,
     unwatched: bool,
-    /// A version mismatch and the check consent, as `project_line` says them.
+    /// The check consent, as `project_line` says it.
     extra: String,
 }
 
 impl Header {
     fn load(state: &State, root: &Path) -> Self {
-        let (status, short, unwatched, mut extra) = match background::watcher(state, root) {
-            Ok(background::Watcher::Watched(Some(record))) => {
-                let (how, short) = if record.background {
-                    ("in the background", "watched")
-                } else {
-                    ("by dispatch serve", "watched by serve")
-                };
-                let since = record.started_at.with_timezone(&chrono::Local);
-                let mut extra = String::new();
-                if record.dispatch_version != crate::VERSION {
-                    extra = format!(
-                        "; it runs Dispatch {}, this is {}: dispatch stop && dispatch start",
-                        record.dispatch_version,
-                        crate::VERSION
-                    );
-                }
-                (
-                    format!("watched {how} since {}", since.format("%H:%M")),
-                    short,
-                    false,
-                    extra,
-                )
+        let watcher = background::watcher(state, root);
+        let (short, unwatched) = match &watcher {
+            Ok(background::Watcher::Watched(Some(record))) if !record.background => {
+                ("watched by serve", false)
             }
-            Ok(background::Watcher::Watched(None)) => (
-                "watched by a Dispatch process that left no record".into(),
-                "watched",
-                false,
-                String::new(),
-            ),
-            Ok(background::Watcher::NotWatched) => (
-                "not watched · start watching: dispatch start".into(),
-                "not watched",
-                true,
-                String::new(),
-            ),
-            Err(error) => (
-                format!("watching unknown: {error:#}"),
-                "watching unknown",
-                false,
-                String::new(),
-            ),
+            Ok(background::Watcher::Watched(_)) => ("watched", false),
+            Ok(background::Watcher::NotWatched) => ("not watched", true),
+            Err(_) => ("watching unknown", false),
         };
+        let status = if unwatched {
+            "not watched · start watching: dispatch start".into()
+        } else {
+            background::watcher_line(&watcher, false)
+        };
+        let mut extra = String::new();
         match crate::consent::project_root(root)
             .and_then(|project| crate::consent::consent(state, &project))
             .map(|consent| consent.describe())
@@ -809,6 +793,7 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                 &Context {
                     root: &root,
                     home: home.as_deref(),
+                    watched: !header.unwatched,
                     projection: projection.as_ref(),
                     checks: &checks,
                 },
@@ -982,17 +967,13 @@ fn refusal(run: Option<&RunRecord>, error: &anyhow::Error) -> String {
     let blocked = run
         .filter(|run| run.outcome.application == ApplicationState::BlockedBySourceDrift)
         .and_then(|run| run.coherence.as_ref()?.validity.as_ref());
-    match blocked {
-        Some(validity) if validity.decision == Decision::Refresh => format!(
-            "not applied. Stale (REFRESH){}. The source is unchanged. Next: r reject it.",
-            validity
-                .reasons
-                .first()
-                .map(|reason| format!(": {}", one_line(&reason.detail).trim_end_matches('.')))
-                .unwrap_or_default()
-        ),
-        Some(validity) if validity.decision == Decision::Stop => {
-            "not applied. STOP: its changes are already in the source. Next: r reject it.".into()
+    // The reason is on the Verdict line; the notice says what to do.
+    match blocked.map(|validity| validity.decision) {
+        Some(Decision::Refresh) => {
+            "not applied: stale (REFRESH). The source is unchanged. Next: r reject it.".into()
+        }
+        Some(Decision::Stop) => {
+            "not applied: STOP, its changes are already in the source. Next: r reject it.".into()
         }
         _ => format!("not applied: {}.", first_sentence(error)),
     }
@@ -1240,13 +1221,16 @@ fn render(frame: &mut Frame, screen: &Screen, palette: &Theme) {
                 .collect()
         })
         .unwrap_or_default();
-    let mut hint: Vec<&str> = item.map(|item| item.keys.clone()).unwrap_or_default();
-    hint.push(if wide { "↑↓ select" } else { "↑↓" });
-    hint.push("q leave");
-    let hint = Line::styled(
-        fit(&fold(&hint.join(" · "), ascii), width, ascii),
-        palette.secondary,
-    );
+    // Too long, the offered keys go from the end, then `↑↓`; `q leave` stays.
+    let mut keys: Vec<&str> = item.map(|item| item.keys.clone()).unwrap_or_default();
+    let mut tail = vec![if wide { "↑↓ select" } else { "↑↓" }, "q leave"];
+    let hint = |keys: &[&str], tail: &[&str]| fold(&[keys, tail].concat().join(" · "), ascii);
+    while hint(&keys, &tail).width() > width && tail.len() > 1 {
+        if keys.pop().is_none() {
+            tail.remove(0);
+        }
+    }
+    let hint = Line::styled(fit(&hint(&keys, &tail), width, ascii), palette.secondary);
 
     // The list: a table on wide terminals, two-line cards on narrow ones.
     let empty: Vec<String> = if screen.items.is_empty() {
@@ -1271,41 +1255,47 @@ fn render(frame: &mut Frame, screen: &Screen, palette: &Theme) {
     };
     let groups = item.map(|item| details(item, width, ascii, palette));
     let line_one = usize::from(wide && item.is_some());
-    let detail_full = groups.as_ref().map_or(0, |groups| {
-        let all = line_one + groups.iter().map(|(_, lines)| lines.len()).sum::<usize>();
-        if wide { all.min(WIDE_DETAILS) } else { all }
-    });
-    let detail_needed = groups.as_ref().map_or(0, |groups| {
-        line_one
-            + groups
+    let detail_lines = |needed: bool| {
+        groups.as_ref().map_or(0, |groups| {
+            groups
                 .iter()
-                .filter(|(rank, _)| *rank == 0)
+                .filter(|(rank, _)| (*rank == 0) == needed)
                 .map(|(_, lines)| lines.len())
                 .sum::<usize>()
-    });
-    let rules = if item.is_some() && wide { 3 } else { 2 };
-    let fixed = 2 + rules + notice.len();
-    let room = usize::from(area.height).saturating_sub(fixed);
-    let list_least = list_full.min(4);
-    let detail_height = if room >= list_full + detail_full {
-        detail_full
-    } else {
-        detail_full
-            .min(room.saturating_sub(list_least))
-            .max(detail_needed.min(room))
+        })
     };
-    let mut list_height = room.saturating_sub(detail_height).min(list_full);
-    if !wide && empty.is_empty() {
-        list_height -= list_height % 2;
+    let mut detail_full = line_one + detail_lines(true) + detail_lines(false);
+    if wide {
+        detail_full = detail_full.min(WIDE_DETAILS);
     }
-    let detail_height = detail_full.min(room.saturating_sub(list_height));
+    let detail_needed = (line_one + detail_lines(true)).min(detail_full);
+
+    // The height goes, in this order, to the column titles and the selected
+    // Work's row (or its card), its details' first line, Verdict and Next,
+    // the other rows, then the rest of the details. The header, notice and
+    // hint always show.
+    let mut room = usize::from(area.height).saturating_sub(2 + notice.len() + 1);
+    // Lines in steps of `step`: cards are two lines each.
+    let mut take = |want: usize, step: usize| {
+        let got = want.min(room) / step * step;
+        room -= got;
+        got
+    };
+    let selected_row = take(if empty.is_empty() { 2 } else { empty.len() }, 1);
+    let middle_rule = take(usize::from(item.is_some()), 1);
+    let needed = take(detail_needed, 1);
+    let card = if wide || !empty.is_empty() { 1 } else { 2 };
+    let other_rows = take(list_full.saturating_sub(selected_row), card);
+    let closing_rule = take(usize::from(wide || item.is_none()), 1);
+    let detail_height = needed + take(detail_full - detail_needed, 1);
+    let list_height = selected_row + other_rows;
 
     let mut heights = vec![1, 1, list_height];
     if item.is_some() {
-        heights.extend([1, detail_height]);
+        heights.extend([middle_rule, detail_height]);
     }
     if wide || item.is_none() {
-        heights.push(1);
+        heights.push(closing_rule);
     }
     heights.extend([notice.len(), 1]);
     let parts = Layout::vertical(
@@ -1512,7 +1502,7 @@ fn table<'a>(
 /// don't fit.
 fn touched(touches: &Touches, width: usize, ascii: bool, count: bool) -> String {
     let names = match touches {
-        Touches::Pending => return "?".into(),
+        Touches::Unknown => return "?".into(),
         Touches::Names(names) if names.is_empty() => return fold("–", ascii),
         Touches::Names(names) => names,
     };
@@ -1665,7 +1655,7 @@ fn details(
 
 /// The details within `height` lines: Began goes first, then Touches,
 /// Checks, then the verdict's extra lines. Should the rest still not fit,
-/// the verdict is cut short before Next is.
+/// wrapped lines are cut from the bottom, Next's before the verdict's.
 fn fitted(mut groups: Vec<(u8, Vec<Line<'static>>)>, height: usize) -> Vec<Line<'static>> {
     let total = |groups: &[(u8, Vec<Line>)]| groups.iter().map(|(_, l)| l.len()).sum::<usize>();
     for rank in (1..=4).rev() {
@@ -1674,16 +1664,23 @@ fn fitted(mut groups: Vec<(u8, Vec<Line<'static>>)>, height: usize) -> Vec<Line<
         }
         groups.retain(|(r, _)| *r != rank);
     }
-    while total(&groups) > height && groups.first().is_some_and(|(_, l)| l.len() > 1) {
-        groups[0].1.pop();
+    let mut excess = total(&groups).saturating_sub(height);
+    for (_, lines) in groups.iter_mut().rev() {
+        let cut = excess.min(lines.len() - 1);
+        lines.truncate(lines.len() - cut);
+        excess -= cut;
     }
-    groups.into_iter().flat_map(|(_, lines)| lines).collect()
+    groups
+        .into_iter()
+        .flat_map(|(_, lines)| lines)
+        .take(height)
+        .collect()
 }
 
 /// The details' first line: the name, how the Work came to be listed, where
-/// it is when that fits, and its ID.
+/// it is when that fits, and always its ID: the name is cut to make room.
 fn first_detail(item: &Item, width: usize, ascii: bool, palette: &Theme) -> Line<'static> {
-    let name = fold(&item.name, ascii);
+    let mut name = fold(&item.name, ascii);
     let separator = fold(" · ", ascii);
     let id = format!("{separator}Work {}", item.short);
     let origin = fold(&format!(" · {}", item.origin), ascii);
@@ -1706,6 +1703,7 @@ fn first_detail(item: &Item, width: usize, ascii: bool, palette: &Theme) -> Line
             )
         );
     }
+    name = fit(&name, width.saturating_sub(rest.width()), ascii);
     Line::from(vec![
         Span::styled(name, palette.foreground.bold()),
         Span::styled(rest, palette.foreground),
@@ -1842,6 +1840,7 @@ mod tests {
             &Context {
                 root: Path::new(ROOT),
                 home: Some(Path::new("/home/me")),
+                watched: true,
                 projection,
                 checks: &checks,
             },
@@ -2100,6 +2099,7 @@ mod tests {
             &Context {
                 root: Path::new(ROOT),
                 home: None,
+                watched: true,
                 projection: None,
                 checks: &checks,
             },
@@ -2452,31 +2452,80 @@ mod tests {
         }
     }
 
+    /// Draw `items` with `notice` about the selected Work.
+    fn draw_notice(
+        items: &[Item],
+        selected: &Item,
+        notice: (Kind, &str),
+        size: (u16, u16),
+        palette: &Theme,
+    ) -> Buffer {
+        let header = header(false);
+        let notice = Notice::new(Some(selected), notice.0, notice.1);
+        let screen = Screen {
+            header: &header,
+            items,
+            selected: Some(&selected.id),
+            notice: Some((notice.kind, notice.shown(items))),
+            ascii: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+        terminal.draw(|f| render(f, &screen, palette)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     #[test]
     fn a_notice_names_its_work_and_a_refusal_is_an_error() {
         let listed = items(&demo());
         let palette = truecolor();
-        let header = header(false);
-        let notice = Notice::new(
-            Some(&listed[1]),
-            Kind::Refused,
-            format!(
-                "not applied. Stale (REFRESH): {REASON}. The source is unchanged. Next: r reject it."
-            ),
+        let mut blocked = demo().remove(0);
+        blocked.outcome.application = ApplicationState::BlockedBySourceDrift;
+        let refused = refusal(Some(&blocked), &anyhow::anyhow!("stale"));
+        // At 60 columns the whole refusal shows, down to what to do next.
+        let buffer = draw_notice(
+            &listed,
+            &listed[1],
+            (Kind::Refused, &refused),
+            (60, 20),
+            &palette,
         );
-        let screen = Screen {
-            header: &header,
-            items: &listed,
-            selected: Some(&listed[1].id),
-            notice: Some((notice.kind, notice.shown(&listed))),
-            ascii: false,
-        };
-        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        terminal.draw(|f| render(f, &screen, &palette)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let (x, y) = find(buffer, "me-endpoint: not applied. Stale (REFRESH)").unwrap();
+        let (x, y) = find(&buffer, "me-endpoint: not applied: stale (REFRESH).").unwrap();
         assert_eq!(Some(buffer[(x, y)].fg), palette.error.fg);
-        let text = rows(buffer);
+        let text = rows(&buffer);
+        let at = usize::from(y);
+        assert_eq!(
+            format!("{} {}", text[at].trim(), text[at + 1].trim()),
+            "me-endpoint: not applied: stale (REFRESH). The source is unchanged. Next: r reject it."
+        );
+        assert!(text[at + 2].contains("q leave"), "{text:#?}");
+        let mut stop = blocked.clone();
+        judge(&mut stop, Decision::Stop, true, &[REASON]);
+        let refused = refusal(Some(&stop), &anyhow::anyhow!("stop"));
+        let text = rows(&draw_notice(
+            &listed,
+            &listed[1],
+            (Kind::Refused, &refused),
+            (60, 20),
+            &palette,
+        ))
+        .join(" ");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("me-endpoint: not applied: STOP, its changes are already in the source. Next: r reject it."),
+            "{text}"
+        );
+
+        // A longer notice is cut to two lines.
+        let long = format!("not applied: {}.", "a long reason ".repeat(10));
+        let buffer = draw_notice(
+            &listed,
+            &listed[1],
+            (Kind::Refused, &long),
+            (60, 20),
+            &palette,
+        );
+        let (_, y) = find(&buffer, "me-endpoint: not applied: a long").unwrap();
+        let text = rows(&buffer);
         let at = usize::from(y);
         assert!(text[at + 1].trim_end().ends_with('…'), "{text:#?}");
         assert!(text[at + 2].contains("q leave"), "{text:#?}");
@@ -2777,7 +2826,7 @@ mod tests {
         let mut projection = projection(&auth, &me, Vec::new());
         projection.participants[0].analysis = Analysis::Pending;
         let listed = items_with(&[auth, me], Some(&projection));
-        assert_eq!(listed[0].touches, Touches::Pending);
+        assert_eq!(listed[0].touches, Touches::Unknown);
         assert_eq!(listed[1].touches, Touches::Names(Vec::new()));
         assert!(listed[1].details.iter().all(|d| d.label != "Touches"));
         let text = rows(&draw(
@@ -2792,6 +2841,220 @@ mod tests {
             text.contains("not known yet: its files don't parse while it's being edited"),
             "{text}"
         );
+    }
+
+    /// Without a projection nothing says what Work touches: `?`, never `–`.
+    #[test]
+    fn without_a_projection_touches_are_not_known() {
+        let pair = demo_pair();
+        let checks = HashMap::new();
+        for (watched, why) in [
+            (false, "not known: the project is not watched"),
+            (true, "not known yet"),
+        ] {
+            let listed = build(
+                &pair,
+                &Context {
+                    root: Path::new(ROOT),
+                    home: None,
+                    watched,
+                    projection: None,
+                    checks: &checks,
+                },
+            );
+            assert!(listed.iter().all(|item| item.touches == Touches::Unknown));
+            assert_eq!(lines(&listed[0], "Touches"), [why]);
+            let buffer = draw(&listed, Some(&listed[0].id), (120, 30), false, &no_color());
+            let text = rows(&buffer);
+            let (touches, _) = find(&buffer, "TOUCHES").unwrap();
+            for item in &listed {
+                let (_, y) = find(&buffer, &format!(" {} ", item.name)).unwrap();
+                let row: String = text[usize::from(y)]
+                    .chars()
+                    .skip(usize::from(touches))
+                    .collect();
+                assert_eq!(row.trim(), "?", "{text:#?}");
+            }
+            assert!(
+                text.iter()
+                    .any(|row| row.trim() == format!("Touches  {why}")),
+                "{text:#?}"
+            );
+            let narrow = rows(&draw(
+                &listed,
+                Some(&listed[0].id),
+                (60, 20),
+                false,
+                &no_color(),
+            ));
+            assert!(
+                narrow
+                    .iter()
+                    .any(|row| row.trim_end().ends_with("· touches ?")),
+                "{narrow:#?}"
+            );
+        }
+        // Done Work takes no part, watched or not.
+        let applied = items(&demo()).pop().unwrap();
+        assert_eq!(applied.state, "applied");
+        assert_eq!(applied.touches, Touches::Names(Vec::new()));
+        assert!(applied.details.iter().all(|d| d.label != "Touches"));
+    }
+
+    /// However short the terminal, the selected Work's row shows, with the
+    /// header, the notice and the hint; Next's wrapped lines go before the
+    /// verdict's.
+    #[test]
+    fn a_short_terminal_still_shows_the_selected_work() {
+        let mut runs = demo();
+        runs.extend((5..9).map(|minute| {
+            working(worktree(
+                &format!("01M4DRY{minute}00000000000000000"),
+                &format!("more-{minute}"),
+                minute,
+            ))
+        }));
+        let listed = items(&runs);
+        let palette = no_color();
+        let refused = "not applied: stale (REFRESH). The source is unchanged. Next: r reject it.";
+        for item in &listed {
+            for size in [(100, 10), (60, 12), (100, 8), (60, 9), (200, 7)] {
+                let buffer = draw_notice(&listed, item, (Kind::Refused, refused), size, &palette);
+                let text = rows(&buffer);
+                assert!(
+                    find(&buffer, &format!("› {} ", item.name)).is_some(),
+                    "{size:?}: {text:#?}"
+                );
+                assert!(text[0].contains("tinyauth"), "{size:?}: {text:#?}");
+                assert!(
+                    text.iter()
+                        .any(|row| row.contains(&format!("{}: not applied", item.name))),
+                    "{size:?}: {text:#?}"
+                );
+                assert!(
+                    text.iter().any(|row| row.trim_end().ends_with("q leave")),
+                    "{size:?}: {text:#?}"
+                );
+            }
+        }
+        let me = listed
+            .iter()
+            .find(|item| item.name == "me-endpoint")
+            .unwrap();
+        let trimmed = |buffer: &Buffer| {
+            rows(buffer)
+                .iter()
+                .map(|row| row.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let buffer = draw_notice(&listed, me, (Kind::Refused, refused), (100, 10), &palette);
+        let text = trimmed(&buffer);
+        assert!(text.contains("› me-endpoint "), "{text}");
+        assert!(text.contains("Verdict  REFRESH · "), "{text}");
+        assert!(
+            text.contains("Next     It can't be accepted as is."),
+            "{text}"
+        );
+        assert!(!text.contains("current source."), "{text}");
+        // Narrow: the verdict wraps too; Next's second line goes first.
+        let text = trimmed(&draw(&listed, Some(&me.id), (60, 9), false, &palette));
+        assert!(text.contains("› me-endpoint "), "{text}");
+        assert!(
+            text.contains(
+                "Verdict  REFRESH · def validate(token): => def\n          validate(ctx, token):\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Next     It can't be accepted as is."),
+            "{text}"
+        );
+        assert!(!text.contains("current source."), "{text}");
+    }
+
+    /// Seeing every Work matters more than the optional details.
+    #[test]
+    fn every_work_is_listed_before_optional_details() {
+        let runs: Vec<RunRecord> = (1..7)
+            .map(|minute| {
+                working(worktree(
+                    &format!("01M4DRX{minute}00000000000000000"),
+                    &format!("work-{minute}"),
+                    minute,
+                ))
+            })
+            .collect();
+        let listed = items(&runs);
+        // A 60x30 terminal: the inline view is at most 20 lines tall.
+        for height in [20, 30] {
+            let buffer = draw(
+                &listed,
+                Some(&listed[0].id),
+                (60, height),
+                false,
+                &no_color(),
+            );
+            for item in &listed {
+                assert!(
+                    find(&buffer, &format!(" {} ", item.name)).is_some(),
+                    "{height}: {:#?}",
+                    rows(&buffer)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn details_line_one_ends_with_the_work_id_however_long_the_name() {
+        let name = format!("feature-{}", "x".repeat(72));
+        let listed = items(&[working(worktree("01M4DRX900000000000000000A", &name, 1))]);
+        for width in [90, 120, 200] {
+            let text = rows(&draw(
+                &listed,
+                Some(&listed[0].id),
+                (width, 30),
+                false,
+                &no_color(),
+            ));
+            let line = text
+                .iter()
+                .find(|row| row.trim_start().starts_with("feature-x") && row.contains(" · "))
+                .unwrap_or_else(|| panic!("{width}: {text:#?}"));
+            assert!(
+                line.trim_end().ends_with(" · Work 01M4DRX9"),
+                "{width}: {line}"
+            );
+            assert_eq!(line.contains(&name), width >= 100, "{width}: {line}");
+        }
+    }
+
+    #[test]
+    fn the_hint_keeps_q_leave_and_drops_offered_keys_from_the_end() {
+        let listed = items(&[ready(
+            run("01M4DRXH00000000000000000B", "t", 1),
+            Some((Decision::Continue, false)),
+        )]);
+        let hint = |width, ascii| {
+            rows(&draw(
+                &listed,
+                Some(&listed[0].id),
+                (width, 20),
+                ascii,
+                &no_color(),
+            ))
+            .into_iter()
+            .rfind(|row| row.contains("leave"))
+            .unwrap()
+            .trim()
+            .to_owned()
+        };
+        assert_eq!(
+            hint(60, false),
+            "a accept · d review · r reject · ↑↓ · q leave"
+        );
+        assert_eq!(hint(40, false), "a accept · d review · ↑↓ · q leave");
+        assert_eq!(hint(40, true), "a accept - up/down - q leave");
     }
 
     #[test]
@@ -2832,14 +3095,12 @@ mod tests {
         blocked.outcome.application = ApplicationState::BlockedBySourceDrift;
         assert_eq!(
             refusal(Some(&blocked), &error),
-            format!(
-                "not applied. Stale (REFRESH): {REASON}. The source is unchanged. Next: r reject it."
-            )
+            "not applied: stale (REFRESH). The source is unchanged. Next: r reject it."
         );
         judge(&mut blocked, Decision::Stop, true, &[REASON]);
         assert_eq!(
             refusal(Some(&blocked), &error),
-            "not applied. STOP: its changes are already in the source. Next: r reject it."
+            "not applied: STOP, its changes are already in the source. Next: r reject it."
         );
         // A stored REFRESH that the gate did not block on says nothing.
         blocked.outcome.application = ApplicationState::NotApplied;

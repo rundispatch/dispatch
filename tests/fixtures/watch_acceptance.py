@@ -35,6 +35,7 @@ UTIL = "def slug(text):\n    return text.lower()\n"
 UTIL_EDIT = "def slug(text):\n    return text.strip().lower()\n"
 ROOT = "tinyauth"
 VIEWPORT = 20  # the inline viewport is at most 20 lines tall
+SETTLED = 0.15  # a frame unchanged this long is drawn whole
 
 
 # ---------------------------------------------------------------- the screen
@@ -227,6 +228,7 @@ class Watch(Session):
         self.fed = 0
         self.ascii = "--ascii" in flags
         self.terminal_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.settled_at = None  # `fed` when the screen was last seen settled
 
     def pump(self, duration=0.05):
         super().pump(duration)
@@ -236,11 +238,42 @@ class Watch(Session):
 
     def resize(self, width, height):
         self.term.resize(width, height)
+        self.settled_at = None
         super().resize(width, height)
 
-    # What is on screen.
+    def settle_frame(self, timeout=WAIT):
+        """Wait for a whole frame before any read: its last line, the hint, is
+        drawn (`q leave`, or a confirmation's `Esc back`) and the screen stays
+        the same for SETTLED seconds. A frame is drawn top to bottom, so a
+        read in between sees half of one. Nothing new since the last settled
+        frame means it is still that frame."""
+        self.pump(0.01)
+        if self.settled_at == self.fed:
+            return
+        deadline = time.monotonic() + timeout
+        seen, since = None, time.monotonic()
+        while self.process.poll() is None:
+            now = self.term.lines()[:VIEWPORT]
+            if now != seen:
+                seen, since = now, time.monotonic()
+            else:
+                drawn = [line.strip() for line in now if line.strip()]
+                if (drawn and drawn[-1].endswith(("q leave", "Esc back"))
+                        and time.monotonic() - since >= SETTLED):
+                    self.settled_at = self.fed
+                    return
+            if time.monotonic() > deadline:
+                raise AssertionError(f"no settled frame in {timeout} s\n--- screen ---\n" + "\n".join(now))
+            self.pump()
+
+    # What is on screen: always a whole frame.
     def lines(self):
+        self.settle_frame()
         return self.term.lines()[:VIEWPORT]
+
+    def cell_lines(self):
+        self.settle_frame()
+        return self.term.cell_lines()[:VIEWPORT]
 
     def screen(self):
         return "\n".join(self.lines())
@@ -267,7 +300,7 @@ class Watch(Session):
         return lines[-1].strip() if lines else ""
 
     def column_titles(self):
-        for i, line in enumerate(self.term.cell_lines()[:VIEWPORT]):
+        for i, line in enumerate(self.cell_lines()):
             if re.search(r"\bWORK\s+AGENT\s+STATE\s+VERDICT\s+CHECKS\s+TOUCHES\b", line):
                 return i, {title: line.index(title) for title in
                            ("WORK", "AGENT", "STATE", "VERDICT", "CHECKS", "TOUCHES")}
@@ -279,7 +312,7 @@ class Watch(Session):
         if at is None:
             return []
         rows = []
-        for cell_line in self.term.cell_lines()[at + 1:VIEWPORT]:
+        for cell_line in self.cell_lines()[at + 1:]:
             text = cell_line.replace("\0", "").rstrip()
             if self.is_rule(text) or not text.strip():
                 break
@@ -790,21 +823,31 @@ def resize(binary, base):
     with project.watch(120) as watch:
         watch.until("listed", lambda: listed_order(watch, names) == names)
         select(watch, "two", names)
+        # A frame is drawn top to bottom, ending with the hint: wait for the
+        # whole frame before the next resize, so none of it lands at the new
+        # size.
+        two = f"Work {project.short('two')}"
+        watch.until("two's details", lambda: two in watch.details()
+                    and watch.hint() == "a accept · d review · r reject · ↑↓ select · q leave")
+
+        def drawn(width, selected):
+            hint = "a accept · d review · r reject · " + ("↑↓ select" if width >= 90 else "↑↓") + " · q leave"
+            watch.until(f"redrawn at {width} on {selected}", lambda: listed_order(watch, names) == names
+                        and (watch.column_titles()[0] is not None) == (width >= 90)
+                        and selected_name(watch, names) == selected and watch.hint() == hint)
+
         for width in (60, 200, 80, 90, 89, 120):
             watch.resize(width, 30)
-            watch.until(f"redrawn at {width}", lambda: listed_order(watch, names) == names
-                        and (watch.column_titles()[0] is not None) == (width >= 90))
-            assert selected_name(watch, names) == "two", (width, watch.screen())
+            drawn(width, "two")
             assert watch.term.wraps == 0, (width, watch.screen())
         # Below 40 columns: only a request to widen, and q; keys still work.
         watch.resize(39, 30)
-        watch.shows("Widen the terminal to at least 40 columns.")
-        assert watch.hint() == "q leave", watch.screen()
+        watch.until("only a request to widen", lambda: "Widen the terminal to at least 40 columns."
+                    in watch.joined() and watch.hint() == "q leave")
         watch.send("j")
-        watch.settle(0.5)
         watch.resize(60, 30)
-        watch.until("narrow", lambda: watch.column_titles()[0] is None and watch.cards())
-        assert selected_name(watch, names) == "three", ("j below 40 columns moved the selection", watch.screen())
+        # j below 40 columns moved the selection.
+        drawn(60, "three")
         watch.send("k")
         watch.until("back on two", lambda: selected_name(watch, names) == "two")
         watch.send("r")
@@ -956,7 +999,9 @@ def states_ready(binary, base):
             assert "Next " + next_text in details, (name, next_text, watch.screen())
             assert f"Work {project.short(name)}" in details, (name, watch.screen())
             assert "attached workspace" in details, (name, watch.screen())
-            assert "S0" not in watch.screen(), ("S0 leaves the rows", watch.screen())
+            # The word S0, as 0.4.10's rows said `S0 merge-base …`; a Work ID
+            # such as 01M4EES0 may contain the letters.
+            assert not re.search(r"\bS0\b", watch.screen()), ("S0 leaves the rows", watch.screen())
             assert watch.hint() == hint, (name, watch.hint(), hint)
             if name == "refresh-me":
                 assert "Or: dispatch refresh" not in details, details
@@ -1100,12 +1145,11 @@ def feedback(binary, base):
         watch.until("listed", lambda: listed_order(watch, order) == order)
         select(watch, "stale", order)
         watch.send("a")
-        watch.shows("stale: not applied. Stale (REFRESH): ")
-        watch.shows("Next: r reject it.")
+        watch.shows("stale: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.")
         assert not applied(project, "stale") and (project.root / "api.py").read_text() == source_before
         select(watch, "dup", order)
         watch.send("a")
-        watch.shows("dup: not applied. STOP: its changes are already in the source. Next: r reject it.")
+        watch.shows("dup: not applied: STOP, its changes are already in the source. Next: r reject it.")
         assert not applied(project, "dup")
         select(watch, "live", order)
         watch.send("d")
@@ -1238,8 +1282,8 @@ def short_terminal(binary, base):
     for width, height in ((60, 12), (100, 10)):
         with project.watch(width, height) as watch:
             watch.until("the selected Work on screen", lambda: watch.selected(), timeout=15)
-            watch.send("a")  # refused: a two-line notice
-            watch.shows("me-endpoint: not applied. Stale (REFRESH)")
+            watch.send("a")  # refused: a notice of up to two lines, shown whole
+            watch.shows("me-endpoint: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.")
             watch.settle()
             assert watch.selected() and selected_name(watch, order) == "me-endpoint", \
                 (width, height, "the selection is off screen", watch.screen())
@@ -1248,17 +1292,42 @@ def short_terminal(binary, base):
 
 
 def narrowest_hint(binary, base):
-    """§3.8: the hint is the offered keys, then `↑↓ · q leave`, at 40 columns too."""
+    """§3.8: the hint is the offered keys, then `↑↓ · q leave`, at 40 columns too.
+    The whole hint is 45 cells; what does not fit in 40 columns goes from the
+    end of the offered keys, and `q leave` always stays (0.4.11 A2, fix 3)."""
     project = Project(binary, base)
     project.attach("ready-one")
     project.edit("ready-one", "ready.py", "READY = 1\n")
     project.finish("ready-one")
-    with project.watch(40) as watch:
+    with project.watch(60) as watch:
         watch.until("drawn", lambda: watch.cards())
         watch.settle()
         assert watch.hint() == "a accept · d review · r reject · ↑↓ · q leave", (watch.hint(), watch.screen())
         watch.leave()
+    with project.watch(40) as watch:
+        watch.until("drawn", lambda: watch.cards())
+        watch.settle()
+        assert watch.hint() == "a accept · d review · ↑↓ · q leave", (watch.hint(), watch.screen())
+        watch.leave()
     print("PASS narrowest-hint")
+
+
+def six_cards(binary, base):
+    """Every Work is listed before the optional details: six Work at 60x30
+    (a view at most 20 lines tall) show all six cards (0.4.11 A2, fix 4)."""
+    project = Project(binary, base)
+    names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+    for name in names:
+        project.attach(name)
+    with project.watch(60, 30) as watch:
+        watch.until("six cards", lambda: listed_order(watch, names) == names
+                    and watch.hint().endswith("q leave"))
+        assert len(watch.cards()) == 6, watch.screen()
+        assert selected_name(watch, names) == "alpha", watch.screen()
+        assert "Verdict not checked yet" in watch.details(), watch.screen()
+        assert "Next When the agent is done, f finish: freezes its changes." in watch.details(), watch.screen()
+        watch.leave()
+    print("PASS six-cards")
 
 
 def unwatched(binary, base):
@@ -1276,7 +1345,12 @@ def unwatched(binary, base):
         header = watch.lines()[0]
         assert re.match(r"^ ?tinyauth · not watched · start watching: dispatch start(\s|$)", header), header
         check_row(watch, "pending", "ready", "not checked", True)
+        # Unknown stays unknown: nothing computes interactions (0.4.11 A2, fix 5).
+        _, titles = watch.column_titles()
+        for name in order:
+            assert row_of(watch, name)[1][titles["TOUCHES"]:].strip() == "?", (name, watch.screen())
         details = watch.details()
+        assert "Touches not known: the project is not watched" in details, details
         assert "Verdict not checked yet" in details, details
         assert "Next a accept: Dispatch checks it against the source first." in details, details
         hint = watch.hint()
@@ -1445,7 +1519,7 @@ SCENARIOS = {
     "states-ready": states_ready, "states-live": states_live, "interactions": interactions,
     "feedback": feedback, "no-color": no_color, "ascii": ascii_mode, "empty": empty, "plain": plain,
     "unwatched": unwatched, "long-name-detail": long_name_detail, "short-terminal": short_terminal,
-    "narrowest-hint": narrowest_hint, "refusal-other": refusal_other,
+    "narrowest-hint": narrowest_hint, "refusal-other": refusal_other, "six-cards": six_cards,
 }
 
 

@@ -239,7 +239,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             ui.send('r');screen.see('Reject Make the second artifact (Work %s)?'%short(other,stale))
             ui.send('\x1b');screen.see('Make the second artifact: nothing changed.')
             screen.resize(200,30);ui.send('k');screen.see('› Make the first artifact','r reject · d review')
-            ui.send('a');screen.see('Make the first artifact: not applied. Stale (REFRESH)')
+            ui.send('a');screen.see('Make the first artifact: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.')
             # Refused: nothing applied, and the refusal is recorded as such.
             assert meta(stale)['outcome']['application']=='blocked_by_source_drift',meta(stale)['outcome']
             assert (tiny/'dispatch-fake-good.txt').read_text()=="someone else's\n"

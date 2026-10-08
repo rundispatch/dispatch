@@ -176,7 +176,13 @@ pub(crate) fn project_line(state: &State, root: &Path) -> String {
 
 /// One line on who watches `root`, for `watch` and `status`.
 pub(crate) fn describe(state: &State, root: &Path) -> String {
-    match watcher(state, root) {
+    watcher_line(&watcher(state, root), true)
+}
+
+/// `describe`'s line for what `watcher` found; the interactive `watch`
+/// leaves out the pid.
+pub(crate) fn watcher_line(watcher: &Result<Watcher>, pid: bool) -> String {
+    match watcher {
         Ok(Watcher::Watched(Some(record))) => {
             let how = if record.background {
                 "in the background"
@@ -184,7 +190,10 @@ pub(crate) fn describe(state: &State, root: &Path) -> String {
                 "by dispatch serve"
             };
             let since = record.started_at.with_timezone(&Local).format("%H:%M");
-            let mut line = format!("watched {how} since {since} (pid {})", record.identity.pid);
+            let mut line = format!("watched {how} since {since}");
+            if pid {
+                line.push_str(&format!(" (pid {})", record.identity.pid));
+            }
             if record.dispatch_version != VERSION {
                 line.push_str(&format!(
                     "; it runs Dispatch {}, this is {VERSION}: dispatch stop && dispatch start",
@@ -354,4 +363,61 @@ pub fn stop(state: &State, root: Option<PathBuf>) -> Result<()> {
 #[cfg(not(unix))]
 pub fn stop(_state: &State, _root: Option<PathBuf>) -> Result<()> {
     anyhow::bail!("watching in the background needs a Unix system")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `describe` says exactly what it said before `watch` shared its line.
+    #[test]
+    fn describe_is_unchanged_and_watch_leaves_out_the_pid() {
+        let home = tempfile::TempDir::new().unwrap();
+        let state = State {
+            root: home.path().join("state"),
+        };
+        let root = home.path().join("project");
+        assert_eq!(describe(&state, &root), "not watched · dispatch start");
+
+        let _lock = acquire(&state, &root).unwrap();
+        assert_eq!(
+            describe(&state, &root),
+            "watched by a Dispatch process that left no record"
+        );
+        write_record(&state, &root, true).unwrap();
+        let record = read_record(&state, &root).unwrap();
+        let since = record.started_at.with_timezone(&Local).format("%H:%M");
+        let pid = std::process::id();
+        assert_eq!(
+            describe(&state, &root),
+            format!("watched in the background since {since} (pid {pid})")
+        );
+        assert_eq!(
+            watcher_line(&watcher(&state, &root), false),
+            format!("watched in the background since {since}")
+        );
+
+        let mut record = record;
+        record.background = false;
+        record.dispatch_version = "0.0.1".into();
+        write_atomically(
+            &record_path(&state, &root),
+            &serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        let mismatch =
+            format!("; it runs Dispatch 0.0.1, this is {VERSION}: dispatch stop && dispatch start");
+        assert_eq!(
+            describe(&state, &root),
+            format!("watched by dispatch serve since {since} (pid {pid}){mismatch}")
+        );
+        assert_eq!(
+            watcher_line(&watcher(&state, &root), false),
+            format!("watched by dispatch serve since {since}{mismatch}")
+        );
+        assert_eq!(
+            watcher_line(&Err(anyhow::anyhow!("no probe")), true),
+            "watching unknown: no probe"
+        );
+    }
 }
