@@ -12,7 +12,8 @@ of the product. The technical reference is [coherence.md](coherence.md).
 | A finished result is validated against the source as it is now, and a stale result is never applied | Shipped; `tests/coherence_accept.rs`, `tests/coherence_cli.rs` |
 | Verdicts carry reasons, including the old and new declaration for a broken symbol fact | Shipped for Rust and Python; file-level facts elsewhere |
 | Zero false CONTINUE and zero false REFRESH on the fixture matrix | True for the 36 scenarios in `tests/coherence_matrix.rs`, each on a Git and a plain-directory source |
-| Agents need no protocol; nothing is locked; no daemon or index | Shipped |
+| Agents need no protocol; nothing is locked; no index | Shipped |
+| Watching runs as one local background process per project (`dispatch start`, stopped by `dispatch stop`). It keeps verdicts current and applies only attached Work allowed to integrate; it never launches, refreshes or discovers agents. Since 0.4.7 there is a background process, so "no daemon" is no longer claimed | Shipped; `tests/background.rs` |
 | Mid-run detection, and cancellation with `mid_run: stop` | Implemented for allocation runs; observe-only by default; no real run has been stopped |
 | Tokens, minutes or money saved | Not claimed. Only wall-clock time after the first invalid verdict is recorded, and it is not cost |
 | Works across languages | Not claimed. Symbol facts exist for `.rs` and `.py` only |
@@ -21,6 +22,9 @@ of the product. The technical reference is [coherence.md](coherence.md).
 | Two runs finishing against one source serialize on the source lock and the second is re-judged against the new world; an edit during integration checks is fenced and re-validated once | Shipped; `tests/auto_apply_concurrency.rs` |
 | Work done by an external agent in its own worktree is judged by the same coherence model as Dispatch-launched work; S0 is the Git merge base with full confidence, or a snapshot at attach with partial confidence | Shipped; `tests/attach_cli.rs`, `tests/attach_wrapped.rs`, `tests/attach_scenarios.rs`; real-agent attach with Claude Code (`claude-sonnet-5`) on 2026-09-22 (`248c09d`) |
 | A repo-scoped foreground loop re-evaluates foreign attached work when the root moves and applies eligible work through the same auto-apply path | Shipped; `tests/serve.rs`, `tests/attach_scenarios.rs` |
+| While a project is watched, Work not yet integrated is compared and interactions are reported: the same declaration or file, textual overlap, a contract one changes and the other uses, a file one changes and the other relies on. Advisory: no verdict changes and nothing is blocked | Shipped in 0.4.8; exact to the declaration for Rust and Python, to the file elsewhere; `tests/interactions.rs` |
+| How often a reported interaction is followed by an invalid verdict is measured locally | Shipped in 0.4.9; `tests/measurement_landing.rs`, `tests/measurement_queries.rs`. No results from real use are published, and "invalidated" is Dispatch's own later verdict, not a confirmed conflict |
+| Every eligible runtime session in a watched project ends registered, pending or told it is not tracked, with no half-created Work | Shipped in 0.4.10; `tests/runtime_registration.rs`, `tests/runtime_hooks.rs`; stress trial in `docs/plan-0.4.10.md` |
 
 Every public statement must fit this table. When a row changes, change the
 README and the website in the same release.

@@ -14,8 +14,9 @@ only protection was a whole-tree content hash: any difference (except `.git` and
 
 Coherence treats finished work as an optimistic transaction. It asks whether the work
 is still valid against the source **as it is now**, using only what the run already
-stores. It adds no database table, no daemon, no index and no change to how agents are
-launched or admitted. It never starts an agent by itself.
+stores. It adds no database table and no index, needs no background process of its
+own (watching, with `dispatch start`, re-runs the same check as the code moves), and
+does not change how agents are launched or admitted. It never starts an agent by itself.
 
 ## Model
 

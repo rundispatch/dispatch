@@ -672,9 +672,10 @@ directory, exactly as it already refuses any newer schema.
 
 ## Known limits
 
-- No socket and no daemon: coordination is SQLite (WAL, revision-fenced projections)
-  plus `flock` files; `serve` discovers new or changed Work on its next tick (at most
-  `poll_secs`, default 10 s). This is adequate for work measured in minutes to hours,
+- No socket and no push: `dispatch start` runs one local background process per
+  project (`serve --background`), and it coordinates with every other command through
+  SQLite (WAL, revision-fenced projections) plus `flock` files. `serve` discovers new
+  or changed Work on its next tick (at most `poll_secs`, default 10 s). This is adequate for work measured in minutes to hours,
   not for sub-second push updates.
 - Interactions between Work are advisory, exist only while an owner watches the
   project, and never change a verdict or block anything.
