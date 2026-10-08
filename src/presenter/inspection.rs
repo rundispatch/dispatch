@@ -249,7 +249,7 @@ impl Ui {
                         return Ok(Input::Eof);
                     }
                     // Never submits or edits the typed action; redraw shows the flip.
-                    KeyCode::BackTab => {
+                    KeyCode::BackTab if self.auto_apply_mode => {
                         self.auto_apply = !self.auto_apply;
                     }
                     KeyCode::Char(c) if c.is_ascii_alphabetic() && action.len() < 12 => {

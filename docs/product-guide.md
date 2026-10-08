@@ -329,22 +329,38 @@ repository, and returns your shell. The owner:
   moves, native or attached;
 - applies the attached work you marked `--auto-apply` once it is ready and coherent.
 
-**`dispatch watch`** shows a one-line-per-run project view,
-`<id> · agent · CONTINUE/REFRESH/STOP · working/question/ready/applied/blocked · reason`,
-under a line saying who watches. It redraws in place as things change, and leaving
-it does not stop watching. On a terminal, ↑/↓ select a row and a key acts on it
-as the command would:
-- `f` finishes attached Work, asking first before running checks nobody has
-  allowed;
-- `a` accepts, through the same gate as `dispatch accept`;
-- `r` rejects, after asking, with focus on Cancel;
+**`dispatch watch`** shows the project view under a line saying who watches. It
+redraws as things change, and leaving it does not stop watching. Piped, or with
+`--plain` or `--json`, it prints one line per run,
+`<id> · agent · CONTINUE/REFRESH/STOP · working/question/ready/applied/blocked · reason`.
+
+On a terminal it is a table: WORK, AGENT, STATE, VERDICT, CHECKS and TOUCHES,
+one row per Work. Work is named by its worktree folder, else its task, else its
+short ID. Work that needs you (a question, ready, blocked, a removed or lost
+worktree) comes first, then Work in progress, then Work that is done, which
+shows `–` as its verdict. Below the table, the selected Work's details: how it
+came to be listed, its verdict and reasons (or how it landed), its checks, the
+Work it touches, what it began against (a Dispatch snapshot is called that, not
+a commit), and the next thing to do. Below 90 columns each Work is a two-line
+card. The selection follows the Work, not the row: if the selected Work leaves
+the list, the next key only says where the selection went. ↑/↓ select, and a
+key acts on the selected Work as the command would; the bottom line offers the
+keys that apply:
+- `f` finishes attached Work, asking first, naming it, before running checks
+  nobody has allowed;
+- `a` accepts, through the same gate as `dispatch accept`; a refusal names the
+  Work, its verdict's reason and what to do instead;
+- `r` rejects, after asking, naming it, with focus on Cancel;
 - `d` or Enter opens the review;
 - `q` leaves.
 
-A row ends with `interacts with <id>` when that Work already touches other Work
-not yet integrated, and the selected row's `Concurrent` lines say how, for
-example "it changes the signature of validate (auth.py), which this Work uses".
-`dispatch status` shows the same section. This is advisory and separate from
+`NO_COLOR`, `--no-color` and `--ascii` work as everywhere else; color only
+repeats what the words say.
+
+The TOUCHES column names the other Work not yet integrated that this Work
+already touches, and the selected Work's details say how, naming both, for
+example "auth-ctx changes the signature of validate (auth.py), which me-endpoint
+uses". `dispatch status` shows the same section. This is advisory and separate from
 the verdict: it blocks nothing, and once one piece lands the other is judged
 against the project as before. **`dispatch stop`** ends watching. `dispatch serve` is
 the same owner in the foreground, with the view.
