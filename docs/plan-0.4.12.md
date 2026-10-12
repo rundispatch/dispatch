@@ -518,3 +518,45 @@ CLI reasons: `unfinished`, `workspace-removed`, `already-present`, `superseded`
 (stored snake_case). `already-present` requires the existing reverse-apply check
 to pass in current source; `superseded` requires `--replacement <id>` naming
 different, finished Work whose Δ was retained.
+
+### Execution arrangement as run
+
+- `dispatch.yml` in the clone: `cargo fmt --check`, `cargo clippy --all-targets
+  -- -D warnings`, `cargo test` (the full suite, per §5), `coherence.poll_secs: 5`.
+- Build caches: each managed workspace keeps the default `target/`. That changes
+  §5's "outside source" wording on purpose. Managed workspaces live under the
+  supervision state, outside the integration root, so nothing walks them; `/target/` is
+  ignored by the tracked `.gitignore`, so it never enters S0 or Δ
+  (`validate_candidate_tree` and `collect_diff` list with `--exclude-standard`);
+  and `finish` reuses the worker's own build in the same workspace. Merged-tree
+  checks at accept build from nothing in their scratch tree.
+- The clone's `.claude/settings.local.json` holds only a permission allowlist
+  (cargo, read-only git, search, the prompt/handoff directories); no hooks, no
+  `worktree` setting. Claude Code applied it in the managed workspace (a linked
+  worktree of the clone).
+- Workers: `herdr pane run` of the supervisor's
+  `attach --root <clone> --agent claude --allow-unsafe-local -- claude
+  --permission-mode acceptEdits`, so edits inside the workspace are accepted and
+  every other command not on the allowlist asks; the integrator approves each
+  after reading it. Prompts: `~/dispatch-dev/prompts-0412/`; handoffs:
+  `~/dispatch-dev/handoffs-0412/`.
+- Plan edits during a packet are kept outside the clone and committed between
+  packets, so the integration source does not move under a running worker.
+
+### P1
+
+| Item | Value |
+|---|---|
+| Work | `01M4RH6MSGJH5TS4QZJC96V0QA`, wrapped, workspace `state-0412/workspaces/01M4RH6MSGJH5TS4QZJC96V0QA`, branch `dispatch/01m4rh6msgjh5ts4qzjc96v0qa` |
+| Agent | Claude Code (interactive), model and effort the user's defaults (Opus 5.5, xhigh); usage unknown unless reported |
+| Prompt | `prompts-0412/p1.md` |
+| Started | 2026-10-12 11:0x local |
+| Handoff | `handoffs-0412/p1.md` |
+| Approvals | Each non-allowlisted command was read and approved once. From about 11:30 to 11:35 the worker ran in Claude Code's auto mode: approving a three-option dialog with Enter selected "switch to auto mode". 23 commands ran unapproved in that window, all cargo fmt/clippy/test, read-only git/sed/grep/ls, and the candidate's `close --help`; none wrote outside the workspace or its scratchpad. Mode restored to accept-edits; approvals since are sent as the key `1`, after confirming the dialog is on screen |
+| Integrator review | Two changes requested and made: `close` refuses while a watching owner has not yet kept a vanished workspace's last-seen changes (unwatched, it closes and says nothing was kept); `--replacement` refuses closed or rejected Work |
+| Worker validation | fmt, clippy pass; `cargo test` 634 passed, 0 failed, 5 ignored (run 2; run 1 before review changes: 633/0/5); R1's test fails on a `git archive` export of the old code |
+| Independent validation | Workspace diff applied to a `git archive` of the clone's HEAD, own `CARGO_TARGET_DIR`: fmt, clippy pass; `cargo test` 634 passed, 0 failed, 5 ignored. P0 script against this build: R1's summary names A in every command and the ID-less accept refuses, listing A and B, source untouched; R5's STOP names `dispatch close <id> --reason already-present`; closing R5 records one `work.closed` and no `review.*` event, and `reject` then refuses. R2 and R4 unchanged (P2) |
+| Production LOC | `src/` +611 / −144, net +467 (worker's count, excluding `#[cfg(test)]`) |
+| Dispatch finish checks | fmt, clippy passed; `cargo test` **failed** once: `runtime_hooks::an_empty_worktree_that_vanishes_unannounced_closes_with_no_changes` timed out waiting for the owner (suite took 34.8 s against about 7 s normally). The test predates P1 and P1 does not change it; it sleeps a fixed 3 s and assumes the owner followed the worktree by then. Reruns on P1's build: the test alone 6/6 passed, the `runtime_hooks` suite 3/3 passed. Recorded as a timing flake; its fix is in P2 |
+| Frozen Δ | Applied to a fresh `git archive` of HEAD, its tree (`3e5751d`) equals the reviewed and independently validated tree |
+| Decision | Accepted by the human with the flaky failure on record (2026-10-12); `check` CONTINUE, world unchanged; applied 16 files; committed as `b1f97d7` |
