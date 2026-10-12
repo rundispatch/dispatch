@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::{ApplyOutcome, WorkLine, apply, auto_apply, persist_event, work_line};
+use super::{ApplyOutcome, WorkLine, apply, auto_apply, awaits_review, persist_event, work_line};
 use crate::{
     ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReviewState,
     RunMode, RunRecord, SourceKind, Validity, WorkResult,
@@ -1009,11 +1009,6 @@ fn awaits_finish_by_consent(run: &RunRecord) -> bool {
             .as_ref()
             .and_then(|attachment| attachment.workspace_removed.as_ref())
             .is_some_and(|removal| removal.exact)
-}
-
-/// A Ready result nobody has accepted, rejected or applied yet.
-fn awaits_review(run: &RunRecord) -> bool {
-    run.outcome.review == ReviewState::Pending && coherence::is_ready_unapplied(run)
 }
 
 /// Whether the owner stores `validity` over `stored`: when it says something

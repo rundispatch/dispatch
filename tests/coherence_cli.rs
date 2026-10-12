@@ -181,8 +181,12 @@ fn check_stops_when_the_patch_is_already_in_the_source() {
 
     assert!(stdout.contains("Coherence: STOP"), "{stdout}");
     assert!(stdout.contains("already_applied: "), "{stdout}");
+    // Landed changes are closed, not rejected: no human judgment of them.
     assert!(
-        stdout.contains(&format!("Next: dispatch reject {}", fixture.run_id)),
+        stdout.contains(&format!(
+            "Next: dispatch close {} --reason already-present",
+            fixture.run_id
+        )),
         "{stdout}"
     );
 }

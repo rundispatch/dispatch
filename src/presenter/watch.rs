@@ -20,6 +20,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use super::*;
+use crate::CloseReason;
 use crate::coherence::interactions::{
     Analysis, Change, Interaction, Projection, Rule, Side, Target,
 };
@@ -38,6 +39,7 @@ const ACCEPT: &str = "a accept";
 const REJECT: &str = "r reject";
 const REVIEW: &str = "d review";
 const FINISH: &str = "f finish";
+const CLOSE: &str = "c close";
 
 /// What a piece of text is colored with; the words always say the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +182,7 @@ fn item(
     let state = line.state;
     let group = match state {
         "working" | "idle" => Group::InProgress,
-        "applied" | "rejected" | "finished" => Group::Done,
+        "applied" | "rejected" | "closed" | "finished" => Group::Done,
         _ => Group::NeedsYou,
     };
     let verdict = match line.verdict {
@@ -210,6 +212,19 @@ fn item(
     match state {
         "applied" => details.push(Detail::new("Landed", landed(run, &line), 0)),
         "rejected" => details.push(Detail::new("Outcome", "Rejected · nothing was applied", 0)),
+        "closed" => {
+            let closed = run.outcome.closed.as_ref();
+            let mut lines = vec![format!(
+                "Closed: {} · nothing was applied",
+                closed.map(|closed| closed.describe()).unwrap_or_default()
+            )];
+            lines.extend(closed.and_then(|closed| closed.explanation.as_deref().map(one_line)));
+            details.push(Detail {
+                label: "Outcome",
+                lines,
+                rank: 0,
+            });
+        }
         "finished" => details.push(Detail::new("Outcome", "Ended without a result", 0)),
         _ => {
             let mut lines = match line.verdict {
@@ -403,22 +418,22 @@ fn next(
             vec![],
         ),
         "idle" => (
-            "No session is open. f finish to freeze its changes, or resume the session in its worktree."
+            "Its session ended. f finish to freeze its changes, or resume the session in its worktree. Or c close it."
                 .into(),
-            vec![FINISH],
+            vec![FINISH, CLOSE],
         ),
         "removed" => (
-            "Its worktree was removed and its exact changes were kept. f finish to check them."
+            "Its worktree was removed and its exact changes were kept. f finish to check them, or c close it."
                 .into(),
-            vec![FINISH],
+            vec![FINISH, CLOSE],
         ),
         "lost" => (
-            "Its worktree is gone; only its last-seen changes were kept. f finish to freeze them, then review."
+            "Its worktree is gone; only its last-seen changes were kept, and they cannot be finished. c close it."
                 .into(),
-            vec![FINISH],
+            vec![CLOSE],
         ),
         "applied" => (format!("Nothing to do: it is in {root}."), vec![]),
-        "rejected" | "finished" => ("Nothing to do.".into(), vec![]),
+        "rejected" | "closed" | "finished" => ("Nothing to do.".into(), vec![]),
         // Ready, or blocked: what accepting it would do.
         _ if verdict == "REFRESH" => {
             let mut text = "It can't be accepted as is. r reject it, then run the agent again from the current source.".to_owned();
@@ -428,8 +443,8 @@ fn next(
             (text, vec![REJECT, REVIEW])
         }
         _ if verdict == "STOP" => (
-            "Its changes are already in the source. r reject it.".into(),
-            vec![REJECT],
+            "Its changes are already in the source. c close it.".into(),
+            vec![CLOSE],
         ),
         _ if checks == "failed" => (
             "Its checks failed. d review the output, then a accept or r reject.".into(),
@@ -841,7 +856,7 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Char(c @ ('a' | 'r' | 'f' | 'd')) => c.to_string(),
+            KeyCode::Char(c @ ('a' | 'r' | 'f' | 'd' | 'c')) => c.to_string(),
             KeyCode::Enter => "Enter".to_owned(),
             // Shift+Tab included: watch has no auto-apply mode.
             _ => continue,
@@ -863,8 +878,9 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
         };
         notice = match action.as_str() {
             "a" => Some(accept(state, &root, &item)),
-            "r" => Some(reject(&mut ui, state, &root, &item).await?),
+            "r" => Some(reject(&mut ui, state, &root, &run, &item).await?),
             "f" => Some(finish(&mut ui, state, &run, &item).await?),
+            "c" => Some(close(&mut ui, state, &run, &item).await?),
             _ if run.outcome.review == ReviewState::Pending
                 && run.outcome.work_result == WorkResult::Ready =>
             {
@@ -973,14 +989,28 @@ fn refusal(run: Option<&RunRecord>, error: &anyhow::Error) -> String {
             "not applied: stale (REFRESH). The source is unchanged. Next: r reject it.".into()
         }
         Some(Decision::Stop) => {
-            "not applied: STOP, its changes are already in the source. Next: r reject it.".into()
+            "not applied: STOP, its changes are already in the source. Next: c close it.".into()
         }
         _ => format!("not applied: {}.", first_sentence(error)),
     }
 }
 
 /// `r`: `dispatch reject`, once the person says so; Enter alone cancels.
-async fn reject(ui: &mut Ui, state: &State, root: &Path, item: &Item) -> Result<Notice> {
+/// Unfinished Work has no result to reject: that refusal comes first.
+async fn reject(
+    ui: &mut Ui,
+    state: &State,
+    root: &Path,
+    run: &RunRecord,
+    item: &Item,
+) -> Result<Notice> {
+    if let Err(error) = orchestrator::ensure_rejectable(run) {
+        return Ok(Notice::new(
+            Some(item),
+            Kind::Refused,
+            format!("not rejected: {}.", first_sentence(&error)),
+        ));
+    }
     let question = format!(
         "Reject {} (Work {})? Nothing is applied, and a workspace Dispatch made is kept.",
         item.name, item.short
@@ -1007,6 +1037,75 @@ async fn reject(ui: &mut Ui, state: &State, root: &Path, item: &Item) -> Result<
             ),
         },
     )
+}
+
+/// `c`: `dispatch close`, once the person has chosen why and confirmed;
+/// Enter alone cancels either question. Superseding names the Work that
+/// replaces it, so it stays a typed command.
+async fn close(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Result<Notice> {
+    let reasons = match orchestrator::attach::close_reasons(run) {
+        Ok(reasons) => reasons,
+        Err(error) => {
+            return Ok(Notice::new(
+                Some(item),
+                Kind::Refused,
+                format!("not closed: {}.", first_sentence(&error)),
+            ));
+        }
+    };
+    let reasons: Vec<(CloseReason, &str)> = reasons
+        .into_iter()
+        .filter_map(|reason| match reason {
+            CloseReason::Unfinished => Some((reason, "Unfinished: nobody will finish it")),
+            CloseReason::WorkspaceRemoved => Some((reason, "Workspace removed: it is gone")),
+            CloseReason::AlreadyPresent => {
+                Some((reason, "Already present: its changes are in the source"))
+            }
+            CloseReason::Superseded => None,
+        })
+        .collect();
+    let mut rows: Vec<Choice> = reasons
+        .iter()
+        .map(|(_, label)| Choice::new(*label))
+        .collect();
+    rows.push(Choice::new("Cancel"));
+    let question = format!(
+        "Why close {} (Work {})? Closing records no review.",
+        item.name, item.short
+    );
+    let Some(&(reason, label)) = ui
+        .select(&question, &rows, reasons.len())
+        .await?
+        .and_then(|chosen| reasons.get(chosen))
+    else {
+        return Ok(Notice::new(Some(item), Kind::Info, "nothing changed."));
+    };
+    let question = format!(
+        "Close {} (Work {})? {label}. Nothing is applied, rejected or deleted.",
+        item.name, item.short
+    );
+    let rows = [Choice::new("Close"), Choice::new("Cancel")];
+    if ui.select(&question, &rows, 1).await? != Some(0) {
+        return Ok(Notice::new(Some(item), Kind::Info, "nothing changed."));
+    }
+    let request = orchestrator::attach::CloseRequest {
+        run_id: item.id.clone(),
+        reason,
+        replacement: None,
+        explanation: None,
+    };
+    Ok(match orchestrator::attach::close(state, request) {
+        Ok(_) => Notice::new(
+            Some(item),
+            Kind::Done,
+            "closed; no review was recorded and nothing was applied.",
+        ),
+        Err(error) => Notice::new(
+            Some(item),
+            Kind::Refused,
+            format!("not closed: {}.", first_sentence(&error)),
+        ),
+    })
 }
 
 /// `f`: `dispatch finish` for active attached Work. Running the project's
@@ -1958,6 +2057,14 @@ mod tests {
         applied.outcome.applied_by = Some(crate::AppliedBy::Human);
         let mut rejected = ready(run(id, "t", 1), None);
         rejected.outcome.review = ReviewState::Rejected;
+        let mut closed = ready(run(id, "t", 1), Some((Decision::Stop, true)));
+        closed.outcome.review = ReviewState::NotRequested;
+        closed.outcome.closed = Some(crate::Closure {
+            reason: CloseReason::AlreadyPresent,
+            at: chrono::Utc::now(),
+            replacement: None,
+            explanation: None,
+        });
         let mut advisory = working(worktree(id, "wt", 1));
         judge(&mut advisory, Decision::Refresh, true, &[REASON]);
         let mut question = working(run(id, "t", 1));
@@ -2012,8 +2119,8 @@ mod tests {
                 ready(run(id, "t", 1), Some((Decision::Stop, true))),
                 "blocked",
                 "STOP",
-                "Its changes are already in the source. r reject it.",
-                &[REJECT],
+                "Its changes are already in the source. c close it.",
+                &[CLOSE],
             ),
             (
                 failed,
@@ -2055,23 +2162,24 @@ mod tests {
                 idle,
                 "idle",
                 "not checked",
-                "No session is open. f finish to freeze its changes, or resume the session in its worktree.",
-                &[FINISH],
+                "Its session ended. f finish to freeze its changes, or resume the session in its worktree. Or c close it.",
+                &[FINISH, CLOSE],
             ),
             (
                 removed(true),
                 "removed",
                 "not checked",
-                "Its worktree was removed and its exact changes were kept. f finish to check them.",
-                &[FINISH],
+                "Its worktree was removed and its exact changes were kept. f finish to check them, or c close it.",
+                &[FINISH, CLOSE],
             ),
             (
                 removed(false),
                 "lost",
                 "not checked",
-                "Its worktree is gone; only its last-seen changes were kept. f finish to freeze them, then review.",
-                &[FINISH],
+                "Its worktree is gone; only its last-seen changes were kept, and they cannot be finished. c close it.",
+                &[CLOSE],
             ),
+            (closed, "closed", "–", "Nothing to do.", &[]),
         ];
         for (run, state, verdict, next, keys) in cases {
             let item = items(&[run]).remove(0);
@@ -2191,6 +2299,25 @@ mod tests {
         assert_eq!(
             lines(&items(&[rejected])[0], "Outcome"),
             ["Rejected · nothing was applied"]
+        );
+
+        // Closing is not a review: it says why, in the person's words too.
+        let mut closed = ready(run(id, "t", 1), None);
+        closed.outcome.review = ReviewState::NotRequested;
+        closed.outcome.closed = Some(crate::Closure {
+            reason: CloseReason::Superseded,
+            at: chrono::Utc::now(),
+            replacement: Some("01M4DRXH00000000000000000C".into()),
+            explanation: Some("the  repaired\nworkspace".into()),
+        });
+        let closed = items(&[closed]);
+        assert_eq!(closed[0].group, Group::Done);
+        assert_eq!(
+            lines(&closed[0], "Outcome"),
+            [
+                "Closed: superseded by 01M4DRXH00000000000000000C · nothing was applied",
+                "the repaired workspace"
+            ]
         );
 
         let mut failed = ready(run(id, "t", 1), None);
@@ -2511,7 +2638,7 @@ mod tests {
         .join(" ");
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            text.contains("me-endpoint: not applied: STOP, its changes are already in the source. Next: r reject it."),
+            text.contains("me-endpoint: not applied: STOP, its changes are already in the source. Next: c close it."),
             "{text}"
         );
 
@@ -3100,7 +3227,7 @@ mod tests {
         judge(&mut blocked, Decision::Stop, true, &[REASON]);
         assert_eq!(
             refusal(Some(&blocked), &error),
-            "not applied: STOP, its changes are already in the source. Next: r reject it."
+            "not applied: STOP, its changes are already in the source. Next: c close it."
         );
         // A stored REFRESH that the gate did not block on says nothing.
         blocked.outcome.application = ApplicationState::NotApplied;

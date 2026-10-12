@@ -189,8 +189,8 @@ fn removed(state: &State, workspace: &Path) -> Result<Reply> {
         )
     } else {
         format!(
-            "Dispatch kept this worktree's changes as Work {id}; \
-             finish or reject it: dispatch finish {run_id} or dispatch reject {run_id}."
+            "Dispatch kept this worktree's changes as Work {id}; finish it, or close it: \
+             dispatch finish {id} or dispatch close {id} --reason workspace-removed."
         )
     }))
 }

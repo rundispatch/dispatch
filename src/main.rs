@@ -195,10 +195,14 @@ enum Command {
         #[arg(long, conflicts_with = "stat")]
         name_only: bool,
     },
-    /// Accept and safely apply the latest single result.
+    /// Accept and safely apply a result; without an ID, the only one waiting.
     Accept(AcceptArgs),
-    /// Reject the latest single result without changing the source tree.
+    /// Reject a result without changing the source tree; without an ID, the
+    /// only one waiting.
     Reject(ReviewArgs),
+    /// Close Work without judging it: no review is recorded, and nothing is
+    /// applied, committed or deleted.
+    Close(CloseArgs),
     /// Print the Dispatch version.
     Version,
 }
@@ -334,6 +338,12 @@ struct FeedbackArgs {
     #[arg(long = "reason")]
     reasons: Vec<String>,
 
+    #[command(flatten)]
+    explanation: ExplanationArgs,
+}
+
+#[derive(Debug, Args)]
+struct ExplanationArgs {
     /// Optional unrestricted explanation, stored verbatim.
     #[arg(long, conflicts_with = "explanation_file")]
     explanation: Option<String>,
@@ -343,13 +353,30 @@ struct FeedbackArgs {
     explanation_file: Option<PathBuf>,
 }
 
-impl FeedbackArgs {
-    fn read_explanation(&self) -> Result<Option<String>> {
+impl ExplanationArgs {
+    fn read(&self) -> Result<Option<String>> {
         match &self.explanation_file {
             Some(path) => orchestrator::read_verbatim(path).map(Some),
             None => Ok(self.explanation.clone()),
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct CloseArgs {
+    /// The Work, by ID or unique prefix.
+    run_id: String,
+
+    /// Why it is closed.
+    #[arg(long, value_enum)]
+    reason: dispatch::CloseReason,
+
+    /// The finished Work that replaces it; required with --reason superseded.
+    #[arg(long)]
+    replacement: Option<String>,
+
+    #[command(flatten)]
+    explanation: ExplanationArgs,
 }
 
 #[derive(Debug, Args)]
@@ -684,7 +711,7 @@ async fn run() -> Result<()> {
             name_only,
         ),
         Command::Accept(args) => {
-            let explanation = args.review.feedback.read_explanation()?;
+            let explanation = args.review.feedback.explanation.read()?;
             orchestrator::accept_or_reject_latest(
                 &state,
                 args.review.run_id.as_deref(),
@@ -697,7 +724,7 @@ async fn run() -> Result<()> {
             )
         }
         Command::Reject(args) => {
-            let explanation = args.feedback.read_explanation()?;
+            let explanation = args.feedback.explanation.read()?;
             orchestrator::accept_or_reject_latest(
                 &state,
                 args.run_id.as_deref(),
@@ -706,6 +733,19 @@ async fn run() -> Result<()> {
                 args.feedback.reasons,
                 explanation,
             )
+        }
+        Command::Close(args) => {
+            let line = orchestrator::attach::close(
+                &state,
+                orchestrator::attach::CloseRequest {
+                    run_id: args.run_id,
+                    reason: args.reason,
+                    replacement: args.replacement,
+                    explanation: args.explanation.read()?,
+                },
+            )?;
+            println!("{line}");
+            Ok(())
         }
         Command::Version => {
             println!("dispatch {}", dispatch::VERSION);

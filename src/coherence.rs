@@ -190,7 +190,11 @@ impl fmt::Display for CoherenceBlocked {
         }
         write!(f, ". The source was left unchanged. ")?;
         if self.validity.decision == Decision::Stop {
-            write!(f, "Run 'dispatch reject {}'.", self.run_id)?;
+            write!(
+                f,
+                "Run 'dispatch close {} --reason already-present'.",
+                self.run_id
+            )?;
         } else if self.attached {
             write!(
                 f,
@@ -433,6 +437,24 @@ pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
         reasons,
         analysis,
     })
+}
+
+/// Whether the whole of a candidate's retained patch is in the source now:
+/// the reverse-apply check behind STOP's `already_applied`. Partial presence
+/// is not presence, and an empty patch is never present. `Some` carries the
+/// digest of the world it was found in, for the record.
+pub fn patch_present(run: &RunRecord, candidate_label: &str) -> Result<Option<String>> {
+    let work = WorkView::of(run, find_candidate(run, candidate_label)?);
+    if patch_is_empty(work.delta_patch)? || apply_check(&work, true)?.is_some() {
+        return Ok(None);
+    }
+    let world = world::observe(
+        &run.source_path,
+        &run.baseline_path,
+        &run.baseline_commit,
+        &run.source_kind,
+    )?;
+    Ok(Some(world.digest))
 }
 
 fn patch_is_empty(patch: &Path) -> Result<bool> {
@@ -835,6 +857,26 @@ mod tests {
         assert!(live_validity(&run).is_none());
     }
 
+    /// `dispatch close --reason already-present` takes only the whole patch:
+    /// one of its two hunks in the source is not presence.
+    #[test]
+    fn a_patch_is_present_only_when_all_of_it_is_in_the_source() {
+        let fixture = Fixture::new(true, &base_files());
+        let both = "--- a/a.txt\n+++ b/a.txt\n@@ -1,5 +1,5 @@\n one\n-two\n+TWO\n three\n four\n five\n\
+                    --- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-b\n+B\n";
+        let run = fixture.run(fixture.patch(both));
+        assert_eq!(patch_present(&run, "A").unwrap(), None, "unmoved");
+        fixture.write("a.txt", "one\nTWO\nthree\nfour\nfive\n");
+        assert_eq!(patch_present(&run, "A").unwrap(), None, "partial");
+        fixture.write("b.txt", "B\n");
+        let digest = patch_present(&run, "A")
+            .unwrap()
+            .expect("whole patch present");
+        assert_eq!(digest, fixture.world().digest);
+        let empty = fixture.run(fixture.patch(""));
+        assert_eq!(patch_present(&empty, "A").unwrap(), None, "empty");
+    }
+
     #[test]
     fn blocked_message_names_the_next_commands() {
         let fixture = Fixture::new(true, &base_files());
@@ -849,7 +891,10 @@ mod tests {
             landed_by: None,
         }
         .to_string();
-        assert!(text.contains("STOP") && text.contains("Run 'dispatch reject RUN1'"));
+        assert!(
+            text.contains("STOP")
+                && text.contains("Run 'dispatch close RUN1 --reason already-present'")
+        );
         let refresh = CoherenceBlocked {
             run_id: "RUN1".into(),
             validity: Validity {

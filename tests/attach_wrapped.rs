@@ -562,6 +562,42 @@ fn wrapped_attach_from_the_checkout_works_in_a_workspace_dispatch_makes() {
     assert_eq!(f.event_count("workspace.released"), 1);
 }
 
+/// A live wrapper owns its Work for the whole session: close refuses it,
+/// records nothing and leaves the agent running; once the agent exits, the
+/// wrapper finishes the Work as usual.
+#[test]
+fn close_refuses_work_a_live_wrapper_owns() {
+    let f = Fixture::new();
+    let ready = f._temp.path().join("ready");
+    let gate = f._temp.path().join("gate");
+    let mut command = f.attach_command(&f.workspace, &[]);
+    command
+        .env("STDIN_CAPTURE", f._temp.path().join("stdin-capture"))
+        .env("READY", &ready)
+        .env("GATE", &gate)
+        .env("EXIT_CODE", "0");
+    let mut child = OwnedChild(command.spawn().unwrap());
+    child.write_stdin_line("hello");
+    wait_until(|| ready.exists(), "agent never reached its gate");
+
+    let id = f.only_run_id();
+    let close = f.dispatch(&["close", &id, "--reason", "unfinished"]);
+    assert!(!close.status.success());
+    let stderr = String::from_utf8_lossy(&close.stderr);
+    assert!(stderr.contains("held by its Dispatch owner"), "{stderr}");
+    assert_eq!(f.metadata(&id)["outcome"]["lifecycle"], "working");
+    assert_eq!(f.event_count("work.closed"), 0);
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the agent still runs"
+    );
+
+    fs::write(&gate, "go\n").unwrap();
+    assert!(child.finish().status.success());
+    assert_eq!(f.metadata(&id)["outcome"]["work_result"], "ready");
+    assert!(f.metadata(&id)["outcome"].get("closed").is_none());
+}
+
 #[test]
 fn a_rejected_workspace_dispatch_made_is_kept() {
     let f = Fixture::new();

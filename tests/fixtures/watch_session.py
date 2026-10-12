@@ -168,6 +168,43 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             assert meta(work)['outcome']['verification']=='passed'
             screen.see('auth-ctx: finished; checks passed. It now waits for your review.')
             ui.send('q');ui.finish()
+        # Unfinished Work has no result to reject: r refuses, naming the command
+        # that closes it. c asks why, then to confirm; Enter alone cancels either
+        # question and records nothing. Closing records no review and deletes
+        # nothing.
+        git('worktree','add','-q','-b','spare','.claude/worktrees/spare')
+        spare_tree=(repo/'.claude/worktrees/spare').resolve()
+        hook=json.dumps({'hook_event_name':'SessionStart','session_id':'s2','source':'startup','cwd':str(spare_tree)})
+        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True)
+        spare=[p.parent.name for p in (state/'runs').glob('*/metadata.json')
+               if (json.loads(p.read_text()).get('attachment') or {}).get('workspace')==str(spare_tree)]
+        assert len(spare)==1,spare; spare=spare[0]; tag=short(spare,work)
+        (spare_tree/'lib.txt').write_text('spare\n')
+        with Session([binary,'--state-dir',str(state),'watch','--root',str(repo)],repo,captures,'watch-close',width=160,height=30) as ui:
+            screen=Screen(ui)
+            flat=lambda:' '.join(' '.join(screen.rows()).split())
+            asking=lambda text:any(text in row for row in screen.rows())
+            screen.see('› auth-ctx','spare');ui.send('j');screen.see('› spare','f finish')
+            ui.send('r')
+            until(ui,lambda:'not rejected: Work %s is unfinished'%spare in flat()
+                  and 'dispatch close %s --reason unfinished'%spare in flat(),'reject refused')
+            assert not asking('Reject spare'),'asked to reject unfinished Work'
+            ui.send('c');screen.see('Why close spare (Work %s)?'%tag,'Unfinished: nobody will finish it','Cancel')
+            ui.send('\r');until(ui,lambda:not asking('Why close spare'),'reason cancelled')
+            ui.send('c');screen.see('Why close spare');ui.send('\x1b[A');ui.pump(.3);ui.send('\r')
+            screen.see('Close spare (Work %s)? Unfinished: nobody will finish it.'%tag)
+            ui.send('\r');until(ui,lambda:not asking('Close spare (Work'),'confirmation cancelled');ui.pump(.3)
+            assert meta(spare)['outcome']['lifecycle']=='working' and 'closed' not in meta(spare)['outcome'],\
+                'closed without a reason and a confirmation'
+            ui.send('c');screen.see('Why close spare');ui.send('\x1b[A');ui.pump(.3);ui.send('\r')
+            screen.see('Close spare (Work %s)?'%tag);ui.send('\x1b[A');ui.pump(.3);ui.send('\r')
+            until(ui,lambda:(meta(spare)['outcome'].get('closed') or {}).get('reason')=='unfinished','closed')
+            screen.see('spare: closed; no review was recorded and nothing was applied.')
+            outcome=meta(spare)['outcome']
+            assert (outcome['work_result'],outcome['review'])==('cancelled','not_requested'),outcome
+            assert 'spare' in (state/'runs'/spare/'delta.patch').read_text(),'its changes were not kept'
+            assert spare_tree.exists(),'closing deleted the worktree'
+            ui.send('q');ui.finish()
     finally:
         subprocess.run([binary,'--state-dir',str(state),'stop','--root',str(repo)],capture_output=True)
     # dispatch clean asks before removing a workspace Dispatch made; Enter alone

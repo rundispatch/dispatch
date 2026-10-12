@@ -175,6 +175,11 @@ pub struct RunOutcome {
     /// actor was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_by: Option<AppliedBy>,
+    /// A person closed the Work without judging it (`dispatch close`).
+    /// `None` otherwise, including Work closed before 0.4.12, whose
+    /// `work.closed` event is its only record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<Closure>,
 }
 
 /// The authority under which a candidate was applied to the source. It is
@@ -185,6 +190,65 @@ pub struct RunOutcome {
 pub enum AppliedBy {
     Human,
     AutoApply,
+}
+
+/// Why and when a person closed Work. Closing is not a review: it records no
+/// preference about the Work's quality.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Closure {
+    pub reason: CloseReason,
+    pub at: DateTime<Utc>,
+    /// The Work that replaces it, for `superseded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    /// The person's own words, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+impl Closure {
+    /// The reason as every view says it after "closed: ".
+    pub fn describe(&self) -> String {
+        match (self.reason, &self.replacement) {
+            (CloseReason::Unfinished, _) => "unfinished".into(),
+            (CloseReason::WorkspaceRemoved, _) => "workspace removed".into(),
+            (CloseReason::AlreadyPresent, _) => "changes already present".into(),
+            (CloseReason::Superseded, Some(id)) => format!("superseded by {id}"),
+            (CloseReason::Superseded, None) => "superseded".into(),
+        }
+    }
+}
+
+/// `dispatch close --reason`: kebab-case on the command line, snake_case
+/// when stored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    /// Unfinished Work nobody will finish.
+    Unfinished,
+    /// Unfinished Work whose workspace is gone.
+    WorkspaceRemoved,
+    /// A result whose whole patch is already in the source.
+    AlreadyPresent,
+    /// Work another finished Work replaces (--replacement).
+    Superseded,
+}
+
+impl CloseReason {
+    /// As stored, and as the attempt's outcome when it closes unfinished Work.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unfinished => "unfinished",
+            Self::WorkspaceRemoved => "workspace_removed",
+            Self::AlreadyPresent => "already_present",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    /// As typed after `--reason`.
+    pub fn flag(self) -> String {
+        self.as_str().replace('_', "-")
+    }
 }
 
 impl Default for RunOutcome {
@@ -199,6 +263,7 @@ impl Default for RunOutcome {
             phase: RunPhase::Finished,
             waiting_on: WaitingOn::None,
             applied_by: None,
+            closed: None,
         }
     }
 }

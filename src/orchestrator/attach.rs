@@ -2,6 +2,7 @@
 //! attached external work Dispatch did not select or route, as a `RunRecord`
 //! with `mode: Attached`. See `docs/plan-0.3-auto-apply-and-attach.md`, parts
 //! 6.1–6.9 and 14.3–14.10 (the design freeze this module implements exactly).
+//! `dispatch close` retires Work, attached or not, without judging it.
 //!
 //! The wrapped form (`dispatch attach -- <command...>`) is the owner loop of
 //! its own Work (part 6.1): `create` it, spawn the agent under the terminal,
@@ -23,15 +24,15 @@ use chrono::{DateTime, Utc};
 use ulid::Ulid;
 
 use super::{
-    ApplyOutcome, apply, auto_apply, persist_event, refresh_outcome, registration,
-    result_verification,
+    ApplyOutcome, apply, auto_apply, persist_event, print_review_commands, refresh_outcome,
+    registration, result_verification,
 };
 use crate::{
     ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
-    AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, Config,
-    DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, ManagedWorkspace,
-    OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, RuntimeSession,
-    VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
+    AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, CloseReason,
+    Closure, Config, DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState,
+    ManagedWorkspace, OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus,
+    RuntimeSession, VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
     coherence::watch::{WatchSpec, Watcher},
     db::Database,
     lock::OperationLock,
@@ -1225,7 +1226,7 @@ pub(super) async fn finish_locked(
             removal.exact,
             "the workspace of {} was removed before Dispatch could keep its final changes; \
              only the changes last seen are kept, at {}, and they cannot be finished. \
-             Reject this work: dispatch reject {}",
+             Close this work: dispatch close {} --reason workspace-removed",
             run.id,
             run_dir.join("delta-last-seen.patch").display(),
             run.id
@@ -1336,7 +1337,7 @@ pub(super) async fn finish_locked(
 /// synced into the run and the removal committed before this returns; any
 /// error means the deletion must not go ahead. The Work does not end: a
 /// removed workspace is an observation, and a person still finishes or
-/// rejects it. Only an empty Δ closes it, as there is nothing to review.
+/// closes it. Only an empty Δ ends it, as there is nothing to review.
 /// Returns how many files the kept Δ changes.
 pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u64> {
     let _lock = OperationLock::acquire_wait(
@@ -1380,17 +1381,7 @@ pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u6
         });
     }
     if files_changed == 0 {
-        run.candidates[0].status = CandidateStatus::Cancelled;
-        run.status = RunStatus::Interrupted;
-        run.completed_at = Some(now);
-        run.outcome.lifecycle = LifecycleState::Finished;
-        run.outcome.work_result = WorkResult::Cancelled;
-        run.outcome.phase = RunPhase::Finished;
-        run.outcome.review = ReviewState::NotRequested;
-        if let Some(attempt) = run.attempts.first_mut() {
-            attempt.completed_at = Some(now);
-            attempt.outcome = "no_changes".into();
-        }
+        cancel_work(&mut run, now, "no_changes");
     }
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1490,19 +1481,7 @@ pub(crate) fn note_workspace_gone(
     // Last seen with no changes at all: nothing was lost, so nothing waits.
     let empty = last_seen.as_ref().is_some_and(Vec::is_empty);
     if empty {
-        if let Some(candidate) = run.candidates.first_mut() {
-            candidate.status = CandidateStatus::Cancelled;
-        }
-        run.status = RunStatus::Interrupted;
-        run.completed_at = Some(now);
-        run.outcome.lifecycle = LifecycleState::Finished;
-        run.outcome.work_result = WorkResult::Cancelled;
-        run.outcome.phase = RunPhase::Finished;
-        run.outcome.review = ReviewState::NotRequested;
-        if let Some(attempt) = run.attempts.first_mut() {
-            attempt.completed_at = Some(now);
-            attempt.outcome = "no_changes".into();
-        }
+        cancel_work(&mut run, now, "no_changes");
     }
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1521,53 +1500,234 @@ pub(crate) fn note_workspace_gone(
     )
 }
 
-/// Close unfinished Work whose workspace is gone: the person's decision
-/// (`dispatch reject`) not to keep it. Its changes stay beside the run: the
-/// exact ones kept at removal, or those last seen when it vanished.
-pub(crate) fn close_removed(state: &State, run_id: &str) -> Result<()> {
-    let _lock = OperationLock::acquire_wait(
-        &state.run_dir(run_id).join(".operation.lock"),
-        "attached work has a foreground owner",
-        Duration::from_secs(5),
-    )?;
-    let mut run = state.load_run(run_id)?;
-    anyhow::ensure!(
-        run.outcome.lifecycle == LifecycleState::Working
-            && run
-                .attachment
-                .as_ref()
-                .is_some_and(|attachment| attachment.workspace_removed.is_some()),
-        "work {run_id} is not unfinished work whose workspace is gone"
-    );
-    let now = Utc::now();
+/// End unfinished Work without a result: when a person closes it, or when
+/// its workspace turns out to have held no changes. `attempt_outcome` says
+/// which.
+fn cancel_work(run: &mut RunRecord, at: DateTime<Utc>, attempt_outcome: &str) {
     if let Some(candidate) = run.candidates.first_mut() {
         candidate.status = CandidateStatus::Cancelled;
     }
     run.status = RunStatus::Interrupted;
-    run.completed_at = Some(now);
+    run.completed_at = Some(at);
     run.outcome.lifecycle = LifecycleState::Finished;
     run.outcome.work_result = WorkResult::Cancelled;
     run.outcome.phase = RunPhase::Finished;
     run.outcome.review = ReviewState::NotRequested;
     if let Some(attempt) = run.attempts.first_mut() {
-        attempt.completed_at = Some(now);
-        attempt.outcome = "workspace_removed".into();
+        attempt.completed_at = Some(at);
+        attempt.outcome = attempt_outcome.into();
     }
+}
+
+/// Whether the workspace of attached Work is gone: removed as a runtime
+/// reported, found missing, or no longer there.
+pub(crate) fn workspace_gone(run: &RunRecord) -> bool {
+    run.attachment.as_ref().is_some_and(|attachment| {
+        attachment.workspace_removed.is_some() || !attachment.workspace.exists()
+    })
+}
+
+/// `dispatch close <id> --reason <reason>`.
+pub struct CloseRequest {
+    /// The Work, by ID or unique prefix.
+    pub run_id: String,
+    pub reason: CloseReason,
+    /// The Work that replaces it, by ID or unique prefix; with `superseded`
+    /// and only then.
+    pub replacement: Option<String>,
+    pub explanation: Option<String>,
+}
+
+/// The reasons `close` takes for `run` as it is now, or why nothing may close
+/// it. Unfinished attached Work is unfinished, or its workspace is gone; a
+/// result waiting for review is already present. Either may be superseded.
+pub(crate) fn close_reasons(run: &RunRecord) -> Result<Vec<CloseReason>> {
+    let id = &run.id;
+    if let Some(closed) = &run.outcome.closed {
+        bail!("Work {id} is already closed ({})", closed.describe());
+    }
+    if run.outcome.application == ApplicationState::Applied {
+        bail!("Work {id} was applied; there is nothing to close");
+    }
+    if matches!(
+        run.outcome.review,
+        ReviewState::Accepted | ReviewState::Rejected
+    ) {
+        bail!("Work {id} was already reviewed; closing it would not change that");
+    }
+    if run.mode == RunMode::Attached
+        && run.outcome.lifecycle == LifecycleState::Working
+        && run.candidates.len() == 1
+    {
+        let why = if workspace_gone(run) {
+            CloseReason::WorkspaceRemoved
+        } else {
+            CloseReason::Unfinished
+        };
+        return Ok(vec![why, CloseReason::Superseded]);
+    }
+    if run.candidates.len() == 1 && super::awaits_review(run) {
+        return Ok(vec![CloseReason::AlreadyPresent, CloseReason::Superseded]);
+    }
+    bail!(
+        "Work {id} is neither unfinished attached Work nor a result waiting for review; there is nothing to close"
+    )
+}
+
+/// `dispatch close`: a person retires Work without judging it. It records
+/// no review and no preference, and never applies, commits, signals an
+/// agent or deletes a workspace. Unfinished Work is frozen first, as
+/// `finish` freezes it but without checks; when its workspace is gone, what
+/// was kept of it stays: the exact Δ, or the changes last seen. A workspace
+/// gone with nothing recorded yet is refused while an owner watches the
+/// project, until it has kept what it last saw. A delivered result keeps its
+/// Δ. A live wrapper holds the run's lock for its whole session, so Work it
+/// owns is refused. Returns what happened, in words.
+pub fn close(state: &State, request: CloseRequest) -> Result<String> {
+    let id = state.resolve_run_id(&request.run_id)?;
+    let superseded = request.reason == CloseReason::Superseded;
+    anyhow::ensure!(
+        superseded == request.replacement.is_some(),
+        "--replacement names the Work that supersedes this one: it goes with --reason superseded, and only with it"
+    );
+    let replacement = match &request.replacement {
+        Some(other) => Some(state.resolve_run_id(other)?),
+        None => None,
+    };
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(&id).join(".operation.lock"),
+        "Work is held by its Dispatch owner",
+        Duration::from_secs(5),
+    )?;
+    let mut run = state.load_run(&id)?;
+    let reasons = close_reasons(&run)?;
+    anyhow::ensure!(
+        reasons.contains(&request.reason),
+        "--reason {} does not fit Work {id} as it is; it takes {}",
+        request.reason.flag(),
+        reasons
+            .iter()
+            .map(|reason| reason.flag())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    );
+
+    let mut payload = serde_json::json!({"reason": request.reason, "by": "human"});
+    if request.reason == CloseReason::AlreadyPresent {
+        let label = run.candidates[0].label.clone();
+        let Some(digest) = crate::coherence::patch_present(&run, &label)? else {
+            bail!(
+                "the whole of Work {id}'s patch is not in the source now, so it was not closed; dispatch check {id} shows where it stands"
+            );
+        };
+        payload["world_digest"] = digest.into();
+    }
+    if let Some(other) = &replacement {
+        anyhow::ensure!(other != &id, "Work {id} cannot supersede itself");
+        let other = state.load_run(other)?;
+        anyhow::ensure!(
+            other.source_path == run.source_path,
+            "Work {} belongs to another project, so it does not replace {id}",
+            other.id
+        );
+        anyhow::ensure!(
+            other.outcome.lifecycle == LifecycleState::Finished
+                && other.outcome.work_result == WorkResult::Ready,
+            "Work {0} has no finished result, so {id} stays open; finish it first: dispatch finish {0}",
+            other.id
+        );
+        anyhow::ensure!(
+            other.outcome.closed.is_none() && other.outcome.review != ReviewState::Rejected,
+            "Work {} was itself {}, so it replaces nothing and {id} stays open",
+            other.id,
+            if other.outcome.closed.is_some() {
+                "closed"
+            } else {
+                "rejected"
+            }
+        );
+        let kept = other
+            .candidates
+            .first()
+            .and_then(|candidate| fs::metadata(&candidate.diff_path).ok())
+            .is_some_and(|patch| patch.len() > 0);
+        anyhow::ensure!(
+            kept,
+            "Work {} kept no changes, so it replaces nothing and {id} stays open",
+            other.id
+        );
+        payload["replacement"] = other.id.clone().into();
+    }
+
+    let now = Utc::now();
+    let run_dir = state.run_dir(&id);
+    let mut kept = run.candidates[0].diff_path.clone();
+    let mut unobserved = false;
+    if run.outcome.lifecycle == LifecycleState::Working {
+        let removal = run
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.workspace_removed.clone());
+        match removal {
+            Some(removal) if !removal.exact => kept = run_dir.join("delta-last-seen.patch"),
+            Some(_) => {}
+            // Gone without a word: a watching owner keeps the changes it last
+            // saw on its next tick, which closed Work would stop. Without one,
+            // nobody followed the workspace.
+            None if workspace_gone(&run) => {
+                anyhow::ensure!(
+                    matches!(
+                        super::background::watcher(state, &run.source_path)?,
+                        super::background::Watcher::NotWatched
+                    ),
+                    "the workspace of Work {id} vanished, and the project's owner has not yet kept the changes it last saw; nothing was closed, so try again in a few seconds"
+                );
+                unobserved = true;
+            }
+            None => {
+                let workspace = run.candidates[0].workspace_path.clone();
+                run.candidates[0].diff_stats =
+                    source::collect_diff(&run.baseline_path, &workspace, &kept)?;
+            }
+        }
+        cancel_work(&mut run, now, request.reason.as_str());
+    } else {
+        run.outcome.review = ReviewState::NotRequested;
+        run.outcome.phase = RunPhase::Finished;
+    }
+    let closure = Closure {
+        reason: request.reason,
+        at: now,
+        replacement,
+        explanation: request.explanation,
+    };
+    let closed = closure.describe();
+    run.outcome.closed = Some(closure);
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
     persist_event(
         state,
         &db,
         EventRecord {
-            run_id: run.id.clone(),
+            run_id: id.clone(),
             candidate_label: None,
             event_type: "work.closed".into(),
             timestamp: now,
-            payload: serde_json::json!({"reason": "workspace_removed", "by": "human"}),
+            payload,
             ..EventRecord::default()
         },
         &mut run,
-    )
+    )?;
+    let kept = match fs::metadata(&kept) {
+        _ if unobserved => "no changes were kept, because its workspace vanished while \
+                            nothing watched the project"
+            .into(),
+        Ok(patch) if patch.len() > 0 => format!("its changes stay at {}", kept.display()),
+        _ => "it kept no changes".into(),
+    };
+    Ok(format!(
+        "Closed {id}: {closed}. No review was recorded, nothing was applied or deleted, and {kept}."
+    ))
 }
 
 fn finish_attachment(run: &mut RunRecord, reason: FinishReason) {
@@ -1606,6 +1766,5 @@ fn print_finish_summary(run: &RunRecord) {
     println!("Task\n  {}\n", run.task);
     println!("Agent\n  {}\n", candidate.harness_id);
     println!("Verification\n  {}\n", result_verification(candidate));
-    println!("Review\n  dispatch diff\n");
-    println!("Then\n  dispatch accept\n  dispatch reject");
+    print_review_commands(run);
 }

@@ -963,8 +963,8 @@ def states_ready(binary, base):
                        "It can't be accepted as is. r reject it, then run the agent again from the current source.",
                        "r reject · d review · ↑↓ select · q leave"),
         "stop-me": ("blocked", "STOP", "passed", ["Verdict STOP · its changes are already in the source"],
-                    "Its changes are already in the source. r reject it.",
-                    "r reject · ↑↓ select · q leave"),
+                    "Its changes are already in the source. c close it.",
+                    "c close · ↑↓ select · q leave"),
         "fails": ("ready", "CONTINUE", "failed", ["Checks failed · d review the output"],
                   "Its checks failed. d review the output, then a accept or r reject.",
                   "d review · a accept · r reject · ↑↓ select · q leave"),
@@ -1037,14 +1037,17 @@ def states_live(binary, base):
     finish_next = "When the agent is done, f finish: freezes its changes and runs true."
     expect = {
         "me-live": ("working", finish_next, "f finish · ↑↓ select · q leave", "attached workspace"),
-        "gone-exact": ("removed", "Its worktree was removed and its exact changes were kept. f finish to check them.",
-                       "f finish · ↑↓ select · q leave", "claude session in its own worktree"),
-        "gone-lost": ("lost", "Its worktree is gone; only its last-seen changes were kept. f finish to freeze them, then review.",
-                      "f finish · ↑↓ select · q leave", "attached workspace"),
+        "gone-exact": ("removed", "Its worktree was removed and its exact changes were kept. f finish to check them, "
+                       "or c close it.",
+                       "f finish · c close · ↑↓ select · q leave", "claude session in its own worktree"),
+        "gone-lost": ("lost", "Its worktree is gone; only its last-seen changes were kept, and they cannot be "
+                      "finished. c close it.",
+                      "c close · ↑↓ select · q leave", "attached workspace"),
         "slugify": ("working", finish_next, "f finish · ↑↓ select · q leave", "attached workspace"),
         "auth-ctx": ("working", finish_next, "f finish · ↑↓ select · q leave", "claude session in its own worktree"),
-        "idle-one": ("idle", "No session is open. f finish to freeze its changes, or resume the session in its worktree.",
-                     "f finish · ↑↓ select · q leave", "claude session in its own worktree"),
+        "idle-one": ("idle", "Its session ended. f finish to freeze its changes, or resume the session in its "
+                     "worktree. Or c close it.",
+                     "f finish · c close · ↑↓ select · q leave", "claude session in its own worktree"),
     }
     with project.watch(130, 30) as watch:
         watch.until("listed", lambda: listed_order(watch, order) == order)
@@ -1149,7 +1152,7 @@ def feedback(binary, base):
         assert not applied(project, "stale") and (project.root / "api.py").read_text() == source_before
         select(watch, "dup", order)
         watch.send("a")
-        watch.shows("dup: not applied: STOP, its changes are already in the source. Next: r reject it.")
+        watch.shows("dup: not applied: STOP, its changes are already in the source. Next: c close it.")
         assert not applied(project, "dup")
         select(watch, "live", order)
         watch.send("d")

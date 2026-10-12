@@ -109,6 +109,10 @@ fn latest_project_diff_accept_reject_and_explain_need_no_run_id() -> anyhow::Res
         .assert()
         .success()
         .stdout(predicates::str::contains("agent-work.txt"));
+    let run_dir = fs::read_dir(state.join("runs"))?.next().unwrap()?.path();
+    let id = run_dir.file_name().unwrap().to_str().unwrap().to_owned();
+    // Without an ID, status says which Work it describes, and every command
+    // it suggests names that Work.
     base()
         .arg("status")
         .assert()
@@ -117,16 +121,15 @@ fn latest_project_diff_accept_reject_and_explain_need_no_run_id() -> anyhow::Res
         .stdout(predicates::str::contains(
             "Chosen with --agent (no profile)",
         ))
-        .stdout(predicates::str::contains(
-            "Work\n  native codex · began against directory snapshot",
-        ))
+        .stdout(predicates::str::contains(format!(
+            "Work {id}\n  native codex · began against directory snapshot"
+        )))
+        .stdout(predicates::str::contains(format!(
+            "dispatch diff {id}\n\nThen\n  dispatch accept {id}\n  dispatch reject {id}"
+        )))
         .stdout(predicates::str::contains("tier").not());
     // Reading a run never rewrites its projection when nothing changed.
-    let metadata = fs::read_dir(state.join("runs"))?
-        .next()
-        .unwrap()?
-        .path()
-        .join("metadata.json");
+    let metadata = run_dir.join("metadata.json");
     let before = fs::metadata(&metadata)?.modified()?;
     #[cfg(unix)]
     let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&metadata)?);
