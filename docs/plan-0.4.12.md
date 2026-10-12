@@ -560,3 +560,19 @@ different, finished Work whose Δ was retained.
 | Dispatch finish checks | fmt, clippy passed; `cargo test` **failed** once: `runtime_hooks::an_empty_worktree_that_vanishes_unannounced_closes_with_no_changes` timed out waiting for the owner (suite took 34.8 s against about 7 s normally). The test predates P1 and P1 does not change it; it sleeps a fixed 3 s and assumes the owner followed the worktree by then. Reruns on P1's build: the test alone 6/6 passed, the `runtime_hooks` suite 3/3 passed. Recorded as a timing flake; its fix is in P2 |
 | Frozen Δ | Applied to a fresh `git archive` of HEAD, its tree (`3e5751d`) equals the reviewed and independently validated tree |
 | Decision | Accepted by the human with the flaky failure on record (2026-10-12); `check` CONTINUE, world unchanged; applied 16 files; committed as `b1f97d7` |
+
+### P2
+
+| Item | Value |
+|---|---|
+| Work | `01M4RPNCZRC7S8XG144H5MHCXQ`, wrapped, from `5220b9c` (S0 tree equals the clone's HEAD tree) |
+| Agent | Claude Code (interactive), Opus 5.5, xhigh; usage unknown. Paused once at the account's usage limit and resumed by itself |
+| Prompt | `prompts-0412/p2.md`, with P1's flaky-test fix and open questions added |
+| Approvals | Each non-allowlisted command read and approved once with the key `1` after confirming the dialog; the mode stayed accept-edits throughout. Two in-place `perl -pi` edits of its own files ran without a prompt under accept-edits |
+| Integrator review | Asked for: accept from `watch` and the review screen names the merged-check outcome; a closed native result is headed "Closed". Both made |
+| Worker validation | fmt, clippy pass; `cargo test` 649 passed, 0 failed, 5 ignored (first run 648/0/5); the flaky test alone 6/6, its suite 3/3, four suite binaries at once 4/4 |
+| Independent validation | Workspace diff on a `git archive` of HEAD, own `CARGO_TARGET_DIR`: fmt, clippy pass; `cargo test` 649 passed, 0 failed, 5 ignored. P0 script on this build: R1 refuses ambiguity; R2's finish says "Finished, but stale (REFRESH)", names `c.txt` and keeps Git's output in `patch-conflict.txt`, and offers no accept; R3's three accepts print "not run — unmoved", "passed … logs: …" and "not run — no checks are configured"; R4's `clean --dry-run` does not list W's workspace while N works there, and lists external worktrees as kept with their Work IDs; R5 names close |
+| Production LOC | `src/` +655 / −216, net +439 (worker's count, excluding `#[cfg(test)]`) |
+| Dispatch finish checks | fmt, clippy, `cargo test` all passed |
+| Frozen Δ | Applied to a fresh `git archive` of HEAD, its tree (`aff9146`) equals the reviewed and independently validated tree |
+| Decision | Accepted by the human (2026-10-13); `check` CONTINUE, world unchanged; applied 19 files; committed as `35511d9` |
