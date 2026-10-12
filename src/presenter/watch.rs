@@ -967,7 +967,12 @@ fn accept(state: &State, root: &Path, item: &Item) -> Notice {
         true,
     );
     match result {
-        Ok(_) => Notice::new(Some(item), Kind::Done, "accepted and applied."),
+        Ok(Some(checks)) => Notice::new(
+            Some(item),
+            Kind::Done,
+            format!("accepted and applied; merged checks {checks}."),
+        ),
+        Ok(None) => Notice::new(Some(item), Kind::Done, "accepted and applied."),
         Err(error) => Notice::new(
             Some(item),
             Kind::Refused,

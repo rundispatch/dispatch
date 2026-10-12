@@ -26,6 +26,7 @@ use crate::{
     WorkResult,
     coherence::{
         AcceptGate, CoherenceBlocked,
+        integration::MergedChecks,
         measure::{self, Landing, OwnerView, landing},
         run_config, world,
     },
@@ -371,14 +372,15 @@ pub(super) fn landed_by(state: &State, run: &RunRecord) -> Option<String> {
 /// Apply the run's result onto the source under the per-source lock.
 /// The caller holds the run's operation lock. `authority` names who is
 /// applying: only a human decision marks the review as accepted; a policy
-/// application leaves the review exactly as it was.
+/// application leaves the review exactly as it was. Returns the verdict a
+/// human overrode, if any, and what became of the merged checks.
 pub(super) fn apply_locked(
     state: &State,
     mut run: RunRecord,
     quiet: bool,
     authority: ApplyAuthority,
     despite_refresh: bool,
-) -> Result<Option<Validity>> {
+) -> Result<(Option<Validity>, MergedChecks)> {
     anyhow::ensure!(
         matches!(
             run.status,
@@ -405,14 +407,15 @@ pub(super) fn apply_locked(
         despite_refresh,
     )
     .and_then(|gate| {
-        let (validity, overridden) = match gate {
-            AcceptGate::Legacy => (None, None),
-            AcceptGate::Compatible(validity) => (Some(validity), None),
+        let (validity, overridden, checks) = match gate {
+            AcceptGate::Legacy(skipped) => (None, None, MergedChecks::Skipped(skipped)),
+            AcceptGate::Compatible { validity, checks } => (Some(validity), None, checks),
             AcceptGate::Overridden {
                 overridden,
                 verified,
-            } => (Some(verified), Some(overridden)),
-            AcceptGate::Blocked(validity) => {
+                checks,
+            } => (Some(verified), Some(overridden), checks),
+            AcceptGate::Blocked { validity, checks } => {
                 return Err(CoherenceBlocked {
                     run_id: run.id.clone(),
                     landed_by: (validity.decision == Decision::Stop)
@@ -421,20 +424,32 @@ pub(super) fn apply_locked(
                     validity,
                     attached: run.mode == crate::RunMode::Attached,
                     despite_refresh,
+                    checks,
                 }
                 .into());
             }
         };
+        if !quiet {
+            println!("Merged checks: {checks}");
+        }
         let landing = observe_landing(state, &run, authority, validity.as_ref());
         let report = match &validity {
             None => source::safe_apply(&run, &normalized_label)?,
             Some(validity) => {
-                source::apply_validated(&run, &normalized_label, &validity.world_digest)?
+                source::apply_validated(&run, &normalized_label, &validity.world_digest).map_err(
+                    |error| {
+                        if is_fence_failure(&format!("{error:#}")) {
+                            error.context("the source changed after accept checked it, so nothing was applied; accept again to check it as it is now")
+                        } else {
+                            error
+                        }
+                    },
+                )?
             }
         };
-        Ok((report, validity, overridden, landing))
+        Ok((report, validity, overridden, landing, checks))
     });
-    let (report, validity, overridden, landing) = match applied {
+    let (report, validity, overridden, landing, checks) = match applied {
         Ok(applied) => applied,
         Err(error) => {
             let message = format!("{error:#}");
@@ -488,7 +503,7 @@ pub(super) fn apply_locked(
             report.files_changed
         );
     }
-    Ok(overridden)
+    Ok((overridden, checks))
 }
 
 /// Commit `auto_apply.skipped {reason}`. Nothing about the outcome changes:
@@ -600,21 +615,21 @@ fn decide(
             // `config_unreadable` was already ruled out in stage 1: a config
             // that was readable there and is unreadable here would be an
             // extraordinary race, not a case this predicate distinguishes.
-            AcceptGate::Legacy => {
+            AcceptGate::Legacy(_) => {
                 if source::fingerprint_tree(&run.source_path)? == run.source_fingerprint {
                     Ok(Authorization::Fingerprint)
                 } else {
                     Err(("strict_mode_drift".into(), None))
                 }
             }
-            AcceptGate::Compatible(validity) => {
+            AcceptGate::Compatible { validity, .. } => {
                 if !validity.world_changed || validity.analysis == AnalysisLevel::Integration {
                     Ok(Authorization::Digest(validity))
                 } else {
                     Err(("integration_evidence_missing".into(), Some(validity)))
                 }
             }
-            AcceptGate::Blocked(validity)
+            AcceptGate::Blocked { validity, .. }
             | AcceptGate::Overridden {
                 overridden: validity,
                 ..

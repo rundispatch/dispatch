@@ -9,21 +9,135 @@
 //! check logs are kept under the run directory as evidence.
 
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use ulid::Ulid;
 
-use super::{MAX_DETAIL_CHARS, MAX_REASONS, find_candidate, patch_is_empty};
+use super::{MAX_DETAIL_CHARS, MAX_REASONS, find_candidate, patch_is_empty, run_config};
 use crate::{
-    AnalysisLevel, CheckPhase, CheckResult, CheckStatus, Decision, Reason, ReasonCode, RunRecord,
-    Validity,
-    config::Config,
+    AnalysisLevel, CheckPhase, CheckResult, CheckStatus, Decision, Reason, ReasonCode, RunMode,
+    RunRecord, Validity,
+    config::{AcceptMode, Config},
     executor::run_checks_with_config,
-    source::{apply_patch_in_workspace, create_scratch_tree},
+    source::{apply_patch_in_workspace, create_scratch_tree, fingerprint_tree},
 };
+
+/// Why accept does not run `checks.verify` on the merged tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksSkipped {
+    /// The run's frozen configuration cannot be read, so accept is strict.
+    ConfigUnreadable,
+    /// `coherence.accept: strict`.
+    Strict,
+    /// The source has not moved since S0: the merged tree is the Work's own.
+    Unmoved,
+    /// `coherence.integration_checks: false`.
+    Disabled,
+    /// `checks.verify` is empty.
+    NotConfigured,
+    /// Local execution, and the run never recorded `--allow-unsafe-local`.
+    NoAuthority,
+    /// The patch is empty.
+    EmptyPatch,
+}
+
+impl fmt::Display for ChecksSkipped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ConfigUnreadable => {
+                "the run's frozen configuration cannot be read, so accept is strict and applies only onto a source unchanged since the Work began"
+            }
+            Self::Strict => {
+                "accept is strict (coherence.accept: strict) and applies only onto a source unchanged since the Work began"
+            }
+            Self::Unmoved => {
+                "the source has not moved since the Work began, so the merged result is the Work's own tree"
+            }
+            Self::Disabled => "they are turned off (coherence.integration_checks: false)",
+            Self::NotConfigured => "no checks are configured (checks.verify is empty)",
+            Self::NoAuthority => {
+                "this Work has no recorded permission to run commands on the host (--allow-unsafe-local)"
+            }
+            Self::EmptyPatch => "the patch is empty",
+        })
+    }
+}
+
+/// Why accept will not run `checks.verify` on the merged tree for
+/// `candidate_label` of `run`, or `None` when it will. The one place these
+/// conditions live: the accept gate and its oracle act on the answer, and
+/// finish, check and accept report it. `world_changed` is a fresh
+/// evaluation's; before one (`None`), only a run Dispatch launched can show
+/// an unmoved source, by its whole-tree fingerprint.
+pub fn checks_skipped(
+    run: &RunRecord,
+    candidate_label: &str,
+    run_dir: &Path,
+    world_changed: Option<bool>,
+) -> Result<Option<ChecksSkipped>> {
+    let Some(config) = run_config(run_dir) else {
+        return Ok(Some(ChecksSkipped::ConfigUnreadable));
+    };
+    if config.coherence.accept == AcceptMode::Strict {
+        return Ok(Some(ChecksSkipped::Strict));
+    }
+    let unmoved = match world_changed {
+        Some(changed) => !changed,
+        // For a run Dispatch launched, the whole-tree fingerprint was taken
+        // from the same tree S0 was copied from, so an equal fingerprint
+        // means an unmoved world. Attached work's S0 is a merge-base commit
+        // while its fingerprint is the root's working tree at attach time,
+        // which may already differ from S0, so only an evaluation can say.
+        None => {
+            run.mode != RunMode::Attached
+                && fingerprint_tree(&run.source_path)? == run.source_fingerprint
+        }
+    };
+    let skipped = if unmoved {
+        ChecksSkipped::Unmoved
+    } else if !config.coherence.integration_checks {
+        ChecksSkipped::Disabled
+    } else if config.checks.verify.is_empty() {
+        ChecksSkipped::NotConfigured
+    } else if config.execution.backend == "local" && !run.environment.unsafe_local {
+        // Never widen authority at accept time: local commands need the
+        // acknowledgement the run itself recorded.
+        ChecksSkipped::NoAuthority
+    } else if patch_is_empty(&find_candidate(run, candidate_label)?.diff_path)? {
+        ChecksSkipped::EmptyPatch
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(skipped))
+}
+
+/// What became of the checks on the merged tree at accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergedChecks {
+    Skipped(ChecksSkipped),
+    /// They ran and passed; their logs are in this directory.
+    Passed(PathBuf),
+    /// They ran and did not all pass, or could not run: the verdict's
+    /// reasons name the command and its logs.
+    Failed,
+}
+
+impl fmt::Display for MergedChecks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Skipped(why) => write!(f, "not run — {why}"),
+            Self::Passed(logs) => write!(
+                f,
+                "passed on the current source with this patch; logs: {}",
+                logs.display()
+            ),
+            Self::Failed => f.write_str("did not pass"),
+        }
+    }
+}
 
 /// Longest slice of a configured command quoted in a reason, so the log path
 /// after it survives the overall detail cap.
@@ -45,43 +159,37 @@ impl Drop for Scratch {
 }
 
 /// Verify `candidate_label` against the merged tree. Returns `validity`
-/// unchanged when nothing needs verifying or this run has no authority to run
-/// local commands. A failing check downgrades the verdict to Refresh; so does
-/// an infrastructure error, because a false Refresh costs a rerun while a false
+/// unchanged, with the reason, when `checks_skipped` says the checks do not
+/// run. A failing check downgrades the verdict to Refresh; so does an
+/// infrastructure error, because a false Refresh costs a rerun while a false
 /// Continue would corrupt the source.
 pub async fn verify_integration(
     run: &RunRecord,
     candidate_label: &str,
     validity: Validity,
-    config: &Config,
     run_dir: &Path,
-) -> Result<Validity> {
-    if !validity.world_changed
-        || !config.coherence.integration_checks
-        || config.checks.verify.is_empty()
-        // Never widen authority at accept time: local commands need the
-        // acknowledgement the run itself recorded.
-        || (config.execution.backend == "local" && !run.environment.unsafe_local)
+) -> Result<(Validity, MergedChecks)> {
+    if let Some(skipped) =
+        checks_skipped(run, candidate_label, run_dir, Some(validity.world_changed))?
     {
-        return Ok(validity);
+        return Ok((validity, MergedChecks::Skipped(skipped)));
     }
+    let config = run_config(run_dir).context("the run's frozen configuration cannot be read")?;
     let patch = find_candidate(run, candidate_label)?.diff_path.clone();
-    if patch_is_empty(&patch)? {
-        return Ok(validity);
-    }
 
     let id = Ulid::new().to_string();
     let output_dir = run_dir.join("coherence-checks").join(&id);
-    let new_reasons = match run_checks(run, &patch, config, run_dir, &id, &output_dir).await {
+    let new_reasons = match run_checks(run, &patch, &config, run_dir, &id, &output_dir).await {
         Ok(results) => match results
             .iter()
             .find(|result| result.status != CheckStatus::Passed)
         {
             None => {
-                return Ok(Validity {
+                let validity = Validity {
                     analysis: AnalysisLevel::Integration,
                     ..validity
-                });
+                };
+                return Ok((validity, MergedChecks::Passed(output_dir)));
             }
             Some(_) => failure_reasons(&results),
         },
@@ -97,11 +205,12 @@ pub async fn verify_integration(
     let mut reasons = validity.reasons;
     reasons.extend(new_reasons);
     reasons.truncate(MAX_REASONS);
-    Ok(Validity {
+    let validity = Validity {
         decision: Decision::Refresh,
         reasons,
         ..validity
-    })
+    };
+    Ok((validity, MergedChecks::Failed))
 }
 
 /// Build the merged tree in a scratch area and run the verify commands there.

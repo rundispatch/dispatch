@@ -744,7 +744,18 @@ fn an_empty_worktree_that_vanishes_unannounced_closes_with_no_changes() {
     p.watch();
     p.start("s1", "startup", &p.worktree);
     // Let the owner follow it once, empty, then delete it behind its back.
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // The owner writes the Work's live patch only after it has taken the
+    // patch it would keep as last seen, so that file says it has followed.
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    let followed = p.run_dir(&id).join("delta-live.patch");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !followed.is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner never followed the worktree"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     git(
         &p.root,
         &["worktree", "remove", "--force", ".claude/worktrees/x"],

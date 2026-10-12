@@ -4,7 +4,9 @@
 //! This is the pure evaluator: L0 (file and patch state) then L1 (symbol and
 //! file facts, see `facts`). It reads the source tree, the candidate patch and
 //! the run's baseline, and runs `git apply` only with `--check`, so it never
-//! mutates anything, and it never touches the database or the run record.
+//! mutates the source, and it never touches the database or the run record.
+//! The one file it may write is Git's complaint about a conflicting patch,
+//! beside the run, when finish or accept asks (`evaluate_run`).
 
 use std::{fmt, fs, future::Future, path::Path};
 
@@ -14,9 +16,12 @@ use chrono::Utc;
 use crate::{
     AnalysisLevel, ApplicationState, CandidateRecord, CoherenceRecord, Decision, LifecycleState,
     Reason, ReasonCode, RunRecord, RunStatus, Validity, WorkResult,
-    coherence::world::WorldObservation,
-    config::{AcceptMode, Config},
-    source::{fingerprint_tree, git_command, run_git},
+    coherence::{
+        integration::{ChecksSkipped, MergedChecks},
+        world::WorldObservation,
+    },
+    config::Config,
+    source::{git_command, run_git},
 };
 
 pub mod facts;
@@ -29,6 +34,9 @@ pub mod world;
 
 const MAX_REASONS: usize = 20;
 const MAX_DETAIL_CHARS: usize = 300;
+/// Beside the run: Git's whole complaint about a patch that no longer
+/// applies, as finish or accept last found it.
+pub const CONFLICT_OUTPUT: &str = "patch-conflict.txt";
 
 /// What the evaluator needs to know about the work: where the source lives,
 /// the patch (the work's delta against its baseline), and the run's private
@@ -52,7 +60,14 @@ impl<'a> WorkView<'a> {
 }
 
 /// Observe the current source tree and evaluate one candidate's patch of `run`.
-pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> {
+/// With `keep` (the run's directory, for finish and accept), a patch that no
+/// longer applies leaves Git's whole complaint there (`CONFLICT_OUTPUT`) and
+/// its reason says so; without it nothing is written.
+pub fn evaluate_run(
+    run: &RunRecord,
+    candidate_label: &str,
+    keep: Option<&Path>,
+) -> Result<Validity> {
     let candidate = find_candidate(run, candidate_label)?;
     let world = world::observe(
         &run.source_path,
@@ -60,7 +75,12 @@ pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> 
         &run.baseline_commit,
         &run.source_kind,
     )?;
-    evaluate(&world, &WorkView::of(run, candidate))
+    let kept = keep.map(|run_dir| run_dir.join(CONFLICT_OUTPUT));
+    let (validity, conflict) = assess(&world, &WorkView::of(run, candidate), kept.as_deref())?;
+    if let (Some(path), Some(output)) = (&kept, conflict) {
+        fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(validity)
 }
 
 /// The verdict `check`, `status`, `explain` and `refresh` show: a fresh file
@@ -68,9 +88,14 @@ pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> 
 /// merged tree of this same world. Only accept runs the integration checks,
 /// so a fresh evaluation of an unmoved world must not hide that refusal. Once
 /// the world moves, the fresh verdict stands. The accept gate itself always
-/// evaluates afresh, so a retry runs the checks again.
-pub fn shown_validity(run: &RunRecord, candidate_label: &str) -> Result<Validity> {
-    let live = evaluate_run(run, candidate_label)?;
+/// evaluates afresh, so a retry runs the checks again. `keep` as for
+/// `evaluate_run`.
+pub fn shown_validity(
+    run: &RunRecord,
+    candidate_label: &str,
+    keep: Option<&Path>,
+) -> Result<Validity> {
+    let live = evaluate_run(run, candidate_label, keep)?;
     Ok(
         match run.coherence.as_ref().and_then(|c| c.validity.as_ref()) {
             Some(stored)
@@ -107,13 +132,18 @@ pub fn is_ready_unapplied(run: &RunRecord) -> bool {
 /// been applied and has exactly one candidate; `None` for any other run, or
 /// when evaluation fails. Reads only; nothing is written.
 pub fn live_validity(run: &RunRecord) -> Option<Validity> {
+    live(run, None)
+}
+
+/// `live_validity`, with `keep` as for `evaluate_run`.
+fn live(run: &RunRecord, keep: Option<&Path>) -> Option<Validity> {
     if !is_ready_unapplied(run) {
         return None;
     }
     let [candidate] = run.candidates.as_slice() else {
         return None;
     };
-    match shown_validity(run, &candidate.label) {
+    match shown_validity(run, &candidate.label, keep) {
         Ok(validity) => Some(validity),
         Err(error) => {
             tracing::debug!("coherence evaluation of run {} failed: {error:#}", run.id);
@@ -125,8 +155,18 @@ pub fn live_validity(run: &RunRecord) -> Option<Validity> {
 /// A copy of `run` whose stored validity is replaced by the live one when there
 /// is one, for pure renderers. The copy is for display and is never persisted.
 pub fn with_live_validity(run: &RunRecord) -> RunRecord {
+    shown_with(run, live_validity(run))
+}
+
+/// `with_live_validity` for finish and the end of a native run: a patch that
+/// no longer applies leaves Git's whole complaint beside the run (`run_dir`).
+pub fn with_kept_validity(run: &RunRecord, run_dir: &Path) -> RunRecord {
+    shown_with(run, live(run, Some(run_dir)))
+}
+
+fn shown_with(run: &RunRecord, live: Option<Validity>) -> RunRecord {
     let mut shown = run.clone();
-    if let Some(validity) = live_validity(run) {
+    if let Some(validity) = live {
         let record = shown.coherence.get_or_insert(CoherenceRecord {
             version: 1,
             refreshed_from: None,
@@ -173,6 +213,9 @@ pub struct CoherenceBlocked {
     pub despite_refresh: bool,
     /// For a STOP, the applied run that already landed the same patch.
     pub landed_by: Option<String>,
+    /// What became of the merged checks; `None` when the verdict refused the
+    /// work before them.
+    pub checks: Option<MergedChecks>,
 }
 
 impl fmt::Display for CoherenceBlocked {
@@ -189,6 +232,15 @@ impl fmt::Display for CoherenceBlocked {
             write!(f, " (landed by run {id})")?;
         }
         write!(f, ". The source was left unchanged. ")?;
+        match &self.checks {
+            // The reasons name the failing check and its logs.
+            Some(MergedChecks::Failed) => {}
+            Some(checks) => write!(f, "Merged checks: {checks}. ")?,
+            None => write!(
+                f,
+                "Merged checks: not run — accept refuses {verdict} work before them. "
+            )?,
+        }
         if self.validity.decision == Decision::Stop {
             write!(
                 f,
@@ -232,20 +284,30 @@ impl fmt::Display for CoherenceBlocked {
 
 impl std::error::Error for CoherenceBlocked {}
 
-/// What acceptance may do about a possibly moved source.
+/// What acceptance may do about a possibly moved source, and what became of
+/// the merged checks.
 pub enum AcceptGate {
     /// Strict mode, or the whole tree is byte-identical to the snapshot: the
-    /// existing all-or-nothing fingerprint rules apply unchanged.
-    Legacy,
-    /// The world moved but the work is still valid; apply against that world.
-    Compatible(Validity),
-    /// The work is stale; nothing may be accepted or applied.
-    Blocked(Validity),
+    /// existing all-or-nothing fingerprint rules apply unchanged, and the
+    /// merged checks do not run, for this reason.
+    Legacy(ChecksSkipped),
+    /// The work is still valid against the world as it is; apply against it.
+    Compatible {
+        validity: Validity,
+        checks: MergedChecks,
+    },
+    /// The work is stale; nothing may be accepted or applied. `checks` is
+    /// `None` when the verdict refused it before them.
+    Blocked {
+        validity: Validity,
+        checks: Option<MergedChecks>,
+    },
     /// A human overrode an analysis-only REFRESH (`--despite-refresh`) and the
     /// merged tree's checks passed: apply against the verified world.
     Overridden {
         overridden: Validity,
         verified: Validity,
+        checks: MergedChecks,
     },
 }
 
@@ -292,35 +354,35 @@ pub fn gate(
     run_dir: &Path,
     despite_refresh: bool,
 ) -> Result<AcceptGate> {
-    // An unreadable snapshot means strict, so the oracle is never reached.
-    let Some(config) = run_config(run_dir) else {
-        return Ok(AcceptGate::Legacy);
-    };
-    // For a run Dispatch launched, the whole-tree fingerprint was taken from
-    // the same tree S0 was copied from, so an equal fingerprint means an
-    // unmoved world. Attached work's S0 is a merge-base commit while its
-    // fingerprint is the root's working tree at attach time, which may already
-    // differ from S0; the shortcut would skip evaluation and the integration
-    // checks, so attached runs always evaluate.
-    if config.coherence.accept == AcceptMode::Strict
-        || (run.mode != crate::RunMode::Attached
-            && fingerprint_tree(&run.source_path)? == run.source_fingerprint)
+    // Strict accept, or a launched run's unmoved tree: the fingerprint rules
+    // apply, and nothing is evaluated.
+    if let Some(
+        skipped
+        @ (ChecksSkipped::ConfigUnreadable | ChecksSkipped::Strict | ChecksSkipped::Unmoved),
+    ) = integration::checks_skipped(run, candidate_label, run_dir, None)?
     {
-        return Ok(AcceptGate::Legacy);
+        return Ok(AcceptGate::Legacy(skipped));
     }
-    let mut validity = evaluate_run(run, candidate_label)?;
+    let mut validity = evaluate_run(run, candidate_label, Some(run_dir))?;
     if validity.decision == Decision::Continue {
-        validity = block_on(integration::verify_integration(
+        let (validity, checks) = block_on(integration::verify_integration(
             run,
             candidate_label,
             validity,
-            &config,
             run_dir,
         ))??;
-    } else if despite_refresh && overridable(&validity) {
+        return Ok(match validity.decision {
+            Decision::Continue => AcceptGate::Compatible { validity, checks },
+            Decision::Refresh | Decision::Stop => AcceptGate::Blocked {
+                validity,
+                checks: Some(checks),
+            },
+        });
+    }
+    if despite_refresh && overridable(&validity) {
         // The override sets aside the analysis, never the checks: they must
         // run on the merged tree and pass.
-        let verified = block_on(integration::verify_integration(
+        let (verified, checks) = block_on(integration::verify_integration(
             run,
             candidate_label,
             Validity {
@@ -328,35 +390,39 @@ pub fn gate(
                 reasons: Vec::new(),
                 ..validity.clone()
             },
-            &config,
             run_dir,
         ))??;
-        return Ok(match verified.decision {
-            Decision::Continue if verified.analysis == AnalysisLevel::Integration => {
-                AcceptGate::Overridden {
-                    overridden: validity,
-                    verified,
-                }
-            }
-            Decision::Continue => {
+        return Ok(match (verified.decision, checks) {
+            (Decision::Continue, checks @ MergedChecks::Passed(_)) => AcceptGate::Overridden {
+                overridden: validity,
+                verified,
+                checks,
+            },
+            (Decision::Continue, checks) => {
                 validity.reasons.push(Reason {
                     code: ReasonCode::AnalysisUncertain,
                     fact_id: None,
                     path: None,
                     detail: "an override needs checks.verify to run and pass on the merged tree, and none ran".into(),
                 });
-                AcceptGate::Blocked(validity)
+                AcceptGate::Blocked {
+                    validity,
+                    checks: Some(checks),
+                }
             }
-            _ => {
+            (_, checks) => {
                 validity.reasons.extend(verified.reasons);
                 validity.reasons.truncate(MAX_REASONS);
-                AcceptGate::Blocked(validity)
+                AcceptGate::Blocked {
+                    validity,
+                    checks: Some(checks),
+                }
             }
         });
     }
-    Ok(match validity.decision {
-        Decision::Continue => AcceptGate::Compatible(validity),
-        Decision::Refresh | Decision::Stop => AcceptGate::Blocked(validity),
+    Ok(AcceptGate::Blocked {
+        validity,
+        checks: None,
     })
 }
 
@@ -389,8 +455,20 @@ fn block_on<T: Send>(future: impl Future<Output = T> + Send) -> Result<T> {
 /// continues and the world moved does L1 check the symbols and files the patch
 /// assumes; any reason it finds means refresh.
 pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
+    Ok(assess(world, work, None)?.0)
+}
+
+/// `evaluate`, also returning Git's whole complaint when the patch no longer
+/// applies; the bounded reason names the paths it mentions, and `kept`, where
+/// the caller keeps the complaint.
+fn assess(
+    world: &WorldObservation,
+    work: &WorkView,
+    kept: Option<&Path>,
+) -> Result<(Validity, Option<String>)> {
     let world_changed = !world.changes.is_empty();
     let mut analysis = AnalysisLevel::FilesOnly;
+    let mut conflict = None;
     // An unchanged world is checked first so that it costs no file or Git work.
     let (decision, mut reasons) = if !world_changed || patch_is_empty(work.delta_patch)? {
         (Decision::Continue, Vec::new())
@@ -403,17 +481,14 @@ pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
         };
         (Decision::Stop, vec![reason])
     } else if let Some(stderr) = apply_check(work, false)? {
-        let detail = if stderr.is_empty() {
-            "the patch does not apply to the current source".to_owned()
-        } else {
-            stderr.chars().take(MAX_DETAIL_CHARS).collect()
-        };
+        let paths = conflicting_paths(&stderr);
         let reason = Reason {
             code: ReasonCode::PatchConflict,
             fact_id: None,
-            path: None,
-            detail,
+            path: paths.first().cloned(),
+            detail: conflict_detail(&stderr, &paths, kept),
         };
+        conflict = Some(stderr);
         (Decision::Refresh, vec![reason])
     } else {
         let (found, level) = facts::check(work, world)?;
@@ -428,7 +503,7 @@ pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
         )
     };
     reasons.truncate(MAX_REASONS);
-    Ok(Validity {
+    let validity = Validity {
         decision,
         evaluated_at: Utc::now(),
         world_digest: world.digest.clone(),
@@ -436,7 +511,52 @@ pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
         changed_files: u32::try_from(world.changes.len()).unwrap_or(u32::MAX),
         reasons,
         analysis,
-    })
+    };
+    Ok((validity, conflict))
+}
+
+/// The paths `git apply --check` names in `stderr`, once each, in order:
+/// `error: patch failed: <path>:<line>` and `error: <path>: <problem>`.
+fn conflicting_paths(stderr: &str) -> Vec<String> {
+    let mut paths = Vec::<String>::new();
+    for line in stderr.lines() {
+        let Some(rest) = line.strip_prefix("error: ") else {
+            continue;
+        };
+        let path = match rest.strip_prefix("patch failed: ") {
+            Some(at) => at.rsplit_once(':').map_or(at, |(path, _)| path),
+            None => match rest.split_once(": ") {
+                Some((path, _)) => path,
+                None => continue,
+            },
+        };
+        if !paths.iter().any(|known| known == path) {
+            paths.push(path.to_owned());
+        }
+    }
+    paths
+}
+
+/// A patch conflict in one bounded line: the paths, where Git's whole
+/// complaint is kept, and as much of it as fits.
+fn conflict_detail(stderr: &str, paths: &[String], kept: Option<&Path>) -> String {
+    let mut detail = match paths {
+        [] => "the patch does not apply to the current source".to_owned(),
+        [one] => format!("the patch no longer applies to {one}"),
+        [first, second] => format!("the patch no longer applies to {first} and {second}"),
+        [first, second, rest @ ..] => format!(
+            "the patch no longer applies to {first}, {second} and {} more",
+            rest.len()
+        ),
+    };
+    if let Some(path) = kept {
+        detail.push_str(&format!("; Git's full output: {}", path.display()));
+    }
+    if !stderr.is_empty() {
+        let said = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+        detail.push_str(&format!("; git: {said}"));
+    }
+    detail.chars().take(MAX_DETAIL_CHARS).collect()
 }
 
 /// Whether the whole of a candidate's retained patch is in the source now:
@@ -787,9 +907,67 @@ mod tests {
         fixture.write("a.txt", "one\ntwo changed elsewhere\nthree\nfour\nfive\n");
         let validity = fixture.evaluate(&patch);
         let detail = &validity.reasons[0].detail;
-        assert!(detail.contains("a.txt"), "{detail}");
+        assert!(
+            detail.starts_with(
+                "the patch no longer applies to a.txt; git: error: patch failed: a.txt:1"
+            ),
+            "{detail}"
+        );
+        assert_eq!(validity.reasons[0].path.as_deref(), Some("a.txt"));
         assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
         assert_eq!(validity.changed_files, 1);
+    }
+
+    /// Finish and accept keep Git's whole complaint beside the run and say
+    /// where; a reading evaluation writes nothing.
+    #[test]
+    fn a_conflict_keeps_git_output_only_when_asked() {
+        let fixture = Fixture::new(true, &base_files());
+        let run = fixture.run(fixture.patch(PATCH_A));
+        fixture.write("a.txt", "one\ntwo changed elsewhere\nthree\nfour\nfive\n");
+        let run_dir = fixture.root.path().join("run");
+        let kept = run_dir.join(CONFLICT_OUTPUT);
+        assert!(
+            !evaluate_run(&run, "A", None).unwrap().reasons[0]
+                .detail
+                .contains(CONFLICT_OUTPUT)
+        );
+        assert!(!kept.exists());
+        let validity = evaluate_run(&run, "A", Some(&run_dir)).unwrap();
+        assert!(
+            validity.reasons[0]
+                .detail
+                .contains(&format!("Git's full output: {}", kept.display())),
+            "{:?}",
+            validity.reasons
+        );
+        let output = fs::read_to_string(&kept).unwrap();
+        assert!(output.contains("error: patch failed: a.txt:1"), "{output}");
+        assert!(
+            output.contains("error: a.txt: patch does not apply"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn conflicting_paths_come_from_git_complaint_once_each() {
+        let stderr = "error: patch failed: src/a.rs:12\nerror: src/a.rs: patch does not apply\n\
+                      error: b.txt: already exists in working directory\n\
+                      error: c d.txt: does not exist in index\nerror: corrupt patch at line 9";
+        assert_eq!(conflicting_paths(stderr), ["src/a.rs", "b.txt", "c d.txt"]);
+        let paths = conflicting_paths(stderr);
+        let detail = conflict_detail(stderr, &paths, Some(Path::new("/r/patch-conflict.txt")));
+        assert!(
+            detail.starts_with(
+                "the patch no longer applies to src/a.rs, b.txt and 1 more; Git's full output: /r/patch-conflict.txt; git: error: patch failed: src/a.rs:12 error:"
+            ),
+            "{detail}"
+        );
+        assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
+        assert_eq!(
+            conflict_detail("", &[], None),
+            "the patch does not apply to the current source"
+        );
     }
 
     #[test]
@@ -815,9 +993,9 @@ mod tests {
         let patch = fixture.patch(PATCH_A);
         let run = fixture.run(patch);
         fixture.write("a.txt", "one\nTWO\nthree\nfour\nfive\n");
-        let validity = evaluate_run(&run, "A").unwrap();
+        let validity = evaluate_run(&run, "A", None).unwrap();
         assert_eq!(validity.decision, Decision::Stop);
-        assert!(evaluate_run(&run, "B").is_err());
+        assert!(evaluate_run(&run, "B", None).is_err());
         assert!(matches!(run.source_kind, SourceKind::Git));
     }
 
@@ -882,13 +1060,14 @@ mod tests {
         let fixture = Fixture::new(true, &base_files());
         let run = fixture.run(fixture.patch(PATCH_A));
         fixture.write("a.txt", "one\nTWO\nthree\nfour\nfive\n");
-        let validity = evaluate_run(&run, "A").unwrap();
+        let validity = evaluate_run(&run, "A", None).unwrap();
         let text = CoherenceBlocked {
             run_id: "RUN1".into(),
             validity: validity.clone(),
             attached: false,
             despite_refresh: false,
             landed_by: None,
+            checks: None,
         }
         .to_string();
         assert!(
@@ -904,6 +1083,7 @@ mod tests {
             attached: false,
             despite_refresh: false,
             landed_by: None,
+            checks: None,
         }
         .to_string();
         assert!(refresh.contains(
@@ -919,6 +1099,7 @@ mod tests {
             attached: true,
             despite_refresh: false,
             landed_by: None,
+            checks: None,
         }
         .to_string();
         assert!(!attached.contains("dispatch refresh"), "{attached}");
@@ -930,6 +1111,7 @@ mod tests {
             attached: false,
             despite_refresh: true,
             landed_by: None,
+            checks: None,
         }
         .to_string();
         assert!(stop.contains("cannot be overridden"), "{stop}");
@@ -944,7 +1126,7 @@ mod tests {
         assert!(run_config(&run_dir).is_none());
         assert!(matches!(
             gate(&run, "A", &run_dir, false).unwrap(),
-            AcceptGate::Legacy
+            AcceptGate::Legacy(ChecksSkipped::ConfigUnreadable)
         ));
         fs::write(run_dir.join("config.snapshot.yml"), "coherence: [not a map").unwrap();
         assert!(run_config(&run_dir).is_none());

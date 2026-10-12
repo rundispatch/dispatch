@@ -14,6 +14,8 @@ struct Fixture {
     source: PathBuf,
     state: PathBuf,
     run_id: String,
+    /// What `dispatch run` printed.
+    run_stdout: String,
 }
 
 impl Fixture {
@@ -44,8 +46,8 @@ impl Fixture {
             .success()
             .get_output()
             .clone();
-        let run_id = String::from_utf8(output.stdout)
-            .unwrap()
+        let run_stdout = String::from_utf8(output.stdout).unwrap();
+        let run_id = run_stdout
             .lines()
             .find_map(|line| line.strip_prefix("RUN "))
             .expect("run output includes an ID")
@@ -56,6 +58,7 @@ impl Fixture {
             source,
             state,
             run_id,
+            run_stdout,
         }
     }
 
@@ -172,6 +175,70 @@ fn check_refreshes_for_a_conflicting_edit_and_names_the_next_commands() {
     assert_eq!(fixture.snapshot(id), before);
 }
 
+/// The native result summary says what holds now, by Work ID: the frozen
+/// patch, its verification, a fresh verdict, what accept would verify, and
+/// the commands that fit.
+#[test]
+fn the_result_summary_shows_the_patch_verdict_and_what_accept_would_verify() {
+    let fixture = Fixture::new("");
+    let (id, out) = (&fixture.run_id, &fixture.run_stdout);
+    assert!(out.contains("Ready for review"), "{out}");
+    assert!(out.contains(&format!("Work {id}\n")), "{out}");
+    assert!(
+        out.contains("  patch: ") && out.contains("diff.patch (1 file)"),
+        "{out}"
+    );
+    assert!(out.contains("Verification\n  Not configured"), "{out}");
+    assert!(
+        out.contains("Coherence: CONTINUE — world unchanged"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "At accept\n  merged checks would not run now — the source has not moved since the Work began"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "Then\n  dispatch accept {id}\n  dispatch reject {id}"
+        )),
+        "{out}"
+    );
+}
+
+/// A result that no longer applies: `status` and `check` agree on the verdict
+/// and on what accept would verify, offer refresh rather than accept, name
+/// the file, and write nothing.
+#[test]
+fn status_and_check_agree_on_a_result_that_no_longer_applies_and_write_nothing() {
+    let fixture = Fixture::new("");
+    let id = &fixture.run_id;
+    fixture.conflicting_edit();
+    let before = fixture.snapshot(id);
+    let status = Fixture::stdout(&fixture.dispatch(&["status", id]).success());
+    let check = Fixture::stdout(&fixture.dispatch(&["check", id]).success());
+    assert_eq!(fixture.snapshot(id), before);
+
+    let conflict = "patch_conflict: the patch no longer applies to dispatch-fake-good.txt";
+    let scope = "accept would refuse it now (REFRESH), before any merged checks";
+    assert!(status.contains("Finished, but stale (REFRESH)"), "{status}");
+    assert!(status.contains(conflict), "{status}");
+    assert!(
+        status.contains(&format!("At accept\n  {scope}")),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!(
+            "Then\n  dispatch refresh {id}\n  dispatch reject {id}"
+        )),
+        "{status}"
+    );
+    assert!(!status.contains("dispatch accept"), "{status}");
+    assert!(check.contains(conflict), "{check}");
+    assert!(check.contains(&format!("At accept: {scope}")), "{check}");
+}
+
 #[test]
 fn check_stops_when_the_patch_is_already_in_the_source() {
     let fixture = Fixture::new("");
@@ -188,6 +255,26 @@ fn check_stops_when_the_patch_is_already_in_the_source() {
             fixture.run_id
         )),
         "{stdout}"
+    );
+}
+
+/// A closed result reads as closed, never as waiting for review.
+#[test]
+fn a_closed_result_is_headed_closed() {
+    let fixture = Fixture::new("");
+    let id = &fixture.run_id;
+    fs::write(fixture.source.join("dispatch-fake-good.txt"), "").unwrap();
+    fixture
+        .dispatch(&["close", id, "--reason", "already-present"])
+        .success();
+
+    let status = Fixture::stdout(&fixture.dispatch(&["status", id]).success());
+
+    assert!(status.starts_with("\nClosed\n"), "{status}");
+    assert!(!status.contains("Ready for review"), "{status}");
+    assert!(
+        status.contains("Closed: changes already present; source tree unchanged"),
+        "{status}"
     );
 }
 

@@ -1288,3 +1288,410 @@ fn concurrent_close_and_finish_never_lose_the_changes() {
     let patch = fs::read_to_string(f.state.join("runs").join(&id).join("delta.patch")).unwrap();
     assert!(patch.contains("+    2"), "{patch}");
 }
+
+/// R2: the agent and the root both change the same line. Finish keeps the
+/// result but says it no longer applies, names the file, keeps Git's whole
+/// complaint beside the run and never suggests accept; `check` agrees on the
+/// verdict and on what accept would verify, and writes nothing. Once the
+/// source is repaired, the same frozen patch holds again.
+#[test]
+fn finish_says_a_patch_that_no_longer_applies_is_stale_and_check_agrees() {
+    let f = Fixture::new(true);
+    let id = f.attach(&[]);
+    fs::write(f.workspace.join("src/lib.rs"), TWO).unwrap();
+    fs::write(f.root.join("src/lib.rs"), "pub fn f() -> i32 {\n    3\n}\n").unwrap();
+    let summary = Fixture::stdout(&f.dispatch(&["finish", &id]).success());
+    let kept = f.state.join("runs").join(&id).join("patch-conflict.txt");
+    assert!(!summary.contains("Ready for review"), "{summary}");
+    assert!(
+        summary.contains("Finished, but stale (REFRESH)"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(&format!("Work {id}\n  patch: ")) && summary.contains("(1 file)"),
+        "{summary}"
+    );
+    assert!(summary.contains("Verification\n  PASS"), "{summary}");
+    assert!(summary.contains("Coherence: REFRESH"), "{summary}");
+    let conflict = "patch_conflict: the patch no longer applies to src/lib.rs";
+    assert!(summary.contains(conflict), "{summary}");
+    assert!(summary.contains("Git's full output: "), "{summary}");
+    let full = fs::read_to_string(&kept).unwrap();
+    assert!(
+        full.contains("error: patch failed: src/lib.rs:1")
+            && full.contains("error: src/lib.rs: patch does not apply"),
+        "{full}"
+    );
+    assert!(!summary.contains("dispatch accept"), "{summary}");
+    assert!(
+        summary.contains(&format!(
+            "dispatch close {id} --reason superseded --replacement <new-id>\n  dispatch reject {id}"
+        )),
+        "{summary}"
+    );
+    let scope = "accept would refuse it now (REFRESH), before any merged checks";
+    assert!(
+        summary.contains(&format!("At accept\n  {scope}")),
+        "{summary}"
+    );
+
+    fs::remove_file(&kept).unwrap();
+    let check = Fixture::stdout(&f.dispatch(&["check", &id]).success());
+    assert!(check.contains("Coherence: REFRESH"), "{check}");
+    assert!(check.contains(conflict), "{check}");
+    assert!(check.contains(&format!("At accept: {scope}")), "{check}");
+    assert!(!check.contains("dispatch accept"), "{check}");
+    f.dispatch(&["status", &id]).success();
+    assert!(!kept.exists(), "check and status only read");
+
+    // The source repaired: the same frozen patch holds.
+    fs::write(f.root.join("src/lib.rs"), ONE).unwrap();
+    let check = Fixture::stdout(&f.dispatch(&["check", &id]).success());
+    assert!(check.contains("Coherence: CONTINUE"), "{check}");
+    assert!(
+        check.contains("At accept: merged checks would not run now — the source has not moved"),
+        "{check}"
+    );
+    assert!(
+        check.contains(&format!("Next: dispatch accept {id}")),
+        "{check}"
+    );
+}
+
+/// The Work's change is already in the source: finish says so and points to
+/// close, never to accept or reject.
+#[test]
+fn finish_names_close_for_changes_already_in_the_source() {
+    let f = Fixture::new(true);
+    let id = f.attach(&[]);
+    fs::write(f.workspace.join("src/lib.rs"), TWO).unwrap();
+    fs::write(f.root.join("src/lib.rs"), TWO).unwrap();
+    let summary = Fixture::stdout(&f.dispatch(&["finish", &id]).success());
+    assert!(
+        summary.contains("Finished, already in the source (STOP)"),
+        "{summary}"
+    );
+    assert!(summary.contains("already_applied"), "{summary}");
+    assert!(
+        summary.contains(&format!(
+            "Then\n  dispatch close {id} --reason already-present\n"
+        )),
+        "{summary}"
+    );
+    assert!(
+        !summary.contains("dispatch accept") && !summary.contains("dispatch reject"),
+        "{summary}"
+    );
+}
+
+/// The `logs: <dir>` a passing merged run names, which must exist.
+fn merged_logs(out: &str) -> PathBuf {
+    let line = out
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Merged checks: passed on the current source with this patch; logs: ")
+        })
+        .unwrap_or_else(|| panic!("no passing merged checks in {out}"));
+    PathBuf::from(line)
+}
+
+/// R3: accept says what became of the merged checks, in three different,
+/// true lines; finish said beforehand what accept would do.
+#[test]
+fn accept_says_whether_merged_checks_ran_and_why_not() {
+    let unmoved = "the source has not moved since the Work began, so the merged result is the Work's own tree";
+
+    // Checks configured, the source unmoved.
+    let a = Fixture::new(true);
+    let id = a.attach(&[]);
+    fs::write(a.workspace.join("src/lib.rs"), TWO).unwrap();
+    let summary = Fixture::stdout(&a.dispatch(&["finish", &id]).success());
+    assert!(
+        summary.contains(&format!("merged checks would not run now — {unmoved}")),
+        "{summary}"
+    );
+    let out = Fixture::stdout(&a.dispatch(&["accept", &id]).success());
+    assert!(
+        out.contains(&format!("Merged checks: not run — {unmoved}")),
+        "{out}"
+    );
+    assert!(
+        !a.state
+            .join("runs")
+            .join(&id)
+            .join("coherence-checks")
+            .exists()
+    );
+
+    // Checks configured, an unrelated change in the source.
+    let b = Fixture::new(true);
+    let id = b.attach(&[]);
+    fs::write(b.workspace.join("src/lib.rs"), TWO).unwrap();
+    fs::write(b.root.join("notes.txt"), "elsewhere\n").unwrap();
+    let summary = Fixture::stdout(&b.dispatch(&["finish", &id]).success());
+    assert!(
+        summary.contains("merged checks will run (checks.verify on the source as it is then, with this patch) and must pass before anything is applied"),
+        "{summary}"
+    );
+    let out = Fixture::stdout(&b.dispatch(&["accept", &id]).success());
+    let logs = merged_logs(&out);
+    assert!(logs.is_dir(), "{out}");
+    assert!(
+        logs.parent().unwrap().ends_with("coherence-checks"),
+        "{out}"
+    );
+
+    // No checks configured, an unrelated change in the source.
+    let c = Fixture::new(false);
+    let id = c.attach(&[]);
+    fs::write(c.workspace.join("src/lib.rs"), TWO).unwrap();
+    fs::write(c.root.join("notes.txt"), "elsewhere\n").unwrap();
+    let summary = Fixture::stdout(&c.dispatch(&["finish", &id]).success());
+    let none = "no checks are configured (checks.verify is empty)";
+    assert!(
+        summary.contains(&format!("merged checks would not run now — {none}")),
+        "{summary}"
+    );
+    let out = Fixture::stdout(&c.dispatch(&["accept", &id]).success());
+    assert!(
+        out.contains(&format!("Merged checks: not run — {none}")),
+        "{out}"
+    );
+}
+
+/// Work that changed nothing gives the merged checks nothing to verify.
+#[test]
+fn accept_of_an_empty_patch_says_there_was_nothing_to_check() {
+    let f = Fixture::new(true);
+    let id = f.attach(&[]);
+    fs::write(f.root.join("notes.txt"), "elsewhere\n").unwrap();
+    let summary = Fixture::stdout(&f.dispatch(&["finish", &id]).success());
+    assert!(
+        summary.contains("merged checks would not run now — the patch is empty"),
+        "{summary}"
+    );
+    let out = Fixture::stdout(&f.dispatch(&["accept", &id]).success());
+    assert!(
+        out.contains("Merged checks: not run — the patch is empty"),
+        "{out}"
+    );
+}
+
+/// The checks pass in the workspace and fail on the merged tree. Finish says
+/// CONTINUE with the merged checks still to run, never that they passed;
+/// accept runs them, refuses, names the failing command, and changes nothing.
+/// The refusal stays visible while the source stays as it was.
+#[test]
+fn a_workspace_pass_then_a_merged_failure_refuses_accept() {
+    let f = Fixture::new(true);
+    fs::write(
+        f.root.join("dispatch.yml"),
+        "checks:\n  verify: ['test ! -f forbidden.txt']\n",
+    )
+    .unwrap();
+    let id = f.attach(&[]);
+    fs::write(f.workspace.join("src/lib.rs"), TWO).unwrap();
+    fs::write(f.root.join("forbidden.txt"), "someone else's\n").unwrap();
+    let summary = Fixture::stdout(&f.dispatch(&["finish", &id]).success());
+    assert!(summary.contains("Verification\n  PASS"), "{summary}");
+    assert!(summary.contains("Coherence: CONTINUE"), "{summary}");
+    assert!(summary.contains("merged checks will run"), "{summary}");
+    assert!(!summary.contains("passed"), "{summary}");
+
+    let refused = f.dispatch(&["accept", &id]).failure();
+    let stderr = Fixture::stderr(&refused);
+    assert!(
+        stderr.contains("check `test ! -f forbidden.txt` failed (exit 1)"),
+        "{stderr}"
+    );
+    assert!(!Fixture::stdout(&refused).contains("passed"));
+    assert_eq!(fs::read_to_string(f.root.join("src/lib.rs")).unwrap(), ONE);
+    let outcome = f.metadata(&id)["outcome"].clone();
+    assert_eq!(outcome["review"], "pending");
+    assert_eq!(outcome["application"], "blocked_by_source_drift");
+    assert_eq!(f.event_count(&id, "review.accepted"), 0);
+    let check = Fixture::stdout(&f.dispatch(&["check", &id]).success());
+    assert!(check.contains("integration_check_failed"), "{check}");
+}
+
+/// The source moves while the merged checks run: they pass, but on a source
+/// that is no longer there, so nothing is applied and accept says why.
+#[test]
+fn the_source_moving_while_merged_checks_run_blocks_the_apply() {
+    let f = Fixture::new(true);
+    let moved = f.root.join("moved.txt");
+    // Only the run on the merged tree, in a coherence scratch tree, writes
+    // into the source.
+    fs::write(
+        f.root.join("dispatch.yml"),
+        format!(
+            "checks:\n  verify:\n    - if pwd | grep -q coherence-scratch-; then echo moved >> {}; fi\n",
+            moved.display()
+        ),
+    )
+    .unwrap();
+    let id = f.attach(&[]);
+    fs::write(f.workspace.join("src/lib.rs"), TWO).unwrap();
+    f.dispatch(&["finish", &id]).success();
+    assert!(
+        !moved.exists(),
+        "the workspace's checks leave the source alone"
+    );
+
+    let refused = f.dispatch(&["accept", &id]).failure();
+    let (stdout, stderr) = (Fixture::stdout(&refused), Fixture::stderr(&refused));
+    assert!(merged_logs(&stdout).is_dir(), "{stdout}");
+    assert!(
+        stderr.contains("the source changed after accept checked it, so nothing was applied"),
+        "{stderr}"
+    );
+    assert!(moved.is_file());
+    assert_eq!(fs::read_to_string(f.root.join("src/lib.rs")).unwrap(), ONE);
+    let outcome = f.metadata(&id)["outcome"].clone();
+    assert_eq!(outcome["application"], "blocked_by_source_drift");
+    assert_eq!(outcome["review"], "pending");
+    assert_eq!(f.event_count(&id, "review.accepted"), 0);
+}
+
+impl Fixture {
+    /// `dispatch attach --root <root> -- /bin/sh -c <script>` from the root:
+    /// Work in a workspace Dispatch makes. Its ID and workspace.
+    fn wrapped(&self, script: &str) -> (String, PathBuf) {
+        let root = self.root.to_str().unwrap();
+        let assert = self
+            .dispatch_in_root(&[
+                "attach", "--root", root, "--agent", "fixture", "--", "/bin/sh", "-c", script,
+            ])
+            .success();
+        let id = Self::stdout(&assert)
+            .lines()
+            .find_map(|line| line.strip_prefix("Attached work "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("the wrapper names its Work")
+            .to_owned();
+        let workspace = self.metadata(&id)["attachment"]["workspace"]
+            .as_str()
+            .unwrap()
+            .into();
+        (id, workspace)
+    }
+
+    fn clean(&self, args: &[&str]) -> String {
+        let mut all = vec!["clean"];
+        all.extend_from_slice(args);
+        Self::stdout(&self.dispatch(&all).success())
+    }
+}
+
+const AGENT_EDIT: &str = "printf 'pub fn f() -> i32 {\\n    2\\n}\\n' > src/lib.rs";
+
+/// R4: Work W's workspace, which Dispatch made, is repaired and attached as
+/// new Work N, and W is rejected. `clean` keeps the workspace while N works
+/// in it or waits for review, and removes it only once N is over.
+#[test]
+fn clean_keeps_a_managed_workspace_that_new_work_is_using() {
+    let f = Fixture::new(false);
+    let (w, workspace) = f.wrapped(AGENT_EDIT);
+    fs::write(workspace.join("src/repair.rs"), "pub fn r() {}\n").unwrap();
+    let n = f.attach_at(&workspace);
+    f.dispatch(&["reject", &w]).success();
+    let shown = workspace.display().to_string();
+    let dry = f.clean(&["--dry-run"]);
+    assert!(!dry.contains(&shown), "N is working there: {dry}");
+    f.clean(&["--yes"]);
+    assert!(workspace.exists());
+
+    f.dispatch(&["finish", &n]).success();
+    let dry = f.clean(&["--dry-run"]);
+    assert!(!dry.contains(&shown), "N waits for review: {dry}");
+
+    f.dispatch(&["reject", &n]).success();
+    let dry = f.clean(&["--dry-run"]);
+    assert!(
+        dry.contains(&format!(
+            "{shown} (branch dispatch/{}) · Work {w} · rejected",
+            w.to_lowercase()
+        )),
+        "{dry}"
+    );
+    assert!(!dry.contains(&format!("Work {n}")), "{dry}");
+    f.clean(&["--yes"]);
+    assert!(!workspace.exists());
+}
+
+/// D's repair recipe on a workspace Dispatch made: reattach it as new Work,
+/// finish it, close the old Work as superseded. The workspace survives `clean`
+/// while the replacement waits for review, and is offered as closed once the
+/// replacement is over.
+#[test]
+fn a_superseded_managed_workspace_is_cleanable_once_its_replacement_is_over() {
+    let f = Fixture::new(false);
+    let (w, workspace) = f.wrapped(AGENT_EDIT);
+    fs::write(workspace.join("src/repair.rs"), "pub fn r() {}\n").unwrap();
+    let n = f.attach_at(&workspace);
+    f.dispatch(&["finish", &n]).success();
+    f.dispatch(&["close", &w, "--reason", "superseded", "--replacement", &n])
+        .success();
+    let shown = workspace.display().to_string();
+    assert!(!f.clean(&["--dry-run"]).contains(&shown));
+    f.clean(&["--yes"]);
+    assert!(workspace.exists());
+
+    f.dispatch(&["reject", &n]).success();
+    let dry = f.clean(&["--dry-run"]);
+    assert!(dry.contains(&format!("{shown} ")), "{dry}");
+    assert!(dry.contains(&format!("· Work {w} · closed")), "{dry}");
+    f.clean(&["--yes"]);
+    assert!(!workspace.exists());
+}
+
+/// `clean` removes only what Dispatch made. Terminal Work in a worktree it
+/// did not make is listed with how to remove it, and kept; "nothing to
+/// clean" never claims every worktree is gone.
+#[test]
+fn clean_lists_but_keeps_worktrees_dispatch_did_not_make() {
+    let f = Fixture::new(false);
+    let id = f.attach(&[]);
+    fs::write(f.workspace.join("src/lib.rs"), TWO).unwrap();
+    f.dispatch(&["finish", &id]).success();
+    let waiting = f.clean(&["--dry-run"]);
+    assert!(
+        waiting.contains("Nothing to clean")
+            && waiting.contains("Dispatch removes only the workspaces it made"),
+        "{waiting}"
+    );
+    assert!(
+        !waiting.contains(&f.workspace.display().to_string()),
+        "{waiting}"
+    );
+
+    f.dispatch(&["reject", &id]).success();
+    for args in [&["--dry-run"][..], &["--yes"]] {
+        let out = f.clean(args);
+        assert!(
+            out.contains("Kept, because Dispatch did not make them:"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "{} · made by you · Work {id} (rejected)",
+                f.workspace.display()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("git -C <path> status") && out.contains("git worktree remove <path>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("A locked worktree may still belong to a running agent session"),
+            "{out}"
+        );
+        assert!(!out.contains("--force"), "{out}");
+    }
+    assert!(f.workspace.exists());
+    git(
+        &f.root,
+        &["rev-parse", "--verify", "--quiet", "agent-branch"],
+    );
+}

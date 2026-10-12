@@ -14,6 +14,7 @@ use std::process::Stdio;
 use tokio::signal::unix::{SignalKind, signal};
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -24,8 +25,9 @@ use chrono::{DateTime, Utc};
 use ulid::Ulid;
 
 use super::{
-    ApplyOutcome, apply, auto_apply, persist_event, print_review_commands, refresh_outcome,
-    registration, result_verification,
+    ApplyOutcome, apply, auto_apply, awaits_review, patch_line, persist_event,
+    print_review_commands, print_standing, ready_heading, refresh_outcome, registration,
+    result_verification,
 };
 use crate::{
     ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
@@ -682,8 +684,9 @@ pub(super) fn release_workspace(state: &State, run: &mut RunRecord, reason: &str
 }
 
 /// A workspace `dispatch clean` may remove: Dispatch made it, it is still
-/// there, and its Work is over (rejected, closed, or applied and not yet
-/// released). Never one of Work in progress or waiting for review.
+/// there, its Work is over (rejected, closed, or applied and not yet
+/// released), and no Work in progress or waiting for review is attached to
+/// the same path.
 pub struct Cleanable {
     pub run_id: String,
     pub workspace: PathBuf,
@@ -691,44 +694,81 @@ pub struct Cleanable {
     pub why: &'static str,
 }
 
-pub fn cleanable(state: &State) -> Result<Vec<Cleanable>> {
-    let mut found = Vec::new();
+/// A workspace you or an agent's runtime made, still there, whose Work is
+/// over: `dispatch clean` keeps it and says how to remove it.
+pub struct Kept {
+    pub workspace: PathBuf,
+    pub owner: WorkspaceOwner,
+    /// The Work that was done there, and how each ended.
+    pub work: Vec<(String, &'static str)>,
+}
+
+/// What `dispatch clean` may remove, and the terminal Work it keeps because
+/// Dispatch did not make its workspace.
+pub fn cleanable(state: &State) -> Result<(Vec<Cleanable>, Vec<Kept>)> {
+    let mut runs = Vec::new();
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
-        let Some(made) = projected
-            .attachment
-            .as_ref()
-            .and_then(|attachment| attachment.managed.as_ref())
-            .filter(|made| !made.removed)
-        else {
-            continue;
-        };
-        let run = state.load_run(&projected.id)?;
-        if run.outcome.lifecycle != LifecycleState::Finished {
+        if projected.attachment.is_some() {
+            runs.push(state.load_run(&projected.id)?);
+        }
+    }
+    let attached = runs
+        .iter()
+        .filter_map(|run| Some((run, run.attachment.as_ref()?)))
+        .collect::<Vec<_>>();
+    // The paths some Work still needs, and the paths Dispatch made.
+    let (mut in_use, mut made_here) = (HashSet::new(), HashSet::new());
+    for (run, attachment) in &attached {
+        if run.outcome.lifecycle != LifecycleState::Finished || awaits_review(run) {
+            in_use.insert(&attachment.workspace);
+        }
+        if attachment.managed.is_some() {
+            made_here.insert(&attachment.workspace);
+        }
+    }
+    let (mut found, mut kept) = (Vec::new(), Vec::<Kept>::new());
+    for (run, attachment) in &attached {
+        if run.outcome.lifecycle != LifecycleState::Finished
+            || in_use.contains(&attachment.workspace)
+            || !attachment.workspace.exists()
+        {
             continue;
         }
         let why = if run.outcome.application == ApplicationState::Applied {
             "applied"
         } else if run.outcome.review == ReviewState::Rejected {
             "rejected"
-        } else if run.outcome.work_result != WorkResult::Ready {
+        } else if run.outcome.closed.is_some() || run.outcome.work_result != WorkResult::Ready {
             "closed"
         } else {
             continue; // waiting for review
         };
-        let workspace = run.attachment.as_ref().expect("managed").workspace.clone();
-        if !workspace.exists() {
-            continue;
+        match &attachment.managed {
+            Some(made) if !made.removed => found.push(Cleanable {
+                run_id: run.id.clone(),
+                workspace: attachment.workspace.clone(),
+                branch: made.branch.clone(),
+                why,
+            }),
+            Some(_) => {}
+            None if made_here.contains(&attachment.workspace)
+                || attachment.workspace_owner == WorkspaceOwner::Dispatch => {}
+            None => match kept
+                .iter_mut()
+                .find(|item| item.workspace == attachment.workspace)
+            {
+                Some(item) => item.work.push((run.id.clone(), why)),
+                None => kept.push(Kept {
+                    workspace: attachment.workspace.clone(),
+                    owner: attachment.workspace_owner,
+                    work: vec![(run.id.clone(), why)],
+                }),
+            },
         }
-        found.push(Cleanable {
-            run_id: run.id.clone(),
-            workspace,
-            branch: made.branch.clone(),
-            why,
-        });
     }
-    Ok(found)
+    Ok((found, kept))
 }
 
 /// Remove what `cleanable` listed, each under its run's lock and only if it
@@ -742,6 +782,7 @@ pub fn clean(state: &State, listed: &[Cleanable]) -> Result<usize> {
             Duration::from_secs(5),
         )?;
         let still = cleanable(state)?
+            .0
             .into_iter()
             .any(|now| now.run_id == item.run_id && now.workspace == item.workspace);
         if !still {
@@ -1135,8 +1176,10 @@ pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<
 /// itself, and become an ordinary Ready result. See part 14.9.
 pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Result<RunRecord> {
     let run = finish_quietly(state, run_id, allow_unsafe_local).await?;
-    print_finish_summary(&run);
-    println!("Next: dispatch check {}", run.id);
+    print_finish_summary(
+        state,
+        &crate::coherence::with_kept_validity(&run, &state.run_dir(&run.id)),
+    );
     Ok(run)
 }
 
@@ -1680,7 +1723,7 @@ pub fn close(state: &State, request: CloseRequest) -> Result<String> {
                         super::background::watcher(state, &run.source_path)?,
                         super::background::Watcher::NotWatched
                     ),
-                    "the workspace of Work {id} vanished, and the project's owner has not yet kept the changes it last saw; nothing was closed, so try again in a few seconds"
+                    "the workspace of Work {id} vanished, and the project's owner has not yet kept the changes it last saw; nothing was closed, so try again in a few seconds. If this persists, the owner may be stuck: dispatch stop ends it, and close then goes ahead without those changes"
                 );
                 unobserved = true;
             }
@@ -1754,17 +1797,17 @@ fn run_finished_event(run: &RunRecord) -> EventRecord {
 
 /// A short equivalent of `print_single_result_summary` for attached work:
 /// that function requires a routing or allocation decision, which attached
-/// work never has.
-fn print_finish_summary(run: &RunRecord) {
+/// work never has. `run` is a `with_kept_validity` copy.
+fn print_finish_summary(state: &State, run: &RunRecord) {
     let candidate = &run.candidates[0];
-    let heading = if run.outcome.verification == VerificationState::Failed {
-        "Verification failed"
-    } else {
-        "Ready for review"
-    };
-    println!("\n{heading}\n");
+    println!("\n{}\n", ready_heading(run));
     println!("Task\n  {}\n", run.task);
     println!("Agent\n  {}\n", candidate.harness_id);
+    println!("Work {}\n{}\n", run.id, patch_line(candidate));
     println!("Verification\n  {}\n", result_verification(candidate));
-    print_review_commands(run);
+    let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+    if awaits_review(run) {
+        print_standing(state, run, validity);
+    }
+    print_review_commands(run, validity);
 }

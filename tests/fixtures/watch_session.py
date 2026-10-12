@@ -138,7 +138,10 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
         # Accept applies it.
         ui.send('a')
         until(ui,lambda:meta(second)['outcome']['application']=='applied','applied')
-        screen.see('Write a second artifact: accepted and applied.')
+        # The notice says what accept verified: nothing moved, so no merged checks.
+        screen.see('Write a second artifact: accepted and applied; merged checks not run')
+        shown=' '.join(' '.join(screen.rows()).split())
+        assert 'the source has not moved since the Work began' in shown,shown
         assert (source/'dispatch-fake-good.txt').exists()
         ui.send('q');ui.finish()
     # Finishing work that carries no authority asks before running the

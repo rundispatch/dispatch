@@ -160,8 +160,16 @@ fn passing_check_on_the_merged_tree_applies_and_records_integration() {
     let fixture = Fixture::new("checks:\n  verify:\n    - test -f original.txt\n");
     fs::write(fixture.source.join("notes.txt"), "someone else's work\n").unwrap();
 
-    fixture.apply().success();
+    let applied = fixture.apply().success();
 
+    let stdout = String::from_utf8_lossy(&applied.get_output().stdout).into_owned();
+    let logs = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Merged checks: passed on the current source with this patch; logs: ")
+        })
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(PathBuf::from(logs).is_dir(), "{stdout}");
     assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
     assert!(fixture.source.join("notes.txt").is_file());
     let metadata = fixture.metadata();
@@ -185,6 +193,7 @@ fn check_failing_only_on_the_merged_tree_blocks_apply() {
         stderr.contains("test ! -f forbidden.txt") && stderr.contains("exit 1"),
         "unexpected error: {stderr}"
     );
+    assert!(!stderr.contains("Merged checks: not run"), "{stderr}");
     assert!(!fixture.source.join("dispatch-fake-good.txt").exists());
     assert!(fixture.source.join("forbidden.txt").is_file());
     let metadata = fixture.metadata();
@@ -339,6 +348,15 @@ fn the_owner_marks_a_ready_native_result_stale_when_the_world_moves() {
     assert_eq!(fixture.metadata()["outcome"]["review"], "pending");
 }
 
+/// What accept printed about the merged checks.
+fn merged_line(applied: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&applied.get_output().stdout)
+        .lines()
+        .find(|line| line.starts_with("Merged checks: "))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 #[test]
 fn disabling_integration_checks_skips_the_oracle() {
     let fixture = Fixture::new(&format!(
@@ -346,8 +364,12 @@ fn disabling_integration_checks_skips_the_oracle() {
     ));
     add_forbidden(&fixture);
 
-    fixture.apply().success();
+    let applied = fixture.apply().success();
 
+    assert_eq!(
+        merged_line(&applied),
+        "Merged checks: not run — they are turned off (coherence.integration_checks: false)"
+    );
     assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
     assert_eq!(fixture.analysis(), "files_only");
     assert!(!fixture.run_dir().join("coherence-checks").exists());
@@ -359,8 +381,12 @@ fn no_verify_checks_means_nothing_to_run() {
     let fixture = Fixture::new("");
     add_forbidden(&fixture);
 
-    fixture.apply().success();
+    let applied = fixture.apply().success();
 
+    assert_eq!(
+        merged_line(&applied),
+        "Merged checks: not run — no checks are configured (checks.verify is empty)"
+    );
     assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
     assert_eq!(fixture.analysis(), "files_only");
     assert!(!fixture.run_dir().join("coherence-checks").exists());
@@ -371,8 +397,12 @@ fn no_verify_checks_means_nothing_to_run() {
 fn unmoved_source_never_creates_a_scratch_tree() {
     let fixture = Fixture::new(VERIFY_NO_FORBIDDEN);
 
-    fixture.apply().success();
+    let applied = fixture.apply().success();
 
+    assert_eq!(
+        merged_line(&applied),
+        "Merged checks: not run — the source has not moved since the Work began, so the merged result is the Work's own tree"
+    );
     assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
     assert!(fixture.metadata()["coherence"].is_null());
     assert!(fixture.run_dir_entries("coherence-").is_empty());
@@ -420,8 +450,12 @@ fn a_run_without_local_execution_authority_is_never_verified() {
     .unwrap();
     add_forbidden(&fixture);
 
-    fixture.apply().success();
+    let applied = fixture.apply().success();
 
+    assert_eq!(
+        merged_line(&applied),
+        "Merged checks: not run — this Work has no recorded permission to run commands on the host (--allow-unsafe-local)"
+    );
     assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
     assert_eq!(fixture.analysis(), "files_only");
     assert!(!fixture.run_dir().join("coherence-checks").exists());

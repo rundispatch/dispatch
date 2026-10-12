@@ -773,7 +773,8 @@ def actions(binary, base):
         watch.shows("yankee: nothing changed.")
         assert review(project, "yankee") == "pending"
         watch.send("a")
-        watch.shows("yankee: accepted and applied.")
+        watch.shows("yankee: accepted and applied; merged checks not run — the source has not moved "
+                    "since the Work began, so the merged result is the Work's own tree.")
         assert applied(project, "yankee"), project.run("yankee")["outcome"]
         assert not any(applied(project, other) for other in ("zulu", "papa", "quebec"))
         # Done group is now [xray, yankee] (by creation). Select xray, then it
@@ -805,7 +806,8 @@ def actions(binary, base):
         watch.settle(1)
         assert not applied(project, "papa"), "the first key after the move acted"
         watch.send("a")
-        watch.shows("papa: accepted and applied.")
+        watch.shows("papa: accepted and applied; merged checks not run — no checks are configured "
+                    "(checks.verify is empty).")
         assert applied(project, "papa") and not applied(project, "zulu")
         watch.leave()
     print("PASS actions")
@@ -1176,7 +1178,9 @@ def feedback(binary, base):
         assert project.run("live")["outcome"]["verification"] == "passed"
         select(watch, "good", order)
         watch.send("a")
-        watch.shows("good: accepted and applied.")
+        # The source moved and checks exist: they ran on the merged tree.
+        watch.shows("good: accepted and applied; merged checks passed on the current source with "
+                    "this patch; logs:")
         assert applied(project, "good")
         select(watch, "dup", order)
         watch.send("r")
@@ -1362,7 +1366,8 @@ def unwatched(binary, base):
         watch.settle(1)
         assert watch.hint() == hint and "auto-apply" not in watch.joined().lower(), watch.screen()
         watch.send("a")
-        watch.shows("pending: accepted and applied.")
+        watch.shows("pending: accepted and applied; merged checks not run — the source has not moved "
+                    "since the Work began, so the merged result is the Work's own tree.")
         assert applied(project, "pending")
         watch.send("\x1b")  # Esc leaves
         watch.finish()

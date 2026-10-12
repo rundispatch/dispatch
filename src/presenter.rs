@@ -1979,8 +1979,10 @@ async fn review_goal(
                 let result = orchestrator::review_delivery(state, &target, accept);
                 run = state.load_run(&target.run_id)?;
                 ui.commit(&projection(&run, None, ui.width().saturating_sub(3), options.ascii))?;
-                if let Err(error) = &result {
-                    ui.commit(&format!("{error:#}"))?;
+                match &result {
+                    Ok(Some(checks)) => ui.commit(&format!("Merged checks: {checks}"))?,
+                    Ok(None) => {}
+                    Err(error) => ui.commit(&format!("{error:#}"))?,
                 }
                 if matches!(run.outcome.review, ReviewState::Accepted | ReviewState::Rejected) {
                     ui.reviewed = Some(run);

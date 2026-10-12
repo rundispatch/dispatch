@@ -30,6 +30,7 @@ use crate::{
     EnvironmentRecord, EventRecord, LifecycleState, ReviewOutcome, ReviewState, RunMode,
     RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, VERSION, VerificationState, WaitingOn,
     WorkResult,
+    coherence::integration::MergedChecks,
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -747,7 +748,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                 failure,
                 "goal interrupted during baseline checks",
             )?;
-            native::emit(&run, request.output)?;
+            native::emit(state, &run, request.output)?;
             return Ok(run);
         }
         finish_interrupted(state, &mut db, &mut run)?;
@@ -817,7 +818,10 @@ fn result_verification(candidate: &CandidateRecord) -> &'static str {
     }
 }
 
+/// `run` carries the verdict to show: a `with_live_validity` copy, or a
+/// `with_kept_validity` one at the end of a run.
 fn print_single_result_summary(
+    state: &State,
     run: &RunRecord,
     heading: &str,
     show_status: bool,
@@ -850,12 +854,13 @@ fn print_single_result_summary(
     let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
     let line = work_line(run, validity);
     println!(
-        "Work {}\n  {} {} · began against {} at {}\n",
+        "Work {}\n  {} {} · began against {} at {}\n{}\n",
         run.id,
         line.origin,
         line.agent,
         line.s0,
-        run.created_at.format("%Y-%m-%d %H:%M UTC")
+        run.created_at.format("%Y-%m-%d %H:%M UTC"),
+        patch_line(candidate)
     );
     if let Some(attempt) = run.attempts.last()
         && (attempt.requested_model.is_some() || attempt.observed_model.is_some())
@@ -867,7 +872,9 @@ fn print_single_result_summary(
         );
     }
     println!("Verification\n  {}\n", result_verification(candidate));
-    if let Some(line) = coherence_line(run) {
+    if awaits_review(run) {
+        print_standing(state, run, validity);
+    } else if let Some(line) = coherence_line(run) {
         println!("{line}\n");
     }
     if show_status {
@@ -888,17 +895,134 @@ fn print_single_result_summary(
             closed.describe()
         );
     } else {
-        print_review_commands(run);
+        print_review_commands(run, validity);
     }
 }
 
+/// Where the frozen patch is and how many files it changes.
+fn patch_line(candidate: &CandidateRecord) -> String {
+    let files = candidate.diff_stats.files_changed;
+    format!(
+        "  patch: {} ({files} file{})",
+        candidate.diff_path.display(),
+        if files == 1 { "" } else { "s" }
+    )
+}
+
 /// The commands for `run`'s result, each naming it in full: with several
-/// results waiting, an ID-less decision refuses. Accept and reject only
-/// while it waits for review.
-fn print_review_commands(run: &RunRecord) {
+/// results waiting, an ID-less decision refuses. While it waits for review,
+/// the next step follows its verdict (`validity`).
+fn print_review_commands(run: &RunRecord, validity: Option<&crate::Validity>) {
     println!("Review\n  dispatch diff {}\n", run.id);
     if awaits_review(run) {
-        println!("Then\n  dispatch accept {0}\n  dispatch reject {0}", run.id);
+        let decision = validity.map_or(Decision::Continue, |validity| validity.decision);
+        let (step, alternative) = next_step(run, decision);
+        println!("Then\n  {step}");
+        if let Some(alternative) = alternative {
+            println!("  {alternative}");
+        }
+    }
+}
+
+/// What a person can do with a result waiting for review, given its verdict:
+/// the step, and its alternative. Accept only while it holds; a REFRESH is
+/// redone and a STOP closed. Each names the Work.
+fn next_step(run: &RunRecord, decision: Decision) -> (String, Option<String>) {
+    let id = &run.id;
+    let reject = Some(format!("dispatch reject {id}"));
+    match decision {
+        Decision::Continue => (format!("dispatch accept {id}"), reject),
+        Decision::Refresh if run.mode == RunMode::Attached => (
+            format!(
+                "run your agent again on the current source and attach it; once that Work is finished: dispatch close {id} --reason superseded --replacement <new-id>"
+            ),
+            reject,
+        ),
+        Decision::Refresh => (format!("dispatch refresh {id}"), reject),
+        Decision::Stop => (
+            format!("dispatch close {id} --reason already-present"),
+            None,
+        ),
+    }
+}
+
+/// How many of a verdict's reasons a summary shows; `check` shows them all.
+const SUMMARY_REASONS: usize = 5;
+
+/// What holds now for a result waiting for review, as finish and the result
+/// summaries show it: the fresh static verdict `run` carries (`validity`)
+/// with its reasons, and what accept would verify.
+fn print_standing(state: &State, run: &RunRecord, validity: Option<&crate::Validity>) {
+    let Some(validity) = validity else {
+        println!("Coherence: not known; dispatch check {} says why\n", run.id);
+        return;
+    };
+    if validity.decision == Decision::Continue {
+        println!("{}", crate::presenter::coherence_text(validity));
+    } else {
+        println!(
+            "Coherence: {} — {} file{} changed underneath",
+            crate::coherence::verdict(validity.decision),
+            validity.changed_files,
+            if validity.changed_files == 1 { "" } else { "s" }
+        );
+        for reason in validity.reasons.iter().take(SUMMARY_REASONS) {
+            println!("  {}", reason_line(reason));
+        }
+        if validity.reasons.len() > SUMMARY_REASONS {
+            println!(
+                "  and {} more: dispatch check {}",
+                validity.reasons.len() - SUMMARY_REASONS,
+                run.id
+            );
+        }
+    }
+    println!("\nAt accept\n  {}\n", accept_scope(state, run, validity));
+}
+
+/// What accept would verify for `run` as it stands (`validity`), in the one
+/// line finish, the result summaries and `check` share. A CONTINUE says the
+/// merged checks are still to run, never that they passed.
+fn accept_scope(state: &State, run: &RunRecord, validity: &crate::Validity) -> String {
+    if validity.decision != Decision::Continue {
+        return format!(
+            "accept would refuse it now ({}), before any merged checks",
+            crate::coherence::verdict(validity.decision)
+        );
+    }
+    let skipped = sole_candidate(run).and_then(|candidate| {
+        crate::coherence::integration::checks_skipped(
+            run,
+            &candidate.label,
+            &state.run_dir(&run.id),
+            Some(validity.world_changed),
+        )
+    });
+    match skipped {
+        Ok(None) => "merged checks will run (checks.verify on the source as it is then, with this patch) and must pass before anything is applied".into(),
+        Ok(Some(why)) => format!("merged checks would not run now — {why}"),
+        Err(error) => format!("merged checks: not known — {error:#}"),
+    }
+}
+
+/// The heading of a delivered result's summary: whether it holds now, not
+/// only that it finished.
+fn ready_heading(run: &RunRecord) -> &'static str {
+    let decision = run
+        .coherence
+        .as_ref()
+        .and_then(|record| record.validity.as_ref())
+        .map(|validity| validity.decision);
+    if run.outcome.closed.is_some() {
+        return "Closed";
+    }
+    if run.outcome.verification == VerificationState::Failed {
+        return "Verification failed";
+    }
+    match decision {
+        Some(Decision::Refresh) if awaits_review(run) => "Finished, but stale (REFRESH)",
+        Some(Decision::Stop) if awaits_review(run) => "Finished, already in the source (STOP)",
+        _ => "Ready for review",
     }
 }
 
@@ -1547,11 +1671,11 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
     if run.execution.is_some() {
-        native::emit(&run, RunOutputMode::Human)?;
+        native::emit(state, &run, RunOutputMode::Human)?;
     } else if id.is_none() && run.allocation.is_some() && run.candidates.len() == 1 {
         let feedback = Database::open(state.db_path())?.latest_goal_feedback(&run.id)?;
         let human_outcome = feedback.as_ref().map(|feedback| &feedback.outcome);
-        print_single_result_summary(&run, "Latest task", true, human_outcome);
+        print_single_result_summary(state, &run, "Latest task", true, human_outcome);
     } else {
         print_run_header(&run);
         println!("\nTask\n  {}\n", one_line(&run.task, 120));
@@ -1841,7 +1965,13 @@ pub fn review_diff(state: &State, command: &ReviewCommand) -> Result<String> {
     Ok(patch)
 }
 
-pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> Result<RunRecord> {
+/// The review screen's accept or reject. An accept that applied returns what
+/// became of the merged checks.
+pub fn review_delivery(
+    state: &State,
+    command: &ReviewCommand,
+    accept: bool,
+) -> Result<Option<MergedChecks>> {
     let (run, _lock) = review_target(state, command)?;
     let decision = if accept {
         ReviewDecision::Accept {
@@ -1850,8 +1980,7 @@ pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> 
     } else {
         ReviewDecision::Reject
     };
-    review_locked(state, run, decision, Vec::new(), None, true)?;
-    state.load_run(&command.run_id)
+    review_locked(state, run, decision, Vec::new(), None, true)
 }
 
 /// A human's decision about a delivered result.
@@ -1885,7 +2014,8 @@ pub fn accept_or_reject_latest(
 }
 
 /// `accept` or `reject`, the same decision wherever the person makes it.
-/// `quiet` prints nothing, for `watch`, which shows the returned line itself.
+/// `quiet` prints nothing, for `watch`, which words its own notice. An
+/// accept that applied returns what became of the merged checks.
 pub(crate) fn decide(
     state: &State,
     run_id: Option<&str>,
@@ -1894,7 +2024,7 @@ pub(crate) fn decide(
     reasons: Vec<String>,
     explanation: Option<String>,
     quiet: bool,
-) -> Result<String> {
+) -> Result<Option<MergedChecks>> {
     let accept = matches!(decision, ReviewDecision::Accept { .. });
     let despite_refresh = matches!(
         decision,
@@ -1927,35 +2057,11 @@ pub(crate) fn decide(
     let (run, _lock) = locked_delivery(state, &command, false)?;
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    let id = run.id.clone();
-    let kept = run
-        .attachment
-        .as_ref()
-        .filter(|attachment| {
-            attachment
-                .managed
-                .as_ref()
-                .is_some_and(|made| !made.removed)
-        })
-        .map(|attachment| attachment.workspace.clone());
-    review_locked(state, run, decision, reasons, explanation, quiet)?;
-    let line = if accept {
-        if already_auto_applied {
-            "Result was already applied by auto-apply; your review is recorded.".to_owned()
-        } else {
-            format!("Accepted and applied {id}.")
-        }
-    } else {
-        let mut line = format!("Rejected {id}; the source tree was not changed.");
-        if let Some(kept) = kept {
-            line.push_str(&format!(" Its workspace is kept at {}.", kept.display()));
-        }
-        line
-    };
+    let merged = review_locked(state, run, decision, reasons, explanation, quiet)?;
     if !quiet {
         if accept {
             if already_auto_applied {
-                println!("{line}");
+                println!("Result was already applied by auto-apply; your review is recorded.");
             }
         } else {
             println!("Result rejected. The source tree was not changed.");
@@ -1964,7 +2070,7 @@ pub(crate) fn decide(
             }
         }
     }
-    Ok(line)
+    Ok(merged)
 }
 
 /// Reject judges a delivered result. Unfinished attached Work has none: a
@@ -2003,7 +2109,7 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
     };
     ensure_unapplied_ready(&run, "check")?;
     let candidate = sole_candidate(&run)?;
-    let validity = crate::coherence::shown_validity(&run, &candidate.label)?;
+    let validity = crate::coherence::shown_validity(&run, &candidate.label, None)?;
     let landed_by = (validity.decision == Decision::Stop)
         .then(|| apply::landed_by(state, &run))
         .flatten();
@@ -2032,17 +2138,10 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
         println!("Closed: {}; nothing to do", closed.describe());
         return Ok(());
     }
-    match validity.decision {
-        Decision::Continue => println!("Next: dispatch accept {}", run.id),
-        Decision::Refresh if run.mode == RunMode::Attached => println!(
-            "Next: run your agent again on the current source and attach it (or dispatch reject {})",
-            run.id
-        ),
-        Decision::Refresh => println!(
-            "Next: dispatch refresh {id}  (or dispatch reject {id})",
-            id = run.id
-        ),
-        Decision::Stop => println!("Next: dispatch close {} --reason already-present", run.id),
+    println!("At accept: {}", accept_scope(state, &run, &validity));
+    match next_step(&run, validity.decision) {
+        (step, Some(alternative)) => println!("Next: {step}  (or {alternative})"),
+        (step, None) => println!("Next: {step}"),
     }
     Ok(())
 }
@@ -2613,6 +2712,7 @@ fn print_allocation_details(decision: &AllocationDecision) {
 /// revision (reasons and explanation verbatim), `outcome.review` and a
 /// `review.accepted|rejected` event. The caller holds the run lock from
 /// `locked_delivery`, so the apply and the review judge the same revision.
+/// An accept that applied returns what became of the merged checks.
 fn review_locked(
     state: &State,
     mut run: RunRecord,
@@ -2620,7 +2720,7 @@ fn review_locked(
     reasons: Vec<String>,
     explanation: Option<String>,
     quiet: bool,
-) -> Result<()> {
+) -> Result<Option<MergedChecks>> {
     let (accept, despite_refresh) = match decision {
         ReviewDecision::Accept { despite_refresh } => (true, despite_refresh),
         ReviewDecision::Reject => (false, false),
@@ -2631,13 +2731,15 @@ fn review_locked(
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     let reasons = normalize_reasons(reasons)?;
+    let mut merged = None;
     // An accept is recorded only once the work has landed. When coherence or
     // the apply refuses it, the refusal is recorded and the review stays
     // pending: no human acceptance of work that never reached the source.
     if accept && !already_auto_applied {
         let id = run.id.clone();
-        let overridden =
+        let (overridden, checks) =
             apply::apply_locked(state, run, quiet, ApplyAuthority::Human, despite_refresh)?;
+        merged = Some(checks);
         let database = Database::open(state.db_path())?;
         run = database
             .committed_run_projection(&id)?
@@ -2719,7 +2821,7 @@ fn review_locked(
             );
         }
     }
-    Ok(())
+    Ok(merged)
 }
 
 pub fn read_verbatim(path: &Path) -> Result<String> {

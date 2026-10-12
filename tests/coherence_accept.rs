@@ -205,6 +205,33 @@ fn conflicting_source_change_blocks_apply_and_leaves_source_unchanged() {
         metadata["coherence"]["validity"]["reasons"][0]["code"],
         "patch_conflict"
     );
+    // The refusal names the file, says the merged checks never ran, and keeps
+    // Git's whole complaint beside the run.
+    let reason = &metadata["coherence"]["validity"]["reasons"][0];
+    assert_eq!(reason["path"], "dispatch-fake-good.txt");
+    assert!(
+        reason["detail"]
+            .as_str()
+            .unwrap()
+            .contains("patch-conflict.txt"),
+        "{reason}"
+    );
+    let full = fs::read_to_string(
+        fixture
+            .state
+            .join("runs")
+            .join(&fixture.run_id)
+            .join("patch-conflict.txt"),
+    )
+    .unwrap();
+    assert!(
+        full.contains("error: dispatch-fake-good.txt: already exists in working directory"),
+        "{full}"
+    );
+    assert!(
+        stderr.contains("Merged checks: not run — accept refuses REFRESH work before them"),
+        "{stderr}"
+    );
     fixture.assert_review_still_pending();
     // Still the latest pending result: a bare accept finds it again.
     let bare = cargo_bin_cmd!("dispatch")
@@ -275,12 +302,44 @@ fn strict_mode_keeps_the_any_drift_refusal() {
         stderr.contains("source has changed since this run was created"),
         "unexpected error: {stderr}"
     );
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("Merged checks: not run — accept is strict (coherence.accept: strict)"),
+        "{stdout}"
+    );
     assert!(!fixture.source.join("dispatch-fake-good.txt").exists());
     assert_eq!(
         fixture.metadata()["outcome"]["application"],
         "blocked_by_source_drift"
     );
     assert!(fixture.metadata()["coherence"].is_null());
+}
+
+/// A frozen configuration that cannot be read makes accept strict, and
+/// accept says that is why the merged checks did not run.
+#[test]
+fn an_unreadable_configuration_makes_accept_strict_and_says_so() {
+    let fixture = Fixture::new(false, "");
+    fs::write(
+        fixture
+            .state
+            .join("runs")
+            .join(&fixture.run_id)
+            .join("config.snapshot.yml"),
+        "coherence: [not a map",
+    )
+    .unwrap();
+
+    let assert = fixture.apply().success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains(
+            "Merged checks: not run — the run's frozen configuration cannot be read, so accept is strict"
+        ),
+        "{stdout}"
+    );
+    assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
 }
 
 #[test]
