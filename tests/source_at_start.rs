@@ -513,6 +513,9 @@ fn the_owner_observes_runtime_work_after_publication_and_only_then() {
 
     let reply = hook(&p, &start_event("s1", "startup", &worktree));
     assert!(reply.contains("tracking this worktree"), "{reply}");
+    let id = only_run(&p);
+    // The reply names the Work, and a random ID can contain any of these.
+    let words = reply.replace(&id, "<id>");
     for word in [
         "differ",
         "S0",
@@ -521,9 +524,8 @@ fn the_owner_observes_runtime_work_after_publication_and_only_then() {
         "baseRef",
         "observed",
     ] {
-        assert!(!reply.contains(word), "{reply}");
+        assert!(!words.contains(word), "{reply}");
     }
-    let id = only_run(&p);
     let observed = until(&p, &id, |at_start| at_start["observed"].is_object())["observed"].clone();
     assert_eq!(
         observed["paths"],
