@@ -1438,15 +1438,18 @@ mod tests {
             base: None,
             lock: None,
         };
-        let inventory = Inventory {
-            version: 1,
-            entries: vec![
+        // From JSON, as the owner writes it: fields other packets add to the
+        // inventory take their defaults.
+        let inventory: Inventory = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "entries": [
                 entry(&found),
                 entry(&tracked),
                 entry(&finished),
                 entry(&temp.path().join("gone")),
             ],
-        };
+        }))
+        .unwrap();
         let work = |workspace: &Path, lifecycle| {
             let mut run: RunRecord = serde_json::from_value(serde_json::json!({
                 "id": workspace.file_name().unwrap().to_string_lossy(), "task": "t",
