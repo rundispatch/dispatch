@@ -1685,7 +1685,11 @@ pub(crate) fn plain_git_command() -> Command {
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
         .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // Never take a lock Git calls optional: `git status` would otherwise
+        // refresh the person's index under `index.lock` on every owner tick,
+        // and their own `git commit` could fail while Dispatch watches.
+        .env("GIT_OPTIONAL_LOCKS", "0");
     command
 }
 
@@ -3102,6 +3106,46 @@ mod tests {
         let plain = temp.path().join("plain");
         fs::create_dir(&plain).unwrap();
         assert!(repo_identity(&plain).unwrap().is_none());
+    }
+
+    /// The owner runs `git status` in the person's project every tick. With
+    /// Git's optional locks, that refreshes and rewrites their index under
+    /// `index.lock`, so their own `git commit` could fail while Dispatch
+    /// watches (seen in the 0.4.13 build as a test's `git commit` exiting 128).
+    #[test]
+    fn dispatch_never_rewrites_the_persons_index() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        write(&repo.join("file.txt"), "one\n");
+        initialize_user_repository(&repo);
+        let index = repo.join(".git").join("index");
+        // Same content, newer modification time: the index's stat data is
+        // stale, which a refreshing `git status` writes back.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write(&repo.join("file.txt"), "one\n");
+        let before = fs::read(&index).unwrap();
+
+        let status = git_command(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            before,
+            "Dispatch rewrote the index"
+        );
+
+        // Without the setting the same command rewrites it, so the assertion
+        // above is not vacuous.
+        let refreshed = git_command(&repo)
+            .env_remove("GIT_OPTIONAL_LOCKS")
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(refreshed.status.success());
+        assert_ne!(fs::read(&index).unwrap(), before);
     }
 
     #[test]
