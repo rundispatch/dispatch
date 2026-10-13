@@ -673,3 +673,35 @@ upgrade fixture, and the release itself was built by four interactive Claude
 Code sessions under the 0.4.11 supervisor, but no 0.4.12 owner observed a live
 Claude session. The affected project's original evidence (§3, items 1–4 and
 6) is still unknown, so the `d` review report remains an open investigation.
+
+### Real-agent trial (2026-10-13)
+
+`~/dispatch-dev/trial-0412/`: a scratch Git project with checks, Dispatch's four
+hooks in its `.claude/settings.local.json` pointing at the 0.4.12 release binary
+and its own state, `worktree.baseRef: "head"`, and a 0.4.12 owner watching it.
+Claude Code 2.1.296. A capture hook beside Dispatch's saved every `SessionStart`
+and `SessionEnd` payload verbatim (`payloads/`).
+
+- Wave 1: Work A (`subtract`) accepted and left uncommitted.
+- Wave 2: `claude -p --worktree trial-b`, a real one-line edit. The hook
+  registered it as Work and Claude showed "Dispatch is tracking this worktree as
+  Work …". The owner recorded the start observation: `calc.py (in applied Work
+  A)`, the managed-launch remedy, then the Claude adapter's `baseRef` advice.
+- A root session (`claude` in the checkout): Dispatch's shared-checkout notice
+  appeared.
+- An interactive `claude --worktree trial-d`, a one-line edit, `/exit`, "Keep
+  worktree": registered and observed as above.
+
+**Defect found: session ends from worktree sessions are never recorded.**
+- Interactive: Claude sends `SessionEnd` (`reason: prompt_input_exit`) with
+  `cwd` set to the **main checkout**, not the worktree. `runtime::ingest`
+  resolves the workspace from `cwd`, finds no active Work for the root, and drops
+  the end. The Work stays `working` with its session `open`.
+- `-p`: Claude sends no `SessionEnd` at all; even the capture hook never ran.
+- This is very likely the root cause of the field report "rows remain working
+  after exit" (§2), and P1's "session ended" hint can never appear for a real
+  Claude worktree session. 0.4.11 behaves the same.
+- Smallest fix: when an end's `cwd` matches no active Work, record it on the
+  unfinished Work that holds an open session with that provider and
+  `session_id`. Document that `-p` sessions report no end and must be finished
+  explicitly.
