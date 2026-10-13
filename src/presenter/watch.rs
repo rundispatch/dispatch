@@ -8,7 +8,7 @@
 //! draws it; `interactive` reads keys and acts on the selected Work by its ID.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -121,6 +121,12 @@ struct Context<'a> {
     /// Each run's configured checks, and whether accept runs them on the
     /// merged result (`coherence.integration_checks`).
     checks: &'a HashMap<String, (Vec<String>, bool)>,
+    /// Files changed now in each Work the owner follows (`serve::live_files`);
+    /// `None` while no owner holds the project.
+    live: Option<&'a BTreeMap<String, usize>>,
+    /// `agent running (pid N)` for Work whose recorded agent process is
+    /// alive (`orchestrator::agent_running`).
+    running: &'a HashMap<String, String>,
 }
 
 /// The view model: one item per run in view, Work that needs you first, then
@@ -272,6 +278,9 @@ fn item(
             }
         }
     }
+    if group == Group::InProgress {
+        details.push(Detail::new("Progress", progress(run, context), 1));
+    }
     details.push(Detail::new(
         "Checks",
         match checks {
@@ -317,6 +326,16 @@ fn item(
     let origin = match line.origin {
         "native" => format!("{agent} · launched by Dispatch"),
         "isolated" => format!("{agent} · attached; Dispatch made its workspace"),
+        "discovered"
+            if run.attachment.as_ref().is_some_and(|attachment| {
+                matches!(
+                    attachment.provenance,
+                    crate::BaselineProvenance::Discovered { .. }
+                )
+            }) =>
+        {
+            format!("{agent} session in its own worktree, found by Dispatch")
+        }
         "discovered" => format!("{agent} session in its own worktree"),
         _ => format!("{agent} · attached workspace"),
     };
@@ -343,6 +362,25 @@ fn item(
         keys,
         group,
     }
+}
+
+/// Work in progress as the owner last saw it: the files changed now, or
+/// `files: unknown` before it looked or with no owner, never the unset zero;
+/// how long it has been tracked; whether its agent runs.
+fn progress(run: &RunRecord, context: &Context) -> String {
+    let mut parts = vec![match context.live.and_then(|live| live.get(&run.id)) {
+        None => "files: unknown".to_owned(),
+        Some(0) => "files: none changed yet".to_owned(),
+        Some(files) => format!("files: {files} changed"),
+    }];
+    if let Some(attachment) = &run.attachment {
+        parts.push(format!(
+            "tracked for {}",
+            orchestrator::tracked_for(attachment)
+        ));
+    }
+    parts.extend(context.running.get(&run.id).cloned());
+    parts.join(" · ")
 }
 
 /// How applied Work landed, in place of its verdict.
@@ -787,6 +825,9 @@ impl Selection {
 struct Screen<'a> {
     header: &'a Header,
     items: &'a [Item],
+    /// Worktrees found, not tracked (`serve::untracked`): not Work, so
+    /// listed apart and never selected.
+    found: &'a [orchestrator::discovery::InventoryEntry],
     selected: Option<&'a str>,
     notice: Option<(Kind, String)>,
     ascii: bool,
@@ -804,6 +845,7 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut header = Header::default();
     let mut items: Vec<Item> = Vec::new();
+    let mut found = Vec::new();
     let mut selection = Selection::default();
     let mut notice: Option<Notice> = None;
     let mut journal: Option<i64> = None;
@@ -821,6 +863,19 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                 .iter()
                 .map(|run| (run.id.clone(), configured_checks(state, &run.id)))
                 .collect();
+            let live = serve::live_files(state, &root);
+            let running = runs
+                .iter()
+                .filter(|run| run.outcome.lifecycle != LifecycleState::Finished)
+                .filter_map(|run| {
+                    let running = orchestrator::agent_running(run.attachment.as_ref()?)?;
+                    Some((run.id.clone(), running))
+                })
+                .collect();
+            found = serve::untracked(
+                &orchestrator::discovery::Inventory::load(state, &root),
+                &runs,
+            );
             let fresh = build(
                 &runs,
                 &Context {
@@ -829,6 +884,8 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                     watched: !header.unwatched,
                     projection: projection.as_ref(),
                     checks: &checks,
+                    live: live.as_ref(),
+                    running: &running,
                 },
             );
             if let Some(left) = selection.follow(&items, &fresh) {
@@ -847,6 +904,7 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
         let screen = Screen {
             header: &header,
             items: &items,
+            found: &found,
             selected: selection.id.as_deref(),
             notice: notice
                 .as_ref()
@@ -1410,9 +1468,10 @@ fn render(frame: &mut Frame, screen: &Screen, palette: &Theme) {
     let other_rows = take(list_full.saturating_sub(selected_row), card);
     let closing_rule = take(usize::from(wide || item.is_none()), 1);
     let detail_height = needed + take(detail_full - detail_needed, 1);
+    let found_height = take(screen.found.len(), 1);
     let list_height = selected_row + other_rows;
 
-    let mut heights = vec![1, 1, list_height];
+    let mut heights = vec![1, 1, list_height, found_height];
     if item.is_some() {
         heights.extend([middle_rule, detail_height]);
     }
@@ -1448,6 +1507,7 @@ fn render(frame: &mut Frame, screen: &Screen, palette: &Theme) {
     } else {
         frame.render_widget(Paragraph::new(cards(screen, selected, list, palette)), list);
     }
+    frame.render_widget(Paragraph::new(found(screen, width, palette)), take());
     if let (Some(item), Some(groups)) = (item, groups) {
         frame.render_widget(Paragraph::new(rule.clone()), take());
         let mut lines = Vec::new();
@@ -1462,6 +1522,26 @@ fn render(frame: &mut Frame, screen: &Screen, palette: &Theme) {
     }
     frame.render_widget(Paragraph::new(notice), take());
     frame.render_widget(Paragraph::new(hint), take());
+}
+
+/// Under the list, one line per worktree found, not tracked: its folder and
+/// the command that makes it Work. The last lines to get room.
+fn found(screen: &Screen, width: usize, palette: &Theme) -> Vec<Line<'static>> {
+    screen
+        .found
+        .iter()
+        .map(|entry| {
+            let text = format!(
+                "  found, not tracked · {} · {}",
+                folder_name(&entry.path),
+                serve::attach_command(&entry.path)
+            );
+            Line::styled(
+                fit(&fold(&text, screen.ascii), width, screen.ascii),
+                palette.secondary,
+            )
+        })
+        .collect()
 }
 
 /// The project, who watches it and, when there is room, how many items need
@@ -1954,6 +2034,16 @@ mod tests {
     }
 
     fn items_with(runs: &[RunRecord], projection: Option<&Projection>) -> Vec<Item> {
+        items_live(runs, projection, None, &HashMap::new())
+    }
+
+    /// With what the owner counted and which agents run.
+    fn items_live(
+        runs: &[RunRecord],
+        projection: Option<&Projection>,
+        live: Option<&BTreeMap<String, usize>>,
+        running: &HashMap<String, String>,
+    ) -> Vec<Item> {
         let checks: HashMap<String, (Vec<String>, bool)> = runs
             .iter()
             .map(|run| (run.id.clone(), (vec!["pytest".to_owned()], true)))
@@ -1966,6 +2056,8 @@ mod tests {
                 watched: true,
                 projection,
                 checks: &checks,
+                live,
+                running,
             },
         )
     }
@@ -2003,10 +2095,22 @@ mod tests {
         ascii: bool,
         palette: &Theme,
     ) -> Buffer {
+        draw_found(items, &[], selected, size, ascii, palette)
+    }
+
+    fn draw_found(
+        items: &[Item],
+        found: &[orchestrator::discovery::InventoryEntry],
+        selected: Option<&str>,
+        size: (u16, u16),
+        ascii: bool,
+        palette: &Theme,
+    ) -> Buffer {
         let header = header(false);
         let screen = Screen {
             header: &header,
             items,
+            found,
             selected,
             notice: None,
             ascii,
@@ -2234,6 +2338,8 @@ mod tests {
                 watched: true,
                 projection: None,
                 checks: &checks,
+                live: None,
+                running: &HashMap::new(),
             },
         )
         .remove(0);
@@ -2312,6 +2418,140 @@ mod tests {
             ),
             ["not observed"]
         );
+    }
+
+    /// Work in progress: files unknown until the owner counted them, then the
+    /// count, and how long it has been tracked; never the unset zeros of a
+    /// result not delivered yet. A delivered result shows no progress.
+    #[test]
+    fn working_work_shows_files_unknown_until_counted_and_how_long_it_is_tracked() {
+        let mut work = working(worktree("01W", "auth-ctx", 1));
+        work.attachment.as_mut().unwrap().attached_at =
+            chrono::Utc::now() - chrono::Duration::minutes(12);
+        let none = HashMap::new();
+        let other = BTreeMap::from([("01X".to_owned(), 4)]);
+        for live in [None, Some(&other)] {
+            let item = items_live(std::slice::from_ref(&work), None, live, &none).remove(0);
+            assert_eq!(
+                lines(&item, "Progress"),
+                ["files: unknown · tracked for 12m"]
+            );
+            let text = format!("{:?}", item.details);
+            assert!(
+                !text.contains("0 files") && !text.contains("0.0s"),
+                "{text}"
+            );
+        }
+        for (count, files) in [
+            (0, "files: none changed yet"),
+            (1, "files: 1 changed"),
+            (3, "files: 3 changed"),
+        ] {
+            let live = BTreeMap::from([("01W".to_owned(), count)]);
+            let item = items_live(std::slice::from_ref(&work), None, Some(&live), &none).remove(0);
+            assert_eq!(
+                lines(&item, "Progress"),
+                [format!("{files} · tracked for 12m")]
+            );
+        }
+        let mut idle = work.clone();
+        idle.attachment.as_mut().unwrap().sessions[0].ended_at = Some(chrono::Utc::now());
+        let item = items(&[idle]).remove(0);
+        assert_eq!(item.state, "idle");
+        assert_eq!(
+            lines(&item, "Progress"),
+            ["files: unknown · tracked for 12m"]
+        );
+        let delivered = ready(
+            worktree("01R", "done", 2),
+            Some((Decision::Continue, false)),
+        );
+        let live = BTreeMap::from([("01R".to_owned(), 2)]);
+        let item = items_live(&[delivered], None, Some(&live), &none).remove(0);
+        assert!(item.details.iter().all(|d| d.label != "Progress"));
+    }
+
+    /// "agent running (pid N)" only for the exact live process recorded on
+    /// the Work: not for none, a pid that is gone, a pid now another
+    /// process's, or a start that cannot be read.
+    #[test]
+    fn the_agent_runs_only_while_its_exact_process_is_alive() {
+        let mut attachment = working(worktree("01W", "auth-ctx", 1)).attachment.unwrap();
+        assert_eq!(orchestrator::agent_running(&attachment), None);
+        let me = crate::process::ProcessIdentity::current();
+        if me.start.is_none() || me.boot.is_none() {
+            return; // this platform cannot tell an exact identity
+        }
+        attachment.agent_process = Some(me.clone());
+        assert_eq!(
+            orchestrator::agent_running(&attachment),
+            Some(format!("agent running (pid {})", me.pid))
+        );
+        let reused = crate::process::ProcessIdentity {
+            start: Some("Thu Jan  1 00:00:00 1970".into()),
+            ..me.clone()
+        };
+        let unknown = crate::process::ProcessIdentity {
+            start: None,
+            ..me.clone()
+        };
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        let gone = crate::process::ProcessIdentity {
+            pid: child.id(),
+            ..me
+        };
+        for identity in [reused, unknown, gone] {
+            attachment.agent_process = Some(identity);
+            assert_eq!(orchestrator::agent_running(&attachment), None);
+        }
+        let work = working(worktree("01W", "auth-ctx", 1));
+        let running = HashMap::from([("01W".to_owned(), "agent running (pid 4242)".to_owned())]);
+        let item = items_live(&[work], None, None, &running).remove(0);
+        assert!(
+            lines(&item, "Progress")[0].ends_with(" · agent running (pid 4242)"),
+            "{:?}",
+            item.details
+        );
+    }
+
+    /// Worktrees found, not tracked, are listed under the Work, each with
+    /// the command that attaches it, at both layouts and with no Work.
+    #[test]
+    fn worktrees_found_not_tracked_are_listed_with_their_attach_command() {
+        let found = [orchestrator::discovery::InventoryEntry {
+            path: PathBuf::from(format!("{ROOT}/.claude/worktrees/trial-b")),
+            first_seen: chrono::Utc::now(),
+            base: Some("abc".into()),
+            lock: Some("claude session trial-b (pid 1 start x)".into()),
+        }];
+        let want = "found, not tracked · trial-b · dispatch attach --workspace /home/me/tinyauth/.claude/worktrees/trial-b";
+        let listed = items(&demo());
+        for width in [120, 200] {
+            let buffer = draw_found(
+                &listed,
+                &found,
+                Some(&listed[0].id),
+                (width, 30),
+                false,
+                &no_color(),
+            );
+            let (_, y) = find(&buffer, want).unwrap_or_else(|| panic!("{:#?}", rows(&buffer)));
+            for item in &listed {
+                let (_, row) = find(&buffer, &item.name).unwrap();
+                assert!(row < y, "{:#?}", rows(&buffer));
+            }
+        }
+        let buffer = draw_found(&listed, &found, None, (60, 30), false, &no_color());
+        assert!(
+            find(&buffer, "found, not tracked · trial-b · dispatch").is_some(),
+            "{:#?}",
+            rows(&buffer)
+        );
+        let buffer = draw_found(&[], &found, None, (200, 20), false, &no_color());
+        let text = rows(&buffer).join("\n");
+        assert!(text.contains("No Work in the last hour."), "{text}");
+        assert!(text.contains(want), "{text}");
     }
 
     #[test]
@@ -2648,6 +2888,7 @@ mod tests {
             let screen = Screen {
                 header: &header,
                 items: &[],
+                found: &[],
                 selected: None,
                 notice: None,
                 ascii: false,
@@ -2674,6 +2915,7 @@ mod tests {
         let screen = Screen {
             header: &header,
             items,
+            found: &[],
             selected: Some(&selected.id),
             notice: Some((notice.kind, notice.shown(items))),
             ascii: false,
@@ -3069,6 +3311,8 @@ mod tests {
                     watched,
                     projection: None,
                     checks: &checks,
+                    live: None,
+                    running: &HashMap::new(),
                 },
             );
             assert!(listed.iter().all(|item| item.touches == Touches::Unknown));

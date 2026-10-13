@@ -1681,7 +1681,7 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     } else {
         print_run_header(&run);
         println!("\nTask\n  {}\n", one_line(&run.task, 120));
-        print_candidates(&run);
+        print_candidates(&run, files_now(state, &run));
         if let Some(line) = coherence_line(&run) {
             println!("{line}");
         }
@@ -1702,7 +1702,38 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
         "\nProject: {}",
         background::project_line(state, &run.source_path)
     );
+    let found = found_not_tracked(state, &run.source_path)?;
+    if !found.is_empty() {
+        println!("\nFound, not tracked");
+        for entry in found {
+            println!("  {}", serve::attach_command(&entry.path));
+        }
+    }
     Ok(())
+}
+
+/// Files changed now in attached Work in progress, as the project owner last
+/// counted them; `None` before it looked, or with no owner.
+fn files_now(state: &State, run: &RunRecord) -> Option<usize> {
+    if run.mode != RunMode::Attached || run.outcome.lifecycle == LifecycleState::Finished {
+        return None;
+    }
+    serve::live_files(state, &run.source_path)?
+        .get(&run.id)
+        .copied()
+}
+
+/// The worktrees a runtime made that were there when watching began and that
+/// no Work tracks (`discovery::Inventory`).
+fn found_not_tracked(state: &State, root: &Path) -> Result<Vec<discovery::InventoryEntry>> {
+    let inventory = discovery::Inventory::load(state, root);
+    if inventory.entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(serve::untracked(
+        &inventory,
+        &serve::load_source_runs(state, root)?,
+    ))
 }
 
 /// Where `run` touches other Work in progress, from the project owner's view:
@@ -1816,7 +1847,7 @@ pub fn show(state: &State, run_id: &str) -> Result<()> {
     println!("\nBaseline checks");
     print_checks(&run.baseline_checks);
     println!("\nCandidates");
-    print_candidates(&run);
+    print_candidates(&run, files_now(state, &run));
     for candidate in &run.candidates {
         println!("Candidate {} artifacts", candidate.label);
         println!("  stdout   {}", candidate.stdout_path.display());
@@ -2304,7 +2335,7 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             format!("workspace at start {}", short(commit))
         }
         Some(crate::BaselineProvenance::Discovered { commit }) => {
-            format!("found, merge-base {} (full)", short(commit))
+            format!("merge-base {} (full; found by Dispatch)", short(commit))
         }
         // Native S0 is the project as it was, named by its commit when it has
         // one; Dispatch's own baseline commit means nothing to the reader.
@@ -2396,7 +2427,15 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
         Some(attachment) if attachment.workspace_owner == crate::WorkspaceOwner::Dispatch => {
             "isolated"
         }
-        Some(attachment) if !attachment.sessions.is_empty() => "discovered",
+        Some(attachment)
+            if !attachment.sessions.is_empty()
+                || matches!(
+                    attachment.provenance,
+                    crate::BaselineProvenance::Discovered { .. }
+                ) =>
+        {
+            "discovered"
+        }
         Some(_) => "attached",
     };
     WorkLine {
@@ -2477,6 +2516,30 @@ fn agent_seconds_after(run: &RunRecord, invalid_at: chrono::DateTime<Utc>) -> Op
 
 fn minutes_seconds(seconds: i64) -> String {
     format!("{}m{}s", seconds / 60, seconds % 60)
+}
+
+/// How long Dispatch has tracked attached Work: since it was attached.
+pub(crate) fn tracked_for(attachment: &crate::AttachmentRecord) -> String {
+    elapsed((Utc::now() - attachment.attached_at).num_seconds())
+}
+
+/// A time span in its two largest units: `45s`, `12m`, `3h05m`, `2d4h`.
+fn elapsed(seconds: i64) -> String {
+    match seconds.max(0) {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+        s => format!("{}d{}h", s / 86400, s % 86400 / 3600),
+    }
+}
+
+/// `agent running (pid N)` while the agent process recorded on the Work is
+/// that exact process, alive. Nothing otherwise: an ended session says so
+/// through the sessions its runtime recorded.
+pub(crate) fn agent_running(attachment: &crate::AttachmentRecord) -> Option<String> {
+    let process = attachment.agent_process.as_ref()?;
+    (crate::process::identity_state(process) == crate::process::IdentityState::ExactLive)
+        .then(|| format!("agent running (pid {})", process.pid))
 }
 
 /// Print the Coherence section when the run has coherence data (a moved world
@@ -2594,6 +2657,9 @@ fn workspace_details(run: &RunRecord, attachment: &crate::AttachmentRecord) -> V
             }
         ));
     }
+    if unfinished && let Some(running) = agent_running(attachment) {
+        lines.push(format!("  {running}"));
+    }
     let close = format!("dispatch close {id} --reason");
     if let Some(removal) = &attachment.workspace_removed {
         lines.push(format!(
@@ -2694,7 +2760,7 @@ fn print_attachment_details(run: &RunRecord) {
         }
         crate::BaselineProvenance::Discovered { commit } => {
             println!(
-                "  S0: commit {commit} (merge base with the root; the worktree was found after watching began)"
+                "  S0: commit {commit} (merge base with the root; found by Dispatch, the worktree appeared while the project was watched)"
             );
         }
     }
@@ -3010,19 +3076,31 @@ fn print_run_header(run: &RunRecord) {
     }
 }
 
-fn print_candidates(run: &RunRecord) {
+/// Each candidate's record. Attached Work in progress has delivered nothing
+/// yet: its runtime is unknown, and its files are the project owner's live
+/// count (`files_now`) or unknown, never the unset zeros.
+fn print_candidates(run: &RunRecord, files_now: Option<usize>) {
     if run.candidates.is_empty() {
         println!("No candidates recorded.");
         return;
     }
+    let in_progress =
+        run.mode == RunMode::Attached && run.outcome.lifecycle != LifecycleState::Finished;
     for candidate in &run.candidates {
         println!("Candidate {} ({})", candidate.label, candidate.harness_id);
         println!("  Status          {}", candidate.status.as_str());
         println!("  Verification    {}", verification_summary(candidate));
-        println!(
-            "  Runtime         {}",
-            format_duration(candidate.duration_ms)
-        );
+        if in_progress {
+            println!("  Runtime         unknown");
+            if let Some(tracked) = run.attachment.as_ref().map(tracked_for) {
+                println!("  Tracked         for {tracked}");
+            }
+        } else {
+            println!(
+                "  Runtime         {}",
+                format_duration(candidate.duration_ms)
+            );
+        }
         println!(
             "  Cost            {}",
             candidate
@@ -3039,11 +3117,18 @@ fn print_candidates(run: &RunRecord) {
             "  Token basis     {}",
             candidate.token_semantics.as_deref().unwrap_or("unknown")
         );
-        println!("  Files changed   {}", candidate.diff_stats.files_changed);
-        println!(
-            "  Diff             +{} / -{}",
-            candidate.diff_stats.lines_added, candidate.diff_stats.lines_removed
-        );
+        if in_progress {
+            println!(
+                "  Files changed   {}",
+                files_now.map_or_else(|| "unknown".into(), |files| format!("{files} now"))
+            );
+        } else {
+            println!("  Files changed   {}", candidate.diff_stats.files_changed);
+            println!(
+                "  Diff             +{} / -{}",
+                candidate.diff_stats.lines_added, candidate.diff_stats.lines_removed
+            );
+        }
         if let Some(error) = &candidate.error {
             println!("  Error           {}", one_line(error, 100));
         }
@@ -3175,6 +3260,19 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::Validity;
+
+    #[test]
+    fn tracked_time_is_given_in_its_two_largest_units() {
+        for (seconds, text) in [
+            (-5, "0s"),
+            (45, "45s"),
+            (12 * 60 + 30, "12m"),
+            (3 * 3600 + 5 * 60 + 9, "3h05m"),
+            (2 * 86400 + 4 * 3600 + 59, "2d4h"),
+        ] {
+            assert_eq!(elapsed(seconds), text);
+        }
+    }
 
     #[test]
     fn a_work_line_reason_is_one_line() {

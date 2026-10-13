@@ -9,7 +9,7 @@
 //! view from canonical state and owns nothing.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -20,7 +20,11 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::{ApplyOutcome, WorkLine, apply, auto_apply, awaits_review, persist_event, work_line};
+use super::{
+    ApplyOutcome, WorkLine, apply, auto_apply, awaits_review,
+    discovery::{Inventory, InventoryEntry},
+    persist_event, work_line,
+};
 use crate::{
     ApplicationState, BaselineProvenance, Config, Decision, EventRecord, LifecycleState,
     OwnerState, ReviewState, RunMode, RunRecord, SourceAtStart, SourceKind, Validity, WorkResult,
@@ -66,6 +70,7 @@ pub async fn serve(
     }
     let result = run(state, &mut owner, poll, json, background).await;
     super::background::remove_record(state, &root);
+    let _ = fs::remove_file(live_path(state, &root));
     if background {
         eprintln!("{} stopped", Utc::now().to_rfc3339());
     }
@@ -137,7 +142,7 @@ async fn run(
         // Render every tick: a run attached, finished or applied by another
         // process changes the view without any verdict or apply of our own.
         // `render` prints only what differs from what is already shown.
-        view.render(None, &tick.runs, json, owner.projection());
+        view.render(None, &tick.runs, json, owner.projection(), &[]);
         let _ = io::stdout().flush();
     }
 }
@@ -153,7 +158,13 @@ pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut view = View::default();
-    let mut shown: Option<(Option<i64>, String, Option<chrono::DateTime<Utc>>)> = None;
+    type Shown = (
+        Option<i64>,
+        String,
+        Option<chrono::DateTime<Utc>>,
+        Inventory,
+    );
+    let mut shown: Option<Shown> = None;
     let mut rendered_at = Instant::now();
     loop {
         tokio::select! {
@@ -171,12 +182,16 @@ pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
             .flatten();
         let interactions = super::background::interactions(state, &root);
         let computed = interactions.as_ref().map(|p| p.computed_at);
-        let now = (journal, header, computed);
+        let inventory = Inventory::load(state, &root);
+        let now = (journal, header, computed, inventory);
         if shown.as_ref() == Some(&now) && rendered_at.elapsed() < Duration::from_secs(30) {
             continue;
         }
         match load_source_runs(state, &root) {
-            Ok(runs) => view.render(Some(&now.1), &runs, json, interactions.as_ref()),
+            Ok(runs) => {
+                let found = untracked(&now.3, &runs);
+                view.render(Some(&now.1), &runs, json, interactions.as_ref(), &found);
+            }
             Err(error) => eprintln!("watch: {error:#}"),
         }
         let _ = io::stdout().flush();
@@ -211,7 +226,38 @@ pub(crate) struct Owner {
     started: chrono::DateTime<Utc>,
     /// Work whose source at start this owner observed or left alone.
     starts: HashSet<String>,
+    /// The live counts as this owner last wrote them; `None` until then.
+    live: Option<BTreeMap<String, usize>>,
     scratch: tempfile::TempDir,
+}
+
+/// What the project owner saw of Work in progress, beside its record
+/// (`watchers/<key>.live.json`): how many files each Work it followed on its
+/// last tick had changed. Disposable, like the interaction view, and
+/// believed only while the owner that wrote it holds the project.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Live {
+    version: u32,
+    owner_pid: u32,
+    files: BTreeMap<String, usize>,
+}
+
+fn live_path(state: &State, root: &Path) -> PathBuf {
+    super::background::watcher_file(state, root, "live.json")
+}
+
+/// Files changed now in each Work the owner of `root` follows, by run ID.
+/// `None` while no owner holds the project, or the file is not its own: a
+/// count left by an owner that is gone says nothing about Work now. Work
+/// missing from the map has not been looked at.
+pub(crate) fn live_files(state: &State, root: &Path) -> Option<BTreeMap<String, usize>> {
+    let Ok(super::background::Watcher::Watched(Some(record))) =
+        super::background::watcher(state, root)
+    else {
+        return None;
+    };
+    let live: Live = serde_json::from_slice(&fs::read(live_path(state, root)).ok()?).ok()?;
+    (live.owner_pid == record.identity.pid).then_some(live.files)
 }
 
 /// What one tick did, and the root's runs as they stand after it.
@@ -302,6 +348,7 @@ impl Owner {
             measured: HashSet::new(),
             started: Utc::now(),
             starts: HashSet::new(),
+            live: None,
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -378,6 +425,7 @@ impl Owner {
             self.interact(state, &runs, &mut tick);
         }
         self.measure(state, &runs, &mut tick);
+        self.publish_live(state, &mut tick);
         // Registrations whose S0 is durable become Work; failed ones go.
         if let Err(error) = super::registration::reconcile(state, &self.root) {
             tick.report(&error);
@@ -423,6 +471,36 @@ impl Owner {
                 Ok(_) => tick.persisted = true,
                 Err(error) => tick.report(&error),
             }
+        }
+    }
+
+    /// Count the files changed in each patch followed this tick, the one
+    /// kept as last-seen evidence, and write the counts when they changed.
+    fn publish_live(&mut self, state: &State, tick: &mut Tick) {
+        let files: BTreeMap<String, usize> = tick
+            .followed
+            .iter()
+            .filter_map(|id| {
+                let patch = fs::read(self.scratch.path().join(format!("{id}.patch"))).ok()?;
+                Some((id.clone(), coherence::facts::changed_paths(&patch).len()))
+            })
+            .collect();
+        if self.live.as_ref() == Some(&files) {
+            return;
+        }
+        let live = Live {
+            version: 1,
+            owner_pid: std::process::id(),
+            files,
+        };
+        let written = serde_json::to_vec_pretty(&live)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                crate::state::write_atomically(&live_path(state, &self.root), &bytes)
+            });
+        match written {
+            Ok(()) => self.live = Some(live.files),
+            Err(error) => tick.report(&error),
         }
     }
 
@@ -1144,6 +1222,40 @@ pub(crate) fn watch_view(
     ))
 }
 
+/// The inventory's worktrees that are still there and that no unfinished
+/// Work tracks: "found, not tracked", for `watch` and `status`.
+pub(crate) fn untracked(inventory: &Inventory, runs: &[RunRecord]) -> Vec<InventoryEntry> {
+    let tracked: HashSet<&Path> = runs
+        .iter()
+        .filter(|run| run.outcome.lifecycle != LifecycleState::Finished)
+        .filter_map(|run| run.attachment.as_ref())
+        .map(|attachment| attachment.workspace.as_path())
+        .collect();
+    inventory
+        .entries
+        .iter()
+        .filter(|entry| !tracked.contains(entry.path.as_path()) && entry.path.exists())
+        .cloned()
+        .collect()
+}
+
+/// The command that makes a found worktree Work, its path quoted for a
+/// POSIX shell when it has to be.
+pub(crate) fn attach_command(path: &Path) -> String {
+    let path = path.display().to_string();
+    let plain = path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+@%:,=_".contains(c));
+    if plain {
+        format!("dispatch attach --workspace {path}")
+    } else {
+        format!(
+            "dispatch attach --workspace '{}'",
+            path.replace('\'', r"'\''")
+        )
+    }
+}
+
 fn short_ids<'a>(rows: &[&'a RunRecord]) -> HashMap<&'a str, &'a str> {
     let ids: Vec<&str> = rows.iter().map(|run| run.id.as_str()).collect();
     crate::state::short_ids(&ids)
@@ -1167,28 +1279,43 @@ pub(crate) struct View {
     shown: HashMap<String, String>,
     last_block: Vec<String>,
     last_header: Option<String>,
+    last_found: Vec<InventoryEntry>,
 }
 
 impl View {
     /// Print the project view under an optional header line. `--json`
     /// emits one `{"type":"work",...}` object per run whose displayed fields
     /// changed since the last tick, and a `{"type":"watcher",...}` object
-    /// when the header changed; otherwise the whole block is printed,
-    /// redrawn in place on a TTY and appended as lines otherwise.
+    /// when the header or the worktrees found, not tracked, changed;
+    /// otherwise the whole block is printed, those worktrees last, redrawn
+    /// in place on a TTY and appended as lines otherwise.
     pub(crate) fn render(
         &mut self,
         header: Option<&str>,
         runs: &[RunRecord],
         json: bool,
         interactions: Option<&Projection>,
+        found: &[InventoryEntry],
     ) {
-        if json && header.is_some() && self.last_header.as_deref() != header {
-            println!(
-                "{}",
-                serde_json::json!({"type": "watcher", "watcher": header})
-            );
+        if json
+            && header.is_some()
+            && (self.last_header.as_deref() != header || self.last_found != found)
+        {
+            let mut watcher = serde_json::json!({"type": "watcher", "watcher": header});
+            if !found.is_empty() {
+                watcher["inventory"] = found
+                    .iter()
+                    .map(|entry| {
+                        let mut value = serde_json::json!(entry);
+                        value["attach"] = attach_command(&entry.path).into();
+                        value
+                    })
+                    .collect();
+            }
+            println!("{watcher}");
         }
         self.last_header = header.map(str::to_owned);
+        self.last_found = found.to_vec();
         let (shown, last_block) = (&mut self.shown, &mut self.last_block);
         let rows = view_rows(runs);
 
@@ -1234,6 +1361,11 @@ impl View {
                     .collect::<Vec<_>>()
             })
             .chain(empty.then(|| "no Work in the last hour".to_owned()))
+            .chain(
+                found
+                    .iter()
+                    .map(|entry| format!("found, not tracked · {}", attach_command(&entry.path))),
+            )
             .collect();
 
         // Rendered every tick, so redraw only when the block would differ.
@@ -1258,6 +1390,106 @@ mod tests {
     #[test]
     fn live_owner_state_maps_identity_outcomes() {
         assert_eq!(live_owner_state(None), OwnerState::Unknown);
+    }
+
+    /// The owner's counts are believed only while the owner that wrote them
+    /// holds the project: with no owner, or a file another owner left, or
+    /// none at all, files are unknown.
+    #[test]
+    fn live_counts_are_believed_only_from_the_owner_holding_the_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = State::discover(Some(temp.path().join("state"))).unwrap();
+        state.initialize().unwrap();
+        let root = temp.path().join("root");
+        let counted = BTreeMap::from([("w".to_owned(), 2)]);
+        let write = |owner_pid| {
+            fs::create_dir_all(state.root.join("watchers")).unwrap();
+            let live = Live {
+                version: 1,
+                owner_pid,
+                files: counted.clone(),
+            };
+            fs::write(live_path(&state, &root), serde_json::to_vec(&live).unwrap()).unwrap();
+        };
+        write(std::process::id());
+        assert_eq!(live_files(&state, &root), None, "no owner holds it");
+        let _held = super::super::background::acquire(&state, &root).unwrap();
+        super::super::background::write_record(&state, &root, true).unwrap();
+        assert_eq!(live_files(&state, &root), Some(counted.clone()));
+        write(std::process::id() + 1);
+        assert_eq!(live_files(&state, &root), None, "another owner's file");
+        fs::remove_file(live_path(&state, &root)).unwrap();
+        assert_eq!(live_files(&state, &root), None, "nothing written yet");
+    }
+
+    /// Found worktrees that still exist and that no unfinished Work tracks;
+    /// Work that finished leaves its worktree attachable again.
+    #[test]
+    fn found_not_tracked_leaves_out_tracked_and_vanished_worktrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let [found, tracked, finished] = ["found", "tracked", "finished"].map(|name| {
+            let path = temp.path().join(name);
+            fs::create_dir(&path).unwrap();
+            path
+        });
+        let entry = |path: &Path| InventoryEntry {
+            path: path.to_owned(),
+            first_seen: Utc::now(),
+            base: None,
+            lock: None,
+        };
+        let inventory = Inventory {
+            version: 1,
+            entries: vec![
+                entry(&found),
+                entry(&tracked),
+                entry(&finished),
+                entry(&temp.path().join("gone")),
+            ],
+        };
+        let work = |workspace: &Path, lifecycle| {
+            let mut run: RunRecord = serde_json::from_value(serde_json::json!({
+                "id": workspace.file_name().unwrap().to_string_lossy(), "task": "t",
+                "exact_prompt": "t", "source_path": "/source", "source_kind": "git_worktree",
+                "source_git_head": null, "source_fingerprint": "f", "baseline_path": "/b",
+                "baseline_commit": "abc", "status": "running",
+                "created_at": "2026-10-13T00:00:00Z", "completed_at": null,
+                "environment": {"dispatch_version":"test","os":"test","architecture":"test","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+                "evaluation": null, "applied_candidate": null,
+                "attachment": {
+                    "version": 1, "workspace": workspace, "integration_root": "/source",
+                    "repo_key": null, "provenance": {"git_merge_base": {"commit": "abc"}},
+                    "confidence": "full", "agent": null, "command": null, "owner": null,
+                    "agent_process": null, "owner_state": "unknown",
+                    "capabilities": {"observe": true, "signal": false, "control": false, "integrate": false},
+                    "attached_at": "2026-10-13T00:00:00Z", "finished_at": null, "finish_reason": null
+                }
+            }))
+            .unwrap();
+            run.outcome.lifecycle = lifecycle;
+            run
+        };
+        let runs = [
+            work(&tracked, LifecycleState::Working),
+            work(&finished, LifecycleState::Finished),
+        ];
+        let listed: Vec<PathBuf> = untracked(&inventory, &runs)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        assert_eq!(listed, [found, finished]);
+    }
+
+    #[test]
+    fn the_attach_command_quotes_a_path_only_when_it_must() {
+        assert_eq!(
+            attach_command(Path::new("/var/folders/x8_3l/T/.claude/worktrees/trial-b")),
+            "dispatch attach --workspace /var/folders/x8_3l/T/.claude/worktrees/trial-b"
+        );
+        assert_eq!(
+            attach_command(Path::new("/my work/it's")),
+            r"dispatch attach --workspace '/my work/it'\''s'"
+        );
     }
 
     #[test]

@@ -817,3 +817,145 @@ fn interactions_cost() {
         }
     }
 }
+
+/// The lines piped `dispatch watch` prints (`--json` too), until `enough`
+/// says so or 20 s pass.
+fn watch_lines(
+    fixture: &Fixture,
+    json: bool,
+    mut enough: impl FnMut(&[String]) -> bool,
+) -> Vec<String> {
+    let mut command = Command::new(assert_cmd::cargo_bin!("dispatch"));
+    command
+        .arg("--state-dir")
+        .arg(&fixture.state)
+        .args(["watch", "--root"])
+        .arg(&fixture.root)
+        .args(json.then_some("--json"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = OwnedChild(command.spawn().unwrap());
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut lines = Vec::new();
+    while !enough(&lines) {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => lines.push(line),
+            Err(_) => break,
+        }
+    }
+    child.kill_and_wait();
+    lines
+}
+
+/// `docs/plan-0.4.13.md` §3 D: attached Work in progress says how many
+/// files it changes now only while the project's owner counts them. Before
+/// that, and once that owner is gone, its files are unknown; its runtime is
+/// unknown throughout. Never the unset zeros of a result not delivered.
+#[test]
+fn status_shows_files_changed_now_only_while_the_owner_counts_them() {
+    let fixture = Fixture::new();
+    let id = fixture.attach(&[]);
+    let status = || Fixture::stdout(&fixture.dispatch(&["status", &id]).success());
+    let before = status();
+    for want in [
+        "Runtime         unknown",
+        "Tracked         for ",
+        "Files changed   unknown",
+    ] {
+        assert!(before.contains(want), "{want}:\n{before}");
+    }
+    for fake in ["0.0s", "Files changed   0", "+0 / -0"] {
+        assert!(!before.contains(fake), "{fake}:\n{before}");
+    }
+    fs::write(
+        fixture.workspace.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    fs::write(fixture.workspace.join("src/new.rs"), "pub fn g() {}\n").unwrap();
+    let serve = ServeProcess::spawn(&fixture, &[]);
+    wait_until(Duration::from_secs(30), || {
+        std::thread::sleep(Duration::from_millis(200));
+        status().contains("Files changed   2 now")
+    });
+    // Killed, the owner leaves its count behind; nobody holds the project.
+    drop(serve);
+    let left = fs::read_dir(fixture.state.join("watchers"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(".live.json"));
+    assert!(left, "the killed owner's count is still on disk");
+    let after = status();
+    assert!(after.contains("Files changed   unknown"), "{after}");
+}
+
+/// §3 D: worktrees a runtime made before watching began are listed as found,
+/// not tracked, each with its attach command: in piped `watch`, as a field of
+/// `watch --json`'s watcher record, and in `status`. Worktrees tracked by
+/// Work are not listed; with no inventory nothing is added.
+#[test]
+fn worktrees_found_not_tracked_are_listed_with_their_attach_command() {
+    let fixture = Fixture::new();
+    let id = fixture.attach(&[]);
+    let status = || Fixture::stdout(&fixture.dispatch(&["status", &id]).success());
+    assert!(!status().contains("Found, not tracked"));
+    let found = fixture.extra_worktree("found");
+    let key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        fixture.root.to_string_lossy().as_bytes(),
+    ));
+    let entry =
+        |path: &Path| serde_json::json!({"path": path, "first_seen": "2026-10-13T00:00:00Z"});
+    fs::create_dir_all(fixture.state.join("watchers")).unwrap();
+    fs::write(
+        fixture
+            .state
+            .join("watchers")
+            .join(format!("{key}.inventory.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "entries": [entry(&found), entry(&fixture.workspace)],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let command = format!("dispatch attach --workspace {}", found.display());
+
+    let lines = watch_lines(&fixture, false, |lines| {
+        lines
+            .iter()
+            .any(|line| line.starts_with("found, not tracked"))
+    });
+    let listed: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("found, not tracked"))
+        .collect();
+    assert_eq!(
+        listed,
+        [&format!("found, not tracked · {command}")],
+        "{lines:#?}"
+    );
+
+    let records = watch_lines(&fixture, true, |lines| !lines.is_empty());
+    let watcher: Value = serde_json::from_str(&records[0]).unwrap();
+    assert_eq!(watcher["type"], "watcher", "{watcher}");
+    let inventory = watcher["inventory"].as_array().expect("an inventory field");
+    assert_eq!(inventory.len(), 1, "{watcher}");
+    assert_eq!(inventory[0]["path"], found.to_str().unwrap(), "{watcher}");
+    assert_eq!(inventory[0]["attach"], command, "{watcher}");
+
+    let status = status();
+    assert!(
+        status.contains(&format!("\nFound, not tracked\n  {command}\n")),
+        "{status}"
+    );
+}

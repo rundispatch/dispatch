@@ -11,6 +11,7 @@ bytes into the screen a person would see.
 Usage: watch_acceptance.py <dispatch binary> <scenario>
 """
 import codecs
+import hashlib
 import json
 import os
 import re
@@ -1522,12 +1523,52 @@ def plain(binary, base):
     print("PASS plain")
 
 
+def live_progress(binary, base):
+    """docs/plan-0.4.13.md §3 D: a working row shows the files it changes now,
+    as the project's owner counts them, and how long it has been tracked; a
+    Claude Code worktree that was there before watching began is listed as
+    found, not tracked, with the command that attaches it."""
+    project = Project(binary, base)
+    # As Claude Code leaves it: CLAUDE_BASE beside the worktree's Git
+    # metadata. In the inventory, as the owner's first scan records it.
+    found = project.root / ".claude" / "worktrees" / "trial-b"
+    project.git("worktree", "add", "--quiet", "-b", "worktree-trial-b", str(found))
+    found = Path(os.path.realpath(found))
+    head = subprocess.run(["git", "-C", str(project.root), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    (project.root / ".git" / "worktrees" / "trial-b" / "CLAUDE_BASE").write_text(head + "\n")
+    watchers = project.state / "watchers"
+    watchers.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(str(project.root).encode()).hexdigest()
+    (watchers / f"{key}.inventory.json").write_text(json.dumps({
+        "version": 1,
+        "entries": [{"path": str(found), "first_seen": "2026-10-13T00:00:00Z", "base": head}],
+    }))
+    project.attach("slugify")
+    project.edit("slugify", "api.py", CALLER)
+    project.edit("slugify", "new.py", "X = 1\n")
+    project.start()
+    with project.watch(200, 30) as watch:
+        watch.until("listed", lambda: row_of(watch, "slugify"))
+        watch.until("slugify's details", lambda: watch.details().split(" ")[0] == "slugify")
+        watch.until("its files, counted", lambda: "Progress files: 2 changed · tracked for " in watch.details())
+        text, cell_line = row_of(watch, "slugify")
+        _, titles = watch.column_titles()
+        assert cell_line[titles["STATE"]:].startswith("working "), cell_line
+        details = watch.details()
+        assert "files: unknown" not in details and "0 files" not in details, details
+        watch.shows(f"found, not tracked · trial-b · dispatch attach --workspace {found}")
+        watch.leave()
+    print("PASS live-progress")
+
+
 SCENARIOS = {
     "widths": widths, "reorder": reorder, "actions": actions, "resize": resize, "names": names,
     "states-ready": states_ready, "states-live": states_live, "interactions": interactions,
     "feedback": feedback, "no-color": no_color, "ascii": ascii_mode, "empty": empty, "plain": plain,
     "unwatched": unwatched, "long-name-detail": long_name_detail, "short-terminal": short_terminal,
     "narrowest-hint": narrowest_hint, "refusal-other": refusal_other, "six-cards": six_cards,
+    "live-progress": live_progress,
 }
 
 

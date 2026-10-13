@@ -153,3 +153,10 @@ fn the_hint_keeps_q_leave_at_forty_columns() {
 fn six_work_at_sixty_columns_show_all_six_cards() {
     scenario("six-cards");
 }
+
+/// 0.4.13 §3 D: a working row shows its live files and tracked time, and a
+/// worktree found before watching is listed with its attach command.
+#[test]
+fn working_work_shows_live_files_and_found_worktrees_are_listed() {
+    scenario("live-progress");
+}
