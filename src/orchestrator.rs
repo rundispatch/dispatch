@@ -2615,6 +2615,56 @@ fn workspace_details(run: &RunRecord, attachment: &crate::AttachmentRecord) -> V
             "  session ended — finish to freeze its changes (dispatch finish {id}), or resume it; or close it: {close} unfinished"
         ));
     }
+    let mut start = source_at_start(attachment).into_iter();
+    if let Some(first) = start.next() {
+        lines.push(format!("  source at start: {first}"));
+        lines.extend(start.map(|line| format!("    {line}")));
+    }
+    lines
+}
+
+/// How the integration source compared with the Work's S0 when it began, as
+/// observed then: what differed, the managed launch that avoids it, and the
+/// runtime's own advice. Empty when there was nothing to observe.
+pub(crate) fn source_at_start(attachment: &crate::AttachmentRecord) -> Vec<String> {
+    let observation = match &attachment.source_at_start {
+        None => return Vec::new(),
+        Some(crate::SourceAtStart::NotObserved) => return vec!["not observed".into()],
+        Some(crate::SourceAtStart::Observed(observation)) => observation,
+    };
+    let when = observation.at.format("%Y-%m-%d %H:%M UTC");
+    let head = observation
+        .source_head
+        .as_deref()
+        .map(|head| format!(", source HEAD {}", &head[..head.len().min(8)]))
+        .unwrap_or_default();
+    if observation.differing == 0 {
+        return vec![format!("the same as its S0 (observed {when}{head})")];
+    }
+    let mut paths: Vec<String> = observation
+        .paths
+        .iter()
+        .take(3)
+        .map(|path| match &path.applied_work {
+            Some(work) => format!("{} (in applied Work {work})", path.path),
+            None => path.path.clone(),
+        })
+        .collect();
+    if observation.differing > paths.len() {
+        paths.push(format!("{} more", observation.differing - paths.len()));
+    }
+    let mut lines = vec![
+        format!(
+            "differed from its S0 at {} path{} (observed {when}{head}): {}",
+            observation.differing,
+            if observation.differing == 1 { "" } else { "s" },
+            paths.join(", ")
+        ),
+        "Work started with dispatch attach -- <agent> begins from the current source, \
+         including uncommitted changes."
+            .into(),
+    ];
+    lines.extend(crate::runtime::start_advice(attachment).map(str::to_owned));
     lines
 }
 

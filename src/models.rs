@@ -625,6 +625,44 @@ pub struct AttachmentRecord {
     /// for a person, except an empty Δ, which leaves nothing to review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_removed: Option<WorkspaceRemoval>,
+    /// How the integration source differed from S0 when the Work began,
+    /// observed once (`attach::observe_start`). `None` for a workspace
+    /// Dispatch made from the current source, and for Work made before this
+    /// was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_at_start: Option<SourceAtStart>,
+}
+
+/// The one observation of the integration source when Work began. Never
+/// recomputed: drift after the start is the verdict's business.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAtStart {
+    /// Nobody observed it: the observation failed, or no project owner saw
+    /// the Work published.
+    NotObserved,
+    Observed(StartObservation),
+}
+
+/// Where the integration source differed from S0, whichever side had the
+/// change. Advisory: no verdict depends on it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartObservation {
+    pub at: DateTime<Utc>,
+    /// The source's HEAD then; `None` for a directory or an unborn branch.
+    pub source_head: Option<String>,
+    /// How many paths differed; `paths` holds at most the first few.
+    pub differing: usize,
+    pub paths: Vec<StartPath>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartPath {
+    pub path: String,
+    /// Applied Work whose retained patch has this path: the only author
+    /// Dispatch names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_work: Option<String>,
 }
 
 /// When the workspace went, and whether Dispatch kept its exact final Δ (a
@@ -1017,6 +1055,7 @@ mod tests {
             managed: None,
             sessions: Vec::new(),
             workspace_removed: None,
+            source_at_start: None,
         }
     }
 

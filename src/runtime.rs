@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::{
-    RuntimeSession,
+    AttachmentRecord, RuntimeSession, WorkspaceOwner,
     orchestrator::{
         attach,
         background::{self, Watcher},
@@ -245,4 +245,16 @@ pub fn mark_process_start() {
 
 fn process_started() -> (Instant, DateTime<Utc>) {
     *STARTED.get_or_init(|| (Instant::now(), Utc::now()))
+}
+
+/// The runtime's own advice for Work in a workspace it made that began from
+/// source other than the project's; none for any other workspace.
+pub fn start_advice(attachment: &AttachmentRecord) -> Option<&'static str> {
+    if attachment.workspace_owner != WorkspaceOwner::Runtime {
+        return None;
+    }
+    match attachment.sessions.first()?.provider.as_str() {
+        "claude" => Some(claude::START_ADVICE),
+        _ => None,
+    }
 }

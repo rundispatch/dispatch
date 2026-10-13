@@ -297,6 +297,20 @@ fn item(
             rank: 3,
         });
     }
+    // What differed at the start, or that nobody looked; not that nothing did.
+    if let Some(attachment) = run.attachment.as_ref().filter(|attachment| {
+        !matches!(&attachment.source_at_start,
+            Some(crate::SourceAtStart::Observed(observation)) if observation.differing == 0)
+    }) {
+        let lines = orchestrator::source_at_start(attachment);
+        if !lines.is_empty() {
+            details.push(Detail {
+                label: "At start",
+                lines,
+                rank: 3,
+            });
+        }
+    }
     details.push(Detail::new("Began", began(run), 4));
 
     let agent = line.agent.clone();
@@ -1917,6 +1931,7 @@ mod tests {
                 model: None,
             }],
             workspace_removed: None,
+            source_at_start: None,
         });
         run
     }
@@ -2235,6 +2250,64 @@ mod tests {
                 .flat_map(|d| d.lines.clone()),
         );
         lines
+    }
+
+    /// What differed at the start leads with the managed launch; only a
+    /// Claude worktree gets Claude's advice. The same source takes no room.
+    #[test]
+    fn details_say_what_differed_at_the_start_and_only_claude_worktrees_get_claude_advice() {
+        let id = "01M4DRXH00000000000000000B";
+        let observed = |differing| {
+            Some(crate::SourceAtStart::Observed(crate::StartObservation {
+                at: "2026-10-12T09:30:00Z".parse().unwrap(),
+                source_head: Some("5e3cb514aaaa".into()),
+                differing,
+                paths: ["notes.txt", "src/a.rs", "src/b.rs", "src/c.rs"]
+                    .into_iter()
+                    .take(differing)
+                    .map(|path| crate::StartPath {
+                        path: path.into(),
+                        applied_work: (path == "src/a.rs").then(|| "01M4AAAA".into()),
+                    })
+                    .collect(),
+            }))
+        };
+        let with = |mut run: RunRecord, at_start| {
+            run.attachment.as_mut().unwrap().source_at_start = at_start;
+            items(&[working(run)]).remove(0)
+        };
+        let generic = "Work started with dispatch attach -- <agent> begins from the current source, including uncommitted changes.";
+
+        let claude = with(worktree(id, "x", 1), observed(4));
+        assert_eq!(
+            lines(&claude, "At start"),
+            [
+                "differed from its S0 at 4 paths (observed 2026-10-12 09:30 UTC, source HEAD 5e3cb514): notes.txt, src/a.rs (in applied Work 01M4AAAA), src/b.rs, 1 more",
+                generic,
+                crate::runtime::claude::START_ADVICE,
+            ]
+        );
+        let yours = attached(run(id, "t", 1), "/home/me/wt", WorkspaceOwner::User);
+        assert_eq!(
+            lines(&with(yours, observed(1)), "At start"),
+            [
+                "differed from its S0 at 1 path (observed 2026-10-12 09:30 UTC, source HEAD 5e3cb514): notes.txt",
+                generic,
+            ]
+        );
+        let none = |item: &Item| item.details.iter().all(|d| d.label != "At start");
+        assert!(none(&with(worktree(id, "x", 1), observed(0))));
+        assert!(none(&with(worktree(id, "x", 1), None)));
+        assert_eq!(
+            lines(
+                &with(
+                    worktree(id, "x", 1),
+                    Some(crate::SourceAtStart::NotObserved)
+                ),
+                "At start"
+            ),
+            ["not observed"]
+        );
     }
 
     #[test]

@@ -34,8 +34,12 @@ use crate::{
     AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, CloseReason,
     Closure, Config, DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState,
     ManagedWorkspace, OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus,
-    RuntimeSession, VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
-    coherence::watch::{WatchSpec, Watcher},
+    RuntimeSession, SourceAtStart, StartObservation, StartPath, VerificationState, WaitingOn,
+    WorkResult, WorkspaceOwner, WorkspaceRemoval,
+    coherence::{
+        watch::{WatchSpec, Watcher},
+        world,
+    },
     db::Database,
     lock::OperationLock,
     process, source,
@@ -86,7 +90,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     let prepared = prepare(state, request)?;
     let run_id = Ulid::new().to_string();
     let building = registration::begin(state, &run_id)?;
-    let run = match build(state, &prepared, &run_id)
+    let mut run = match build(state, &prepared, &run_id)
         .and_then(|built| publish(state, &run_id, Some(built), None))
     {
         Ok(run) => run,
@@ -95,6 +99,14 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
             return Err(error);
         }
     };
+    if !prepared.managed && prepared.request.runtime.is_none() {
+        match super::serve::load_source_runs(state, &prepared.root)
+            .and_then(|runs| observe_start(state, &run.id, &runs))
+        {
+            Ok(observed) => run = observed,
+            Err(error) => tracing::warn!("the source at start was not observed: {error:#}"),
+        }
+    }
 
     // The wrapped form writes nothing to the terminal while the agent runs
     // (part 6.7): its owner loop prints its own single line only after the
@@ -116,6 +128,13 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         println!("Workspace  {}", prepared.workspace.display());
         println!("Root       {}", prepared.root.display());
         println!("S0         {provenance_text}, {confidence_text} confidence");
+        let at_start = super::source_at_start(run.attachment.as_ref().unwrap());
+        for (n, line) in at_start.iter().enumerate() {
+            println!(
+                "{}{line}",
+                if n == 0 { "Source     " } else { "           " }
+            );
+        }
         println!("Next: dispatch finish {} when the agent is done", run.id);
     }
 
@@ -413,6 +432,11 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         } else {
             WorkspaceOwner::User
         },
+        // A workspace Dispatch made begins from the current source; any other
+        // is observed once after publication (`observe_start`).
+        source_at_start: managed_workspace
+            .is_none()
+            .then_some(SourceAtStart::NotObserved),
         managed: managed_workspace,
         sessions: runtime
             .map(|runtime| vec![runtime.session.clone()])
@@ -1153,6 +1177,91 @@ pub(crate) fn record_session_end(
 }
 
 const MAX_SESSIONS: usize = 100;
+
+/// Most differing paths an observation of the source at start keeps.
+const MAX_START_PATHS: usize = 20;
+
+/// Record, once, where the integration source differed from the Work's S0
+/// when it began: `world::observe` lists every path where they differ,
+/// whichever side has the change. A path in the retained patch of Work
+/// applied to this source (`runs`) names that Work; nothing else is
+/// attributed. Advisory: no verdict depends on it. `attach` calls this right
+/// after publishing, the project owner for Work a runtime registered; never
+/// registration. On failure nothing is recorded, and it stays not observed.
+pub(crate) fn observe_start(state: &State, run_id: &str, runs: &[RunRecord]) -> Result<RunRecord> {
+    let pending = |run: &RunRecord| {
+        run.attachment.as_ref().is_some_and(|attachment| {
+            attachment.source_at_start == Some(SourceAtStart::NotObserved)
+        })
+    };
+    // Compared without the run's lock: on a large source this takes seconds,
+    // and hooks wait for that lock only briefly. The lock guards the record.
+    let run = state.load_run(run_id)?;
+    if !pending(&run) {
+        return Ok(run);
+    }
+    let world = world::observe(
+        &run.source_path,
+        &run.baseline_path,
+        &run.baseline_commit,
+        &run.source_kind,
+    )?;
+    let (_, source_head) = source::inspect_source(&run.source_path)?;
+    let mut applied = std::collections::HashMap::new();
+    for other in runs.iter().filter(|other| {
+        other.outcome.application == ApplicationState::Applied && other.id != run.id
+    }) {
+        let candidate = other
+            .candidates
+            .iter()
+            .find(|candidate| other.applied_candidate.as_ref() == Some(&candidate.label));
+        for path in candidate.iter().flat_map(|c| &c.diff_stats.changed_files) {
+            applied.insert(path.as_str(), other.id.as_str());
+        }
+    }
+    let observation = StartObservation {
+        at: Utc::now(),
+        source_head,
+        differing: world.changes.len(),
+        paths: world
+            .changes
+            .iter()
+            .take(MAX_START_PATHS)
+            .map(|change| StartPath {
+                path: change.path.clone(),
+                applied_work: applied.get(change.path.as_str()).map(|id| (*id).to_owned()),
+            })
+            .collect(),
+    };
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(5),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    if !pending(&run) {
+        return Ok(run); // recorded meanwhile: the first observation stands
+    }
+    if let Some(attachment) = run.attachment.as_mut() {
+        attachment.source_at_start = Some(SourceAtStart::Observed(observation.clone()));
+    }
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "attach.source_observed".into(),
+            timestamp: observation.at,
+            payload: serde_json::to_value(&observation)?,
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(run)
+}
 
 pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<Option<String>> {
     for path in state.list_metadata_paths()? {
