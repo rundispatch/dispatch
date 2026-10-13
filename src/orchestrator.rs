@@ -1,6 +1,8 @@
 mod apply;
 pub mod attach;
 pub mod background;
+pub mod discovery;
+pub(crate) mod liveness;
 pub(crate) mod native;
 pub mod registration;
 pub mod serve;
@@ -2301,6 +2303,9 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
         Some(crate::BaselineProvenance::WorkspaceAtStart { commit }) => {
             format!("workspace at start {}", short(commit))
         }
+        Some(crate::BaselineProvenance::Discovered { commit }) => {
+            format!("found, merge-base {} (full)", short(commit))
+        }
         // Native S0 is the project as it was, named by its commit when it has
         // one; Dispatch's own baseline commit means nothing to the reader.
         None => run.source_git_head.as_deref().map_or_else(
@@ -2686,6 +2691,11 @@ fn print_attachment_details(run: &RunRecord) {
         }
         crate::BaselineProvenance::WorkspaceAtStart { commit } => {
             println!("  S0: the workspace as it was when the work began ({commit})");
+        }
+        crate::BaselineProvenance::Discovered { commit } => {
+            println!(
+                "  S0: commit {commit} (merge base with the root; the worktree was found after watching began)"
+            );
         }
     }
     println!("  confidence: {}", snake_case(&attachment.confidence));

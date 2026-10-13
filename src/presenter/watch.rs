@@ -385,6 +385,10 @@ fn began(run: &RunRecord) -> String {
             "a Dispatch snapshot ({}) of its worktree when its first session started, not a commit on any branch",
             short(commit)
         ),
+        Some(crate::BaselineProvenance::Discovered { commit }) => format!(
+            "the Git merge base {} of its worktree and the project; Dispatch found the worktree after watching began",
+            short(commit)
+        ),
         None => match &run.source_git_head {
             Some(head) => format!(
                 "a Dispatch snapshot of the project's working tree at {}",

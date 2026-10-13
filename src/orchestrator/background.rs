@@ -60,6 +60,14 @@ fn record_path(state: &State, root: &Path) -> PathBuf {
         .join(format!("{}.json", key(root)))
 }
 
+/// Another file beside the watcher's record of `root`: `watchers/<key>.<suffix>`.
+pub(crate) fn watcher_file(state: &State, root: &Path, suffix: &str) -> PathBuf {
+    state
+        .root
+        .join("watchers")
+        .join(format!("{}.{suffix}", key(root)))
+}
+
 /// Taken by `serve`. It waits a moment, because `watcher` probes the lock by
 /// taking it briefly.
 pub(crate) fn acquire(state: &State, root: &Path) -> Result<OperationLock> {

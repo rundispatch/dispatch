@@ -119,6 +119,9 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
             BaselineProvenance::WorkspaceAtStart { commit } => {
                 format!("commit {commit} (the workspace at start)")
             }
+            BaselineProvenance::Discovered { commit } => {
+                format!("commit {commit} (merge base; found after watching began)")
+            }
         };
         let confidence_text = match run.attachment.as_ref().unwrap().confidence {
             AttachConfidence::Full => "full",

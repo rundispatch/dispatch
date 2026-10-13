@@ -308,9 +308,217 @@ pub fn hooks_preview(command: &str) -> String {
     serde_json::to_string_pretty(&added).expect("settings serialize")
 }
 
+/// What Claude Code records about a worktree it made, in the worktree's Git
+/// metadata (`.git/worktrees/<name>/`), read without running Git. Observed
+/// with Claude Code 2.1.296 (`docs/plan-0.4.13.md` §2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeSignals {
+    /// `CLAUDE_BASE`: the commit Claude branched the worktree from. A hint of
+    /// provenance, never S0.
+    pub base: Option<String>,
+    /// The worktree's `git worktree lock`, if any.
+    pub lock: Option<Lock>,
+}
+
+/// A `git worktree lock` reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lock {
+    /// `claude session <name> (pid <pid> start <start>)`, the lock a running
+    /// `claude --worktree` session holds; `start` as `ps -o lstart=` prints it
+    /// in UTC.
+    Session {
+        name: String,
+        pid: u32,
+        start: String,
+    },
+    /// Any other reason, verbatim: a person's lock, or one not yet observed.
+    Other(String),
+}
+
+/// Whether the process a lock names still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// That pid runs, and it started when the lock says.
+    Running,
+    /// That pid does not run, or a different process now has it.
+    Gone,
+    /// Not a session lock, or the start time cannot be read.
+    Unknown,
+}
+
+/// The signals of the worktree at `worktree`, whose `.git` file names its
+/// metadata directory. A worktree that is not a linked Git worktree has none.
+pub fn worktree_signals(worktree: &std::path::Path) -> WorktreeSignals {
+    let Some(gitdir) = linked_gitdir(worktree) else {
+        return WorktreeSignals::default();
+    };
+    let read = |name: &str| {
+        std::fs::read_to_string(gitdir.join(name))
+            .ok()
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    WorktreeSignals {
+        base: read("CLAUDE_BASE"),
+        lock: read("locked").map(|reason| parse_lock(&reason)),
+    }
+}
+
+/// Whether Claude Code made the worktree at `worktree` for the project at
+/// `root`: it carries `CLAUDE_BASE` and lives where Claude documents it makes
+/// worktrees.
+pub fn made_by_claude(
+    root: &std::path::Path,
+    worktree: &std::path::Path,
+    signals: &WorktreeSignals,
+) -> bool {
+    signals.base.is_some() && worktree.starts_with(root.join(".claude").join("worktrees"))
+}
+
+/// A lock reason, as `Lock`.
+pub fn parse_lock(reason: &str) -> Lock {
+    let session = || {
+        let rest = reason.strip_prefix("claude session ")?;
+        let (name, rest) = rest.split_once(" (pid ")?;
+        let (pid, rest) = rest.split_once(" start ")?;
+        let start = rest.strip_suffix(')')?;
+        Some(Lock::Session {
+            name: name.to_owned(),
+            pid: pid.parse().ok()?,
+            start: one_spaced(start),
+        })
+    };
+    session().unwrap_or_else(|| Lock::Other(reason.to_owned()))
+}
+
+/// Whether the process `lock` names still runs: its pid exists and started at
+/// the time the lock records, so a recycled pid is not mistaken for it.
+pub fn liveness(lock: &Lock) -> Liveness {
+    let Lock::Session { pid, start, .. } = lock else {
+        return Liveness::Unknown;
+    };
+    if !crate::process::pid_exists(*pid) {
+        return Liveness::Gone;
+    }
+    match process_start_utc(*pid) {
+        Some(now) if now == *start => Liveness::Running,
+        Some(_) => Liveness::Gone,
+        None => Liveness::Unknown,
+    }
+}
+
+/// `pid`'s start time as Claude Code writes it in a lock: `ps -o lstart=` in UTC.
+fn process_start_utc(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .env("TZ", "UTC0")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let start = one_spaced(text.trim());
+    (output.status.success() && !start.is_empty()).then_some(start)
+}
+
+/// `ps` pads single-digit days with a second space; compare words, not spacing.
+fn one_spaced(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The metadata directory a linked worktree's `.git` file points to.
+fn linked_gitdir(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
+    let file = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let gitdir = std::path::PathBuf::from(file.strip_prefix("gitdir:")?.trim());
+    Some(if gitdir.is_absolute() {
+        gitdir
+    } else {
+        worktree.join(gitdir)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_lock_parses_and_anything_else_stays_verbatim() {
+        assert_eq!(
+            parse_lock("claude session trial-b (pid 87076 start Tue Oct 13 14:08:28 2026)"),
+            Lock::Session {
+                name: "trial-b".into(),
+                pid: 87076,
+                start: "Tue Oct 13 14:08:28 2026".into(),
+            }
+        );
+        assert_eq!(
+            parse_lock("claude session x (pid 1 start Sat Oct  3 09:00:00 2026)"),
+            Lock::Session {
+                name: "x".into(),
+                pid: 1,
+                start: "Sat Oct 3 09:00:00 2026".into(),
+            }
+        );
+        for other in [
+            "moving it",
+            "claude session x (pid abc start y)",
+            "claude agent a-1",
+        ] {
+            assert_eq!(parse_lock(other), Lock::Other(other.into()));
+        }
+    }
+
+    #[test]
+    fn liveness_is_exact_for_this_process_and_gone_for_a_wrong_start_or_pid() {
+        let me = std::process::id();
+        let start = process_start_utc(me).expect("ps reads this process's start");
+        let lock = |pid, start: &str| Lock::Session {
+            name: "x".into(),
+            pid,
+            start: start.into(),
+        };
+        assert_eq!(liveness(&lock(me, &start)), Liveness::Running);
+        assert_eq!(
+            liveness(&lock(me, "Thu Jan 1 00:00:00 1970")),
+            Liveness::Gone
+        );
+        assert_eq!(liveness(&lock(u32::MAX - 1, &start)), Liveness::Gone);
+        assert_eq!(liveness(&Lock::Other("x".into())), Liveness::Unknown);
+    }
+
+    #[test]
+    fn signals_come_from_the_worktrees_git_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let gitdir = root.join(".git").join("worktrees").join("a");
+        let worktree = root.join(".claude").join("worktrees").join("a");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        assert_eq!(worktree_signals(&worktree), WorktreeSignals::default());
+        std::fs::write(gitdir.join("CLAUDE_BASE"), "0607b593\n").unwrap();
+        std::fs::write(
+            gitdir.join("locked"),
+            "claude session a (pid 7 start Tue Oct 13 14:08:28 2026)",
+        )
+        .unwrap();
+        let signals = worktree_signals(&worktree);
+        assert_eq!(signals.base.as_deref(), Some("0607b593"));
+        assert!(matches!(signals.lock, Some(Lock::Session { pid: 7, .. })));
+        assert!(made_by_claude(&root, &worktree, &signals));
+        assert!(!made_by_claude(&root, &root.join("elsewhere"), &signals));
+        assert!(!made_by_claude(
+            &root,
+            &worktree,
+            &WorktreeSignals::default()
+        ));
+        assert_eq!(
+            worktree_signals(&temp.path().join("plain")),
+            WorktreeSignals::default()
+        );
+    }
 
     const COMMAND: &str = "'/bin/dispatch' --state-dir '/s' hook claude";
 

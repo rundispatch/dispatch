@@ -335,6 +335,14 @@ impl Owner {
         tick.cost.runs = runs.len();
         tick.adopted = adopt_orphans(state, &runs, &mut tick);
         self.observe_starts(state, &runs, &mut tick);
+        // Worktrees a runtime made, found without hooks, and whether their
+        // agents still run (`docs/plan-0.4.13.md` §3 B and C).
+        if let Err(error) = super::discovery::scan(state, &self.root, &runs) {
+            tick.report(&error);
+        }
+        if let Err(error) = super::liveness::observe(state, &self.root, &runs) {
+            tick.report(&error);
+        }
         let moved = tick.moved || tick.adopted;
         self.reevaluate(state, &runs, &mut tick, moved);
         let started = Instant::now();
@@ -389,6 +397,7 @@ impl Owner {
                     && matches!(
                         attachment.provenance,
                         BaselineProvenance::WorkspaceAtStart { .. }
+                            | BaselineProvenance::Discovered { .. }
                     )
             });
             if !registered || !self.starts.insert(run.id.clone()) {
