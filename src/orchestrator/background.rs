@@ -222,18 +222,29 @@ fn is_exact(record: &WatcherRecord) -> bool {
     identity_state(&record.identity) == IdentityState::ExactLive
 }
 
+/// What `start` says, once watching, in a project without checks.
+const NO_CHECKS: &str = "  No checks are configured, so Work here is not verified. Add them: \
+    dispatch setup --checks, or dispatch setup --checks --verify '<command>'";
+
 /// `dispatch start [--root <path>]`: watch the project in the background and
 /// return. The owner is `dispatch serve --background` in its own session, so
 /// closing the terminal does not stop it; its stderr is
-/// `watchers/<key>.log`.
+/// `watchers/<key>.log`. In a project without checks, a terminal is offered
+/// the detected ones first; without a terminal it watches at once and says
+/// so. Nothing of the project runs here.
 #[cfg(unix)]
-pub fn start(state: &State, root: Option<PathBuf>, verbose: u8) -> Result<()> {
+pub async fn start(
+    state: &State,
+    root: Option<PathBuf>,
+    verbose: u8,
+    options: crate::presenter::Options,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     state.initialize()?;
     let root = source::resolve_source(root.as_deref())?;
     // A broken configuration fails here, before anything is spawned.
-    Config::discover(&root, None)?;
+    let (config, _) = Config::discover(&root, None)?;
     if let Watcher::Watched(_) = watcher(state, &root)? {
         println!(
             "Already watching {}: {}",
@@ -241,6 +252,14 @@ pub fn start(state: &State, root: Option<PathBuf>, verbose: u8) -> Result<()> {
             describe(state, &root)
         );
         return Ok(());
+    }
+    let mut unchecked = config.checks.verify.is_empty();
+    if unchecked && crate::presenter::suitable() {
+        let Some(saved) = crate::presenter::start_checks(&root, options).await? else {
+            println!("Not watching {}: nothing was changed.", root.display());
+            return Ok(());
+        };
+        unchecked = !saved;
     }
     watchers_dir(state)?;
     let log = record_path(state, &root).with_extension("log");
@@ -292,6 +311,9 @@ pub fn start(state: &State, root: Option<PathBuf>, verbose: u8) -> Result<()> {
             println!(
                 "  Dispatch is running in the background. See it: dispatch watch · Stop: dispatch stop"
             );
+            if unchecked {
+                println!("{NO_CHECKS}");
+            }
             return Ok(());
         }
         if child.try_wait()?.is_some() {
@@ -324,7 +346,12 @@ pub fn start(state: &State, root: Option<PathBuf>, verbose: u8) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn start(_state: &State, _root: Option<PathBuf>, _verbose: u8) -> Result<()> {
+pub async fn start(
+    _state: &State,
+    _root: Option<PathBuf>,
+    _verbose: u8,
+    _options: crate::presenter::Options,
+) -> Result<()> {
     anyhow::bail!("watching in the background needs a Unix system; use dispatch serve")
 }
 

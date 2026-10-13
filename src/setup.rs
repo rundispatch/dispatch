@@ -430,25 +430,34 @@ pub fn check_choices(source: &Path) -> Vec<&'static str> {
     }
     choices
 }
-/// Save a detected check. It must still be detected, so a changed project
+/// Save detected checks. Each must still be detected, so a changed project
 /// cannot turn a stale menu choice into an approval.
-pub fn save_checks(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
+pub fn save_checks(source: &Path, commands: &[&str], expected: Option<Vec<u8>>) -> Result<()> {
+    let detected = check_choices(source);
     ensure!(
-        check_choices(source).contains(&command),
+        commands.iter().all(|command| detected.contains(command)),
         "check choice is no longer available"
     );
-    write_check(source, command, expected)
+    write_checks(source, commands, expected).map(drop)
 }
-/// Save a check the person typed; typing it is the approval.
-pub fn save_typed_check(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
-    let command = command.trim();
+/// Save checks the person typed, exactly and in order; typing them is the
+/// approval. Returns where they were saved.
+pub fn save_typed_checks(
+    source: &Path,
+    commands: &[String],
+    expected: Option<Vec<u8>>,
+) -> Result<PathBuf> {
+    let commands: Vec<&str> = commands.iter().map(|c| c.trim()).collect();
     ensure!(
-        !command.is_empty() && !command.contains(['\n', '\r']),
+        !commands.is_empty()
+            && commands
+                .iter()
+                .all(|c| !c.is_empty() && !c.contains(['\n', '\r'])),
         "a check is one non-empty command line"
     );
-    write_check(source, command, expected)
+    write_checks(source, &commands, expected)
 }
-fn write_check(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
+fn write_checks(source: &Path, commands: &[&str], expected: Option<Vec<u8>>) -> Result<PathBuf> {
     let (_, path) = crate::Config::discover(source, None)?;
     let path = path.unwrap_or_else(|| source.join("dispatch.yml"));
     let mut value: serde_yaml::Value = expected
@@ -456,11 +465,12 @@ fn write_check(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Resul
         .map(|b| serde_yaml::from_slice(b))
         .transpose()?
         .unwrap_or(serde_yaml::Value::Mapping(Default::default()));
-    value["checks"]["verify"] = serde_yaml::to_value(vec![command])?;
+    value["checks"]["verify"] = serde_yaml::to_value(commands)?;
     let bytes = serde_yaml::to_string(&value)?;
     let config: crate::Config = serde_yaml::from_str(&bytes)?;
     config.validate()?;
-    atomic_config(&path, expected.as_deref(), bytes.as_bytes())
+    atomic_config(&path, expected.as_deref(), bytes.as_bytes())?;
+    Ok(path)
 }
 pub fn project_config_bytes(source: &Path) -> Result<Option<Vec<u8>>> {
     let (_, path) = crate::Config::discover(source, None)?;
@@ -603,12 +613,13 @@ mod tests {
             "execution:\n  timeout_secs: 123\nprivate_evidence:\n  shadow: false\n",
         )?;
         let before = project_config_bytes(t.path())?;
-        save_checks(t.path(), "sh ./verify.sh", before.clone())?;
+        save_checks(t.path(), &["sh ./verify.sh"], before.clone())?;
         let (config, _) = crate::Config::discover(t.path(), None)?;
         assert_eq!(config.execution.timeout_secs, 123);
         assert_eq!(config.checks.verify, vec!["sh ./verify.sh"]);
-        assert!(save_checks(t.path(), "sh ./verify.sh", before).is_err());
-        assert!(save_checks(t.path(), "curl attacker", project_config_bytes(t.path())?).is_err());
+        assert!(save_checks(t.path(), &["sh ./verify.sh"], before).is_err());
+        let current = project_config_bytes(t.path())?;
+        assert!(save_checks(t.path(), &["sh ./verify.sh", "curl attacker"], current).is_err());
         Ok(())
     }
     #[test]
@@ -625,13 +636,19 @@ mod tests {
             ["npm test", "go test ./...", "python3 -m pytest"]
         );
         // A typed check is saved as typed, but never a detected-only choice.
-        assert!(save_checks(t.path(), "make lint", None).is_err());
-        save_typed_check(t.path(), "  make lint  ", None)?;
+        assert!(save_checks(t.path(), &["make lint"], None).is_err());
+        save_typed_checks(
+            t.path(),
+            &["  make lint  ".into(), "make test".into()],
+            None,
+        )?;
         let (config, _) = crate::Config::discover(t.path(), None)?;
-        assert_eq!(config.checks.verify, vec!["make lint"]);
+        assert_eq!(config.checks.verify, vec!["make lint", "make test"]);
         let current = project_config_bytes(t.path())?;
-        assert!(save_typed_check(t.path(), "", current.clone()).is_err());
-        assert!(save_typed_check(t.path(), "a\nb", current).is_err());
+        for typed in [&[][..], &["".into()], &["a".into(), "a\nb".into()]] {
+            assert!(save_typed_checks(t.path(), typed, current.clone()).is_err());
+        }
+        assert_eq!(project_config_bytes(t.path())?, current);
         Ok(())
     }
     #[test]
