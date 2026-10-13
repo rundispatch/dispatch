@@ -524,6 +524,30 @@ fn a_repeated_session_start_while_pending_lands_on_the_one_work() {
     assert_eq!(sessions, ["s1", "s2"]);
 }
 
+/// Claude Code reports a worktree session's end from the main checkout. Arriving
+/// while the registration is pending, the end publishes it first, matched by
+/// session, then records the end on it.
+#[test]
+fn a_session_end_from_the_checkout_while_pending_publishes_then_records_it() {
+    let p = Project::new();
+    let id = p.pending();
+    let notice = Project::notice(&p.hook(
+        serde_json::json!({
+            "session_id": "s1", "transcript_path": "/dev/null", "cwd": p.root,
+            "hook_event_name": "SessionEnd", "reason": "prompt_input_exit",
+        }),
+        &[],
+    ));
+    assert_eq!(notice, "");
+    let run = published_once(&p, &id, "hook");
+    assert_eq!(
+        run["attachment"]["sessions"][0]["end_reason"],
+        "prompt_input_exit"
+    );
+    assert_eq!(run["outcome"]["lifecycle"], "working");
+    assert_eq!(p.events(&id, "runtime.session_ended").len(), 1);
+}
+
 #[test]
 fn removing_the_worktree_while_pending_publishes_then_keeps_the_exact_changes() {
     let p = Project::new();

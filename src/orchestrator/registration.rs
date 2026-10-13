@@ -434,6 +434,28 @@ pub(crate) fn publish_first(state: &State, workspace: &Path, wait: Duration) -> 
     publish_durable(state, workspace)
 }
 
+/// `publish_first` for the workspace of `root` whose registration recorded
+/// session `session_id` of `provider`: a session's end reported from outside
+/// its workspace is matched by session.
+pub(crate) fn publish_session_first(
+    state: &State,
+    root: &Path,
+    provider: &str,
+    session_id: &str,
+    wait: Duration,
+) -> Result<()> {
+    for (_, dir) in entries(state)? {
+        if let Ok(Some(registration)) = read_record(&dir)
+            && registration.root == root
+            && registration.session.provider == provider
+            && registration.session.session_id == session_id
+        {
+            return publish_first(state, &registration.workspace, wait);
+        }
+    }
+    Ok(())
+}
+
 /// `publish_first`, with the workspace lock held.
 fn publish_durable(state: &State, workspace: &Path) -> Result<()> {
     for (_, dir) in entries(state)? {

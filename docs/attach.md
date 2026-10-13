@@ -575,6 +575,13 @@ runtime's event on stdin):
   - an ended session never ends the Work. `status` and `watch` say the session
     ended: finish to freeze its changes (`dispatch finish <id>`), or resume it; or
     close it (`dispatch close <id> --reason unfinished`);
+  - Claude Code reports a worktree session's end (`SessionEnd`) from the main
+    checkout, not the worktree. When an end names no Work by its directory,
+    Dispatch records it on the unfinished Work of that project holding the same
+    open session, publishing a pending registration of that session first. An end
+    that matches neither changes nothing;
+  - `claude -p` sessions report no end at all, so their Work never says the session
+    ended: finish or close it explicitly;
   - a resume into a worktree Dispatch has not seen is partial, since earlier edits
     may predate S0.
 - **A fresh session in the checkout itself** is told that Dispatch cannot tell its

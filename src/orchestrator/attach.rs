@@ -1264,16 +1264,39 @@ pub(crate) fn observe_start(state: &State, run_id: &str, runs: &[RunRecord]) -> 
 }
 
 pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<Option<String>> {
+    find_active(state, |attachment| attachment.workspace == workspace)
+}
+
+/// Active Work of the project at `root` holding the open runtime session
+/// `session_id` of `provider`.
+pub(crate) fn find_session_attachment(
+    state: &State,
+    root: &Path,
+    provider: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    find_active(state, |attachment| {
+        attachment.integration_root == root
+            && attachment.sessions.iter().any(|session| {
+                session.provider == provider
+                    && session.session_id == session_id
+                    && session.ended_at.is_none()
+            })
+    })
+}
+
+/// One pass over the runs: the first unfinished attached Work `matches`.
+fn find_active(
+    state: &State,
+    matches: impl Fn(&AttachmentRecord) -> bool,
+) -> Result<Option<String>> {
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
         let run = state.load_run(&projected.id)?;
         if run.mode == RunMode::Attached
             && run.outcome.lifecycle == LifecycleState::Working
-            && run
-                .attachment
-                .as_ref()
-                .is_some_and(|attachment| attachment.workspace == workspace)
+            && run.attachment.as_ref().is_some_and(&matches)
         {
             return Ok(Some(run.id));
         }

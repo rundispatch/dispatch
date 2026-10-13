@@ -885,3 +885,119 @@ fn an_ended_session_leaves_its_work_to_finish_resume_or_close() {
     assert_eq!(run["outcome"]["lifecycle"], "working");
     assert_eq!(run["attachment"]["sessions"].as_array().unwrap().len(), 2);
 }
+
+/// The session of `p4-payloads/` (Claude Code 2.1.296): `claude --worktree`.
+const WORKTREE_SESSION: &str = "b3baca80-2977-4c5f-97bb-dee523191685";
+
+impl Project {
+    /// A `SessionStart` as Claude Code sends it for a session in `cwd`.
+    fn claude_start(&self, session: &str, cwd: &Path) -> String {
+        self.hook(serde_json::json!({
+            "session_id": session,
+            "transcript_path": format!("/dev/null/{session}.jsonl"),
+            "cwd": cwd,
+            "scratchpad_dir": format!("/tmp/scratch/{session}/scratchpad"),
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "model": "claude-opus-5-5",
+        }))
+    }
+
+    /// The `SessionEnd` Claude Code sends when `/exit` keeps the worktree:
+    /// `cwd` is the main checkout, not the worktree.
+    fn claude_exit(&self, session: &str) -> String {
+        self.hook(serde_json::json!({
+            "session_id": session,
+            "transcript_path": format!("/dev/null/{session}.jsonl"),
+            "cwd": self.root,
+            "scratchpad_dir": format!("/tmp/scratch/{session}/scratchpad"),
+            "prompt_id": "b5bbe6c2-793f-4d20-a19f-29ace51dc1ca",
+            "hook_event_name": "SessionEnd",
+            "reason": "prompt_input_exit",
+        }))
+    }
+
+    fn session_ends(&self, id: &str) -> i64 {
+        let db = rusqlite::Connection::open(self.state.join("dispatch.db")).unwrap();
+        db.query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'runtime.session_ended'",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+}
+
+/// What a session end may change: the Work's sessions and whether it is done.
+fn sessions_and_lifecycle(run: &Value) -> (Value, Value) {
+    (
+        run["attachment"]["sessions"].clone(),
+        run["outcome"]["lifecycle"].clone(),
+    )
+}
+
+/// Claude Code reports a worktree session's end from the main checkout; it is
+/// matched to its Work by session.
+#[test]
+fn a_worktree_sessions_end_reported_from_the_checkout_is_recorded_by_session() {
+    let p = Project::new("");
+    p.watch();
+    let reply = p.claude_start(WORKTREE_SESSION, &p.worktree);
+    assert!(reply.contains("tracking this worktree"), "{reply}");
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+
+    assert_eq!(p.claude_exit(WORKTREE_SESSION), "");
+    let run = p.only_run();
+    let session = &run["attachment"]["sessions"][0];
+    assert_eq!(session["session_id"], WORKTREE_SESSION);
+    assert_eq!(session["end_reason"], "prompt_input_exit");
+    assert!(session["ended_at"].is_string(), "{run}");
+    assert_eq!(run["outcome"]["lifecycle"], "working");
+    assert_eq!(p.session_ends(&id), 1);
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(status.contains("session ended — finish"), "{status}");
+}
+
+/// An end in the checkout that names no session Dispatch follows stays silent.
+#[test]
+fn an_end_in_the_checkout_for_an_unknown_session_changes_nothing() {
+    let p = Project::new("");
+    p.watch();
+    p.claude_start(WORKTREE_SESSION, &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    let before = sessions_and_lifecycle(&p.only_run());
+
+    assert_eq!(p.claude_exit("4bfa5dad-bb42-4bf1-a0af-840400c8bb34"), "");
+    assert_eq!(sessions_and_lifecycle(&p.only_run()), before);
+    assert_eq!(p.session_ends(&id), 0);
+}
+
+/// A session that already ended, or Work already finished, is left as it is.
+#[test]
+fn an_end_for_an_ended_session_or_finished_work_changes_nothing() {
+    let p = Project::new("");
+    p.watch();
+    p.claude_start(WORKTREE_SESSION, &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    p.claude_exit(WORKTREE_SESSION);
+    let ended = sessions_and_lifecycle(&p.only_run());
+    assert_eq!(p.claude_exit(WORKTREE_SESSION), "");
+    assert_eq!(sessions_and_lifecycle(&p.only_run()), ended);
+    assert_eq!(p.session_ends(&id), 1);
+
+    // Resumed, then finished while open: its end finds no unfinished Work.
+    let resumed = p.hook(serde_json::json!({
+        "hook_event_name": "SessionStart", "session_id": WORKTREE_SESSION,
+        "source": "resume", "cwd": p.worktree,
+    }));
+    assert_eq!(resumed, "");
+    let finish = p.dispatch(&["finish", &id]);
+    assert!(finish.status.success(), "{}", text(&finish));
+    let finished = p.only_run();
+    assert_eq!(finished["outcome"]["lifecycle"], "finished");
+    assert!(finished["attachment"]["sessions"][1]["ended_at"].is_null());
+    let finished = sessions_and_lifecycle(&finished);
+    assert_eq!(p.claude_exit(WORKTREE_SESSION), "");
+    assert_eq!(sessions_and_lifecycle(&p.only_run()), finished);
+    assert_eq!(p.session_ends(&id), 1);
+}

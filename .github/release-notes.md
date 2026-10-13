@@ -38,6 +38,10 @@ on 0.4.11. 0.4.12 fixes it, and the problems those reports raised.
   unfinished Work refuses and names `close`. In `dispatch watch`, `c` closes the selected Work
   after asking for the reason and a confirmation; Enter alone or Esc records nothing. A
   session that ended says so: finish it, resume it, or close it.
+
+  A `claude --worktree` session's end, which Claude Code reports from the main checkout, is now
+  recorded on its Work by session; `claude -p` sessions report no end, so finish or close their
+  Work explicitly.
 - **Finish, check and accept say what holds, and what was verified.** `finish`, and a native
   run's result summary, now show the patch, a verdict computed against the source now, and what
   accept would verify:

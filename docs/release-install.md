@@ -84,6 +84,10 @@ records are not rewritten.
     `Next: dispatch check <id>` is gone.
   - `check` adds `At accept: …`, and its `Next` for attached REFRESH and for STOP changed.
   - `clean` shows full Work IDs and adds a "Kept, because Dispatch did not make them" list.
+- **Worktree session ends are recorded.** Claude Code reports a `claude --worktree`
+  session's end from the main checkout; 0.4.12 records it on the Work by session. Sessions
+  that ended before the upgrade still read as open: finish or close their Work. `claude -p`
+  sessions report no end at all.
 - **Restart the owner.** Run `dispatch stop && dispatch start` so the project owner is 0.4.12.
   An older owner never records the start observation, so Work a runtime registers while it
   runs stays "not observed".

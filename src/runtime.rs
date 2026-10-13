@@ -146,8 +146,17 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
         EventKind::Start { .. } => Ok(Reply::Silent),
         EventKind::End { reason } => {
             // Within the 5 s `SessionEnd` timeout setup installs.
-            registration::publish_first(state, &workspace, Duration::from_secs(3))?;
-            if let Some(run_id) = attach::find_active_attachment(state, &workspace)? {
+            let wait = Duration::from_secs(3);
+            registration::publish_first(state, &workspace, wait)?;
+            let mut run_id = attach::find_active_attachment(state, &workspace)?;
+            if run_id.is_none() {
+                // Claude Code reports a worktree session's end from the main
+                // checkout: match it by session instead.
+                let (provider, session) = (event.provider, event.session_id.as_str());
+                registration::publish_session_first(state, &root, provider, session, wait)?;
+                run_id = attach::find_session_attachment(state, &root, provider, session)?;
+            }
+            if let Some(run_id) = run_id {
                 attach::record_session_end(
                     state,
                     &run_id,
