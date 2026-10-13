@@ -2,6 +2,7 @@
 //! attached external work Dispatch did not select or route, as a `RunRecord`
 //! with `mode: Attached`. See `docs/plan-0.3-auto-apply-and-attach.md`, parts
 //! 6.1–6.9 and 14.3–14.10 (the design freeze this module implements exactly).
+//! `dispatch close` retires Work, attached or not, without judging it.
 //!
 //! The wrapped form (`dispatch attach -- <command...>`) is the owner loop of
 //! its own Work (part 6.1): `create` it, spawn the agent under the terminal,
@@ -13,6 +14,7 @@ use std::process::Stdio;
 use tokio::signal::unix::{SignalKind, signal};
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -23,16 +25,21 @@ use chrono::{DateTime, Utc};
 use ulid::Ulid;
 
 use super::{
-    ApplyOutcome, apply, auto_apply, persist_event, refresh_outcome, registration,
+    ApplyOutcome, apply, auto_apply, awaits_review, patch_line, persist_event,
+    print_review_commands, print_standing, ready_heading, refresh_outcome, registration,
     result_verification,
 };
 use crate::{
     ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
-    AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, Config,
-    DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, ManagedWorkspace,
-    OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, RuntimeSession,
-    VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
-    coherence::watch::{WatchSpec, Watcher},
+    AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, CloseReason,
+    Closure, Config, DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState,
+    ManagedWorkspace, OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus,
+    RuntimeSession, SourceAtStart, StartObservation, StartPath, VerificationState, WaitingOn,
+    WorkResult, WorkspaceOwner, WorkspaceRemoval,
+    coherence::{
+        watch::{WatchSpec, Watcher},
+        world,
+    },
     db::Database,
     lock::OperationLock,
     process, source,
@@ -83,7 +90,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     let prepared = prepare(state, request)?;
     let run_id = Ulid::new().to_string();
     let building = registration::begin(state, &run_id)?;
-    let run = match build(state, &prepared, &run_id)
+    let mut run = match build(state, &prepared, &run_id)
         .and_then(|built| publish(state, &run_id, Some(built), None))
     {
         Ok(run) => run,
@@ -92,6 +99,14 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
             return Err(error);
         }
     };
+    if !prepared.managed && prepared.request.runtime.is_none() {
+        match super::serve::load_source_runs(state, &prepared.root)
+            .and_then(|runs| observe_start(state, &run.id, &runs))
+        {
+            Ok(observed) => run = observed,
+            Err(error) => tracing::warn!("the source at start was not observed: {error:#}"),
+        }
+    }
 
     // The wrapped form writes nothing to the terminal while the agent runs
     // (part 6.7): its owner loop prints its own single line only after the
@@ -113,6 +128,13 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         println!("Workspace  {}", prepared.workspace.display());
         println!("Root       {}", prepared.root.display());
         println!("S0         {provenance_text}, {confidence_text} confidence");
+        let at_start = super::source_at_start(run.attachment.as_ref().unwrap());
+        for (n, line) in at_start.iter().enumerate() {
+            println!(
+                "{}{line}",
+                if n == 0 { "Source     " } else { "           " }
+            );
+        }
         println!("Next: dispatch finish {} when the agent is done", run.id);
     }
 
@@ -410,6 +432,11 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         } else {
             WorkspaceOwner::User
         },
+        // A workspace Dispatch made begins from the current source; any other
+        // is observed once after publication (`observe_start`).
+        source_at_start: managed_workspace
+            .is_none()
+            .then_some(SourceAtStart::NotObserved),
         managed: managed_workspace,
         sessions: runtime
             .map(|runtime| vec![runtime.session.clone()])
@@ -681,8 +708,9 @@ pub(super) fn release_workspace(state: &State, run: &mut RunRecord, reason: &str
 }
 
 /// A workspace `dispatch clean` may remove: Dispatch made it, it is still
-/// there, and its Work is over (rejected, closed, or applied and not yet
-/// released). Never one of Work in progress or waiting for review.
+/// there, its Work is over (rejected, closed, or applied and not yet
+/// released), and no Work in progress or waiting for review is attached to
+/// the same path.
 pub struct Cleanable {
     pub run_id: String,
     pub workspace: PathBuf,
@@ -690,44 +718,81 @@ pub struct Cleanable {
     pub why: &'static str,
 }
 
-pub fn cleanable(state: &State) -> Result<Vec<Cleanable>> {
-    let mut found = Vec::new();
+/// A workspace you or an agent's runtime made, still there, whose Work is
+/// over: `dispatch clean` keeps it and says how to remove it.
+pub struct Kept {
+    pub workspace: PathBuf,
+    pub owner: WorkspaceOwner,
+    /// The Work that was done there, and how each ended.
+    pub work: Vec<(String, &'static str)>,
+}
+
+/// What `dispatch clean` may remove, and the terminal Work it keeps because
+/// Dispatch did not make its workspace.
+pub fn cleanable(state: &State) -> Result<(Vec<Cleanable>, Vec<Kept>)> {
+    let mut runs = Vec::new();
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
-        let Some(made) = projected
-            .attachment
-            .as_ref()
-            .and_then(|attachment| attachment.managed.as_ref())
-            .filter(|made| !made.removed)
-        else {
-            continue;
-        };
-        let run = state.load_run(&projected.id)?;
-        if run.outcome.lifecycle != LifecycleState::Finished {
+        if projected.attachment.is_some() {
+            runs.push(state.load_run(&projected.id)?);
+        }
+    }
+    let attached = runs
+        .iter()
+        .filter_map(|run| Some((run, run.attachment.as_ref()?)))
+        .collect::<Vec<_>>();
+    // The paths some Work still needs, and the paths Dispatch made.
+    let (mut in_use, mut made_here) = (HashSet::new(), HashSet::new());
+    for (run, attachment) in &attached {
+        if run.outcome.lifecycle != LifecycleState::Finished || awaits_review(run) {
+            in_use.insert(&attachment.workspace);
+        }
+        if attachment.managed.is_some() {
+            made_here.insert(&attachment.workspace);
+        }
+    }
+    let (mut found, mut kept) = (Vec::new(), Vec::<Kept>::new());
+    for (run, attachment) in &attached {
+        if run.outcome.lifecycle != LifecycleState::Finished
+            || in_use.contains(&attachment.workspace)
+            || !attachment.workspace.exists()
+        {
             continue;
         }
         let why = if run.outcome.application == ApplicationState::Applied {
             "applied"
         } else if run.outcome.review == ReviewState::Rejected {
             "rejected"
-        } else if run.outcome.work_result != WorkResult::Ready {
+        } else if run.outcome.closed.is_some() || run.outcome.work_result != WorkResult::Ready {
             "closed"
         } else {
             continue; // waiting for review
         };
-        let workspace = run.attachment.as_ref().expect("managed").workspace.clone();
-        if !workspace.exists() {
-            continue;
+        match &attachment.managed {
+            Some(made) if !made.removed => found.push(Cleanable {
+                run_id: run.id.clone(),
+                workspace: attachment.workspace.clone(),
+                branch: made.branch.clone(),
+                why,
+            }),
+            Some(_) => {}
+            None if made_here.contains(&attachment.workspace)
+                || attachment.workspace_owner == WorkspaceOwner::Dispatch => {}
+            None => match kept
+                .iter_mut()
+                .find(|item| item.workspace == attachment.workspace)
+            {
+                Some(item) => item.work.push((run.id.clone(), why)),
+                None => kept.push(Kept {
+                    workspace: attachment.workspace.clone(),
+                    owner: attachment.workspace_owner,
+                    work: vec![(run.id.clone(), why)],
+                }),
+            },
         }
-        found.push(Cleanable {
-            run_id: run.id.clone(),
-            workspace,
-            branch: made.branch.clone(),
-            why,
-        });
     }
-    Ok(found)
+    Ok((found, kept))
 }
 
 /// Remove what `cleanable` listed, each under its run's lock and only if it
@@ -741,6 +806,7 @@ pub fn clean(state: &State, listed: &[Cleanable]) -> Result<usize> {
             Duration::from_secs(5),
         )?;
         let still = cleanable(state)?
+            .0
             .into_iter()
             .any(|now| now.run_id == item.run_id && now.workspace == item.workspace);
         if !still {
@@ -1112,17 +1178,125 @@ pub(crate) fn record_session_end(
 
 const MAX_SESSIONS: usize = 100;
 
+/// Most differing paths an observation of the source at start keeps.
+const MAX_START_PATHS: usize = 20;
+
+/// Record, once, where the integration source differed from the Work's S0
+/// when it began: `world::observe` lists every path where they differ,
+/// whichever side has the change. A path in the retained patch of Work
+/// applied to this source (`runs`) names that Work; nothing else is
+/// attributed. Advisory: no verdict depends on it. `attach` calls this right
+/// after publishing, the project owner for Work a runtime registered; never
+/// registration. On failure nothing is recorded, and it stays not observed.
+pub(crate) fn observe_start(state: &State, run_id: &str, runs: &[RunRecord]) -> Result<RunRecord> {
+    let pending = |run: &RunRecord| {
+        run.attachment.as_ref().is_some_and(|attachment| {
+            attachment.source_at_start == Some(SourceAtStart::NotObserved)
+        })
+    };
+    // Compared without the run's lock: on a large source this takes seconds,
+    // and hooks wait for that lock only briefly. The lock guards the record.
+    let run = state.load_run(run_id)?;
+    if !pending(&run) {
+        return Ok(run);
+    }
+    let world = world::observe(
+        &run.source_path,
+        &run.baseline_path,
+        &run.baseline_commit,
+        &run.source_kind,
+    )?;
+    let (_, source_head) = source::inspect_source(&run.source_path)?;
+    let mut applied = std::collections::HashMap::new();
+    for other in runs.iter().filter(|other| {
+        other.outcome.application == ApplicationState::Applied && other.id != run.id
+    }) {
+        let candidate = other
+            .candidates
+            .iter()
+            .find(|candidate| other.applied_candidate.as_ref() == Some(&candidate.label));
+        for path in candidate.iter().flat_map(|c| &c.diff_stats.changed_files) {
+            applied.insert(path.as_str(), other.id.as_str());
+        }
+    }
+    let observation = StartObservation {
+        at: Utc::now(),
+        source_head,
+        differing: world.changes.len(),
+        paths: world
+            .changes
+            .iter()
+            .take(MAX_START_PATHS)
+            .map(|change| StartPath {
+                path: change.path.clone(),
+                applied_work: applied.get(change.path.as_str()).map(|id| (*id).to_owned()),
+            })
+            .collect(),
+    };
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(5),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    if !pending(&run) {
+        return Ok(run); // recorded meanwhile: the first observation stands
+    }
+    if let Some(attachment) = run.attachment.as_mut() {
+        attachment.source_at_start = Some(SourceAtStart::Observed(observation.clone()));
+    }
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "attach.source_observed".into(),
+            timestamp: observation.at,
+            payload: serde_json::to_value(&observation)?,
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(run)
+}
+
 pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<Option<String>> {
+    find_active(state, |attachment| attachment.workspace == workspace)
+}
+
+/// Active Work of the project at `root` holding the open runtime session
+/// `session_id` of `provider`.
+pub(crate) fn find_session_attachment(
+    state: &State,
+    root: &Path,
+    provider: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    find_active(state, |attachment| {
+        attachment.integration_root == root
+            && attachment.sessions.iter().any(|session| {
+                session.provider == provider
+                    && session.session_id == session_id
+                    && session.ended_at.is_none()
+            })
+    })
+}
+
+/// One pass over the runs: the first unfinished attached Work `matches`.
+fn find_active(
+    state: &State,
+    matches: impl Fn(&AttachmentRecord) -> bool,
+) -> Result<Option<String>> {
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
         let run = state.load_run(&projected.id)?;
         if run.mode == RunMode::Attached
             && run.outcome.lifecycle == LifecycleState::Working
-            && run
-                .attachment
-                .as_ref()
-                .is_some_and(|attachment| attachment.workspace == workspace)
+            && run.attachment.as_ref().is_some_and(&matches)
         {
             return Ok(Some(run.id));
         }
@@ -1134,8 +1308,10 @@ pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<
 /// itself, and become an ordinary Ready result. See part 14.9.
 pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Result<RunRecord> {
     let run = finish_quietly(state, run_id, allow_unsafe_local).await?;
-    print_finish_summary(&run);
-    println!("Next: dispatch check {}", run.id);
+    print_finish_summary(
+        state,
+        &crate::coherence::with_kept_validity(&run, &state.run_dir(&run.id)),
+    );
     Ok(run)
 }
 
@@ -1225,7 +1401,7 @@ pub(super) async fn finish_locked(
             removal.exact,
             "the workspace of {} was removed before Dispatch could keep its final changes; \
              only the changes last seen are kept, at {}, and they cannot be finished. \
-             Reject this work: dispatch reject {}",
+             Close this work: dispatch close {} --reason workspace-removed",
             run.id,
             run_dir.join("delta-last-seen.patch").display(),
             run.id
@@ -1336,7 +1512,7 @@ pub(super) async fn finish_locked(
 /// synced into the run and the removal committed before this returns; any
 /// error means the deletion must not go ahead. The Work does not end: a
 /// removed workspace is an observation, and a person still finishes or
-/// rejects it. Only an empty Δ closes it, as there is nothing to review.
+/// closes it. Only an empty Δ ends it, as there is nothing to review.
 /// Returns how many files the kept Δ changes.
 pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u64> {
     let _lock = OperationLock::acquire_wait(
@@ -1380,17 +1556,7 @@ pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u6
         });
     }
     if files_changed == 0 {
-        run.candidates[0].status = CandidateStatus::Cancelled;
-        run.status = RunStatus::Interrupted;
-        run.completed_at = Some(now);
-        run.outcome.lifecycle = LifecycleState::Finished;
-        run.outcome.work_result = WorkResult::Cancelled;
-        run.outcome.phase = RunPhase::Finished;
-        run.outcome.review = ReviewState::NotRequested;
-        if let Some(attempt) = run.attempts.first_mut() {
-            attempt.completed_at = Some(now);
-            attempt.outcome = "no_changes".into();
-        }
+        cancel_work(&mut run, now, "no_changes");
     }
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1490,19 +1656,7 @@ pub(crate) fn note_workspace_gone(
     // Last seen with no changes at all: nothing was lost, so nothing waits.
     let empty = last_seen.as_ref().is_some_and(Vec::is_empty);
     if empty {
-        if let Some(candidate) = run.candidates.first_mut() {
-            candidate.status = CandidateStatus::Cancelled;
-        }
-        run.status = RunStatus::Interrupted;
-        run.completed_at = Some(now);
-        run.outcome.lifecycle = LifecycleState::Finished;
-        run.outcome.work_result = WorkResult::Cancelled;
-        run.outcome.phase = RunPhase::Finished;
-        run.outcome.review = ReviewState::NotRequested;
-        if let Some(attempt) = run.attempts.first_mut() {
-            attempt.completed_at = Some(now);
-            attempt.outcome = "no_changes".into();
-        }
+        cancel_work(&mut run, now, "no_changes");
     }
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1521,53 +1675,234 @@ pub(crate) fn note_workspace_gone(
     )
 }
 
-/// Close unfinished Work whose workspace is gone: the person's decision
-/// (`dispatch reject`) not to keep it. Its changes stay beside the run: the
-/// exact ones kept at removal, or those last seen when it vanished.
-pub(crate) fn close_removed(state: &State, run_id: &str) -> Result<()> {
-    let _lock = OperationLock::acquire_wait(
-        &state.run_dir(run_id).join(".operation.lock"),
-        "attached work has a foreground owner",
-        Duration::from_secs(5),
-    )?;
-    let mut run = state.load_run(run_id)?;
-    anyhow::ensure!(
-        run.outcome.lifecycle == LifecycleState::Working
-            && run
-                .attachment
-                .as_ref()
-                .is_some_and(|attachment| attachment.workspace_removed.is_some()),
-        "work {run_id} is not unfinished work whose workspace is gone"
-    );
-    let now = Utc::now();
+/// End unfinished Work without a result: when a person closes it, or when
+/// its workspace turns out to have held no changes. `attempt_outcome` says
+/// which.
+fn cancel_work(run: &mut RunRecord, at: DateTime<Utc>, attempt_outcome: &str) {
     if let Some(candidate) = run.candidates.first_mut() {
         candidate.status = CandidateStatus::Cancelled;
     }
     run.status = RunStatus::Interrupted;
-    run.completed_at = Some(now);
+    run.completed_at = Some(at);
     run.outcome.lifecycle = LifecycleState::Finished;
     run.outcome.work_result = WorkResult::Cancelled;
     run.outcome.phase = RunPhase::Finished;
     run.outcome.review = ReviewState::NotRequested;
     if let Some(attempt) = run.attempts.first_mut() {
-        attempt.completed_at = Some(now);
-        attempt.outcome = "workspace_removed".into();
+        attempt.completed_at = Some(at);
+        attempt.outcome = attempt_outcome.into();
     }
+}
+
+/// Whether the workspace of attached Work is gone: removed as a runtime
+/// reported, found missing, or no longer there.
+pub(crate) fn workspace_gone(run: &RunRecord) -> bool {
+    run.attachment.as_ref().is_some_and(|attachment| {
+        attachment.workspace_removed.is_some() || !attachment.workspace.exists()
+    })
+}
+
+/// `dispatch close <id> --reason <reason>`.
+pub struct CloseRequest {
+    /// The Work, by ID or unique prefix.
+    pub run_id: String,
+    pub reason: CloseReason,
+    /// The Work that replaces it, by ID or unique prefix; with `superseded`
+    /// and only then.
+    pub replacement: Option<String>,
+    pub explanation: Option<String>,
+}
+
+/// The reasons `close` takes for `run` as it is now, or why nothing may close
+/// it. Unfinished attached Work is unfinished, or its workspace is gone; a
+/// result waiting for review is already present. Either may be superseded.
+pub(crate) fn close_reasons(run: &RunRecord) -> Result<Vec<CloseReason>> {
+    let id = &run.id;
+    if let Some(closed) = &run.outcome.closed {
+        bail!("Work {id} is already closed ({})", closed.describe());
+    }
+    if run.outcome.application == ApplicationState::Applied {
+        bail!("Work {id} was applied; there is nothing to close");
+    }
+    if matches!(
+        run.outcome.review,
+        ReviewState::Accepted | ReviewState::Rejected
+    ) {
+        bail!("Work {id} was already reviewed; closing it would not change that");
+    }
+    if run.mode == RunMode::Attached
+        && run.outcome.lifecycle == LifecycleState::Working
+        && run.candidates.len() == 1
+    {
+        let why = if workspace_gone(run) {
+            CloseReason::WorkspaceRemoved
+        } else {
+            CloseReason::Unfinished
+        };
+        return Ok(vec![why, CloseReason::Superseded]);
+    }
+    if run.candidates.len() == 1 && super::awaits_review(run) {
+        return Ok(vec![CloseReason::AlreadyPresent, CloseReason::Superseded]);
+    }
+    bail!(
+        "Work {id} is neither unfinished attached Work nor a result waiting for review; there is nothing to close"
+    )
+}
+
+/// `dispatch close`: a person retires Work without judging it. It records
+/// no review and no preference, and never applies, commits, signals an
+/// agent or deletes a workspace. Unfinished Work is frozen first, as
+/// `finish` freezes it but without checks; when its workspace is gone, what
+/// was kept of it stays: the exact Δ, or the changes last seen. A workspace
+/// gone with nothing recorded yet is refused while an owner watches the
+/// project, until it has kept what it last saw. A delivered result keeps its
+/// Δ. A live wrapper holds the run's lock for its whole session, so Work it
+/// owns is refused. Returns what happened, in words.
+pub fn close(state: &State, request: CloseRequest) -> Result<String> {
+    let id = state.resolve_run_id(&request.run_id)?;
+    let superseded = request.reason == CloseReason::Superseded;
+    anyhow::ensure!(
+        superseded == request.replacement.is_some(),
+        "--replacement names the Work that supersedes this one: it goes with --reason superseded, and only with it"
+    );
+    let replacement = match &request.replacement {
+        Some(other) => Some(state.resolve_run_id(other)?),
+        None => None,
+    };
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(&id).join(".operation.lock"),
+        "Work is held by its Dispatch owner",
+        Duration::from_secs(5),
+    )?;
+    let mut run = state.load_run(&id)?;
+    let reasons = close_reasons(&run)?;
+    anyhow::ensure!(
+        reasons.contains(&request.reason),
+        "--reason {} does not fit Work {id} as it is; it takes {}",
+        request.reason.flag(),
+        reasons
+            .iter()
+            .map(|reason| reason.flag())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    );
+
+    let mut payload = serde_json::json!({"reason": request.reason, "by": "human"});
+    if request.reason == CloseReason::AlreadyPresent {
+        let label = run.candidates[0].label.clone();
+        let Some(digest) = crate::coherence::patch_present(&run, &label)? else {
+            bail!(
+                "the whole of Work {id}'s patch is not in the source now, so it was not closed; dispatch check {id} shows where it stands"
+            );
+        };
+        payload["world_digest"] = digest.into();
+    }
+    if let Some(other) = &replacement {
+        anyhow::ensure!(other != &id, "Work {id} cannot supersede itself");
+        let other = state.load_run(other)?;
+        anyhow::ensure!(
+            other.source_path == run.source_path,
+            "Work {} belongs to another project, so it does not replace {id}",
+            other.id
+        );
+        anyhow::ensure!(
+            other.outcome.lifecycle == LifecycleState::Finished
+                && other.outcome.work_result == WorkResult::Ready,
+            "Work {0} has no finished result, so {id} stays open; finish it first: dispatch finish {0}",
+            other.id
+        );
+        anyhow::ensure!(
+            other.outcome.closed.is_none() && other.outcome.review != ReviewState::Rejected,
+            "Work {} was itself {}, so it replaces nothing and {id} stays open",
+            other.id,
+            if other.outcome.closed.is_some() {
+                "closed"
+            } else {
+                "rejected"
+            }
+        );
+        let kept = other
+            .candidates
+            .first()
+            .and_then(|candidate| fs::metadata(&candidate.diff_path).ok())
+            .is_some_and(|patch| patch.len() > 0);
+        anyhow::ensure!(
+            kept,
+            "Work {} kept no changes, so it replaces nothing and {id} stays open",
+            other.id
+        );
+        payload["replacement"] = other.id.clone().into();
+    }
+
+    let now = Utc::now();
+    let run_dir = state.run_dir(&id);
+    let mut kept = run.candidates[0].diff_path.clone();
+    let mut unobserved = false;
+    if run.outcome.lifecycle == LifecycleState::Working {
+        let removal = run
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.workspace_removed.clone());
+        match removal {
+            Some(removal) if !removal.exact => kept = run_dir.join("delta-last-seen.patch"),
+            Some(_) => {}
+            // Gone without a word: a watching owner keeps the changes it last
+            // saw on its next tick, which closed Work would stop. Without one,
+            // nobody followed the workspace.
+            None if workspace_gone(&run) => {
+                anyhow::ensure!(
+                    matches!(
+                        super::background::watcher(state, &run.source_path)?,
+                        super::background::Watcher::NotWatched
+                    ),
+                    "the workspace of Work {id} vanished, and the project's owner has not yet kept the changes it last saw; nothing was closed, so try again in a few seconds. If this persists, the owner may be stuck: dispatch stop ends it, and close then goes ahead without those changes"
+                );
+                unobserved = true;
+            }
+            None => {
+                let workspace = run.candidates[0].workspace_path.clone();
+                run.candidates[0].diff_stats =
+                    source::collect_diff(&run.baseline_path, &workspace, &kept)?;
+            }
+        }
+        cancel_work(&mut run, now, request.reason.as_str());
+    } else {
+        run.outcome.review = ReviewState::NotRequested;
+        run.outcome.phase = RunPhase::Finished;
+    }
+    let closure = Closure {
+        reason: request.reason,
+        at: now,
+        replacement,
+        explanation: request.explanation,
+    };
+    let closed = closure.describe();
+    run.outcome.closed = Some(closure);
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
     persist_event(
         state,
         &db,
         EventRecord {
-            run_id: run.id.clone(),
+            run_id: id.clone(),
             candidate_label: None,
             event_type: "work.closed".into(),
             timestamp: now,
-            payload: serde_json::json!({"reason": "workspace_removed", "by": "human"}),
+            payload,
             ..EventRecord::default()
         },
         &mut run,
-    )
+    )?;
+    let kept = match fs::metadata(&kept) {
+        _ if unobserved => "no changes were kept, because its workspace vanished while \
+                            nothing watched the project"
+            .into(),
+        Ok(patch) if patch.len() > 0 => format!("its changes stay at {}", kept.display()),
+        _ => "it kept no changes".into(),
+    };
+    Ok(format!(
+        "Closed {id}: {closed}. No review was recorded, nothing was applied or deleted, and {kept}."
+    ))
 }
 
 fn finish_attachment(run: &mut RunRecord, reason: FinishReason) {
@@ -1594,18 +1929,17 @@ fn run_finished_event(run: &RunRecord) -> EventRecord {
 
 /// A short equivalent of `print_single_result_summary` for attached work:
 /// that function requires a routing or allocation decision, which attached
-/// work never has.
-fn print_finish_summary(run: &RunRecord) {
+/// work never has. `run` is a `with_kept_validity` copy.
+fn print_finish_summary(state: &State, run: &RunRecord) {
     let candidate = &run.candidates[0];
-    let heading = if run.outcome.verification == VerificationState::Failed {
-        "Verification failed"
-    } else {
-        "Ready for review"
-    };
-    println!("\n{heading}\n");
+    println!("\n{}\n", ready_heading(run));
     println!("Task\n  {}\n", run.task);
     println!("Agent\n  {}\n", candidate.harness_id);
+    println!("Work {}\n{}\n", run.id, patch_line(candidate));
     println!("Verification\n  {}\n", result_verification(candidate));
-    println!("Review\n  dispatch diff\n");
-    println!("Then\n  dispatch accept\n  dispatch reject");
+    let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+    if awaits_review(run) {
+        print_standing(state, run, validity);
+    }
+    print_review_commands(run, validity);
 }

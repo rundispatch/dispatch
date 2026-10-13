@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::{
-    RuntimeSession,
+    AttachmentRecord, RuntimeSession, WorkspaceOwner,
     orchestrator::{
         attach,
         background::{self, Watcher},
@@ -146,8 +146,17 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
         EventKind::Start { .. } => Ok(Reply::Silent),
         EventKind::End { reason } => {
             // Within the 5 s `SessionEnd` timeout setup installs.
-            registration::publish_first(state, &workspace, Duration::from_secs(3))?;
-            if let Some(run_id) = attach::find_active_attachment(state, &workspace)? {
+            let wait = Duration::from_secs(3);
+            registration::publish_first(state, &workspace, wait)?;
+            let mut run_id = attach::find_active_attachment(state, &workspace)?;
+            if run_id.is_none() {
+                // Claude Code reports a worktree session's end from the main
+                // checkout: match it by session instead.
+                let (provider, session) = (event.provider, event.session_id.as_str());
+                registration::publish_session_first(state, &root, provider, session, wait)?;
+                run_id = attach::find_session_attachment(state, &root, provider, session)?;
+            }
+            if let Some(run_id) = run_id {
                 attach::record_session_end(
                     state,
                     &run_id,
@@ -189,8 +198,8 @@ fn removed(state: &State, workspace: &Path) -> Result<Reply> {
         )
     } else {
         format!(
-            "Dispatch kept this worktree's changes as Work {id}; \
-             finish or reject it: dispatch finish {run_id} or dispatch reject {run_id}."
+            "Dispatch kept this worktree's changes as Work {id}; finish it, or close it: \
+             dispatch finish {id} or dispatch close {id} --reason workspace-removed."
         )
     }))
 }
@@ -245,4 +254,16 @@ pub fn mark_process_start() {
 
 fn process_started() -> (Instant, DateTime<Utc>) {
     *STARTED.get_or_init(|| (Instant::now(), Utc::now()))
+}
+
+/// The runtime's own advice for Work in a workspace it made that began from
+/// source other than the project's; none for any other workspace.
+pub fn start_advice(attachment: &AttachmentRecord) -> Option<&'static str> {
+    if attachment.workspace_owner != WorkspaceOwner::Runtime {
+        return None;
+    }
+    match attachment.sessions.first()?.provider.as_str() {
+        "claude" => Some(claude::START_ADVICE),
+        _ => None,
+    }
 }

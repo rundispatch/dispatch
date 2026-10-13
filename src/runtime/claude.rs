@@ -154,6 +154,13 @@ const INSTALLED: [(&str, Option<&str>, u64); 4] = [
     ("PreToolUse", Some("ExitWorktree"), 300),
 ];
 
+/// For Work in a `claude --worktree` workspace that began from source other
+/// than the project's (`runtime::start_advice`). Advice only: Dispatch never
+/// changes the setting, commits or pushes.
+pub const START_ADVICE: &str = "Claude Code: local commits reach a claude --worktree workspace \
+     only with worktree.baseRef: \"head\" in its settings; neither that setting nor a commit \
+     copies uncommitted changes.";
+
 /// Where Claude Code keeps the user's settings: `$CLAUDE_CONFIG_DIR`, or
 /// `~/.claude`.
 pub fn settings_path() -> Result<std::path::PathBuf> {

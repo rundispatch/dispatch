@@ -20,10 +20,10 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::{ApplyOutcome, WorkLine, apply, auto_apply, persist_event, work_line};
+use super::{ApplyOutcome, WorkLine, apply, auto_apply, awaits_review, persist_event, work_line};
 use crate::{
-    ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReviewState,
-    RunMode, RunRecord, SourceKind, Validity, WorkResult,
+    ApplicationState, BaselineProvenance, Config, Decision, EventRecord, LifecycleState,
+    OwnerState, ReviewState, RunMode, RunRecord, SourceAtStart, SourceKind, Validity, WorkResult,
     coherence::{
         self, WorkView,
         interactions::{self, Analysis, Edge, Footprint, Participant, Projection},
@@ -207,6 +207,10 @@ pub(crate) struct Owner {
     /// Landed runs whose every counterpart has its outcome recorded, or that
     /// are too old to measure: never looked at again by this owner.
     measured: HashSet<String>,
+    /// When this owner started: Work published earlier is not its to observe.
+    started: chrono::DateTime<Utc>,
+    /// Work whose source at start this owner observed or left alone.
+    starts: HashSet<String>,
     scratch: tempfile::TempDir,
 }
 
@@ -296,6 +300,8 @@ impl Owner {
             clean: HashMap::new(),
             shown: None,
             measured: HashSet::new(),
+            started: Utc::now(),
+            starts: HashSet::new(),
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -328,6 +334,7 @@ impl Owner {
         tick.cost.load = started.elapsed();
         tick.cost.runs = runs.len();
         tick.adopted = adopt_orphans(state, &runs, &mut tick);
+        self.observe_starts(state, &runs, &mut tick);
         let moved = tick.moved || tick.adopted;
         self.reevaluate(state, &runs, &mut tick, moved);
         let started = Instant::now();
@@ -369,6 +376,45 @@ impl Owner {
         }
         tick.runs = runs;
         tick
+    }
+
+    /// Observe the source at start of Work a runtime registered, on the
+    /// first tick that sees it published (`attach::observe_start`). Work
+    /// published before this owner started stays not observed: the source
+    /// may have moved since, and cannot say what it held then.
+    fn observe_starts(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+        for run in runs {
+            let registered = run.attachment.as_ref().is_some_and(|attachment| {
+                attachment.source_at_start == Some(SourceAtStart::NotObserved)
+                    && matches!(
+                        attachment.provenance,
+                        BaselineProvenance::WorkspaceAtStart { .. }
+                    )
+            });
+            if !registered || !self.starts.insert(run.id.clone()) {
+                continue;
+            }
+            let published = Database::open_read_only(state.db_path())
+                .and_then(|db| db.events_for_run(&run.id))
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .find(|event| event.event_type == "attach.created")
+                        .map(|event| event.timestamp)
+                });
+            match published {
+                Ok(Some(at)) if at >= self.started => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    tick.report(&error);
+                    continue;
+                }
+            }
+            match super::attach::observe_start(state, &run.id, runs) {
+                Ok(_) => tick.persisted = true,
+                Err(error) => tick.report(&error),
+            }
+        }
     }
 
     fn load(&self, state: &State, tick: &mut Tick) -> Vec<RunRecord> {
@@ -1009,11 +1055,6 @@ fn awaits_finish_by_consent(run: &RunRecord) -> bool {
             .as_ref()
             .and_then(|attachment| attachment.workspace_removed.as_ref())
             .is_some_and(|removal| removal.exact)
-}
-
-/// A Ready result nobody has accepted, rejected or applied yet.
-fn awaits_review(run: &RunRecord) -> bool {
-    run.outcome.review == ReviewState::Pending && coherence::is_ready_unapplied(run)
 }
 
 /// Whether the owner stores `validity` over `stored`: when it says something

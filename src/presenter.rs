@@ -106,7 +106,7 @@ pub fn label(run: &RunRecord, event: Option<&EventRecord>) -> &'static str {
             .is_some_and(|attachment| attachment.owner_state == OwnerState::Gone)
             && o.lifecycle != LifecycleState::Finished
         {
-            return "Attached agent's owner is gone; finish or reject";
+            return "Attached agent's owner is gone; finish or close";
         }
         if o.lifecycle == LifecycleState::Working {
             return "Attached agent working";
@@ -127,6 +127,9 @@ pub fn label(run: &RunRecord, event: Option<&EventRecord>) -> &'static str {
     }
     if o.application == ApplicationState::Applied {
         return "Accepted and applied";
+    }
+    if o.closed.is_some() {
+        return "Closed";
     }
     if o.review == ReviewState::Rejected {
         return "Rejected";
@@ -1976,8 +1979,10 @@ async fn review_goal(
                 let result = orchestrator::review_delivery(state, &target, accept);
                 run = state.load_run(&target.run_id)?;
                 ui.commit(&projection(&run, None, ui.width().saturating_sub(3), options.ascii))?;
-                if let Err(error) = &result {
-                    ui.commit(&format!("{error:#}"))?;
+                match &result {
+                    Ok(Some(checks)) => ui.commit(&format!("Merged checks: {checks}"))?,
+                    Ok(None) => {}
+                    Err(error) => ui.commit(&format!("{error:#}"))?,
                 }
                 if matches!(run.outcome.review, ReviewState::Accepted | ReviewState::Rejected) {
                     ui.reviewed = Some(run);
@@ -2089,6 +2094,7 @@ mod tests {
             managed: None,
             sessions: Vec::new(),
             workspace_removed: None,
+            source_at_start: None,
         }
     }
 
@@ -2118,14 +2124,14 @@ mod tests {
         r.attachment.as_mut().unwrap().owner_state = OwnerState::Gone;
         assert_eq!(
             label(&r, None),
-            "Attached agent's owner is gone; finish or reject"
+            "Attached agent's owner is gone; finish or close"
         );
 
         // Once finished, the owner-gone label no longer applies.
         r.outcome.lifecycle = LifecycleState::Finished;
         assert_ne!(
             label(&r, None),
-            "Attached agent's owner is gone; finish or reject"
+            "Attached agent's owner is gone; finish or close"
         );
     }
 

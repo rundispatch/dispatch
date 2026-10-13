@@ -321,12 +321,13 @@ fn removing_the_worktree_keeps_its_exact_changes_before_the_hook_returns() {
         "{}",
         text(&output)
     );
-    // The command it suggests works however many runs share a prefix.
-    assert!(
-        text(&output).contains(&format!("dispatch finish {id}")),
-        "{}",
-        text(&output)
-    );
+    // The commands it suggests work however many runs share a prefix.
+    for command in [
+        format!("dispatch finish {id}"),
+        format!("dispatch close {id} --reason workspace-removed"),
+    ] {
+        assert!(text(&output).contains(&command), "{}", text(&output));
+    }
     // Once the hook has returned, the exact Δ and the removal are durable.
     let patch = fs::read_to_string(p.run_dir(&id).join("delta.patch")).unwrap();
     assert!(patch.contains("+    2"), "{patch}");
@@ -436,20 +437,34 @@ fn a_worktree_that_vanishes_unannounced_is_noted_and_cannot_be_finished() {
     );
     let last = fs::read_to_string(p.run_dir(&id).join("delta-last-seen.patch")).unwrap();
     assert!(last.contains("+    2"), "{last}");
+    let close = format!("dispatch close {id} --reason workspace-removed");
     let finish = p.dispatch(&["finish", &id]);
     assert!(!finish.status.success());
     assert!(
-        text(&finish).contains("cannot be finished"),
+        text(&finish).contains("cannot be finished") && text(&finish).contains(&close),
         "{}",
         text(&finish)
     );
-    // Rejecting it is how a person closes it.
+    // It has no result to reject; closing it records no judgment.
     let reject = p.dispatch(&["reject", &id]);
-    assert!(reject.status.success(), "{}", text(&reject));
-    assert!(text(&reject).contains("Closed"), "{}", text(&reject));
+    assert!(!reject.status.success());
+    assert!(text(&reject).contains(&close), "{}", text(&reject));
+    assert_eq!(p.only_run()["outcome"]["lifecycle"], "working");
+    let closed = p.dispatch(&["close", &id, "--reason", "workspace-removed"]);
+    assert!(closed.status.success(), "{}", text(&closed));
+    assert!(
+        text(&closed).contains("delta-last-seen.patch"),
+        "{}",
+        text(&closed)
+    );
     let run = p.only_run();
     assert_eq!(run["outcome"]["lifecycle"], "finished");
     assert_eq!(run["outcome"]["work_result"], "cancelled");
+    assert_eq!(run["outcome"]["review"], "not_requested");
+    assert_eq!(run["outcome"]["closed"]["reason"], "workspace_removed");
+    // The changes last seen stay as evidence.
+    let last = fs::read_to_string(p.run_dir(&id).join("delta-last-seen.patch")).unwrap();
+    assert!(last.contains("+    2"), "{last}");
 }
 
 /// Claude Code's `ExitWorktree` tool with `action: remove` deletes the worktree
@@ -729,7 +744,18 @@ fn an_empty_worktree_that_vanishes_unannounced_closes_with_no_changes() {
     p.watch();
     p.start("s1", "startup", &p.worktree);
     // Let the owner follow it once, empty, then delete it behind its back.
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // The owner writes the Work's live patch only after it has taken the
+    // patch it would keep as last seen, so that file says it has followed.
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    let followed = p.run_dir(&id).join("delta-live.patch");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !followed.is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner never followed the worktree"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     git(
         &p.root,
         &["worktree", "remove", "--force", ".claude/worktrees/x"],
@@ -740,9 +766,10 @@ fn an_empty_worktree_that_vanishes_unannounced_closes_with_no_changes() {
 }
 
 /// Unfinished Work whose worktree was removed waits for a person: rejecting it
-/// closes it, and its kept changes stay in the run.
+/// is refused, as it has no result to judge, and names `close`, which closes
+/// it with no review and keeps its exact changes in the run.
 #[test]
-fn rejecting_removed_work_closes_it_and_keeps_its_changes() {
+fn closing_removed_work_keeps_its_changes_and_records_no_review() {
     let p = Project::new("");
     p.watch();
     p.start("s1", "startup", &p.worktree);
@@ -754,15 +781,223 @@ fn rejecting_removed_work_closes_it_and_keeps_its_changes() {
     .unwrap();
     assert!(p.remove().status.success());
     let reject = p.dispatch(&["reject", &id]);
-    assert!(reject.status.success(), "{}", text(&reject));
+    assert!(!reject.status.success());
     assert!(
-        text(&reject).contains("kept changes stay at"),
+        text(&reject).contains(&format!("dispatch close {id} --reason workspace-removed")),
         "{}",
         text(&reject)
+    );
+    assert_eq!(p.only_run()["outcome"]["lifecycle"], "working");
+    // `unfinished` does not describe Work whose workspace is gone.
+    let wrong = p.dispatch(&["close", &id, "--reason", "unfinished"]);
+    assert!(!wrong.status.success());
+    assert!(
+        text(&wrong).contains("it takes workspace-removed or superseded"),
+        "{}",
+        text(&wrong)
+    );
+    let close = p.dispatch(&[
+        "close",
+        &id,
+        "--reason",
+        "workspace-removed",
+        "--explanation",
+        "the session moved on",
+    ]);
+    assert!(close.status.success(), "{}", text(&close));
+    assert!(
+        text(&close).contains("its changes stay at"),
+        "{}",
+        text(&close)
     );
     let run = p.only_run();
     assert_eq!(run["outcome"]["lifecycle"], "finished");
     assert_eq!(run["outcome"]["work_result"], "cancelled");
+    assert_eq!(run["outcome"]["closed"]["reason"], "workspace_removed");
+    assert_eq!(
+        run["outcome"]["closed"]["explanation"],
+        "the session moved on"
+    );
+    assert_eq!(run["attempts"][0]["outcome"], "workspace_removed");
     let patch = fs::read_to_string(p.run_dir(&id).join("delta.patch")).unwrap();
     assert!(patch.contains("+    2"), "{patch}");
+    let db = rusqlite::Connection::open(p.state.join("dispatch.db")).unwrap();
+    let (closed, reviews, feedback): (i64, i64, i64) = db
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'work.closed'),
+                    (SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type LIKE 'review.%'),
+                    (SELECT COUNT(*) FROM goal_feedback_revisions WHERE run_id = ?1)",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((closed, reviews, feedback), (1, 0, 0));
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(
+        status.contains("Closed           workspace removed"),
+        "{status}"
+    );
+}
+
+/// A session that ends leaves its Work open: `status` says so, and how to
+/// finish, resume or close it. `/exit` and `/clear` finish nothing, and a
+/// resumed session carries on with the same unsealed Work.
+#[test]
+fn an_ended_session_leaves_its_work_to_finish_resume_or_close() {
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let end = |reason: &str| {
+        p.hook(serde_json::json!({
+            "hook_event_name": "SessionEnd", "session_id": "s1", "reason": reason,
+            "cwd": p.worktree,
+        }))
+    };
+    end("prompt_input_exit");
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(status.contains("session ended — finish"), "{status}");
+    for command in [
+        format!("dispatch finish {id}"),
+        format!("dispatch close {id} --reason unfinished"),
+    ] {
+        assert!(status.contains(&command), "{status}");
+    }
+    let run = p.only_run();
+    assert_eq!(run["outcome"]["lifecycle"], "working");
+    assert_eq!(
+        fs::read_to_string(p.run_dir(&id).join("delta.patch")).unwrap(),
+        "",
+        "nothing is frozen at exit"
+    );
+
+    p.start("s1", "resume", &p.worktree);
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(!status.contains("session ended"), "{status}");
+    end("clear");
+    let run = p.only_run();
+    assert_eq!(run["id"], id.as_str());
+    assert_eq!(run["outcome"]["lifecycle"], "working");
+    assert_eq!(run["attachment"]["sessions"].as_array().unwrap().len(), 2);
+}
+
+/// The session of `p4-payloads/` (Claude Code 2.1.296): `claude --worktree`.
+const WORKTREE_SESSION: &str = "b3baca80-2977-4c5f-97bb-dee523191685";
+
+impl Project {
+    /// A `SessionStart` as Claude Code sends it for a session in `cwd`.
+    fn claude_start(&self, session: &str, cwd: &Path) -> String {
+        self.hook(serde_json::json!({
+            "session_id": session,
+            "transcript_path": format!("/dev/null/{session}.jsonl"),
+            "cwd": cwd,
+            "scratchpad_dir": format!("/tmp/scratch/{session}/scratchpad"),
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "model": "claude-opus-5-5",
+        }))
+    }
+
+    /// The `SessionEnd` Claude Code sends when `/exit` keeps the worktree:
+    /// `cwd` is the main checkout, not the worktree.
+    fn claude_exit(&self, session: &str) -> String {
+        self.hook(serde_json::json!({
+            "session_id": session,
+            "transcript_path": format!("/dev/null/{session}.jsonl"),
+            "cwd": self.root,
+            "scratchpad_dir": format!("/tmp/scratch/{session}/scratchpad"),
+            "prompt_id": "b5bbe6c2-793f-4d20-a19f-29ace51dc1ca",
+            "hook_event_name": "SessionEnd",
+            "reason": "prompt_input_exit",
+        }))
+    }
+
+    fn session_ends(&self, id: &str) -> i64 {
+        let db = rusqlite::Connection::open(self.state.join("dispatch.db")).unwrap();
+        db.query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'runtime.session_ended'",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+}
+
+/// What a session end may change: the Work's sessions and whether it is done.
+fn sessions_and_lifecycle(run: &Value) -> (Value, Value) {
+    (
+        run["attachment"]["sessions"].clone(),
+        run["outcome"]["lifecycle"].clone(),
+    )
+}
+
+/// Claude Code reports a worktree session's end from the main checkout; it is
+/// matched to its Work by session.
+#[test]
+fn a_worktree_sessions_end_reported_from_the_checkout_is_recorded_by_session() {
+    let p = Project::new("");
+    p.watch();
+    let reply = p.claude_start(WORKTREE_SESSION, &p.worktree);
+    assert!(reply.contains("tracking this worktree"), "{reply}");
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+
+    assert_eq!(p.claude_exit(WORKTREE_SESSION), "");
+    let run = p.only_run();
+    let session = &run["attachment"]["sessions"][0];
+    assert_eq!(session["session_id"], WORKTREE_SESSION);
+    assert_eq!(session["end_reason"], "prompt_input_exit");
+    assert!(session["ended_at"].is_string(), "{run}");
+    assert_eq!(run["outcome"]["lifecycle"], "working");
+    assert_eq!(p.session_ends(&id), 1);
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(status.contains("session ended — finish"), "{status}");
+}
+
+/// An end in the checkout that names no session Dispatch follows stays silent.
+#[test]
+fn an_end_in_the_checkout_for_an_unknown_session_changes_nothing() {
+    let p = Project::new("");
+    p.watch();
+    p.claude_start(WORKTREE_SESSION, &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    let before = sessions_and_lifecycle(&p.only_run());
+
+    assert_eq!(p.claude_exit("4bfa5dad-bb42-4bf1-a0af-840400c8bb34"), "");
+    assert_eq!(sessions_and_lifecycle(&p.only_run()), before);
+    assert_eq!(p.session_ends(&id), 0);
+}
+
+/// A session that already ended, or Work already finished, is left as it is.
+#[test]
+fn an_end_for_an_ended_session_or_finished_work_changes_nothing() {
+    let p = Project::new("");
+    p.watch();
+    p.claude_start(WORKTREE_SESSION, &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    p.claude_exit(WORKTREE_SESSION);
+    let ended = sessions_and_lifecycle(&p.only_run());
+    assert_eq!(p.claude_exit(WORKTREE_SESSION), "");
+    assert_eq!(sessions_and_lifecycle(&p.only_run()), ended);
+    assert_eq!(p.session_ends(&id), 1);
+
+    // Resumed, then finished while open: its end finds no unfinished Work.
+    let resumed = p.hook(serde_json::json!({
+        "hook_event_name": "SessionStart", "session_id": WORKTREE_SESSION,
+        "source": "resume", "cwd": p.worktree,
+    }));
+    assert_eq!(resumed, "");
+    let finish = p.dispatch(&["finish", &id]);
+    assert!(finish.status.success(), "{}", text(&finish));
+    let finished = p.only_run();
+    assert_eq!(finished["outcome"]["lifecycle"], "finished");
+    assert!(finished["attachment"]["sessions"][1]["ended_at"].is_null());
+    let finished = sessions_and_lifecycle(&finished);
+    assert_eq!(p.claude_exit(WORKTREE_SESSION), "");
+    assert_eq!(sessions_and_lifecycle(&p.only_run()), finished);
+    assert_eq!(p.session_ends(&id), 1);
 }

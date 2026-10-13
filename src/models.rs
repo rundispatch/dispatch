@@ -175,6 +175,11 @@ pub struct RunOutcome {
     /// actor was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_by: Option<AppliedBy>,
+    /// A person closed the Work without judging it (`dispatch close`).
+    /// `None` otherwise, including Work closed before 0.4.12, whose
+    /// `work.closed` event is its only record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<Closure>,
 }
 
 /// The authority under which a candidate was applied to the source. It is
@@ -185,6 +190,65 @@ pub struct RunOutcome {
 pub enum AppliedBy {
     Human,
     AutoApply,
+}
+
+/// Why and when a person closed Work. Closing is not a review: it records no
+/// preference about the Work's quality.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Closure {
+    pub reason: CloseReason,
+    pub at: DateTime<Utc>,
+    /// The Work that replaces it, for `superseded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    /// The person's own words, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+impl Closure {
+    /// The reason as every view says it after "closed: ".
+    pub fn describe(&self) -> String {
+        match (self.reason, &self.replacement) {
+            (CloseReason::Unfinished, _) => "unfinished".into(),
+            (CloseReason::WorkspaceRemoved, _) => "workspace removed".into(),
+            (CloseReason::AlreadyPresent, _) => "changes already present".into(),
+            (CloseReason::Superseded, Some(id)) => format!("superseded by {id}"),
+            (CloseReason::Superseded, None) => "superseded".into(),
+        }
+    }
+}
+
+/// `dispatch close --reason`: kebab-case on the command line, snake_case
+/// when stored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    /// Unfinished Work nobody will finish.
+    Unfinished,
+    /// Unfinished Work whose workspace is gone.
+    WorkspaceRemoved,
+    /// A result whose whole patch is already in the source.
+    AlreadyPresent,
+    /// Work another finished Work replaces (--replacement).
+    Superseded,
+}
+
+impl CloseReason {
+    /// As stored, and as the attempt's outcome when it closes unfinished Work.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unfinished => "unfinished",
+            Self::WorkspaceRemoved => "workspace_removed",
+            Self::AlreadyPresent => "already_present",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    /// As typed after `--reason`.
+    pub fn flag(self) -> String {
+        self.as_str().replace('_', "-")
+    }
 }
 
 impl Default for RunOutcome {
@@ -199,6 +263,7 @@ impl Default for RunOutcome {
             phase: RunPhase::Finished,
             waiting_on: WaitingOn::None,
             applied_by: None,
+            closed: None,
         }
     }
 }
@@ -560,6 +625,44 @@ pub struct AttachmentRecord {
     /// for a person, except an empty Δ, which leaves nothing to review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_removed: Option<WorkspaceRemoval>,
+    /// How the integration source differed from S0 when the Work began,
+    /// observed once (`attach::observe_start`). `None` for a workspace
+    /// Dispatch made from the current source, and for Work made before this
+    /// was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_at_start: Option<SourceAtStart>,
+}
+
+/// The one observation of the integration source when Work began. Never
+/// recomputed: drift after the start is the verdict's business.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAtStart {
+    /// Nobody observed it: the observation failed, or no project owner saw
+    /// the Work published.
+    NotObserved,
+    Observed(StartObservation),
+}
+
+/// Where the integration source differed from S0, whichever side had the
+/// change. Advisory: no verdict depends on it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartObservation {
+    pub at: DateTime<Utc>,
+    /// The source's HEAD then; `None` for a directory or an unborn branch.
+    pub source_head: Option<String>,
+    /// How many paths differed; `paths` holds at most the first few.
+    pub differing: usize,
+    pub paths: Vec<StartPath>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartPath {
+    pub path: String,
+    /// Applied Work whose retained patch has this path: the only author
+    /// Dispatch names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_work: Option<String>,
 }
 
 /// When the workspace went, and whether Dispatch kept its exact final Δ (a
@@ -952,6 +1055,7 @@ mod tests {
             managed: None,
             sessions: Vec::new(),
             workspace_removed: None,
+            source_at_start: None,
         }
     }
 

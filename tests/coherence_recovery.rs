@@ -435,7 +435,7 @@ fn apply_validated_aborts_when_the_source_moves_after_the_verdict() -> Result<()
     let f = FakeGood::new()?;
     let run = f.loaded()?;
     let label = run.candidates[0].label.clone();
-    let verdict = dispatch::coherence::evaluate_run(&run, &label)?;
+    let verdict = dispatch::coherence::evaluate_run(&run, &label, None)?;
     assert_eq!(verdict.decision, dispatch::Decision::Continue);
     let stale_digest = verdict.world_digest;
 
@@ -454,7 +454,7 @@ fn apply_validated_aborts_when_the_source_moves_after_the_verdict() -> Result<()
 
     // Nothing was recorded and nothing was half done: re-judging the new world
     // and applying with its digest succeeds, keeping the other writer's file.
-    let now = dispatch::coherence::evaluate_run(&run, &label)?;
+    let now = dispatch::coherence::evaluate_run(&run, &label, None)?;
     assert_eq!(now.decision, dispatch::Decision::Continue);
     assert_ne!(now.world_digest, stale_digest);
     dispatch::source::apply_validated(&run, &label, &now.world_digest)?;
@@ -473,7 +473,7 @@ fn apply_validated_digest_names_content_not_time() -> Result<()> {
     let f = FakeGood::new()?;
     let run = f.loaded()?;
     let label = run.candidates[0].label.clone();
-    let digest = dispatch::coherence::evaluate_run(&run, &label)?.world_digest;
+    let digest = dispatch::coherence::evaluate_run(&run, &label, None)?.world_digest;
     fs::write(f.source.join("scratch.txt"), "transient\n")?;
     assert!(dispatch::source::apply_validated(&run, &label, &digest).is_err());
     fs::remove_file(f.source.join("scratch.txt"))?;

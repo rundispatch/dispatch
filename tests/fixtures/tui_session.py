@@ -78,7 +78,7 @@ try:
     elif scenario=='auto_apply_aa':
         send(b'Add tests in src/lib.rs\r');wait('[y/N]');send(b'y\r')
         wait('Review changes');send(b'aa\r')
-        wait('Auto-apply on');wait('accomplish?');send(b'\x04')
+        wait('Merged checks: not run');wait('Auto-apply on');wait('accomplish?');send(b'\x04')
     elif scenario=='auto_apply_skipped':
         send(b'\x1b[Z');wait('auto-apply on')
         send(b'Add tests in src/lib.rs\r');wait('[y/N]');send(b'y\r')

@@ -176,7 +176,7 @@ pub(super) fn sync_transition(
     publish_event(state, event, run)
 }
 
-pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
+pub(super) fn emit(state: &State, run: &RunRecord, output: RunOutputMode) -> Result<()> {
     match output {
         RunOutputMode::Silent => {}
         RunOutputMode::Json => println!("{}", serde_json::to_string(&run_result(run))?),
@@ -201,13 +201,12 @@ pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
                     ReviewState::Rejected => Some(crate::ReviewOutcome::Rejected),
                     _ => None,
                 };
-                let heading = match (run.outcome.work_result, run.outcome.verification) {
+                let heading = match run.outcome.work_result {
                     _ if human.is_some() => "Reviewed",
-                    (WorkResult::Ready, VerificationState::Failed) => "Verification failed",
-                    (WorkResult::Ready, _) => "Ready for review",
+                    WorkResult::Ready => ready_heading(run),
                     _ => "Work stopped; inspect verification and attempt details",
                 };
-                print_single_result_summary(run, heading, false, human.as_ref());
+                print_single_result_summary(state, run, heading, false, human.as_ref());
             } else {
                 println!(
                     "Work stopped: {:?}",
@@ -589,7 +588,7 @@ async fn drive_inner(
             FailureKind::BaselineInfrastructure,
             "baseline checks did not pass; no model escalation",
         )?;
-        emit(&run, output)?;
+        emit(state, &run, output)?;
         return Ok(run);
     }
     // A run bound to a configured profile carries a funding contract; an
@@ -876,7 +875,13 @@ async fn drive_inner(
         sync_transition(state, db, &mut run, "run.finished", payload)?;
         break 'attempt;
     }
-    emit(&run, output)?;
+    if output == RunOutputMode::Human {
+        // What holds now, as finish shows it for attached Work.
+        let shown = crate::coherence::with_kept_validity(&run, &state.run_dir(&run.id));
+        emit(state, &shown, output)?;
+    } else {
+        emit(state, &run, output)?;
+    }
     Ok(run)
 }
 
@@ -1004,6 +1009,6 @@ pub fn cancel_question(
 ) -> Result<RunRecord> {
     RUN_OUTPUT_MODE.store(output.code(), Ordering::Relaxed);
     let (run, _lock) = resolve(state, &command, None)?;
-    emit(&run, output)?;
+    emit(state, &run, output)?;
     Ok(run)
 }

@@ -30,6 +30,7 @@ use crate::{
     EnvironmentRecord, EventRecord, LifecycleState, ReviewOutcome, ReviewState, RunMode,
     RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, VERSION, VerificationState, WaitingOn,
     WorkResult,
+    coherence::integration::MergedChecks,
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -747,7 +748,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                 failure,
                 "goal interrupted during baseline checks",
             )?;
-            native::emit(&run, request.output)?;
+            native::emit(state, &run, request.output)?;
             return Ok(run);
         }
         finish_interrupted(state, &mut db, &mut run)?;
@@ -817,7 +818,10 @@ fn result_verification(candidate: &CandidateRecord) -> &'static str {
     }
 }
 
+/// `run` carries the verdict to show: a `with_live_validity` copy, or a
+/// `with_kept_validity` one at the end of a run.
 fn print_single_result_summary(
+    state: &State,
     run: &RunRecord,
     heading: &str,
     show_status: bool,
@@ -850,11 +854,13 @@ fn print_single_result_summary(
     let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
     let line = work_line(run, validity);
     println!(
-        "Work\n  {} {} · began against {} at {}\n",
+        "Work {}\n  {} {} · began against {} at {}\n{}\n",
+        run.id,
         line.origin,
         line.agent,
         line.s0,
-        run.created_at.format("%Y-%m-%d %H:%M UTC")
+        run.created_at.format("%Y-%m-%d %H:%M UTC"),
+        patch_line(candidate)
     );
     if let Some(attempt) = run.attempts.last()
         && (attempt.requested_model.is_some() || attempt.observed_model.is_some())
@@ -866,7 +872,9 @@ fn print_single_result_summary(
         );
     }
     println!("Verification\n  {}\n", result_verification(candidate));
-    if let Some(line) = coherence_line(run) {
+    if awaits_review(run) {
+        print_standing(state, run, validity);
+    } else if let Some(line) = coherence_line(run) {
         println!("{line}\n");
     }
     if show_status {
@@ -881,10 +889,148 @@ fn print_single_result_summary(
                 println!("Result\n  Rejected; source tree unchanged")
             }
         }
+    } else if let Some(closed) = &run.outcome.closed {
+        println!(
+            "Result\n  Closed: {}; source tree unchanged",
+            closed.describe()
+        );
     } else {
-        println!("Review\n  dispatch diff\n");
-        println!("Then\n  dispatch accept\n  dispatch reject");
+        print_review_commands(run, validity);
     }
+}
+
+/// Where the frozen patch is and how many files it changes.
+fn patch_line(candidate: &CandidateRecord) -> String {
+    let files = candidate.diff_stats.files_changed;
+    format!(
+        "  patch: {} ({files} file{})",
+        candidate.diff_path.display(),
+        if files == 1 { "" } else { "s" }
+    )
+}
+
+/// The commands for `run`'s result, each naming it in full: with several
+/// results waiting, an ID-less decision refuses. While it waits for review,
+/// the next step follows its verdict (`validity`).
+fn print_review_commands(run: &RunRecord, validity: Option<&crate::Validity>) {
+    println!("Review\n  dispatch diff {}\n", run.id);
+    if awaits_review(run) {
+        let decision = validity.map_or(Decision::Continue, |validity| validity.decision);
+        let (step, alternative) = next_step(run, decision);
+        println!("Then\n  {step}");
+        if let Some(alternative) = alternative {
+            println!("  {alternative}");
+        }
+    }
+}
+
+/// What a person can do with a result waiting for review, given its verdict:
+/// the step, and its alternative. Accept only while it holds; a REFRESH is
+/// redone and a STOP closed. Each names the Work.
+fn next_step(run: &RunRecord, decision: Decision) -> (String, Option<String>) {
+    let id = &run.id;
+    let reject = Some(format!("dispatch reject {id}"));
+    match decision {
+        Decision::Continue => (format!("dispatch accept {id}"), reject),
+        Decision::Refresh if run.mode == RunMode::Attached => (
+            format!(
+                "run your agent again on the current source and attach it; once that Work is finished: dispatch close {id} --reason superseded --replacement <new-id>"
+            ),
+            reject,
+        ),
+        Decision::Refresh => (format!("dispatch refresh {id}"), reject),
+        Decision::Stop => (
+            format!("dispatch close {id} --reason already-present"),
+            None,
+        ),
+    }
+}
+
+/// How many of a verdict's reasons a summary shows; `check` shows them all.
+const SUMMARY_REASONS: usize = 5;
+
+/// What holds now for a result waiting for review, as finish and the result
+/// summaries show it: the fresh static verdict `run` carries (`validity`)
+/// with its reasons, and what accept would verify.
+fn print_standing(state: &State, run: &RunRecord, validity: Option<&crate::Validity>) {
+    let Some(validity) = validity else {
+        println!("Coherence: not known; dispatch check {} says why\n", run.id);
+        return;
+    };
+    if validity.decision == Decision::Continue {
+        println!("{}", crate::presenter::coherence_text(validity));
+    } else {
+        println!(
+            "Coherence: {} — {} file{} changed underneath",
+            crate::coherence::verdict(validity.decision),
+            validity.changed_files,
+            if validity.changed_files == 1 { "" } else { "s" }
+        );
+        for reason in validity.reasons.iter().take(SUMMARY_REASONS) {
+            println!("  {}", reason_line(reason));
+        }
+        if validity.reasons.len() > SUMMARY_REASONS {
+            println!(
+                "  and {} more: dispatch check {}",
+                validity.reasons.len() - SUMMARY_REASONS,
+                run.id
+            );
+        }
+    }
+    println!("\nAt accept\n  {}\n", accept_scope(state, run, validity));
+}
+
+/// What accept would verify for `run` as it stands (`validity`), in the one
+/// line finish, the result summaries and `check` share. A CONTINUE says the
+/// merged checks are still to run, never that they passed.
+fn accept_scope(state: &State, run: &RunRecord, validity: &crate::Validity) -> String {
+    if validity.decision != Decision::Continue {
+        return format!(
+            "accept would refuse it now ({}), before any merged checks",
+            crate::coherence::verdict(validity.decision)
+        );
+    }
+    let skipped = sole_candidate(run).and_then(|candidate| {
+        crate::coherence::integration::checks_skipped(
+            run,
+            &candidate.label,
+            &state.run_dir(&run.id),
+            Some(validity.world_changed),
+        )
+    });
+    match skipped {
+        Ok(None) => "merged checks will run (checks.verify on the source as it is then, with this patch) and must pass before anything is applied".into(),
+        Ok(Some(why)) => format!("merged checks would not run now — {why}"),
+        Err(error) => format!("merged checks: not known — {error:#}"),
+    }
+}
+
+/// The heading of a delivered result's summary: whether it holds now, not
+/// only that it finished.
+fn ready_heading(run: &RunRecord) -> &'static str {
+    let decision = run
+        .coherence
+        .as_ref()
+        .and_then(|record| record.validity.as_ref())
+        .map(|validity| validity.decision);
+    if run.outcome.closed.is_some() {
+        return "Closed";
+    }
+    if run.outcome.verification == VerificationState::Failed {
+        return "Verification failed";
+    }
+    match decision {
+        Some(Decision::Refresh) if awaits_review(run) => "Finished, but stale (REFRESH)",
+        Some(Decision::Stop) if awaits_review(run) => "Finished, already in the source (STOP)",
+        _ => "Ready for review",
+    }
+}
+
+/// A delivered result waiting for a person's decision: finished, ready,
+/// pending review and unapplied. Closed Work is not: closing sets its review
+/// to `not_requested`. Only these count for an ID-less `accept` or `reject`.
+fn awaits_review(run: &RunRecord) -> bool {
+    run.outcome.review == ReviewState::Pending && crate::coherence::is_ready_unapplied(run)
 }
 
 struct CandidateExecution {
@@ -1525,11 +1671,11 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
     if run.execution.is_some() {
-        native::emit(&run, RunOutputMode::Human)?;
+        native::emit(state, &run, RunOutputMode::Human)?;
     } else if id.is_none() && run.allocation.is_some() && run.candidates.len() == 1 {
         let feedback = Database::open(state.db_path())?.latest_goal_feedback(&run.id)?;
         let human_outcome = feedback.as_ref().map(|feedback| &feedback.outcome);
-        print_single_result_summary(&run, "Latest task", true, human_outcome);
+        print_single_result_summary(state, &run, "Latest task", true, human_outcome);
     } else {
         print_run_header(&run);
         println!("\nTask\n  {}\n", one_line(&run.task, 120));
@@ -1540,7 +1686,7 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     }
     if let Some(attachment) = &run.attachment {
         println!("\nWorkspace");
-        for line in workspace_details(attachment) {
+        for line in workspace_details(&run, attachment) {
             println!("{line}");
         }
     }
@@ -1706,6 +1852,7 @@ pub fn diff(
         }
         return Ok(());
     }
+    println!("Run {}", run.id);
     if stat {
         print_diff_stats(candidate);
         return Ok(());
@@ -1772,6 +1919,13 @@ fn locked_delivery(
         sole_candidate(&run)?.id == command.candidate_id,
         "candidate does not belong to this delivery"
     );
+    if let Some(closed) = &run.outcome.closed {
+        bail!(
+            "Work {} is closed ({}); closed Work is not reviewed",
+            run.id,
+            closed.describe()
+        );
+    }
     anyhow::ensure!(
         run.outcome.lifecycle == LifecycleState::Finished
             && run.outcome.work_result == WorkResult::Ready
@@ -1811,7 +1965,13 @@ pub fn review_diff(state: &State, command: &ReviewCommand) -> Result<String> {
     Ok(patch)
 }
 
-pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> Result<RunRecord> {
+/// The review screen's accept or reject. An accept that applied returns what
+/// became of the merged checks.
+pub fn review_delivery(
+    state: &State,
+    command: &ReviewCommand,
+    accept: bool,
+) -> Result<Option<MergedChecks>> {
     let (run, _lock) = review_target(state, command)?;
     let decision = if accept {
         ReviewDecision::Accept {
@@ -1820,8 +1980,7 @@ pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> 
     } else {
         ReviewDecision::Reject
     };
-    review_locked(state, run, decision, Vec::new(), None, true)?;
-    state.load_run(&command.run_id)
+    review_locked(state, run, decision, Vec::new(), None, true)
 }
 
 /// A human's decision about a delivered result.
@@ -1855,7 +2014,8 @@ pub fn accept_or_reject_latest(
 }
 
 /// `accept` or `reject`, the same decision wherever the person makes it.
-/// `quiet` prints nothing, for `watch`, which shows the returned line itself.
+/// `quiet` prints nothing, for `watch`, which words its own notice. An
+/// accept that applied returns what became of the merged checks.
 pub(crate) fn decide(
     state: &State,
     run_id: Option<&str>,
@@ -1864,7 +2024,7 @@ pub(crate) fn decide(
     reasons: Vec<String>,
     explanation: Option<String>,
     quiet: bool,
-) -> Result<String> {
+) -> Result<Option<MergedChecks>> {
     let accept = matches!(decision, ReviewDecision::Accept { .. });
     let despite_refresh = matches!(
         decision,
@@ -1881,34 +2041,10 @@ pub(crate) fn decide(
     );
     let run = match run_id {
         Some(run_id) => state.load_run(run_id)?,
-        None => load_latest_unresolved_single(state, source_path)?,
+        None => sole_awaiting_review(state, source_path, if accept { "accept" } else { "reject" })?,
     };
-    // Unfinished Work whose workspace is gone has no result to review yet;
-    // rejecting it is how a person closes it. Its changes stay in the run.
-    let removed = run
-        .attachment
-        .as_ref()
-        .and_then(|attachment| attachment.workspace_removed.as_ref())
-        .map(|removal| removal.exact);
-    if let Some(exact) =
-        removed.filter(|_| !accept && run.outcome.lifecycle == LifecycleState::Working)
-    {
-        attach::close_removed(state, &run.id)?;
-        let kept = if exact {
-            sole_candidate(&run)?.diff_path.clone()
-        } else {
-            state.run_dir(&run.id).join("delta-last-seen.patch")
-        };
-        let line = format!(
-            "Closed {}: its workspace is gone, and its {} changes stay at {}.",
-            run.id,
-            if exact { "kept" } else { "last seen" },
-            kept.display()
-        );
-        if !quiet {
-            println!("{line}");
-        }
-        return Ok(line);
+    if !accept {
+        ensure_rejectable(&run)?;
     }
     let command = ReviewCommand {
         run_id: run.id.clone(),
@@ -1921,35 +2057,11 @@ pub(crate) fn decide(
     let (run, _lock) = locked_delivery(state, &command, false)?;
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    let id = run.id.clone();
-    let kept = run
-        .attachment
-        .as_ref()
-        .filter(|attachment| {
-            attachment
-                .managed
-                .as_ref()
-                .is_some_and(|made| !made.removed)
-        })
-        .map(|attachment| attachment.workspace.clone());
-    review_locked(state, run, decision, reasons, explanation, quiet)?;
-    let line = if accept {
-        if already_auto_applied {
-            "Result was already applied by auto-apply; your review is recorded.".to_owned()
-        } else {
-            format!("Accepted and applied {id}.")
-        }
-    } else {
-        let mut line = format!("Rejected {id}; the source tree was not changed.");
-        if let Some(kept) = kept {
-            line.push_str(&format!(" Its workspace is kept at {}.", kept.display()));
-        }
-        line
-    };
+    let merged = review_locked(state, run, decision, reasons, explanation, quiet)?;
     if !quiet {
         if accept {
             if already_auto_applied {
-                println!("{line}");
+                println!("Result was already applied by auto-apply; your review is recorded.");
             }
         } else {
             println!("Result rejected. The source tree was not changed.");
@@ -1958,7 +2070,24 @@ pub(crate) fn decide(
             }
         }
     }
-    Ok(line)
+    Ok(merged)
+}
+
+/// Reject judges a delivered result. Unfinished attached Work has none: a
+/// person who will not finish it closes it, which records no judgment.
+pub(crate) fn ensure_rejectable(run: &RunRecord) -> Result<()> {
+    if run.mode != RunMode::Attached || run.outcome.lifecycle != LifecycleState::Working {
+        return Ok(());
+    }
+    bail!(
+        "Work {id} is unfinished, with no result to reject; to stop tracking it, close it: dispatch close {id} --reason {}",
+        if attach::workspace_gone(run) {
+            "workspace-removed"
+        } else {
+            "unfinished"
+        },
+        id = run.id
+    )
 }
 
 /// A finished, unapplied result: the only kind `check` and `refresh` act on.
@@ -1980,7 +2109,7 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
     };
     ensure_unapplied_ready(&run, "check")?;
     let candidate = sole_candidate(&run)?;
-    let validity = crate::coherence::shown_validity(&run, &candidate.label)?;
+    let validity = crate::coherence::shown_validity(&run, &candidate.label, None)?;
     let landed_by = (validity.decision == Decision::Stop)
         .then(|| apply::landed_by(state, &run))
         .flatten();
@@ -2005,17 +2134,14 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
     if let Some(id) = &landed_by {
         println!("  already landed by run {id}");
     }
-    match validity.decision {
-        Decision::Continue => println!("Next: dispatch accept {}", run.id),
-        Decision::Refresh if run.mode == RunMode::Attached => println!(
-            "Next: run your agent again on the current source and attach it (or dispatch reject {})",
-            run.id
-        ),
-        Decision::Refresh => println!(
-            "Next: dispatch refresh {id}  (or dispatch reject {id})",
-            id = run.id
-        ),
-        Decision::Stop => println!("Next: dispatch reject {}", run.id),
+    if let Some(closed) = &run.outcome.closed {
+        println!("Closed: {}; nothing to do", closed.describe());
+        return Ok(());
+    }
+    println!("At accept: {}", accept_scope(state, &run, &validity));
+    match next_step(&run, validity.decision) {
+        (step, Some(alternative)) => println!("Next: {step}  (or {alternative})"),
+        (step, None) => println!("Next: {step}"),
     }
     Ok(())
 }
@@ -2074,7 +2200,7 @@ pub fn refresh_request(
     };
     anyhow::ensure!(
         run.mode != RunMode::Attached,
-        "attached work has no Dispatch task to refresh; finish or reject it"
+        "attached work has no Dispatch task to refresh; finish, reject or close it"
     );
     ensure_unapplied_ready(&run, "refresh")?;
     let mut missing = Vec::new();
@@ -2146,7 +2272,8 @@ pub(crate) struct WorkLine {
     pub reason: Option<String>,
     /// `working`, `question`, `idle` (discovered, no live session), `removed`
     /// or `lost` (its workspace is gone, with its exact or only its last-seen
-    /// changes kept), `ready`, `blocked`, `applied` or `finished`.
+    /// changes kept), `ready`, `blocked`, `applied`, `closed` (by a person,
+    /// `dispatch close`) or `finished`.
     pub state: &'static str,
     /// Who applied it: `human` or `auto_apply`; `None` when not applied.
     pub applied_by: Option<&'static str>,
@@ -2208,7 +2335,7 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
         "question"
     } else if run.outcome.lifecycle != LifecycleState::Finished {
         match removal {
-            // Waiting for a person to finish or reject it.
+            // Waiting for a person to finish or close it.
             Some(removal) if removal.exact => "removed",
             Some(_) => "lost",
             // Discovered work with no session open right now.
@@ -2220,6 +2347,8 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             }
             None => "working",
         }
+    } else if run.outcome.closed.is_some() {
+        "closed"
     } else {
         match run.outcome.application {
             ApplicationState::Applied => "applied",
@@ -2248,6 +2377,7 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
     let review = match run.outcome.review {
         ReviewState::Accepted => Some("accepted"),
         ReviewState::Rejected => Some("rejected"),
+        _ if run.outcome.closed.is_some() => None,
         _ if run.outcome.work_result == WorkResult::Ready => Some("pending"),
         _ => None,
     };
@@ -2397,6 +2527,7 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
     };
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
+    println!("Run {}\n", run.id);
     if run.mode == RunMode::Attached {
         // Attached work was neither selected nor allocated by Dispatch: there
         // is no selection to explain, only where its S0 came from and whether
@@ -2424,8 +2555,11 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
 /// S0 (the honesty rule for work Dispatch did not launch), who owns it, and
 /// what it is allowed to do.
 /// Where attached Work happens and what became of the place, for `status`
-/// and `explain`: the recovery facts live on the run, not in a list.
-fn workspace_details(attachment: &crate::AttachmentRecord) -> Vec<String> {
+/// and `explain`: the recovery facts live on the run, not in a list. While
+/// the Work is unfinished, what a person can do next, naming it.
+fn workspace_details(run: &RunRecord, attachment: &crate::AttachmentRecord) -> Vec<String> {
+    let id = &run.id;
+    let unfinished = run.outcome.lifecycle == LifecycleState::Working;
     let mut lines = vec![format!("  workspace: {}", attachment.workspace.display())];
     lines.push(format!(
         "  made by: {}",
@@ -2455,17 +2589,82 @@ fn workspace_details(attachment: &crate::AttachmentRecord) -> Vec<String> {
             }
         ));
     }
+    let close = format!("dispatch close {id} --reason");
     if let Some(removal) = &attachment.workspace_removed {
         lines.push(format!(
             "  removed {}: {}",
             removal.at.format("%Y-%m-%d %H:%M UTC"),
-            if removal.exact {
-                "its exact changes are kept; finish or reject it"
-            } else {
-                "only the changes last seen were kept; it cannot be finished"
+            match (removal.exact, unfinished) {
+                (true, true) => format!(
+                    "its exact changes are kept; finish it (dispatch finish {id}) or close it ({close} workspace-removed)"
+                ),
+                (true, false) => "its exact changes were kept".into(),
+                (false, true) => format!(
+                    "only the changes last seen were kept; it cannot be finished; close it: {close} workspace-removed"
+                ),
+                (false, false) => "only the changes last seen were kept".into(),
             }
         ));
+    } else if unfinished
+        && attachment
+            .sessions
+            .last()
+            .is_some_and(|session| session.ended_at.is_some())
+    {
+        lines.push(format!(
+            "  session ended — finish to freeze its changes (dispatch finish {id}), or resume it; or close it: {close} unfinished"
+        ));
     }
+    let mut start = source_at_start(attachment).into_iter();
+    if let Some(first) = start.next() {
+        lines.push(format!("  source at start: {first}"));
+        lines.extend(start.map(|line| format!("    {line}")));
+    }
+    lines
+}
+
+/// How the integration source compared with the Work's S0 when it began, as
+/// observed then: what differed, the managed launch that avoids it, and the
+/// runtime's own advice. Empty when there was nothing to observe.
+pub(crate) fn source_at_start(attachment: &crate::AttachmentRecord) -> Vec<String> {
+    let observation = match &attachment.source_at_start {
+        None => return Vec::new(),
+        Some(crate::SourceAtStart::NotObserved) => return vec!["not observed".into()],
+        Some(crate::SourceAtStart::Observed(observation)) => observation,
+    };
+    let when = observation.at.format("%Y-%m-%d %H:%M UTC");
+    let head = observation
+        .source_head
+        .as_deref()
+        .map(|head| format!(", source HEAD {}", &head[..head.len().min(8)]))
+        .unwrap_or_default();
+    if observation.differing == 0 {
+        return vec![format!("the same as its S0 (observed {when}{head})")];
+    }
+    let mut paths: Vec<String> = observation
+        .paths
+        .iter()
+        .take(3)
+        .map(|path| match &path.applied_work {
+            Some(work) => format!("{} (in applied Work {work})", path.path),
+            None => path.path.clone(),
+        })
+        .collect();
+    if observation.differing > paths.len() {
+        paths.push(format!("{} more", observation.differing - paths.len()));
+    }
+    let mut lines = vec![
+        format!(
+            "differed from its S0 at {} path{} (observed {when}{head}): {}",
+            observation.differing,
+            if observation.differing == 1 { "" } else { "s" },
+            paths.join(", ")
+        ),
+        "Work started with dispatch attach -- <agent> begins from the current source, \
+         including uncommitted changes."
+            .into(),
+    ];
+    lines.extend(crate::runtime::start_advice(attachment).map(str::to_owned));
     lines
 }
 
@@ -2474,7 +2673,7 @@ fn print_attachment_details(run: &RunRecord) {
         return;
     };
     println!("Attached work");
-    for line in workspace_details(attachment) {
+    for line in workspace_details(run, attachment) {
         println!("{line}");
     }
     println!("  root: {}", attachment.integration_root.display());
@@ -2563,6 +2762,7 @@ fn print_allocation_details(decision: &AllocationDecision) {
 /// revision (reasons and explanation verbatim), `outcome.review` and a
 /// `review.accepted|rejected` event. The caller holds the run lock from
 /// `locked_delivery`, so the apply and the review judge the same revision.
+/// An accept that applied returns what became of the merged checks.
 fn review_locked(
     state: &State,
     mut run: RunRecord,
@@ -2570,7 +2770,7 @@ fn review_locked(
     reasons: Vec<String>,
     explanation: Option<String>,
     quiet: bool,
-) -> Result<()> {
+) -> Result<Option<MergedChecks>> {
     let (accept, despite_refresh) = match decision {
         ReviewDecision::Accept { despite_refresh } => (true, despite_refresh),
         ReviewDecision::Reject => (false, false),
@@ -2581,13 +2781,15 @@ fn review_locked(
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     let reasons = normalize_reasons(reasons)?;
+    let mut merged = None;
     // An accept is recorded only once the work has landed. When coherence or
     // the apply refuses it, the refusal is recorded and the review stays
     // pending: no human acceptance of work that never reached the source.
     if accept && !already_auto_applied {
         let id = run.id.clone();
-        let overridden =
+        let (overridden, checks) =
             apply::apply_locked(state, run, quiet, ApplyAuthority::Human, despite_refresh)?;
+        merged = Some(checks);
         let database = Database::open(state.db_path())?;
         run = database
             .committed_run_projection(&id)?
@@ -2669,7 +2871,7 @@ fn review_locked(
             );
         }
     }
-    Ok(())
+    Ok(merged)
 }
 
 pub fn read_verbatim(path: &Path) -> Result<String> {
@@ -2727,34 +2929,68 @@ fn load_latest_for_source(state: &State, source_path: &Path, single: bool) -> Re
     bail!("no Dispatch runs for {}", source_path.display())
 }
 
-fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<RunRecord> {
+/// The result an ID-less `accept` or `reject` (`command`) decides: the only
+/// one for this source waiting for review (`awaits_review`). With none, or
+/// several, nothing is decided, and the refusal names each result with its
+/// command, and the Work still in progress, which does not count.
+fn sole_awaiting_review(state: &State, source_path: &Path, command: &str) -> Result<RunRecord> {
     let source_path = source::resolve_source(Some(source_path))?;
+    let mut waiting = Vec::new();
+    let mut working = Vec::new();
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
-        let run = state.load_run(&projected.id)?;
-        if run.source_path != source_path
-            || run.candidates.len() != 1
-            || (run.allocation.is_none()
-                && run.execution.is_none()
-                && run.mode != RunMode::Attached)
-        {
+        if projected.source_path != source_path {
             continue;
         }
-        if run.outcome.review == ReviewState::Pending {
-            return Ok(run);
+        let run = state.load_run(&projected.id)?;
+        if run.outcome.lifecycle != LifecycleState::Finished {
+            working.push(run);
+        } else if run.candidates.len() == 1
+            && (run.allocation.is_some()
+                || run.execution.is_some()
+                || run.mode == RunMode::Attached)
+            && awaits_review(&run)
+        {
+            waiting.push(run);
         }
     }
-    bail!(
-        "no unresolved single-result Dispatch run for {}",
-        source_path.display()
-    )
+    if waiting.len() == 1 {
+        return Ok(waiting.remove(0));
+    }
+    let mut message = match waiting.len() {
+        0 => format!("no result waits for review for {}", source_path.display()),
+        count => format!(
+            "{count} results wait for review for {}; nothing was decided. Name the one you mean:",
+            source_path.display()
+        ),
+    };
+    for run in &waiting {
+        message.push_str(&format!(
+            "\n  dispatch {command} {}  ({})",
+            run.id,
+            one_line(&run.task, 60)
+        ));
+    }
+    if !working.is_empty() {
+        message.push_str("\nStill in progress, not counted:");
+        for run in &working {
+            message.push_str(&format!("\n  {}  ({})", run.id, one_line(&run.task, 60)));
+        }
+    }
+    bail!(message)
 }
 
 fn print_run_header(run: &RunRecord) {
     println!("RUN {}", run.id);
     let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
     println!("Status           {}", work_line(run, validity).state);
+    if let Some(closed) = &run.outcome.closed {
+        println!("Closed           {}", closed.describe());
+        if let Some(explanation) = &closed.explanation {
+            println!("                 {}", one_line(explanation, 100));
+        }
+    }
     println!("Source           {}", run.source_path.display());
     println!("Source type      {}", run.source_kind.as_str());
     println!("Baseline         {}", run.baseline_commit);
@@ -3111,6 +3347,44 @@ mod tests {
         // Applied with no stored verdict means accept found the source unmoved.
         assert_eq!(applied.verdict, "unmoved");
         assert!(applied.to_string().contains("applied by auto-apply"));
+    }
+
+    /// Work 0.4.11 closed (`reject` of unfinished Work whose workspace was
+    /// gone) has no `closed` on its outcome: its stored outcome round-trips
+    /// byte for byte and reads as it always did. Closed by `dispatch close`,
+    /// a delivered result reads as closed, with no review pending.
+    #[test]
+    fn closed_work_reads_as_closed_and_earlier_closures_as_before() {
+        let stored = r#"{"version":1,"lifecycle":"finished","work_result":"cancelled","verification":"not_run","review":"not_requested","application":"not_applied","phase":"finished","waiting_on":"none"}"#;
+        let outcome: crate::RunOutcome = serde_json::from_str(stored).unwrap();
+        assert_eq!(outcome.closed, None);
+        assert_eq!(serde_json::to_string(&outcome).unwrap(), stored);
+        let mut run: RunRecord = serde_json::from_value(serde_json::json!({
+            "id":"01WORK", "task":"t", "exact_prompt":"t",
+            "source_path":"/source", "source_kind":"directory", "source_git_head":null,
+            "source_fingerprint":"b", "baseline_path":"/b", "baseline_commit":"abcdef0123456789",
+            "status":"interrupted", "created_at":"2026-09-17T00:00:00Z", "completed_at":null,
+            "environment":{"dispatch_version":"t","os":"t","architecture":"t","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "applied_candidate":null, "outcome": serde_json::from_str::<serde_json::Value>(stored).unwrap()
+        }))
+        .unwrap();
+        run.candidates.push(sample_candidate());
+        let before = work_line(&run, None);
+        assert_eq!((before.state, before.review), ("finished", None));
+
+        run.outcome.work_result = WorkResult::Ready;
+        run.outcome.closed = Some(crate::Closure {
+            reason: crate::CloseReason::AlreadyPresent,
+            at: Utc::now(),
+            replacement: None,
+            explanation: None,
+        });
+        let closed = work_line(&run, None);
+        assert_eq!((closed.state, closed.review), ("closed", None));
+        assert!(!awaits_review(&run));
+        let json = serde_json::to_value(&run.outcome).unwrap();
+        assert_eq!(json["closed"]["reason"], "already_present");
+        assert!(json["closed"].get("replacement").is_none());
     }
 
     #[test]
