@@ -593,3 +593,83 @@ different, finished Work whose Δ was retained.
 | Dispatch finish checks | fmt, clippy, `cargo test` all passed |
 | Frozen Δ | Applied to a fresh `git archive` of HEAD, its tree (`2fcb978`) equals the reviewed and independently validated tree |
 | Decision | Accepted by the human (2026-10-13); `check` CONTINUE; applied 10 files; committed as `f348edb` |
+
+### R (integrator): state upgrade
+
+`~/dispatch-dev/upgrade-0412/upgrade.sh`, output `upgrade.log` and `out/`. The
+pinned 0.4.11 release made a state with: runtime Work X registered through the
+hook, its worktree removed (exact Δ kept), then closed by 0.4.11's `reject`
+(`work.closed`, `workspace_removed`); a result Y waiting for review; Z applied
+(feedback row `accepted`); R rejected with reason `correctness` and an
+explanation (feedback row `rejected`). The candidate built from `0ebfc9c`
+(P1–P3) then read the same state. Identical before and after: every Work's
+`status` header and stored outcome, the event counts by type (ten types, one
+`work.closed`), both feedback rows, the schema version, and `history`. On the
+upgraded state the candidate's `check Y` states the verification scope,
+`clean --dry-run` keeps R's and Z's user-made worktrees and names them,
+`close` refuses X as already finished, and its owner starts and stops cleanly.
+(A first run used an invalid reject reason and a wrong column name; both were
+script errors, fixed and rerun.)
+
+### R (docs)
+
+| Item | Value |
+|---|---|
+| Work | `01M4SN9P75ARXHH1KVANJPZNG2`, wrapped, from `0ebfc9c` |
+| Agent | Claude Code (interactive), Opus 5.5, xhigh; usage unknown |
+| Prompt | `prompts-0412/r.md` |
+| Integrator review | Release-note claims checked against the code and the integrator's runs. Two corrections made: the A/B wrong-target accept is described as a review finding reproduced by a fixture, not as a field report; the credit line says four packets went through Dispatch |
+| Worker validation | fmt, clippy pass; `cargo test` 659 passed, 0 failed, 5 ignored |
+| Dispatch finish checks | all passed |
+| Frozen Δ | Its tree (`ea04679`) equals the reviewed tree |
+| Decision | Accepted by the human (2026-10-13); applied 9 files; committed as `b4108fb` |
+
+### Per-packet evaluation
+
+Mechanical facts only; quality is the human's review, recorded as the decision.
+
+| Packet | Production `src/` (net) | Tests at hand-off | Review rounds | Dispatch finish checks | Decision |
+|---|---|---|---|---|---|
+| P1 | +467 | 634 passed | 1 (2 changes) | `cargo test` failed once on a pre-existing timing test, then fixed in P2 | accepted with the failure on record |
+| P2 | +439 | 649 passed | 1 (2 changes) | all passed | accepted |
+| P3 | +276 | 659 passed | 1 (2 changes) | all passed | accepted |
+| R | 0 (docs, version) | 659 passed | 1 (2 corrections) | all passed | accepted |
+
+Release total against 0.4.11 (`18a543b`), production `src/` excluding
+`#[cfg(test)]`: +1194 / −247, net +947, on about 27,300 production lines. Most
+of it is new command surface and user-facing text: `close` and its validation,
+the skip reasons and shared summary pieces, the `clean` guard and kept list, and
+the start observation. Deleted along the way: `close_removed` and three copies
+of the cancel mechanics, the duplicated skip conditions in the gate and oracle,
+`check`'s own `Next` match and finish's separate heading logic.
+
+Agent usage and cost are unknown: interactive Claude Code sessions reported none
+to Dispatch. Both the integrator and the workers paused once each at the
+account's usage limit and resumed.
+
+### Release validation (integrator)
+
+On a fresh `git archive` of `b4108fb` with its own `CARGO_TARGET_DIR`:
+`cargo fmt --check` and `cargo clippy --all-targets --locked -- -D warnings`
+pass; `cargo test --locked` 659 passed, 0 failed, 5 ignored (42 test binaries);
+`cargo build --release --locked` reports `dispatch 0.4.12`. Against that
+release binary: the P0 script shows R1's ambiguity refused, R2 "Finished, but
+stale (REFRESH)", R3's three true merged-check lines, R4's in-use workspace not
+offered for removal, and R5 pointing to close; the 0.4.11 state upgrade reads
+outcomes, schema, feedback rows, events and history identically. The two-wave
+journey was run on P3's build (above); P3 is unchanged since.
+
+Release blockers from §6, each checked: wrong-Work decisions (R1, refused);
+lost Δ (close freezes or keeps it, and refuses to race the owner); dishonest S0
+(no S0 is rewritten; start observations are recorded once); unauthorized host
+checks (authorization unchanged; skips are now stated); source modified after a
+blocked apply (gate and digest guard unchanged, and the "source changed after
+accept checked it" path applies nothing); `clean` removing a workspace live Work
+uses (R4, refused).
+
+Not done, and why: no real-agent trial with live Claude Code hooks against the
+candidate. The hook paths are covered by the suites and by the hook-driven
+upgrade fixture, and the release itself was built by four interactive Claude
+Code sessions under the 0.4.11 supervisor, but no 0.4.12 owner observed a live
+Claude session. The affected project's original evidence (§3, items 1–4 and
+6) is still unknown, so the `d` review report remains an open investigation.
