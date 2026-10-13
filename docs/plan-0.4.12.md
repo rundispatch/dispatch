@@ -705,3 +705,20 @@ and `SessionEnd` payload verbatim (`payloads/`).
   unfinished Work that holds an open session with that provider and
   `session_id`. Document that `-p` sessions report no end and must be finished
   explicitly.
+
+### P4
+
+| Item | Value |
+|---|---|
+| Work | `01M4TSWXRGVR6DXNBX71CGS045`, wrapped, from `834b7da` |
+| Agent | Claude Code (interactive), Opus 5.5, xhigh; usage unknown |
+| Prompt | `prompts-0412/p4.md`, with the captured payloads in `prompts-0412/p4-payloads/` |
+| What | A runtime session end that matches no Work by its `cwd` is matched by provider and `session_id` among the project's unfinished Work with an open session, after publishing a pending registration for that session first. `WorktreeRemove` and `ExitWorktree` unchanged. Docs: Claude reports a worktree session's end from the main checkout; `claude -p` reports none |
+| Integrator review | Asked mid-packet to drop a temporary `P4_OLD` environment switch from `src/runtime.rs` and prove the old failure on a `git archive` export instead; done. The worker's three open questions (a second pass over the runs, matching only within the project, a resumed checkout session closing its own earlier worktree session) are accepted as correct behaviour |
+| Worker validation | fmt, clippy pass; `cargo test` all pass; the three new tests that need the fix fail on the old code; the four new tests rerun 3 times |
+| Independent validation | Diff on a `git archive` of HEAD, own `CARGO_TARGET_DIR`: fmt, clippy pass; `cargo test` 663 passed, 0 failed, 5 ignored; release build |
+| Live retest | Trial hooks pointed at P4's release binary, its owner restarted. An interactive `claude --worktree trial-e`, a one-line edit, `/exit`, keep: the Work reads `idle`, its session `ended`, `status` shows "session ended — finish … or resume it; or close it: dispatch close <id> --reason unfinished", one `runtime.session_ended` event, nothing auto-finished. Its patch conflicted with the accepted, uncommitted Work A, so `finish` said "Finished, but stale (REFRESH)" naming `calc.py`, and `accept` refused with the source unchanged and "Merged checks: not run — accept refuses REFRESH work before them". The earlier stale `trial-d` Work closed as `unfinished` with no review |
+| Production LOC | `src/` +60 / −6, net +54 |
+| Dispatch finish checks | fmt, clippy, `cargo test` all passed |
+| Frozen Δ | Its tree (`b56a7ed`) equals the reviewed and independently validated tree |
+| Decision | Accepted by the human (2026-10-13); applied 8 files; committed as `ae110b0` |
