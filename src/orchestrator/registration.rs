@@ -410,7 +410,70 @@ fn request(registration: &Registration) -> AttachRequest {
             session: registration.session.clone(),
             resumed: registration.resumed,
             commit: registration.s0_commit.clone(),
+            discovered: false,
         }),
+    }
+}
+
+/// Register `session`, which the project owner found running in `workspace`,
+/// a worktree its runtime made after watching began (`discovery`): S0 is the
+/// worktree's merge base with `root`, published like a hook's Work. Under the
+/// workspace lock, taken without waiting. `None`: the lock is held, or the
+/// workspace has Work by now, a hook's included; a later hook joins this
+/// Work as it would join its own.
+pub(crate) fn discovered(
+    state: &State,
+    root: &Path,
+    workspace: &Path,
+    session: RuntimeSession,
+) -> Result<Option<String>> {
+    let Ok(_lock) = OperationLock::acquire(
+        &workspace_lock(state, workspace),
+        "another session is registering this workspace",
+    ) else {
+        return Ok(None);
+    };
+    publish_durable(state, workspace)?;
+    if attach::find_active_attachment(state, workspace)?.is_some() {
+        return Ok(None);
+    }
+    let commit = source::merge_base(root, workspace)?
+        .context("the worktree shares no history with the project")?;
+    let name = workspace
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let registered = Registered {
+        started_at: session.started_at,
+        via: "discovery",
+    };
+    let request = AttachRequest {
+        workspace: workspace.to_owned(),
+        root: Some(root.to_owned()),
+        task: Some(format!("{} session in {name}", session.provider)),
+        agent: Some(session.provider.clone()),
+        pid: None,
+        command: None,
+        // As for a hook's Work: authority only from the person's consent.
+        allow_unsafe_local: crate::consent::consent(state, root)?.is_valid(),
+        auto_apply: false,
+        runtime: Some(RuntimeStart {
+            session,
+            resumed: false,
+            commit,
+            discovered: true,
+        }),
+    };
+    let run_id = ulid::Ulid::new().to_string();
+    let building = begin(state, &run_id)?;
+    let published = attach::prepare(state, request)
+        .and_then(|prepared| attach::build(state, &prepared, &run_id))
+        .and_then(|built| attach::publish(state, &run_id, Some(built), Some(registered)));
+    match published {
+        Ok(_) => Ok(Some(run_id)),
+        Err(error) => {
+            building.remove();
+            Err(error)
+        }
     }
 }
 

@@ -109,6 +109,7 @@ pub(crate) fn write_record(state: &State, root: &Path, background: bool) -> Resu
 pub(crate) fn remove_record(state: &State, root: &Path) {
     let _ = fs::remove_file(record_path(state, root));
     let _ = fs::remove_file(interactions_path(state, root));
+    let _ = fs::remove_file(super::discovery::path(state, root));
 }
 
 /// Where the owner keeps its disposable view of how the project's Work
