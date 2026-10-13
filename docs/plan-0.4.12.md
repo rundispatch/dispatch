@@ -722,3 +722,17 @@ and `SessionEnd` payload verbatim (`payloads/`).
 | Dispatch finish checks | fmt, clippy, `cargo test` all passed |
 | Frozen Δ | Its tree (`b56a7ed`) equals the reviewed and independently validated tree |
 | Decision | Accepted by the human (2026-10-13); applied 8 files; committed as `ae110b0` |
+
+### Final release validation (integrator)
+
+On a fresh `git archive` of `395b76a` (P1–P4 and R) with its own
+`CARGO_TARGET_DIR`: fmt and clippy pass; `cargo test --locked` 663 passed, 0
+failed, 5 ignored (42 test binaries); the release build reports `dispatch 0.4.12`.
+Against that binary the P0 script holds (R1 refused, R2 stale, R3's three
+merged-check lines, R4 not offered for removal, R5 close), and the 0.4.11 state
+upgrade reads outcomes, schema, feedback rows, events and history identically.
+P4's behaviour was confirmed live with a real interactive Claude Code session
+(above).
+
+Release total against 0.4.11, production `src/` excluding `#[cfg(test)]`:
++1254 / −253, net 1001.
