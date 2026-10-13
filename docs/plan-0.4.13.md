@@ -196,3 +196,55 @@ Release blockers:
 - A `WorktreeCreate` hook.
 - Implicit Git init or commits.
 - Consent from repository content or non-interactive commands.
+
+## 7. Execution log
+
+### Setup (2026-10-13)
+
+| Item | Value |
+|---|---|
+| Supervisor | `~/dispatch-dev/dispatch-0.4.12/dispatch`, the `v0.4.12` release: archive checked against `SHA256SUMS`, binary SHA-256 equals `BUILD.json` (`fd843cde…`), `BUILD.json` head `8fc2fdc`; read-only |
+| Supervision state | `~/dispatch-dev/state-0413` (mode 700) |
+| Integration clone | `~/dispatch-dev/integration-0413`, `release-0.4.13` from `origin/main` at `8fc2fdc`, no upstream; `dispatch.yml` (fmt, clippy, full `cargo test`) and `.claude/` excluded |
+| P0 | `859e607`: plan; `runtime::claude` worktree signals and liveness with tests on the real lock text; `BaselineProvenance::Discovered`; stub `discovery`/`liveness` modules called from the owner tick; `Inventory`. fmt, clippy pass; `cargo test` 666 passed, 0 failed, 5 ignored |
+| Workers | Four root-wrapped interactive Claude Code sessions started together, each in its own herdr tab, `--permission-mode auto` (the user's choice for speed; every diff is still reviewed and independently validated before a human accepts it) |
+| Recording | Each worker, and a live `dispatch watch` of all four, recorded with `asciinema rec` (asciicast v2, idle limit 3 s) to `~/dispatch-dev/recordings-0413/*.cast`; local files, nothing uploaded. The terminal was 45×34 when recording began |
+
+| Packet | Work | Workspace S0 |
+|---|---|---|
+| P1 discovery | `01M4V439XF7W895ZPDV5KG474Q` | `859e607` |
+| P2 liveness | `01M4V43DJ51VC213Q7KXN2DVBC` | `859e607` |
+| P3 live progress | `01M4V43HH0XMYKSTBWJD01PY8X` | `859e607` |
+| P4 first use | `01M4V43NEDC7JJ3Q2C0FN8VV27` | `859e607` |
+
+### Integration
+
+Each packet: the worker's handoff reviewed; one review round where needed; an
+independent run of fmt, clippy and the full suite on the worker's changes
+applied to a `git archive` of the clone's HEAD with its own `CARGO_TARGET_DIR`
+(`notes-0413/verify.sh`); after the human's approval the worker exits, Dispatch
+freezes Δ and runs its checks; the frozen Δ's tree is compared with the
+reviewed tree (`notes-0413/land.sh`); `check`, `accept`, commit.
+
+| Packet | Review | Worker suite | Independent suite | Finish checks | Frozen = reviewed | Accept | Commit |
+|---|---|---|---|---|---|---|---|
+| P4 first use | "Continue without checks" focused, so Enter alone never writes to the project | 672/0/5 | 672/0/5 on `859e607` | all passed | `bd8342b` | source unmoved, merged checks not needed | `b4df615` |
+| P3 live progress | none needed (decisions recorded: `status` drops the fake zeros for all working Work; no live count in JSON yet) | 676/0/5 | 676/0/5 on `859e607` | all passed | `a2d893b` | CONTINUE (symbols, P4's 8 files underneath); merged checks passed on P3 + P4 | `7b194f3` |
+
+Workers paused once together at the account's usage limit and resumed by
+themselves; parallel Opus sessions reach the limit sooner.
+| P2 liveness | `claude::liveness(lock)` (one `ps`, no `sysctl`) when the lock names the recorded pid; only runtime-owned workspaces, so a person's attach with `--pid` is never touched | 674/0/5 | 691/0/5 on `7b194f3` (P3 + P4) | all passed | `1665ec1` | first accept **refused** by merged checks: `source_at_start::the_owner_observes_runtime_work_after_publication_and_only_then` failed because the random Work ID in the hook reply contained "S0"; after that test was fixed, the retry's merged checks passed | `5aa8633` |
+
+**Integration fixes (integrator), each found by parallel integration:**
+
+- `8d651e9` test: P3's unit test named every `Inventory` field; P1 adds fields,
+  so the merged tree did not compile. The test builds the inventory from JSON.
+- `8cde666` fix: the owner's per-tick `git status` in the person's repository
+  took Git's optional `index.lock`, so the person's own `git commit` could fail
+  while Dispatch watched (since 0.4.5). Found when a PTY test's own `git commit`
+  in a watched fixture exited 128 under the load of parallel suites. Every Git
+  command Dispatch runs now sets `GIT_OPTIONAL_LOCKS=0`; a regression test shows
+  `git status` no longer rewrites a stale index, and does without the setting.
+- `ddd90ba` test: a 0.4.12 test asserted a hook reply contains no "S0", but the
+  reply names a random Work ID (fails about 1 run in 70).
+| P1 discovery | register a worktree that appeared after watching began even when its `claude session` lock names a dead process (a `claude -p` run between ticks), with its session recorded already ended; keep tracking a worktree whose hook registration timed out; the 3 s grace accepted | 674/0/5 | first run on `8d651e9` (P3 + P4 + fix): 688 passed, **1 failed** (`watch_acceptance` `states-live`: the fixture's own `git commit` exited 128, the `index.lock` race fixed in `8cde666`), the scenario alone 4/4; final run on `5aa8633`: 700/0/5 | all passed | `d6a9766` | CONTINUE (symbols, 17 files underneath); merged checks passed | `52a149a` |
