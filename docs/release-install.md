@@ -51,6 +51,43 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.12
+
+No migration; the schema stays at 24. New fields live in the existing run JSON, and existing
+records are not rewritten.
+- **ID-less `accept` and `reject` refuse when several results wait.** Without an ID they act
+  only when exactly one result waits for review for the source. With none or several they
+  change nothing, exit 1 and list the waiting results with explicit commands. Scripts should
+  pass the Work's ID; a unique prefix still works.
+- **`reject` no longer closes unfinished Work.** In 0.4.11, rejecting unfinished Work whose
+  workspace was gone closed it. Now `reject` refuses unfinished Work and names
+  `dispatch close <id> --reason unfinished` or `--reason workspace-removed`. STOP now points
+  to `dispatch close <id> --reason already-present` instead of `reject`.
+- **Additive JSON.**
+  - `outcome.closed` (`{reason, at, replacement?, explanation?}`) on Work a person closed, in
+    the run's metadata, `status --json` and every event's `outcome`. Closed Work reads as the
+    state `closed` in `watch --json`, `serve --json` and `history`, with `review` null.
+  - `work.closed` gains the reasons `unfinished`, `already_present` (with `world_digest`) and
+    `superseded` (with `replacement`). Records 0.4.11 wrote, `workspace_removed`, read as
+    before.
+  - The attachment gains `source_at_start`: `"not_observed"`, or `{"observed": {at,
+    source_head, differing, paths: [{path, applied_work?}]}}`. It is absent for workspaces
+    Dispatch made and for Work created before 0.4.12. `attach.created` carries
+    `"not_observed"`, and the new event `attach.source_observed` carries the observation once.
+    `status --json` does not include it.
+- **Human output changed.** Anyone parsing it should read `check --json`, `status --json` or
+  `watch --json` where they exist.
+  - `accept` prints `Merged checks: …` before it applies.
+  - `finish` and a native result's summary are headed by the verdict (for example
+    `Finished, but stale (REFRESH)`), add `Work <id>` with its patch, `Coherence:` and
+    `At accept`, and list verdict-driven commands under `Then`. The trailing
+    `Next: dispatch check <id>` is gone.
+  - `check` adds `At accept: …`, and its `Next` for attached REFRESH and for STOP changed.
+  - `clean` shows full Work IDs and adds a "Kept, because Dispatch did not make them" list.
+- **Restart the owner.** Run `dispatch stop && dispatch start` so the project owner is 0.4.12.
+  An older owner never records the start observation, so Work a runtime registers while it
+  runs stays "not observed".
+
 ### Upgrading to 0.4.11
 
 No migration; the schema stays at 24, and nothing on disk changes.

@@ -1,14 +1,15 @@
 # Building Dispatch with Dispatch
 
-This guide sets up the arrangement that built 0.4.9 and 0.4.10: parallel coding
-agents, each in its own workspace, supervised by a pinned Dispatch release. You
-integrate their work one contribution at a time. Each command below was run as
-written against a real clone and state directory, with Dispatch 0.4.9 as the
-supervisor.
+This guide sets up the arrangement that built 0.4.12: coding agents, each in a
+workspace Dispatch makes from the current integration source, supervised by a
+pinned Dispatch release. You integrate their work one contribution at a time.
+0.4.12 was built this way with Dispatch 0.4.11 as the supervisor. Earlier
+releases, from 0.4.9, were built with Claude Code's own worktrees and Dispatch's
+hooks, which section 5 keeps as an alternative.
 
 The paths are examples. Keep each one outside `/tmp` and outside any build
 directory, and use the same binary and state directory in every command.
-`DISPATCH_HOME` can stand in for `--state-dir`, but the hooks name
+`DISPATCH_HOME` can stand in for `--state-dir`, but the hooks in section 5 name
 `--state-dir` explicitly, because Claude Code runs them with its own
 environment.
 
@@ -18,17 +19,17 @@ The supervisor is a release, not something you build. A candidate build never
 supervises the work that produces it.
 
 ```sh
-mkdir -p ~/dispatch-dev/downloads/v0.4.9 && cd ~/dispatch-dev/downloads/v0.4.9
-gh release download v0.4.9 -R rundispatch/dispatch \
+mkdir -p ~/dispatch-dev/downloads/v0.4.11 && cd ~/dispatch-dev/downloads/v0.4.11
+gh release download v0.4.11 -R rundispatch/dispatch \
   -p dispatch-macos-arm64.tar.gz -p SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing     # dispatch-macos-arm64.tar.gz: OK
-mkdir ~/dispatch-dev/dispatch-0.4.9
-tar -xzf dispatch-macos-arm64.tar.gz -C ~/dispatch-dev/dispatch-0.4.9
-cd ~/dispatch-dev/dispatch-0.4.9
+mkdir ~/dispatch-dev/dispatch-0.4.11
+tar -xzf dispatch-macos-arm64.tar.gz -C ~/dispatch-dev/dispatch-0.4.11
+cd ~/dispatch-dev/dispatch-0.4.11
 jq -r .binary_sha256 BUILD.json
 shasum -a 256 dispatch                           # must print the same hash
 chmod a-w dispatch BUILD.json .
-./dispatch version                               # dispatch 0.4.9
+./dispatch version                               # dispatch 0.4.11
 ```
 
 - **Two checks.** `SHA256SUMS` covers the archive, and `BUILD.json`'s
@@ -61,14 +62,15 @@ the checkout you normally work in:
 ```sh
 git clone git@github.com:rundispatch/dispatch.git ~/dispatch-dev/integration
 cd ~/dispatch-dev/integration
-git switch -c release-0.4.10 origin/main   # or `git switch release-0.4.10` if it exists upstream
+git switch -c release-0.4.12 origin/main   # or `git switch release-0.4.12` if it exists upstream
 printf 'dispatch.yml\n.claude/\n' >> .git/info/exclude
 ```
 
 `dispatch.yml` and `.claude/` are your local setup, not part of the release.
 Excluding them through `.git/info/exclude` keeps them out of every baseline
 (S0), every patch (Δ) and every commit, without touching the tracked
-`.gitignore`. `.claude/` also holds the worktrees `claude --worktree` makes.
+`.gitignore`. `.claude/` also holds Claude Code's local settings and the
+worktrees `claude --worktree` makes.
 
 Write `dispatch.yml` with the project's checks:
 
@@ -79,7 +81,7 @@ checks:
   verify:
     - cargo fmt --check
     - cargo clippy --all-targets -- -D warnings
-    - cargo test --lib
+    - cargo test
 ```
 
 These checks run on the host:
@@ -95,13 +97,92 @@ moves, and open the view:
 
 ```sh
 cd ~/dispatch-dev/integration
-~/dispatch-dev/dispatch-0.4.9/dispatch --state-dir ~/dispatch-dev/state start
-~/dispatch-dev/dispatch-0.4.9/dispatch --state-dir ~/dispatch-dev/state watch
+~/dispatch-dev/dispatch-0.4.11/dispatch --state-dir ~/dispatch-dev/state start
+~/dispatch-dev/dispatch-0.4.11/dispatch --state-dir ~/dispatch-dev/state watch
 ```
 
 Leaving `watch` with Ctrl+C does not stop the owner.
 
-## 4. Install the hooks in the project only
+## 4. Run workers in workspaces Dispatch makes
+
+This is the recommended arrangement. Each worker starts from the clone's
+current source, including accepted work you have not committed yet, and no
+worker edits the clone itself.
+
+From the integration clone, wrap the agent:
+
+```sh
+cd ~/dispatch-dev/integration
+~/dispatch-dev/dispatch-0.4.11/dispatch --state-dir ~/dispatch-dev/state \
+  attach --root ~/dispatch-dev/integration --task "<packet>" \
+  --agent claude --allow-unsafe-local -- claude
+```
+
+- **The workspace.** Dispatch records the clone's exact world as S0, uncommitted
+  and untracked files included, ignored ones not, and checks it out under
+  `<state>/workspaces/<id>` on its own `dispatch/<id>` branch. The agent runs
+  there; your clone is not touched.
+- **Interactive.** The agent gets your terminal, so you read and approve its
+  permission prompts yourself. Dispatch prints the workspace and branch before
+  the agent starts, and nothing while it runs.
+- **When it exits,** Dispatch freezes the patch, runs the checks in the
+  workspace, and prints one line naming the Work's ID.
+- **Any agent.** Replace `--agent claude -- claude` with another agent's label
+  and command. The agent needs no worktree support of its own.
+- **No `--worktree` inside it.** Do not ask the agent to make another worktree
+  in Dispatch's workspace.
+
+`--allow-unsafe-local` acknowledges that `checks.verify` runs on the host.
+Nothing here is sandboxed.
+
+**No Dispatch hooks in the clone.** Wrapped workers need none. With hooks, a
+Claude Code session in the workspace would also be reported to Dispatch, join
+the wrapped Work, and could show it idle while the wrapper still runs. Hooks
+installed user-wide report to the state directory they name; as long as that
+state does not watch this clone, they stay silent here.
+
+**A permission allowlist, if you want fewer prompts.** Claude Code reads the
+clone's `.claude/settings.local.json` in the workspace, which is a linked
+worktree of the clone. Keep it to permissions only, with no hooks and no
+`worktree` setting:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo fmt:*)", "Bash(cargo clippy:*)", "Bash(cargo test:*)",
+      "Bash(cargo build:*)", "Bash(git status:*)", "Bash(git diff:*)",
+      "Bash(git log:*)", "Bash(git show:*)", "Bash(rg:*)", "Bash(ls:*)",
+      "Read(//Users/you/dispatch-dev/prompts/**)",
+      "Write(//Users/you/dispatch-dev/handoffs/**)"
+    ]
+  }
+}
+```
+
+Every command not on the list still asks. Keep the workers' instructions and
+reports outside the clone, so they never enter a patch.
+
+**Build caches.** Each workspace keeps the default `target/`, so set no
+`CARGO_TARGET_DIR` for workers or checks:
+- Dispatch's workspaces live under the state directory, outside the clone, so
+  nothing that walks the clone walks them.
+- `/target/` is ignored by the tracked `.gitignore`, so it never enters S0 or Δ.
+- `finish` runs the checks in the same workspace and reuses the worker's own
+  build. Merged-tree checks at accept build from nothing in their scratch tree.
+
+A workspace is removed once its Work is applied. Otherwise it stays until
+`dispatch clean`, which never removes one that unfinished Work, or Work waiting
+for review, still uses.
+
+## 5. Alternative: Claude Code worktrees with hooks
+
+Each worker runs `claude --worktree <name>` from the clone, and Dispatch's
+hooks turn each session into Work. Such a worktree starts from a commit, never
+from uncommitted changes, so commit each accepted contribution (section 7,
+step 6) before starting the next worker. With a 0.4.12 or later supervisor, a
+worker that still began from older source is reported once, in `status` and
+`watch`.
 
 `dispatch setup` → **Runtime integrations…** installs four Claude Code hooks
 user-wide, in `~/.claude/settings.json`. They point at the binary that ran
@@ -116,20 +197,20 @@ your absolute paths:
   "hooks": {
     "SessionStart": [
       { "hooks": [{ "type": "command", "timeout": 60,
-        "command": "'/Users/you/dispatch-dev/dispatch-0.4.9/dispatch' --state-dir '/Users/you/dispatch-dev/state' hook claude" }] }
+        "command": "'/Users/you/dispatch-dev/dispatch-0.4.11/dispatch' --state-dir '/Users/you/dispatch-dev/state' hook claude" }] }
     ],
     "SessionEnd": [
       { "hooks": [{ "type": "command", "timeout": 5,
-        "command": "'/Users/you/dispatch-dev/dispatch-0.4.9/dispatch' --state-dir '/Users/you/dispatch-dev/state' hook claude" }] }
+        "command": "'/Users/you/dispatch-dev/dispatch-0.4.11/dispatch' --state-dir '/Users/you/dispatch-dev/state' hook claude" }] }
     ],
     "WorktreeRemove": [
       { "hooks": [{ "type": "command", "timeout": 300,
-        "command": "'/Users/you/dispatch-dev/dispatch-0.4.9/dispatch' --state-dir '/Users/you/dispatch-dev/state' hook claude" }] }
+        "command": "'/Users/you/dispatch-dev/dispatch-0.4.11/dispatch' --state-dir '/Users/you/dispatch-dev/state' hook claude" }] }
     ],
     "PreToolUse": [
       { "matcher": "ExitWorktree",
         "hooks": [{ "type": "command", "timeout": 300,
-        "command": "'/Users/you/dispatch-dev/dispatch-0.4.9/dispatch' --state-dir '/Users/you/dispatch-dev/state' hook claude" }] }
+        "command": "'/Users/you/dispatch-dev/dispatch-0.4.11/dispatch' --state-dir '/Users/you/dispatch-dev/state' hook claude" }] }
     ]
   }
 }
@@ -137,33 +218,17 @@ your absolute paths:
 
 - **`"worktree": {"baseRef": "head"}`.** Without it, `claude --worktree` starts
   each worktree from the remote's default branch, not from the release branch
-  you have checked out. The worker would begin from the wrong source.
+  you have checked out. With it, a worktree starts from the clone's local HEAD,
+  so it carries local commits. Neither `baseRef: head` nor a commit copies
+  uncommitted changes: accepted work reaches a new worktree only once it is
+  committed.
 - **Timeouts.** These are the ones `dispatch setup` installs.
 - **One set of hooks.** Claude Code runs the hooks from every settings file.
   If Dispatch's hooks are also in `~/.claude/settings.json`, a session in this
   clone is reported to both binaries and both states.
-
-## 5. Run workers in isolated workspaces
-
-Each worker gets a workspace of its own. No worker edits the integration clone
-itself.
-
-- **Claude Code:** from the integration clone, run `claude --worktree <name>`.
-  The session works in `.claude/worktrees/<name>` and opens with "Dispatch is
-  tracking this worktree as Work `<id>`". A session started in the clone itself
-  is told that Dispatch cannot tell its edits from yours and does not track
-  them.
-- **Any other agent CLI:** from the integration clone, run:
-  ```sh
-  ~/dispatch-dev/dispatch-0.4.9/dispatch --state-dir ~/dispatch-dev/state \
-    attach --allow-unsafe-local --agent <label> -- <agent command>
-  ```
-  Dispatch makes a workspace under the state directory and runs the agent
-  there. When the agent exits, Dispatch freezes the patch and runs the checks.
-  Your checkout is not touched.
-
-`--allow-unsafe-local` acknowledges that `checks.verify` runs on the host.
-Nothing here is sandboxed.
+- **Sessions.** A session in its own worktree opens with "Dispatch is tracking
+  this worktree as Work `<id>`". A session started in the clone itself is told
+  that Dispatch cannot tell its edits from yours and does not track them.
 
 Each worker builds in its own target directory, outside the repository. Put
 this in the worker's instructions:
@@ -193,31 +258,32 @@ mkdir -m 700 ~/dispatch-dev/state-candidate
   and the pinned release may not read what a newer build writes.
 - **Never replace the pinned binary** with a candidate while it supervises.
 - **Run trials in a project of their own.** Use a separate clone and state,
-  outside `/tmp`, with hooks in that project's `.claude/settings.local.json`
+  outside `/tmp`, with any hooks in that project's `.claude/settings.local.json`
   only.
 
 ## 7. Integrate one contribution at a time
 
 Land one piece of Work, then look at the rest again before landing the next.
 Run these from the integration clone. `D` below stands for
-`~/dispatch-dev/dispatch-0.4.9/dispatch --state-dir ~/dispatch-dev/state`.
+`~/dispatch-dev/dispatch-0.4.11/dispatch --state-dir ~/dispatch-dev/state`.
 
-1. **Read its state:** `D status <id>` shows its sessions and its `Concurrent`
-   section, and `D watch` shows the whole project.
-2. **Review it in its workspace:** for example,
-   `git -C .claude/worktrees/<name> status` and
-   `git -C .claude/worktrees/<name> diff`. Read the worker's report, and run
-   fmt, clippy and the full suite yourself on HEAD plus the patch.
+1. **Read its state:** `D status <id>` shows where its workspace is and, for
+   Work that did not begin from the current source, what differed at the
+   start. `D watch` shows the whole project.
+2. **Review it in its workspace:** for example, `git -C <workspace> status`
+   and `git -C <workspace> diff`. Read the worker's report, and run fmt,
+   clippy and the full suite yourself on HEAD plus the patch.
 3. **Get the human's approval.** Recommend accept, revise or reject. A person
    decides; an agent's opinion is not the approval.
-4. **Finish it:** `D finish <id> --allow-unsafe-local` freezes Δ and runs the
-   checks in the Work's workspace. Wrapped Work (`attach --`) finishes by
-   itself when the agent exits. Then `D diff <id>` prints the frozen patch;
-   confirm it is the one you reviewed. Before `finish`, `diff` shows no
-   changes.
+4. **Finish it:** wrapped Work (`attach --`) finishes by itself when the agent
+   exits. Other Work: `D finish <id> --allow-unsafe-local` freezes Δ and runs
+   the checks in the Work's workspace. The summary shows the verdict against
+   the clone now and what accept would verify. Then `D diff <id>` prints the
+   frozen patch; confirm it is the one you reviewed. Before `finish`, `diff`
+   shows no changes.
 5. **Accept it:** `D accept <id>` validates the patch against the clone as it
-   is now. If the clone has moved, it runs the checks on the merged tree. Then
-   it applies the patch.
+   is now. It prints whether the checks ran on the merged tree, and why not.
+   Then it applies the patch. Always pass the ID.
 6. **Commit it in the integration clone:**
    ```sh
    git status --short     # only the patch: dispatch.yml and .claude/ are excluded
@@ -226,9 +292,17 @@ Run these from the integration clone. `D` below stands for
 7. **Recheck the remaining Work:** `D watch` shows every other Work item judged
    against the new HEAD: CONTINUE, REFRESH or STOP, with reasons.
 
-**Stale Work.** Finish it, then `D reject <id>`; `reject` refuses Work that
-has not been finished. Attached Work has no `refresh`, so start a new worker
-from HEAD and give it the old patch and the reasons.
+**Work you will not accept.**
+- **Stale (REFRESH):** attached Work has no `refresh`. Start a new worker from
+  the current source and give it the old patch and the reasons. Once its Work
+  is finished, `D close <old-id> --reason superseded --replacement <new-id>`.
+- **Already in the clone (STOP):** `D close <id> --reason already-present`.
+- **Unfinished, and nobody will finish it:** `D close <id> --reason unfinished`.
+- **Wrong:** `D reject <id>`, after a person judges it. `reject` refuses Work
+  that has not been finished.
+
+`close` records no review, so landed or abandoned work is not counted as a
+rejection.
 
 **When you are done,** `D stop` ends watching.
 

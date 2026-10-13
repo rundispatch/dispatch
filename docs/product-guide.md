@@ -102,18 +102,33 @@ Review separates configured verification, human acceptance, and application:
 changes; it never accepts. Choose `a` then Enter to accept and safely apply, `r`
 then Enter to reject, `n` to leave pending, or `i` for evidence and full paths.
 If the source moved and the result no longer holds, accepting it applies nothing,
-records no review and leaves the result pending, so you can refresh or reject it.
+records no review and leaves the result pending, so you can refresh or reject it,
+or, when its changes are already in the source (STOP), close it.
 
 While a result waits for review the source may keep changing. A Ready run's
-status shows one `Coherence:` line (`CONTINUE`, `REFRESH` or `STOP`), computed
-fresh from the run's baseline, its patch and the source as it is now; it is
-display only and is never stored. `dispatch explain` adds a Coherence section
-when the source moved or the run is a refresh.
+summary, at the end of the run and in `dispatch status`, shows its verdict
+(`CONTINUE`, `REFRESH` or `STOP`) with up to five reasons, computed fresh from
+the run's baseline, its patch and the source as it is now; it is display only
+and is never stored. Its heading follows the verdict (`Ready for review`,
+`Finished, but stale (REFRESH)`, `Finished, already in the source (STOP)`), and
+an `At accept` line says whether accept would run your checks on the merged
+result, why not, or that accept would refuse it now. `dispatch explain` adds a
+Coherence section when the source moved or the run is a refresh.
 
 - `dispatch check [run] [--json]` prints that verdict, the analysis level, how
-  many files changed underneath the work, the reasons, and the next command
-  (`dispatch accept`, `dispatch refresh` or `dispatch reject`). It changes
+  many files changed underneath the work, the reasons, the `At accept:` line,
+  and the next command: `dispatch accept`, `dispatch refresh`, `dispatch reject`,
+  or for STOP `dispatch close <id> --reason already-present`. It changes
   nothing and exits 0 whenever the evaluation succeeds, whatever the verdict.
+- `dispatch accept [run]` prints `Merged checks:` before it applies: passed, with
+  the logs, or not run and why (the source has not moved, no checks are
+  configured, and so on). Without an ID it acts only when exactly one result
+  waits for review for the source, and so does `dispatch reject`; with several
+  they change nothing and list each one's command.
+- `dispatch close <id> --reason <reason>` retires a result without judging it:
+  `already-present` when its whole patch is already in the source, or
+  `superseded --replacement <id>` when other finished Work replaces it. It
+  records no review and applies nothing.
 - `dispatch refresh [run]` starts a new run of the same task against the
   current source. The task gets a fixed addendum naming the earlier run and up to
   ten reasons it went stale. The old run is untouched. It repeats the original
@@ -310,7 +325,23 @@ dispatch finish <run-id>          # once you know the agent is done
 
 `finish` is the only thing that decides a foreign attachment is done — there is no
 timeout or idle heuristic. Until you run it, or until the agent's own driving script
-does, the work stays observed but not judged.
+does, the work stays observed but not judged. Its summary shows the patch, the
+verdict against the source now, what accept would verify, and the commands for
+this Work by its full ID. A stale result offers no accept: run the agent again on
+the current source, then `dispatch close <old-id> --reason superseded --replacement
+<new-id>`, or reject it. Unfinished Work nobody will finish is closed with
+`dispatch close <id> --reason unfinished`; `reject` refuses it, because there is no
+result to judge.
+
+An existing worktree may not have begun from the current source: accept does not
+commit, so a worktree made from HEAD lacks accepted changes that were never
+committed. `attach --workspace` compares the source with the Work's S0 once and
+prints it as a `Source` line. `status` repeats it, and `watch` shows it when
+they differed or nobody observed the start. When they
+differed, it lists the paths, names applied Work where its patch had the path,
+and recommends `dispatch attach -- <agent>`, which begins from the current
+source, uncommitted changes included. Nothing is recomputed later, and no
+verdict depends on it.
 
 Both forms need a **separate worktree**: attaching your own checkout in place is
 refused (`attach needs a separate worktree; run git worktree add`), because Dispatch
@@ -348,9 +379,14 @@ key acts on the selected Work as the command would; the bottom line offers the
 keys that apply:
 - `f` finishes attached Work, asking first, naming it, before running checks
   nobody has allowed;
-- `a` accepts, through the same gate as `dispatch accept`; a refusal names the
-  Work and what to do instead, and its details show the reason;
-- `r` rejects, after asking, naming it, with focus on Cancel;
+- `a` accepts, through the same gate as `dispatch accept`, and says what became
+  of the merged checks; a refusal names the Work and what to do instead, and its
+  details show the reason;
+- `r` rejects, after asking, naming it, with focus on Cancel. Unfinished Work has
+  no result to reject, so `r` refuses and names `dispatch close`;
+- `c` closes it without a review, after asking why and then for a confirmation,
+  each with focus on Cancel. STOP, an ended session and a removed or lost
+  worktree suggest it;
 - `d` or Enter opens the review;
 - `q` leaves.
 
@@ -384,13 +420,19 @@ Claude Code's hooks into `~/.claude/settings.json`: `SessionStart`, `SessionEnd`
   first edit. When Claude Code removes the worktree, its exact changes are kept
   first. If you allowed the project's checks to run by themselves, Dispatch then
   runs them and the Work waits for your review. Otherwise it waits for you to
-  `finish` or `reject` it.
+  `finish` or `close` it. When the session ends, `status` and `watch` say so:
+  finish it, resume it, or close it. The watching owner also compares the
+  source with the worktree's start once, and says so if they differed (above).
 - **Sessions in your checkout:** a fresh one is told that Dispatch cannot follow it.
 - **Other agents:** `dispatch attach -- <agent>` from your checkout gives any agent
-  CLI a workspace of its own. It is removed once the work is applied. After a
-  reject it stays until `dispatch clean`:
+  CLI a workspace of its own. It begins from the current source, uncommitted
+  changes included. It is removed once the work is applied. After a reject or
+  a close it stays until `dispatch clean`:
   - `clean` lists the leftover workspaces Dispatch made and asks before removing
-    them;
+    them. It never lists one that unfinished Work, or Work waiting for review,
+    still uses;
+  - it lists worktrees you or an agent's runtime made, once their Work is over,
+    with Git commands to inspect and remove them, and never removes them;
   - `--dry-run` only lists them;
   - `--yes` skips the question where there is no terminal.
 
@@ -401,7 +443,8 @@ work** section (workspace, root, where S0 came from and with what confidence, th
 agent, who owns the work, what it may do) in place of a selection explanation, then
 the verdict. `dispatch refresh` has no
 target for attached work (there is no Dispatch task to relaunch) and is refused;
-review it and `dispatch attach` again if you want another pass. In `--json`, an
+`dispatch attach` again for another pass, and once that Work is finished, close
+the old one as superseded by it. In `--json`, an
 attached run appears with `mode: "attached"`; every other run is `mode: "native"`.
 
 No foreign process is ever signaled or killed by Dispatch, and a `REFRESH`/`STOP`

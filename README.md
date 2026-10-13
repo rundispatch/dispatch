@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.11 — experimental developer preview**
+**Dispatch 0.4.12 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -63,7 +63,8 @@ verdict of every Work item it knows about current as the code moves:
 named by its worktree folder or its task, with Work that needs you first; the
 selected Work's details say why its verdict is what it is and what to do next.
 You act on the selected Work without typing its ID: `f` finishes, `a` accepts,
-`r` rejects (after asking, naming the Work), `d` reviews. Below 90 columns
+`r` rejects (after asking, naming the Work), `c` closes it without a review
+(after asking why, then confirming), `d` reviews. Below 90 columns
 each Work is a two-line card. Leaving it does not stop watching. `dispatch stop` ends watching for
 this project. No agent needs to be set up
 for any of this.
@@ -81,7 +82,13 @@ itself.
 - S0 is the worktree as the session found it, before its first edit.
 - Later sessions in the same worktree join the same Work.
 - When Claude Code removes the worktree, Dispatch first keeps its exact
-  changes, then waits for you to `finish` or `reject` them.
+  changes, then waits for you to `finish` them, or `close` the Work.
+- Dispatch compares the source with the worktree's start once, after the Work
+  is recorded. If they differed, for example because accepted changes were not
+  committed when the worktree was made from HEAD, `status`, `explain` and
+  `watch` say so, and recommend `dispatch attach -- <agent>`, which begins from
+  the current source, uncommitted changes included. It is advisory, and
+  `claude --worktree` still starts from what Claude Code chooses.
 - If you have let this project's checks run by themselves (`dispatch setup
   --checks`), Dispatch runs them on the kept changes instead, and the Work waits
   for your review. That permission names the exact commands: when
@@ -148,20 +155,26 @@ it is now. Nothing about it is trusted from an earlier moment.
 | Verdict | Meaning | At accept time | Mid-run |
 |---|---|---|---|
 | `CONTINUE` | The source did not move, or nothing the work relied on changed. | Applies against the current source, after your `checks.verify` pass on the merged result if the source moved. | Nothing, unless it follows an earlier invalid verdict (`coherence.checked`). |
-| `REFRESH` | Δ no longer applies, a relied-on fact changed, or a check failed on the merged tree. | Nothing is applied and the source is left unchanged; the message names `dispatch refresh`. | `coherence.invalidated` is recorded and the agent continues. Only with `mid_run: stop` and `stop_on_refresh: true` is it stopped. |
-| `STOP` | Δ is already present in the source. | Nothing is applied; the message points to `dispatch reject`. | `coherence.invalidated` is recorded. With `mid_run: stop` the agent is stopped. |
+| `REFRESH` | Δ no longer applies, a relied-on fact changed, or a check failed on the merged tree. | Nothing is applied and the source is left unchanged; the message says whether the merged checks ran and names `dispatch refresh` (for attached Work: run the agent again, then close the old Work as superseded) or `dispatch reject`. | `coherence.invalidated` is recorded and the agent continues. Only with `mid_run: stop` and `stop_on_refresh: true` is it stopped. |
+| `STOP` | Δ is already present in the source. | Nothing is applied; the message points to `dispatch close <id> --reason already-present`, which records no review. | `coherence.invalidated` is recorded. With `mid_run: stop` the agent is stopped. |
 
 ### Accept-time flow
 
 - `dispatch check [run]` evaluates the finished result now and prints the verdict,
-  analysis level, number of changed files, reasons and the next command. It is
-  read-only, stores nothing, and exits 0 for any verdict (1 if it cannot evaluate).
-  It runs the file, patch and symbol layers only; integration checks run at accept.
-- `dispatch accept [run]` applies the result and then records your acceptance. If
-  the tree is byte-identical to the snapshot, behavior is unchanged. If it moved,
-  the verdict gates the apply. A `REFRESH` or `STOP` leaves the source untouched,
-  shows the application as blocked by source drift, and records no acceptance: the
-  result stays pending until you refresh or reject it.
+  analysis level, number of changed files, reasons, what accept would verify
+  (`At accept:`) and the next command. It is read-only, stores nothing, and exits 0
+  for any verdict (1 if it cannot evaluate). It runs the file, patch and symbol
+  layers only; integration checks run at accept. The summary at the end of a run or
+  a `finish` shows the same verdict and `At accept` line, and its heading follows the
+  verdict: `Ready for review`, `Finished, but stale (REFRESH)` or
+  `Finished, already in the source (STOP)`.
+- `dispatch accept [run]` applies the result and then records your acceptance. It
+  first prints `Merged checks:`, whether your checks ran on the merged result and
+  passed, or why they did not run. If the tree is byte-identical to the snapshot,
+  behavior is unchanged. If it moved, the verdict gates the apply. A `REFRESH` or
+  `STOP` leaves the source untouched, shows the application as blocked by source
+  drift, and records no acceptance: the result stays pending until you refresh,
+  reject or close it.
 - `dispatch accept [run] --despite-refresh --explanation "<why>"` applies a `REFRESH`
   that comes only from the file and symbol analysis, when you have checked that the
   work still holds. Your checks must still run and pass on the merged tree, and the
@@ -183,8 +196,9 @@ Run <id>
 Coherence: CONTINUE
 Analysis: files_only
 World changed files: 2
-Next: dispatch accept <id>
-$ dispatch accept          # applies onto the edited tree
+At accept: merged checks will run (checks.verify on the source as it is then, with this patch) and must pass before anything is applied
+Next: dispatch accept <id>  (or dispatch reject <id>)
+$ dispatch accept <id>     # runs your checks on the merged tree, then applies onto the edited tree
 
 # Instead, someone changes validate's signature in src/auth.rs.
 $ dispatch check
@@ -193,6 +207,7 @@ Coherence: REFRESH
 Analysis: symbols
 World changed files: 1
   fact_broken: pub fn validate(token: &Token) -> Result<User, AuthError> => pub fn validate(ctx: &AuthContext, token: &Token) -> Result<User, AuthError>
+At accept: accept would refuse it now (REFRESH), before any merged checks
 Next: dispatch refresh <id>  (or dispatch reject <id>)
 ```
 
@@ -253,7 +268,7 @@ dispatch finish <run-id>                                           # you say whe
 dispatch start                                                     # keeps a foreign attachment observed and applies it
 ```
 
-Dispatch is honest about what it saw: full confidence when S0 is the workspace as the work began (a workspace Dispatch made, or a session's start) or a real Git merge-base commit; partial confidence when it had to snapshot a directory at attach time, or when a session resumed in a worktree it had not seen, since earlier edits are then invisible to the patch. A workspace Dispatch made is removed once its work is applied, and kept otherwise until you run `dispatch clean`, which lists what it would remove and asks first. See [attach.md](docs/attach.md).
+Dispatch is honest about what it saw: full confidence when S0 is the workspace as the work began (a workspace Dispatch made, or a session's start) or a real Git merge-base commit; partial confidence when it had to snapshot a directory at attach time, or when a session resumed in a worktree it had not seen, since earlier edits are then invisible to the patch. Attached Work that did not begin from the current source, such as a worktree made from HEAD while accepted changes were still uncommitted, says so once in `attach`, `status` and `watch`. A workspace Dispatch made is removed once its work is applied, and kept otherwise until you run `dispatch clean`, which lists what it would remove and asks first. It never removes a workspace that unfinished Work, or Work waiting for review, still uses, and it lists worktrees you or an agent's runtime made without removing them. `dispatch close <id> --reason <reason>` retires Work nobody will finish, or a result that is already in the source or replaced, without recording a review. See [attach.md](docs/attach.md).
 
 See the [coherence reference](docs/coherence.md) for the model, rules, events and
 the fixture matrix, and [coherence validation](docs/coherence-validation.md) for
@@ -311,7 +326,9 @@ dispatch run "Fix the retry race"
 
 Local agents run with your operating-system permissions. Dispatch asks for confirmation before execution; scripts can use `--allow-unsafe-local` after accepting that risk.
 
-Review and apply the result without copying a run ID:
+Review and apply the result. Without an ID, `diff` shows the latest result and
+names it, and `accept` acts only when exactly one result waits for review for this
+source; with several it changes nothing and lists them with their IDs:
 
 ```bash
 dispatch diff
@@ -323,6 +340,8 @@ Or reject it without changing the source tree:
 ```bash
 dispatch reject
 ```
+
+The summary at the end of the run prints these commands with the run's ID.
 
 To run a specific agent:
 
@@ -368,7 +387,7 @@ Real agents and project checks run with the permissions of the Dispatch process 
 
 Dispatch freezes the source into an internal Git baseline and gives the selected agent an independent candidate workspace. It does not run the agent directly in the original tree. `dispatch accept` uses the existing safe apply path. If the source moved since the snapshot, [work coherence](#work-coherence-keeping-results-valid-while-the-code-moves) decides whether the patch is still valid; a stale result is refused and the source is left unchanged. With `coherence.accept: strict`, any source drift is refused. `dispatch reject` never applies candidate changes.
 
-If verification is configured, the same commands run against the candidate and their output is retained. Without configured checks, Dispatch reports `Verification: Not configured`. Verification is mechanical evidence, not a universal code-quality judgment. A completed harness invocation is reported as `Ready for review`; failed checks are reported as `Verification failed`, never as completed or verified work.
+If verification is configured, the same commands run against the candidate and their output is retained. Without configured checks, Dispatch reports `Verification: Not configured`. Verification is mechanical evidence, not a universal code-quality judgment. A completed harness invocation is reported as `Ready for review` when its patch still holds against the source now, `Finished, but stale (REFRESH)` or `Finished, already in the source (STOP)` when it does not; failed checks are reported as `Verification failed`, never as completed or verified work. The summary shows the patch, the verdict and what accept would verify; a `CONTINUE` there does not mean merged checks have passed.
 
 The local backend is the supported real-agent path in this candidate. Docker execution is advanced and experimental: users must provide a suitable image containing the agent and project toolchain.
 
@@ -383,6 +402,7 @@ dispatch status [run-id] [--json|--jsonl]
 dispatch diff [run-id]
 dispatch accept [run-id]
 dispatch reject [run-id]
+dispatch close <run-id> --reason unfinished|workspace-removed|already-present|superseded [--replacement run-id]
 dispatch explain [run-id]
 dispatch check [run-id] [--json]
 dispatch refresh [run-id] [--allow-unsafe-local] [--json|--jsonl]
@@ -399,7 +419,7 @@ dispatch history [--limit count]
 dispatch version
 ```
 
-Without a run ID, `status`, `diff`, `accept`, `reject`, `explain`, `check`, and `refresh` resolve the latest relevant single-result run for the current source tree. Explicit run IDs remain available for history and debugging. `--task-file path|-` reads a task from a file or stdin, and `--source path` overrides the current directory.
+Without a run ID, `status`, `diff`, `explain`, `check`, and `refresh` resolve the latest relevant single-result run for the current source tree; `status`, `diff`, `explain` and `check` print which run they describe. `accept` and `reject` without an ID act only when exactly one result waits for review for the source; with none or several they change nothing and list the explicit commands. `close` and `finish` always need an ID. An explicit ID may be a unique, case-insensitive prefix; an ambiguous one is refused. `--task-file path|-` reads a task from a file or stdin, and `--source path` overrides the current directory.
 
 `run --json` writes one versioned result object to stdout. `run --jsonl` writes each committed, sequenced event followed by a final result object; `status --jsonl` replays that committed journal. Machine modes require non-interactive authorization flags when local execution needs acknowledgement, keeping stdout parseable.
 

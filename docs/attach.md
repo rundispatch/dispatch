@@ -76,8 +76,9 @@ candidate label, and none of them need to know whether Dispatch launched the age
 | `environment` | `execution_backend: "local"`; `unsafe_local` = the `--allow-unsafe-local` acknowledgement; the rest copied from the root's `dispatch.yml` |
 | `execution` | `None`: no invocation budget, no questions |
 | `task` | `--task` text, or `"attached work in <workspace basename>"`; `exact_prompt` equals `task` |
-| `attachment: Option<AttachmentRecord>` | provenance, capabilities, process identities, timestamps (below); `None` for every native run |
+| `attachment: Option<AttachmentRecord>` | provenance, capabilities, process identities, timestamps, and `source_at_start` (see "The source at the start" below); `None` for every native run |
 | `outcome` while active | `lifecycle: Working, work_result: Pending, verification: NotRun, review: NotRequested, phase: Executing` |
+| `outcome.closed` | set only when a person closed the Work (`dispatch close`): `{reason, at, replacement?, explanation?}`; see "Closing Work" below |
 
 `RunMode::Attached` needs **migration 21**, which rebuilds `runs` (see "Migration 21"
 below). A binary built before this exists refuses a state directory that has already
@@ -113,10 +114,12 @@ ATTACHED <run-id>
 Workspace  <path>
 Root       <path>
 S0         commit <sha> (merge base), full confidence
+Source     the same as its S0 (observed 2026-10-13 03:40 UTC, source HEAD <8 of sha>)
 Next: dispatch finish <run-id> when the agent is done
 ```
 
 or, for a plain-directory snapshot, `S0  snapshot at attach, partial confidence`. The
+`Source` line is the start observation (next section). The
 *wrapped* form prints nothing at attach (rule: Dispatch is silent in that terminal —
 see "Terminal and signals" below), so for wrapped attach the provenance line is not
 printed at attach time; `dispatch explain <id>` shows it afterwards for either form.
@@ -129,6 +132,57 @@ ordinary **Coherence** section when the world moved or the verdict is not `CONTI
 and by the one-line `Coherence: CONTINUE — world unchanged` verdict otherwise. The
 `serve` view's five fixed columns (below) do not include provenance. Programmatically,
 read the run's stored record or its `attach.created` event.
+
+### The source at the start
+
+S0 says what the Work began from, not whether that was the source as it was then. Accept
+does not commit, so a worktree made from HEAD lacks accepted, uncommitted changes, and one
+made from a remote branch lacks unpushed local commits. A session resumed in a worktree
+whose earlier Work was closed or rejected without landing has the reverse: S0 holds changes
+the source lacks.
+
+For attached Work that Dispatch did not start from the current source, Dispatch compares the
+integration source with S0 once, as close to the start as it can. It uses the same
+`world::observe` as the verdict, so both directions come from one comparison, and records
+`attachment.source_at_start`:
+- **absent:** a workspace Dispatch made, which begins from the current source, or Work
+  created before 0.4.12. Nothing is shown.
+- **`not_observed`:** set when the Work is built, and left if nobody observes it, or the
+  observation fails. Shown as "not observed" and never filled in later.
+- **`observed`:** `{at, source_head, differing, paths: [{path, applied_work?}]}`, at most 20
+  paths plus the count. `differing: 0` is recorded too, so "the same" and "not observed" stay
+  apart.
+
+| Work | Who observes | When |
+|---|---|---|
+| `attach --workspace` (foreign, or wrapped with an existing workspace) | the `attach` command | right after the Work is published, before the banner or the agent starts |
+| registered by a runtime's hooks | the project owner | the first tick that sees the Work, if it was published after this owner started |
+
+- The comparison runs without the run's lock. The lock is taken only to record, and only if
+  the run is still `not_observed`, as one `attach.source_observed` event.
+- It is never recomputed. Changes after the start are the verdict's business, and a later
+  comparison against moved source cannot say what the source held then.
+- Registration does no comparison, and the hook reply says nothing about the source.
+- An owner never observes Work published before it started, so Work registered while no
+  owner, or an older one, watched stays "not observed".
+- A differing path is named as another Work's only when it is among the recorded paths of an
+  applied Work's patch on this source. Otherwise no author is named. If two applied Work items
+  touched the path, only one is named.
+- It is advisory: no verdict depends on it.
+
+`status` and `explain` show it under Workspace, `watch` as an "At start" detail (only for a
+difference or "not observed"), and the foreign `attach` banner as its `Source` line:
+
+```text
+source at start: differed from its S0 at 1 path (observed 2026-10-13 03:40 UTC, source HEAD aab43dbb): a.txt (in applied Work 01M4SNJ9XR31N21H3CT04PN7XR)
+  Work started with dispatch attach -- <agent> begins from the current source, including uncommitted changes.
+```
+
+That remedy comes first, for any agent. Advice specific to a runtime comes from that
+runtime's adapter and appears only for workspaces it made. For a Claude Code worktree it
+adds: "Claude Code: local commits reach a claude --worktree workspace only with
+worktree.baseRef: "head" in its settings; neither that setting nor a commit copies
+uncommitted changes." Dispatch never changes settings, commits or pushes in response.
 
 ## Δ and "finished"
 
@@ -148,8 +202,24 @@ read the run's stored record or its `attach.created` event.
   - **Foreign**: only an explicit `dispatch finish <id>`. There is no heuristic ("no
     edits for N minutes") that decides an agent is done; a human, or the agent's own
     driving script, must say so.
+- **The finish summary** says what holds. Δ is kept even when it no longer applies. The
+  summary shows:
+  - a heading by verdict: `Ready for review`, `Finished, but stale (REFRESH)`,
+    `Finished, already in the source (STOP)` or `Verification failed`;
+  - `Work <id>` with its patch path and file count, and the workspace verification;
+  - a verdict computed now with the same static evaluation `check` uses (never stored), with
+    up to five reasons;
+  - `At accept`, the same line `check` prints, saying whether merged checks will run, would
+    not run and why, or that accept would refuse it now;
+  - the next commands, each with the full ID: accept/reject for CONTINUE; for REFRESH, run
+    the agent again and close this Work as superseded, or reject; for STOP, close it as
+    already present.
+
+  A patch that no longer applies names its paths and keeps Git's full output in
+  `<run dir>/patch-conflict.txt`. Only finish, the end of a native run and accept write that
+  file; `check`, `status` and `watch` write nothing. The wrapped form still prints one line.
 - After finish, the record behaves like any other Ready result: `check`, `accept`,
-  `reject`, `auto_apply` apply to it unchanged.
+  `reject`, `close` and `auto_apply` apply to it unchanged.
 - Δ attribution is per workspace — there is no per-process attribution inside one
   workspace — which is why same-checkout attach is refused and why one workspace holds
   at most one active attached Work at a time (`attach --workspace` on an
@@ -188,6 +258,8 @@ dispatch attach [--root <path>] [--workspace <path>] [--task <text>] [--agent <n
 dispatch attach --workspace <path> [--root <path>] [--pid <n>] [--task <text>]
                 [--agent <name>] [--allow-unsafe-local] [--auto-apply]
 dispatch finish <run-id> [--allow-unsafe-local]
+dispatch close  <run-id> --reason <reason> [--replacement <run-id>]
+                [--explanation <text> | --explanation-file <path|->]
 dispatch start  [--root <path>]
 dispatch watch  [--root <path>] [--json]
 dispatch stop   [--root <path>]
@@ -206,10 +278,11 @@ dispatch serve  [--root <path>] [--json]
 | `--auto-apply` | sets `capabilities.integrate`: apply automatically once the work is ready and coherent |
 | `-- <command> [args...]` | selects the **wrapped** form: everything after `--` is the agent command Dispatch spawns and owns for the session |
 | `dispatch finish <run-id> [--allow-unsafe-local]` | foreign work only: freeze Δ, run `checks.verify` in the workspace, become an ordinary Ready result. The flag is recorded on the run (`attach.authorized {by: "human"}`), so accept's merged-tree checks run too |
+| `dispatch close <run-id> --reason <reason>` | retire Work without a review: nothing is applied, committed or deleted (see "Closing Work" below) |
 | `dispatch start [--root <path>]` | run the project owner in the background (`serve --background` in its own session) and return |
 | `dispatch watch [--root <path>] [--json]` | the project view, live; holds no lock, records nothing |
 | `dispatch stop [--root <path>]` | stop exactly this root's owner |
-| `dispatch clean [--dry-run] [--yes]` | remove leftover workspaces Dispatch made, after listing them and asking |
+| `dispatch clean [--dry-run] [--yes]` | remove leftover workspaces Dispatch made, after listing them and asking; list, never remove, worktrees it did not make |
 | `dispatch serve [--root <path>] [--json]` | the project owner in the foreground, with the view |
 
 Whether `attach` is wrapped or foreign is decided by whether a command follows `--`:
@@ -297,7 +370,10 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
 - **Every tick** (`coherence.poll_secs`, minimum 1 second):
   1. Read `world::signal(root)` and compare it with the previous tick's. Load the
      root's runs once (other projects' runs are not read). Adopt any orphaned Work
-     (next bullet).
+     (next bullet). Then observe the source at the start, once, for runtime-registered
+     Work that is still `not_observed` and was published after this owner started (see
+     "The source at the start"); each such Work costs one events query per owner
+     lifetime.
   2. Follow every active attached run whose live owner state is not `Live` (a live
      wrapper is that wrapper's own business). Its signal is a hash of its patch so
      far, taken with the trusted baseline repository into the owner's scratch
@@ -342,8 +418,14 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
     command a person would type, as them, under the same locks and authority:
     - `f` is `dispatch finish`; without the project's check consent it asks
       before running checks, which is the same as `--allow-unsafe-local`;
-    - `a` is `dispatch accept`, and a refusal is shown as accept prints it;
-    - `r` is `dispatch reject`, after a confirmation with focus on Cancel;
+    - `a` is `dispatch accept`. A refusal is shown as accept prints it, and an accept
+      names what became of the merged checks;
+    - `r` is `dispatch reject`, after a confirmation with focus on Cancel. On unfinished
+      Work it refuses before asking and names `dispatch close <id>`;
+    - `c` is `dispatch close`. It asks for the reason (those the Work allows, except
+      `superseded`, which needs a replacement ID and stays a typed command), then for a
+      confirmation. Cancel is the default of both, so Enter alone, Esc or Ctrl+C records
+      nothing;
     - `d` or Enter opens the review screen.
 
     `--json`, `--plain` and output that is not a terminal stay passive.
@@ -409,8 +491,8 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   - `removed` (its workspace is gone and its exact changes are kept, waiting for
     you, or for its checks when the project's check consent holds);
   - `lost` (its workspace vanished unannounced; it cannot be finished);
-  - `ready`, `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
-    `finished`.
+  - `ready`, `blocked`, `applied` (`applied by auto-apply` when policy applied it),
+    `closed` (a person closed it; its review is shown as none) or `finished`.
 
   A run is shown while it is still active, or for up to an hour after it finished.
   On a TTY the block is redrawn in place; otherwise lines are appended. It **renders
@@ -436,17 +518,27 @@ the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
   over, just as with `claude --worktree`.
 - **Release:** the workspace is removed only once its work is applied, because its Δ
   is then in the checkout. It is kept after a reject (whose message prints its
-  path), after a crash, or when removal fails. `dispatch status <id>` shows where it
+  path), after a close, after a crash, or when removal fails. `dispatch status <id>` shows where it
   is and what became of it.
 - **Clean:** nothing is deleted on a timer. `dispatch clean` lists the workspaces
-  Dispatch made whose Work is over (rejected, closed, or applied but not
-  released) and that still exist, with path, branch and Work.
+  Dispatch made whose Work is over (rejected, closed, including closed results, or
+  applied but not released) and that still exist, with path, branch and full Work ID.
+  - A workspace Dispatch made is listed only when no Work needs its path: no
+    unfinished Work, and no Work waiting for review, may be attached to it. So after
+    a workspace is repaired and attached again as new Work, closing or rejecting the
+    old Work does not make it cleanable while the new Work uses it.
   - On confirmation (focus on Cancel; without a terminal, `--yes`) it removes each
     one and its branch, under the run's lock, and only if it is still cleanable.
     It records `workspace.released {reason: "cleaned"}`.
   - `--dry-run` only lists them.
-  - Work in progress or waiting for review is never listed. A runtime's or your
-    own workspace is never touched. The run's record and Δ stay.
+  - Worktrees you or a runtime made are never touched. Those whose Work is over are
+    listed under "Kept, because Dispatch did not make them", one line per path with
+    who made it and each Work ID and how it ended, followed by how to inspect one
+    (`git -C <path> status`) and remove it (`git worktree remove <path>`, or through
+    the runtime that made it), with a caution that a locked worktree may still belong
+    to a running agent session.
+  - "Nothing to clean" adds that Dispatch removes only the workspaces it made.
+  - The run's record and Δ stay.
 
 ## Work a runtime registers
 
@@ -477,7 +569,12 @@ runtime's event on stdin):
     `docs/plan-0.4.10.md` §3.
   - later sessions in that worktree (resume, clear, compact, a fork into it, a
     replayed event) are recorded on the same Work;
-  - an ended session never ends the Work;
+  - the watching owner observes the source at the start once, after the Work is
+    published (see "The source at the start"); registration and the hook reply say
+    nothing about it;
+  - an ended session never ends the Work. `status` and `watch` say the session
+    ended: finish to freeze its changes (`dispatch finish <id>`), or resume it; or
+    close it (`dispatch close <id> --reason unfinished`);
   - a resume into a worktree Dispatch has not seen is partial, since earlier edits
     may predate S0.
 - **A fresh session in the checkout itself** is told that Dispatch cannot tell its
@@ -504,8 +601,9 @@ runtime's event on stdin):
   - If that fails, or takes longer than 240 s, the hook fails and Claude Code keeps
     the worktree (for `ExitWorktree`, the tool call is refused).
   - Removal is an observation, not an ending. The Work waits for `finish`, which
-    verifies it in a workspace rebuilt from S0 and the kept Δ, or for `reject`,
-    which closes it and keeps the Δ in the run.
+    verifies it in a workspace rebuilt from S0 and the kept Δ, or for
+    `dispatch close <id> --reason workspace-removed`, which closes it and keeps the
+    Δ in the run. `reject` refuses it, because there is no result to judge.
   - With the project's check consent still holding, for the same commands the
     Work was authorized with, the owner does that `finish` on its next tick
     (`finish_reason: by_consent`). The Work becomes Ready, or shows its failed
@@ -513,9 +611,13 @@ runtime's event on stdin):
     hook's budget is unchanged.
   - Only an empty Δ closes the Work.
   - If a followed workspace vanishes without the hook, the owner keeps the last Δ it
-    followed (`delta-last-seen.patch`). That Work cannot be finished; rejecting it
-    closes it. If that last Δ was empty, the Work closes by itself with no
-    changes.
+    followed (`delta-last-seen.patch`). That Work cannot be finished;
+    `dispatch close <id> --reason workspace-removed` closes it and keeps that Δ.
+    While an owner watches the project but has not yet recorded the vanished
+    workspace, `close` refuses and asks you to try again in a few seconds. If that
+    persists, the owner may be stuck: `dispatch stop` ends it, and close then goes
+    ahead without those changes. If that last Δ was empty, the Work closes by itself
+    with no changes.
 
 ## The gate rule for attached runs
 
@@ -557,15 +659,52 @@ review of attached work exactly as they do for native work (since 0.4.1): one
 accept, `apply_locked(..., ApplyAuthority::Human)` run under one hold of the run's
 operation lock.
 
-- `load_latest_unresolved_single` (the target of a bare `dispatch accept`/`dispatch
-  reject` with no id) also returns an attached run whose review is still `Pending`.
+- **A decision without an ID needs exactly one candidate.** `dispatch accept` or
+  `dispatch reject` with no ID (`sole_awaiting_review`) acts only when exactly one
+  result for the source waits for review: finished, ready, review pending, not
+  applied and not closed, native or attached. With none or several it changes
+  nothing, exits 1, and lists each waiting result as `dispatch <accept|reject>
+  <full id>  (task)`, and Work still in progress as "not counted". An explicit ID
+  keeps the unique-prefix rule; the full ID is used for locks, writes and events.
+  Every finish and result summary prints its commands with the full ID.
 - **The delivered-result guard.** A review is a judgment of a delivered result; an
-  attached run that has not been finished yet has no Δ to judge. Reviewing an active
-  attachment refuses: *"review requires a delivered result; finish attached work
-  `<id>` first."*
+  attached run that has not been finished yet has no Δ to judge. `reject` on
+  unfinished attached Work refuses and names `dispatch close <id> --reason unfinished`
+  (or `workspace-removed` when its workspace is gone). Accepting an active
+  attachment refuses: *"run `<id>` has no delivered result to review; finish attached
+  work or answer the pending question first."* Closed Work cannot be accepted, rejected
+  or finished.
 - `dispatch refresh` has no meaning for attached work — there is no Dispatch task to
-  relaunch — and is refused: *"attached work has no Dispatch task to refresh; finish
-  or reject it."*
+  relaunch — and is refused: *"attached work has no Dispatch task to refresh; finish,
+  reject or close it."* For a stale result, run the agent again on the current source,
+  and once that Work is finished, close the old one as superseded by it.
+
+### Closing Work
+
+`dispatch close <id> --reason <reason>` retires Work without a quality judgment. It
+records one `work.closed` event (`{reason, by: "human", world_digest?, replacement?}`)
+and sets `outcome.closed`. It writes no `review.*` event and no feedback row, and
+leaves earlier reviews as they are. It never applies, commits, signals an agent or
+deletes a workspace. It takes the run's operation lock, waiting up to 5 s as `finish`
+does, so Work a live wrapper owns is refused.
+
+| Reason | For | Requires |
+|---|---|---|
+| `unfinished` | unfinished Work whose workspace is there | its changes are frozen into `delta.patch` first, without checks |
+| `workspace-removed` | unfinished Work whose workspace is gone | the exact Δ the hook kept, or the last-seen Δ, stays |
+| `already-present` | a result waiting for review | the whole retained patch is already in the source (`git apply --check --reverse`); the world digest is recorded. Part of it is not enough |
+| `superseded` | unfinished Work or a result waiting for review | `--replacement <id>`: different, finished, ready Work on the same source, neither closed nor rejected, with a non-empty retained patch |
+
+- Closing unfinished Work sets `lifecycle: finished`, `work_result: cancelled`,
+  `review: not_requested`. Closing a result keeps its Δ, `work_result: ready` and
+  `application`, and sets `review: not_requested`. Either way the Work leaves pending
+  review and ID-less decisions, and reads as `closed: <reason>` in `status`,
+  `history`, `watch` and `check`.
+- Reviewed or applied Work cannot be closed, and closed Work cannot be closed again.
+- `--explanation` or `--explanation-file` stores the person's words verbatim.
+- Repairing a workspace is explicit: attach the repaired workspace as new Work, finish
+  it, then close the old Work with `--reason superseded --replacement <new-id>`. Both
+  patches are kept. A source-only repair needs no close: `check` the same Work again.
 
 ## Events
 
@@ -575,13 +714,14 @@ In addition to the existing coherence, application and review events (see
 | Event | When | Payload |
 |---|---|---|
 | `attach.created` | `attach` creates the Work (both forms) | `{"attachment": <AttachmentRecord>}` |
+| `attach.source_observed` | the one observation of the source at the start (see "The source at the start") | `StartObservation`: `{"at", "source_head", "differing", "paths": [{"path", "applied_work"?}]}` |
 | `attach.started` | the wrapped form's agent process has been spawned | `{"agent_process": <ProcessIdentity>}` |
 | `attach.finished` | `finish` (either explicit or on agent exit) freezes Δ | `{"reason": <FinishReason>}` |
 | `attach.adopted` | `serve` takes over observation of an orphaned run | `{"owner_state": "adopted"}` |
 | `attach.authorized` | Work gains local authority: from the project's check consent, or from a person's `finish --allow-unsafe-local` | `{"unsafe_local": true, "by": "project consent" \| "human"}` |
 | `workspace.removed` | the workspace is gone: kept exactly by the hook, or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes"}` |
 | `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
-| `work.closed` | a person rejected unfinished Work whose workspace is gone | `{"reason": "workspace_removed", "by": "human"}` |
+| `work.closed` | a person closed Work (`dispatch close`, or `c` in `watch`). Before 0.4.12, a person rejected unfinished Work whose workspace was gone | `{"reason": "unfinished" \| "workspace_removed" \| "already_present" \| "superseded", "by": "human", "world_digest"?, "replacement"?}` |
 | `interaction.landed` | after `result.applied`: what the owner's view said about this Work and the others in progress | `measure::Landing` (see [coherence.md](coherence.md#measuring-interactions-measurers)) |
 | `interaction.outcome` | the owner's first verdict on one of those others after this Work landed | `measure::Outcome` |
 
@@ -605,9 +745,10 @@ that still does, and only for native allocation runs.
 
 - **Durable**: the Work record (`runs/<id>/metadata.json`, including the
   `AttachmentRecord`), the materialized S0 baseline, the frozen `delta.patch`, every
-  event, and `attachment.owner_state`/`finished_at`/`finish_reason`.
+  event, `attachment.owner_state`/`finished_at`/`finish_reason`,
+  `attachment.source_at_start` (recorded once, never recomputed) and `outcome.closed`.
 - **Recomputed on every use**: the world, symbol tables, facts and the verdict shown by
-  `check`, `status` and `explain` — exactly as for
+  `check`, `status`, `explain` and the finish summary — exactly as for
   native runs. `serve`'s view line reads the *last stored* verdict; it does not
   recompute one for display beyond what its own tick already evaluated and persisted.
 
@@ -619,7 +760,9 @@ that still does, and only for native allocation runs.
   alone (a live wrapper owns it); a stored `Live` owner that is now `Gone`/`Reused` is
   adopted (above); a foreign attachment with no owner, or an owner whose liveness
   cannot be told (`Unknown`), is observed but not marked adopted. Nothing is finished,
-  applied or relaunched by a restart.
+  applied or relaunched by a restart. A restarted owner neither repeats nor recomputes a
+  start observation, and runtime-registered Work published while no owner ran stays "not
+  observed".
 - **A wrapper crash** leaves its Work `Working` with a stale `owner_state: Live` until
   `serve` next observes that root and adopts it (or until a human runs `dispatch
   finish` directly), whichever happens first.

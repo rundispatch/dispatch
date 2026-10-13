@@ -83,7 +83,11 @@ At most 20 reasons are kept in a `Validity`; result projections keep 5.
 
 1. World unchanged, or the patch file is empty: `Continue`, no Git or parsing work.
 2. `git apply --check --reverse` in the source succeeds: `Stop`, `already_applied`.
-3. `git apply --check` fails: `Refresh`, `patch_conflict`, with Git's message (at most 300 characters).
+3. `git apply --check` fails: `Refresh`, `patch_conflict`. The detail names the
+   conflicting paths (`Reason.path` is the first), then, when Git's full output was kept,
+   where it is (`<run dir>/patch-conflict.txt`), then Git's words, at most 300 characters
+   in all. The file is written only when finish, the end of a native run or accept
+   evaluates; `check`, `status`, `explain`, `watch` and `refresh` write nothing.
 4. Otherwise go to L1.
 
 `git apply` is only ever run with `--check` during evaluation, so evaluation never
@@ -154,9 +158,14 @@ checked, always from what is on disk now.
 ### L2: integration checks (`integration.rs`)
 
 Run only at accept time, only when L0 and L1 said `Continue` **and** the world moved,
-`coherence.integration_checks` is true, `checks.verify` is not empty, and, for the
-local backend, the run itself was approved for local execution (the run's
-`unsafe_local` flag). Otherwise the verdict is returned unchanged.
+`coherence.integration_checks` is true, `checks.verify` is not empty, for the
+local backend the run itself was approved for local execution (the run's
+`unsafe_local` flag), and the patch is not empty. Otherwise the verdict is returned
+unchanged. These conditions live in one function, `integration::checks_skipped`,
+which names the reason (`ChecksSkipped`: `ConfigUnreadable`, `Strict`, `Unmoved`,
+`Disabled`, `NotConfigured`, `NoAuthority`, `EmptyPatch`). `verify_integration`
+returns the verdict together with `MergedChecks` (`Skipped(reason)`, `Passed(log dir)`
+or `Failed`), which accept prints.
 
 1. Copy the current source into a scratch directory under the run directory
    (`coherence-scratch-<id>`): for Git sources exactly the non-ignored files, so there
@@ -197,22 +206,45 @@ the per-run and per-source locks and calls `coherence::gate`:
 - Otherwise `evaluate_run`, then L2 if the verdict was `Continue`. `Continue` yields
   `Compatible`; `Refresh` and `Stop` yield `Blocked`.
 
+Every gate result says what became of the merged checks: `Legacy` carries its
+`ChecksSkipped` reason (unreadable configuration, strict, or unmoved), and
+`Compatible`, `Blocked` and `Overridden` carry `MergedChecks` (`Blocked` carries none
+when the verdict refused the Work before the checks). Unless quiet, `apply_locked`
+prints it before applying anything:
+
+```text
+Merged checks: not run — the source has not moved since the Work began, so the merged result is the Work's own tree
+Merged checks: passed on the current source with this patch; logs: <run dir>/coherence-checks/<id>
+Merged checks: not run — no checks are configured (checks.verify is empty)
+```
+
+`watch`'s accept notice and the review screen show the same outcome. `finish`, a
+native result's summary and `check` print the line that predicts it (`At accept: …`),
+from the same conditions.
+
 Attached runs go through this same `gate` and the same `auto_apply` as native work —
 there is no second accept path for work Dispatch did not launch.
 
 `Compatible` applies through `source::apply_validated`, which requires the current
 world digest to equal the evaluated one before the dry run and again after it, so a
-change during validation aborts with nothing applied. All-or-nothing `git apply`
-semantics and the existing path safety checks are unchanged.
+change during validation aborts with nothing applied. The error then says that the
+source changed after accept checked it, so nothing was applied, and to accept again
+to check it as it is now. All-or-nothing `git apply` semantics and the existing path
+safety checks are unchanged.
 
-The human's accept/reject decision is recorded before the apply is attempted (it
-is the quality signal and is not withdrawn when apply is blocked). When the gate blocks:
+A human acceptance is recorded only once the work has landed (since 0.4.4); a reject
+only records the review. When the gate blocks:
 
 - nothing is applied and the source is unchanged;
-- the run's application state becomes `blocked_by_source_drift`, the review stays accepted;
+- the run's application state becomes `blocked_by_source_drift`, and the review stays
+  pending;
 - the latest validity is stored in `run.coherence.validity`;
 - an `application.failed` event carries `application`, `error` and `coherence`;
-- the error text names `dispatch refresh <id>` or, for `Stop`, `dispatch reject <id>`.
+- the error text says the merged checks did not run when the verdict refused the Work
+  before them (or why they were skipped), then names the next step: for `Stop`,
+  `dispatch close <id> --reason already-present`; for `Refresh`, `dispatch refresh <id>`
+  for a native run or running the agent again on the current source for attached Work,
+  with `dispatch reject <id>` as the alternative.
 
 When a moved-world apply succeeds, the validity is stored and the `result.applied`
 event includes it under `coherence`. A typed error (`CoherenceBlocked`) replaced the
@@ -644,7 +676,7 @@ How to read it:
 - Integration checks use your `checks.verify` on a scratch copy of the non-ignored files with no build cache
   (a `cargo test` builds from scratch unless the command points `CARGO_TARGET_DIR` elsewhere), hold the apply locks while running, and cannot be cancelled.
   They do not run for a local-backend run that was not approved for local execution.
-- `dispatch check`, `status` and `explain` evaluate L0 and L1 only; integration checks run at accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
+- `dispatch check`, `status`, `explain`, the finish summary and a native result's summary evaluate L0 and L1 only, fresh and never stored; integration checks run at accept. `check`, finish and the native summary also print `At accept: …`, what accept would verify now, and a `Next` step driven by the verdict: REFRESH and STOP never offer accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
 - Plain-directory sources cannot honor `.gitignore`; ignored build output counts as world change (the patch usually still applies).
 - Nested repositories and submodules are not analysed.
 - A source that moved since S0 does not stop a native run, including the continuation after a clarification answer: every attempt starts from the run's original snapshot, the mid-run watcher reports what the move means for the work, and the accept gate judges the result against the source as it is then. (Before 0.4.4 a continuation stopped with `source_drift` whenever the tree differed.)
