@@ -576,3 +576,20 @@ different, finished Work whose Δ was retained.
 | Dispatch finish checks | fmt, clippy, `cargo test` all passed |
 | Frozen Δ | Applied to a fresh `git archive` of HEAD, its tree (`aff9146`) equals the reviewed and independently validated tree |
 | Decision | Accepted by the human (2026-10-13); `check` CONTINUE, world unchanged; applied 19 files; committed as `35511d9` |
+
+### P3
+
+| Item | Value |
+|---|---|
+| Work | `01M4S7ARJYZWDBCKX6SGQTTN75`, wrapped, from `393681c` (S0 tree equals the clone's HEAD tree) |
+| Agent | Claude Code (interactive), Opus 5.5, xhigh; usage unknown |
+| Prompt | `prompts-0412/p3.md` |
+| Approvals | Each non-allowlisted command read and approved once with the key `1`; mode stayed accept-edits |
+| Integrator review | Asked for: the comparison runs without the run's lock, which is taken only to record (re-checking `NotObserved`), so a short session's `SessionEnd` hook cannot time out behind it; the foreign `attach` banner prints the observation. Both made |
+| Worker validation | fmt, clippy pass; `cargo test` 659 passed, 0 failed, 5 ignored, before and after review; `source_at_start` rerun 7 times, 9/9 each |
+| Independent validation | Tracked diff plus the new `tests/source_at_start.rs` on a `git archive` of HEAD, own `CARGO_TARGET_DIR`: fmt, clippy pass; `cargo test` 659 passed, 0 failed, 5 ignored. Two-wave journey on this build: A accepted and left uncommitted; an external worktree B from HEAD prints `Source  differed from its S0 at 1 path …: a.txt (in applied Work A)` and the managed-launch remedy at attach and in `status`; a managed launch C sees A's change and shows no warning |
+| Production LOC | `src/` +282 / −6, net +276 (worker's count) |
+| Noted, not in scope | Any Dispatch command panics if stdout closes early (`println!`), as it always has. In `accept`, every line prints before the apply starts or after the state it reports is recorded, so a closed pipe cannot leave a half-recorded apply |
+| Dispatch finish checks | fmt, clippy, `cargo test` all passed |
+| Frozen Δ | Applied to a fresh `git archive` of HEAD, its tree (`2fcb978`) equals the reviewed and independently validated tree |
+| Decision | Accepted by the human (2026-10-13); `check` CONTINUE; applied 10 files; committed as `f348edb` |
