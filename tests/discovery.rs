@@ -633,3 +633,34 @@ fn a_registration_in_flight_is_left_alone_and_a_failure_is_noted_once_then_retri
         p.runs_in(&broken).len() == 1
     });
 }
+
+/// Found in the 0.4.13 real-agent trial: a `claude -p --worktree` session was
+/// discovered while it ran, then exited before liveness first looked, so
+/// nothing ever recorded its process and its session stayed open. Discovery
+/// records the running session's process as the Work's agent, so the end is
+/// seen however soon it comes.
+#[test]
+fn a_discovered_session_that_ends_at_once_is_still_seen_to_end() {
+    let p = Project::new();
+    p.watch();
+    let mut agent = Command::new("sleep").arg("30").spawn().unwrap();
+    let worktree = p.claude_worktree("quick", Some(&session_lock("quick", agent.id())));
+    wait_until("the session's Work", || p.runs_in(&worktree).len() == 1);
+    let run = p.runs_in(&worktree).remove(0);
+    assert_eq!(
+        run["attachment"]["agent_process"]["pid"],
+        agent.id(),
+        "{run}"
+    );
+    // Gone before the owner's next tick, as the trial's run was.
+    agent.kill().unwrap();
+    agent.wait().unwrap();
+    wait_until("the session's end", || {
+        p.runs_in(&worktree)[0]["attachment"]["sessions"][0]["end_reason"] == "process_gone"
+    });
+    let run = p.runs_in(&worktree).remove(0);
+    assert_eq!(
+        run["outcome"]["lifecycle"], "working",
+        "ending a session finishes nothing"
+    );
+}

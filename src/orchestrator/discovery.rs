@@ -194,8 +194,15 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
 /// Register the session `lock` names as Work in `workspace`, `ended` when
 /// its process is gone, noting a failure once.
 fn register(state: &State, root: &Path, workspace: &Path, lock: &Lock, ended: bool) {
-    let result = session(lock, ended)
-        .and_then(|session| super::registration::discovered(state, root, workspace, session));
+    // A running session's process is recorded as the Work's agent, so that
+    // liveness sees it end even if it ends before liveness first looks.
+    let agent = match lock {
+        Lock::Session { pid, .. } if !ended => Some(*pid),
+        _ => None,
+    };
+    let result = session(lock, ended).and_then(|session| {
+        super::registration::discovered(state, root, workspace, session, agent)
+    });
     let mut failed = FAILED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

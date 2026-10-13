@@ -426,6 +426,7 @@ pub(crate) fn discovered(
     root: &Path,
     workspace: &Path,
     session: RuntimeSession,
+    agent: Option<u32>,
 ) -> Result<Option<String>> {
     let Ok(_lock) = OperationLock::acquire(
         &workspace_lock(state, workspace),
@@ -451,7 +452,8 @@ pub(crate) fn discovered(
         root: Some(root.to_owned()),
         task: Some(format!("{} session in {name}", session.provider)),
         agent: Some(session.provider.clone()),
-        pid: None,
+        // The running session's process, seen just now: the agent liveness follows.
+        pid: agent,
         command: None,
         // As for a hook's Work: authority only from the person's consent.
         allow_unsafe_local: crate::consent::consent(state, root)?.is_valid(),
