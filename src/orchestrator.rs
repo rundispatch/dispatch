@@ -1888,6 +1888,7 @@ pub fn diff(
     println!("Run {}", run.id);
     if stat {
         print_diff_stats(candidate);
+        println!("{}", digest_line(&delta_digest(&candidate.diff_path)?));
         return Ok(());
     }
     println!("Candidate {}\n", candidate.label);
@@ -2026,6 +2027,8 @@ pub enum ReviewDecision {
     Reject,
 }
 
+/// `expect` (`accept --expect`) is a hex prefix of the Δ the person
+/// reviewed: unless the frozen Δ's digest starts with it, nothing happens.
 pub fn accept_or_reject_latest(
     state: &State,
     run_id: Option<&str>,
@@ -2033,7 +2036,34 @@ pub fn accept_or_reject_latest(
     decision: ReviewDecision,
     reasons: Vec<String>,
     explanation: Option<String>,
+    expect: Option<&str>,
 ) -> Result<()> {
+    let expected_run;
+    let run_id = match expect {
+        Some(expected) => {
+            let run = match run_id {
+                Some(run_id) => state.load_run(run_id)?,
+                None => sole_awaiting_review(state, source_path, "accept")?,
+            };
+            // A finished run's Δ is frozen and never written again, so the
+            // run accepted below has exactly the Δ compared here.
+            anyhow::ensure!(
+                run.outcome.lifecycle == LifecycleState::Finished,
+                "Work {} is not finished, so it has no frozen Δ to compare with --expect; nothing was applied",
+                run.id
+            );
+            let actual = delta_digest(&sole_candidate(&run)?.diff_path)?;
+            anyhow::ensure!(
+                actual.starts_with(expected),
+                "the frozen Δ of {} is {}, not the expected Δ {expected}; nothing was applied",
+                run.id,
+                &actual[..expected.len().max(DIGEST_SHOWN)]
+            );
+            expected_run = run.id;
+            Some(expected_run.as_str())
+        }
+        None => run_id,
+    };
     decide(
         state,
         run_id,
@@ -2133,27 +2163,271 @@ fn ensure_unapplied_ready(run: &RunRecord, action: &str) -> Result<()> {
     Ok(())
 }
 
+/// `dispatch check --merged`: the person's acknowledgement for this one
+/// check, never recorded on the Work.
+#[derive(Debug, Clone, Copy)]
+pub struct MergedCheck {
+    pub allow_unsafe_local: bool,
+}
+
 /// `dispatch check`: evaluate the run's sole candidate against the source as it
-/// is now. Reads only; the verdict is printed, never stored.
-pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool) -> Result<()> {
+/// is now. Reads only; the verdict is printed, never stored. With `merged`,
+/// also run `checks.verify` on the current source with the Work's Δ as of
+/// now, in a scratch copy: nothing is applied and no verdict or review
+/// changes; one event records the run.
+pub async fn check(
+    state: &State,
+    run_id: Option<&str>,
+    source_path: &Path,
+    json: bool,
+    merged: Option<MergedCheck>,
+) -> Result<()> {
     let run = match run_id {
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_for_source(state, source_path, true)?,
     };
-    ensure_unapplied_ready(&run, "check")?;
+    let unfinished = merged.is_some()
+        && run.mode == RunMode::Attached
+        && run.outcome.lifecycle == LifecycleState::Working;
+    if !unfinished {
+        ensure_unapplied_ready(&run, "check")?;
+    }
     let candidate = sole_candidate(&run)?;
-    let validity = crate::coherence::shown_validity(&run, &candidate.label, None)?;
+    let merged = match merged {
+        Some(request) => Some(prepare_merged(state, &run, unfinished, request)?),
+        None => None,
+    };
+    let patch = merged
+        .as_ref()
+        .map_or(&candidate.diff_path, |(_, _, patch)| patch);
+    let validity = if unfinished {
+        let world = crate::coherence::world::observe(
+            &run.source_path,
+            &run.baseline_path,
+            &run.baseline_commit,
+            &run.source_kind,
+        )?;
+        crate::coherence::evaluate(
+            &world,
+            &crate::coherence::WorkView {
+                source: &run.source_path,
+                delta_patch: patch,
+                baseline: &run.baseline_path,
+                baseline_commit: &run.baseline_commit,
+            },
+        )?
+    } else {
+        crate::coherence::shown_validity(&run, &candidate.label, None)?
+    };
+    let digest = delta_digest(patch)?;
     let landed_by = (validity.decision == Decision::Stop)
         .then(|| apply::landed_by(state, &run))
         .flatten();
+    if !json {
+        print_check(
+            state,
+            &run,
+            &validity,
+            landed_by.as_deref(),
+            unfinished.then_some(patch),
+        );
+    }
+    let ran = match &merged {
+        Some((config, logs, patch)) => {
+            let ran = crate::coherence::integration::run_merged(
+                &run,
+                patch,
+                config,
+                &state.run_dir(&run.id),
+                logs,
+            )
+            .await;
+            let mut payload = match &ran {
+                Ok(ran) => ran.event_payload("check", &digest),
+                Err(error) => serde_json::json!({
+                    "by": "check",
+                    "delta_digest": digest,
+                    "error": format!("{error:#}"),
+                    "logs": logs,
+                }),
+            };
+            payload["patch"] = serde_json::json!(patch);
+            record_observation(state, &run, "coherence.merged_checks", payload.clone())?;
+            Some((ran, payload))
+        }
+        None => None,
+    };
     if json {
-        let mut shown = serde_json::json!({"run_id": run.id, "validity": validity});
+        let mut shown = serde_json::json!({
+            "run_id": run.id,
+            "validity": validity,
+            "delta_digest": digest,
+        });
         if let Some(id) = &landed_by {
             shown["landed_by"] = serde_json::json!(id);
         }
+        if let Some((_, payload)) = &ran {
+            shown["merged_checks"] = payload.clone();
+        }
         println!("{shown}");
-        return Ok(());
+    } else if let Some((ran, _)) = &ran {
+        match ran {
+            Ok(ran) => {
+                println!(
+                    "Merged checks on the current source ({}) with this Δ: {}",
+                    ran.source,
+                    if ran.passed() {
+                        "passed"
+                    } else {
+                        "did not pass"
+                    }
+                );
+                for result in &ran.results {
+                    println!("{}", check_line(result));
+                }
+            }
+            Err(error) => println!("Merged checks: could not run — {error:#}"),
+        }
+        println!(
+            "Nothing was applied and no verdict changed. accept runs its own merged checks, because the source can move after this."
+        );
     }
+    if !json {
+        println!("{}", digest_line(&digest));
+    }
+    anyhow::ensure!(
+        ran.is_none_or(|(ran, _)| ran.is_ok_and(|ran| ran.passed())),
+        "the merged checks did not pass for {}",
+        run.id
+    );
+    Ok(())
+}
+
+/// What `check --merged` needs before anything runs, refusing first: the
+/// run's frozen configuration, a new logs directory, and the Δ as of now.
+/// Finished Work has its frozen Δ; for unfinished attached Work, the
+/// workspace's change is captured now, as `finish` captures it, into the logs
+/// directory, never over the live or frozen `delta.patch`.
+fn prepare_merged(
+    state: &State,
+    run: &RunRecord,
+    unfinished: bool,
+    request: MergedCheck,
+) -> Result<(Config, PathBuf, PathBuf)> {
+    if let Some(closed) = &run.outcome.closed {
+        bail!(
+            "Work {} is closed ({}); closed Work is not accepted, so there is nothing to check",
+            run.id,
+            closed.describe()
+        );
+    }
+    let run_dir = state.run_dir(&run.id);
+    let config = crate::coherence::run_config(&run_dir)
+        .context("the run's frozen configuration cannot be read")?;
+    anyhow::ensure!(
+        !config.checks.verify.is_empty(),
+        "no checks are configured for {} (checks.verify is empty); nothing to run",
+        run.id
+    );
+    // Never widen authority: the Work's own acknowledgement, standing consent
+    // for exactly these commands, or the person's flag for this check alone.
+    if config.execution.backend == "local"
+        && !request.allow_unsafe_local
+        && !run.environment.unsafe_local
+        && !consented(state, run, &config.checks.verify)
+    {
+        bail!(
+            "check --merged runs checks.verify on the host; pass --allow-unsafe-local, or give this project standing consent for these checks with dispatch setup --checks"
+        );
+    }
+    let logs = crate::coherence::integration::new_logs(&run_dir);
+    let patch = if unfinished {
+        anyhow::ensure!(
+            run.attachment
+                .as_ref()
+                .is_none_or(|attachment| attachment.workspace_removed.is_none()),
+            "the workspace of {} was removed; finish or close it first",
+            run.id
+        );
+        fs::create_dir_all(&logs)
+            .with_context(|| format!("failed to create {}", logs.display()))?;
+        let patch = logs.join("delta-now.patch");
+        source::collect_diff(
+            &run.baseline_path,
+            &sole_candidate(run)?.workspace_path,
+            &patch,
+        )?;
+        patch
+    } else {
+        sole_candidate(run)?.diff_path.clone()
+    };
+    anyhow::ensure!(
+        fs::metadata(&patch)?.len() > 0,
+        "the Δ of {} is empty; there is nothing to check",
+        run.id
+    );
+    Ok((config, logs, patch))
+}
+
+/// Whether the project's standing consent covers exactly `commands`.
+fn consented(state: &State, run: &RunRecord, commands: &[String]) -> bool {
+    crate::consent::project_root(&run.source_path)
+        .and_then(|project| crate::consent::consent(state, &project))
+        .is_ok_and(|consent| {
+            matches!(consent, crate::consent::CheckConsent::Valid(approved) if approved == commands)
+        })
+}
+
+/// Record an event that observes `run` without changing it: the run's state
+/// revision and outcome stay as they are.
+fn record_observation(
+    state: &State,
+    run: &RunRecord,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    Database::open(state.db_path())?.record_event(&EventRecord {
+        run_id: run.id.clone(),
+        candidate_label: run
+            .candidates
+            .first()
+            .map(|candidate| candidate.label.clone()),
+        event_type: event_type.into(),
+        timestamp: Utc::now(),
+        payload,
+        protocol_version: 1,
+        generation: 1,
+        actor: "orchestrator".into(),
+        ..EventRecord::default()
+    })?;
+    // Loading projects the committed events into events.jsonl.
+    state.load_run(&run.id)?;
+    Ok(())
+}
+
+/// The SHA-256 of a patch's bytes, in hex: what identifies a Δ.
+pub(crate) fn delta_digest(patch: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(patch).with_context(|| format!("failed to read {}", patch.display()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// `Δ <first 12 hex>`.
+pub(crate) fn digest_line(digest: &str) -> String {
+    format!("Δ {}", &digest[..DIGEST_SHOWN])
+}
+
+const DIGEST_SHOWN: usize = 12;
+
+/// The `check` verdict for `run`, as people read it. `unfinished` is the Δ
+/// captured now for attached Work that is not finished.
+fn print_check(
+    state: &State,
+    run: &RunRecord,
+    validity: &crate::Validity,
+    landed_by: Option<&str>,
+    unfinished: Option<&Path>,
+) {
     println!("Run {}", run.id);
     println!(
         "Coherence: {}",
@@ -2164,19 +2438,26 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
     for reason in &validity.reasons {
         println!("  {}", reason_line(reason));
     }
-    if let Some(id) = &landed_by {
+    if let Some(id) = landed_by {
         println!("  already landed by run {id}");
     }
     if let Some(closed) = &run.outcome.closed {
         println!("Closed: {}; nothing to do", closed.describe());
-        return Ok(());
+        return;
     }
-    println!("At accept: {}", accept_scope(state, &run, &validity));
-    match next_step(&run, validity.decision) {
+    if let Some(patch) = unfinished {
+        println!(
+            "Unfinished: its Δ as of now is at {}; dispatch finish {} freezes it",
+            patch.display(),
+            run.id
+        );
+        return;
+    }
+    println!("At accept: {}", accept_scope(state, run, validity));
+    match next_step(run, validity.decision) {
         (step, Some(alternative)) => println!("Next: {step}  (or {alternative})"),
         (step, None) => println!("Next: {step}"),
     }
-    Ok(())
 }
 
 const REFRESH_MARKER: &str = "Context: this task was previously attempted against an earlier";
@@ -2927,7 +3208,12 @@ fn review_locked(
             }
             .into(),
             timestamp: feedback.created_at,
-            payload: serde_json::json!({"feedback_revision": feedback.revision}),
+            payload: serde_json::json!({
+                "feedback_revision": feedback.revision,
+                "delta_digest": sole_candidate(&run)
+                    .ok()
+                    .and_then(|candidate| delta_digest(&candidate.diff_path).ok()),
+            }),
             ..EventRecord::default()
         },
         &mut run,
@@ -3152,6 +3438,31 @@ fn print_checks(checks: &[crate::CheckResult]) {
         println!("    stdout {}", check.stdout_path.display());
         println!("    stderr {}", check.stderr_path.display());
     }
+}
+
+/// One check's result on one line: the command, whether it passed, its exit
+/// code, how long it took, and its logs (`<stem>.{stdout,stderr}.log`).
+/// Test-runner counts are not parsed.
+pub(crate) fn check_line(check: &crate::CheckResult) -> String {
+    let stdout = check.stdout_path.display().to_string();
+    let logs = stdout.strip_suffix(".stdout.log").map_or_else(
+        || stdout.clone(),
+        |stem| format!("{stem}.{{stdout,stderr}}.log"),
+    );
+    format!(
+        "  {:<9} exit {:<4} {:>7}  {}  logs: {logs}",
+        match check.status {
+            CheckStatus::Passed => "PASS",
+            CheckStatus::Failed => "FAIL",
+            CheckStatus::TimedOut => "TIMED OUT",
+            CheckStatus::NotRun => "NOT RUN",
+        },
+        check
+            .exit_code
+            .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+        format_duration(check.duration_ms),
+        one_line(&check.command, 120),
+    )
 }
 
 fn print_diff_stats(candidate: &CandidateRecord) {

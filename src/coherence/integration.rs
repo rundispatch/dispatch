@@ -14,15 +14,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use ulid::Ulid;
 
 use super::{MAX_DETAIL_CHARS, MAX_REASONS, find_candidate, patch_is_empty, run_config};
 use crate::{
     AnalysisLevel, CheckPhase, CheckResult, CheckStatus, Decision, Reason, ReasonCode, RunMode,
-    RunRecord, Validity,
+    RunRecord, SourceKind, Validity,
     config::{AcceptMode, Config},
     executor::run_checks_with_config,
-    source::{apply_patch_in_workspace, create_scratch_tree, fingerprint_tree},
+    source::{
+        apply_patch_in_workspace, checked_output, create_scratch_tree, fingerprint_tree,
+        git_command, inspect_source,
+    },
 };
 
 /// Why accept does not run `checks.verify` on the merged tree.
@@ -115,26 +119,116 @@ pub fn checks_skipped(
 }
 
 /// What became of the checks on the merged tree at accept.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum MergedChecks {
     Skipped(ChecksSkipped),
-    /// They ran and passed; their logs are in this directory.
-    Passed(PathBuf),
-    /// They ran and did not all pass, or could not run: the verdict's
-    /// reasons name the command and its logs.
-    Failed,
+    /// They ran and passed.
+    Passed(MergedRun),
+    /// They ran and did not all pass, or could not run (`None`): the
+    /// verdict's reasons name the command and its logs.
+    Failed(Option<MergedRun>),
+}
+
+impl MergedChecks {
+    /// The run, when the checks ran.
+    pub fn ran(&self) -> Option<&MergedRun> {
+        match self {
+            Self::Passed(ran) | Self::Failed(Some(ran)) => Some(ran),
+            Self::Skipped(_) | Self::Failed(None) => None,
+        }
+    }
 }
 
 impl fmt::Display for MergedChecks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Skipped(why) => write!(f, "not run — {why}"),
-            Self::Passed(logs) => write!(
+            Self::Passed(ran) => write!(
                 f,
                 "passed on the current source with this patch; logs: {}",
-                logs.display()
+                ran.logs.display()
             ),
-            Self::Failed => f.write_str("did not pass"),
+            Self::Failed(_) => f.write_str("did not pass"),
+        }
+    }
+}
+
+/// One run of `checks.verify` on a merged tree: the source state it was
+/// built from, each command's result, and the directory with their logs.
+#[derive(Debug, Clone)]
+pub struct MergedRun {
+    pub source: SourceState,
+    pub logs: PathBuf,
+    pub results: Vec<CheckResult>,
+}
+
+impl MergedRun {
+    pub fn passed(&self) -> bool {
+        self.results
+            .iter()
+            .all(|result| result.status == CheckStatus::Passed)
+    }
+
+    /// What the merged-check event records, for accept and `check --merged`
+    /// (`by`): the source state, the Δ digest, and each command's result
+    /// with its duration. Test-runner counts are not parsed.
+    pub fn event_payload(&self, by: &str, delta_digest: &str) -> serde_json::Value {
+        serde_json::json!({
+            "by": by,
+            "source": self.source,
+            "delta_digest": delta_digest,
+            "passed": self.passed(),
+            "duration_ms": self.results.iter().map(|result| result.duration_ms).sum::<u64>(),
+            "results": self.results,
+            "logs": self.logs,
+        })
+    }
+}
+
+/// The source a merged tree was built from: a Git checkout's HEAD (`None`
+/// before its first commit) and whether its files differ from it, or a plain
+/// directory, which has no version to name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceState {
+    Git { head: Option<String>, dirty: bool },
+    PlainDirectory,
+}
+
+impl SourceState {
+    pub fn observe(source: &Path, kind: &SourceKind) -> Result<Self> {
+        if matches!(kind, SourceKind::Directory) {
+            return Ok(Self::PlainDirectory);
+        }
+        let (_, head) = inspect_source(source)?;
+        let mut status = git_command(source);
+        status.args(["status", "--porcelain", "--untracked-files=normal"]);
+        let status = checked_output(status, "failed to read the source's Git status")?;
+        Ok(Self::Git {
+            head,
+            dirty: !status.stdout.is_empty(),
+        })
+    }
+}
+
+impl fmt::Display for SourceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Git { head: None, .. } => f.write_str("Git, no commit yet"),
+            Self::Git {
+                head: Some(head),
+                dirty,
+            } => write!(
+                f,
+                "Git HEAD {}{}",
+                &head[..head.len().min(12)],
+                if *dirty {
+                    " with uncommitted changes"
+                } else {
+                    ""
+                }
+            ),
+            Self::PlainDirectory => f.write_str("plain directory"),
         }
     }
 }
@@ -177,30 +271,28 @@ pub async fn verify_integration(
     let config = run_config(run_dir).context("the run's frozen configuration cannot be read")?;
     let patch = find_candidate(run, candidate_label)?.diff_path.clone();
 
-    let id = Ulid::new().to_string();
-    let output_dir = run_dir.join("coherence-checks").join(&id);
-    let new_reasons = match run_checks(run, &patch, &config, run_dir, &id, &output_dir).await {
-        Ok(results) => match results
-            .iter()
-            .find(|result| result.status != CheckStatus::Passed)
-        {
-            None => {
-                let validity = Validity {
-                    analysis: AnalysisLevel::Integration,
-                    ..validity
-                };
-                return Ok((validity, MergedChecks::Passed(output_dir)));
-            }
-            Some(_) => failure_reasons(&results),
-        },
-        Err(error) => vec![Reason {
-            code: ReasonCode::AnalysisUncertain,
-            fact_id: None,
-            path: None,
-            detail: cap(format!(
-                "{COULD_NOT_RUN}: {error:#}; set coherence.integration_checks: false to skip"
-            )),
-        }],
+    let (new_reasons, ran) = match run_merged(run, &patch, &config, run_dir, &new_logs(run_dir))
+        .await
+    {
+        Ok(ran) if ran.passed() => {
+            let validity = Validity {
+                analysis: AnalysisLevel::Integration,
+                ..validity
+            };
+            return Ok((validity, MergedChecks::Passed(ran)));
+        }
+        Ok(ran) => (failure_reasons(&ran.results), Some(ran)),
+        Err(error) => (
+            vec![Reason {
+                code: ReasonCode::AnalysisUncertain,
+                fact_id: None,
+                path: None,
+                detail: cap(format!(
+                    "{COULD_NOT_RUN}: {error:#}; set coherence.integration_checks: false to skip"
+                )),
+            }],
+            None,
+        ),
     };
     let mut reasons = validity.reasons;
     reasons.extend(new_reasons);
@@ -210,38 +302,54 @@ pub async fn verify_integration(
         reasons,
         ..validity
     };
-    Ok((validity, MergedChecks::Failed))
+    Ok((validity, MergedChecks::Failed(ran)))
 }
 
-/// Build the merged tree in a scratch area and run the verify commands there.
-async fn run_checks(
+/// A new directory under `run_dir` for one merged-check run's logs.
+pub fn new_logs(run_dir: &Path) -> PathBuf {
+    run_dir
+        .join("coherence-checks")
+        .join(Ulid::new().to_string())
+}
+
+/// Build the merged tree (the current source with `patch`) in a scratch area
+/// and run `config`'s verify commands there, keeping their logs in `logs`.
+/// The one merged-check runner: accept's gate and `dispatch check --merged`.
+pub async fn run_merged(
     run: &RunRecord,
     patch: &Path,
     config: &Config,
     run_dir: &Path,
-    id: &str,
-    output_dir: &Path,
-) -> Result<Vec<CheckResult>> {
+    logs: &Path,
+) -> Result<MergedRun> {
+    let id = logs
+        .file_name()
+        .context("merged-check logs need a directory name")?
+        .to_string_lossy();
     let scratch = Scratch(run_dir.join(format!("coherence-scratch-{id}")));
+    let source = SourceState::observe(&run.source_path, &run.source_kind)?;
     // The current source minus ignored build output, as a plain directory;
     // `git apply` does not need a repository.
     create_scratch_tree(&run.source_path, &run.source_kind, &scratch.0)
         .context("failed to copy the current source")?;
     apply_patch_in_workspace(&scratch.0, patch)?;
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    fs::create_dir_all(logs).with_context(|| format!("failed to create {}", logs.display()))?;
     let results = run_checks_with_config(
         &scratch.0,
         &config.checks.verify,
         CheckPhase::Verify,
-        output_dir,
+        logs,
         config.execution.clone(),
     )
     .await;
     if results.len() != config.checks.verify.len() {
         bail!("verification checks did not all report a result");
     }
-    Ok(results)
+    Ok(MergedRun {
+        source,
+        logs: logs.to_owned(),
+        results,
+    })
 }
 
 /// One bounded reason per check that did not pass.
