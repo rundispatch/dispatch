@@ -100,6 +100,7 @@ pub struct HarnessesConfig {
     pub claude: HarnessConfig,
     pub codex: HarnessConfig,
     pub cursor: HarnessConfig,
+    pub hermes: HarnessConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -108,6 +109,7 @@ pub struct HarnessConfig {
     #[serde(skip)]
     pub read_only: bool,
     pub model: Option<String>,
+    pub provider: Option<String>,
     pub effort: Option<String>,
     pub executable: Option<PathBuf>,
     pub extra_args: Vec<String>,
@@ -129,6 +131,7 @@ impl HarnessesConfig {
         match harness {
             "claude" => &self.claude,
             "cursor" => &self.cursor,
+            "hermes" => &self.hermes,
             _ => &self.codex,
         }
     }
@@ -206,17 +209,22 @@ impl Config {
             ("claude", &self.harnesses.claude),
             ("codex", &self.harnesses.codex),
             ("cursor", &self.harnesses.cursor),
+            ("hermes", &self.harnesses.hermes),
         ] {
             validate_model(harness.model.as_deref())
                 .with_context(|| format!("invalid harnesses.{name}.model"))?;
             validate_effort(harness.effort.as_deref())
                 .with_context(|| format!("invalid harnesses.{name}.effort"))?;
+            if name == "hermes" {
+                validate_model(harness.provider.as_deref())
+                    .context("invalid harnesses.hermes.provider")?;
+            }
         }
         Ok(())
     }
 
     pub fn example_yaml() -> &'static str {
-        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    effort: null\n    extra_args: []\n  codex:\n    model: null\n    effort: null\n    extra_args: []\n  cursor:\n    model: null\n    effort: null\n    extra_args: []\n"
+        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    effort: null\n    extra_args: []\n  codex:\n    model: null\n    effort: null\n    extra_args: []\n  cursor:\n    model: null\n    effort: null\n    extra_args: []\n  hermes:\n    model: null\n    provider: null\n    extra_args: []\n"
     }
 }
 

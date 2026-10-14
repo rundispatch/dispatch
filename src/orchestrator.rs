@@ -228,6 +228,7 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
         ("Claude Code", "claude"),
         ("Codex", "codex"),
         ("Cursor", "cursor"),
+        ("Hermes", "hermes"),
     ];
     let mut ready = 0usize;
     for (label, harness_id) in harnesses {
@@ -239,6 +240,7 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
                 "claude" => config.harnesses.claude.executable.is_some(),
                 "codex" => config.harnesses.codex.executable.is_some(),
                 "cursor" => config.harnesses.cursor.executable.is_some(),
+                "hermes" => config.harnesses.hermes.executable.is_some(),
                 _ => false,
             };
             match detection.executable {
@@ -428,6 +430,7 @@ fn harness_name(id: &str) -> &str {
         "claude" => "Claude Code",
         "codex" => "Codex",
         "cursor" => "Cursor",
+        "hermes" => "Hermes",
         _ => id,
     }
 }
@@ -481,7 +484,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         resources.allocation_enabled || request.model.is_some() || request.effort.is_some();
     anyhow::ensure!(
         allocation_requested || request.agent.is_some(),
-        "no coding agent is set up for Dispatch to launch: run `dispatch setup`, or pass --agent claude|codex|cursor. To protect work you run yourself, use `dispatch attach` (no setup needed)."
+        "no coding agent is set up for Dispatch to launch: run `dispatch setup`, or pass --agent claude|codex|cursor|hermes. To protect work you run yourself, use `dispatch attach` (no setup needed)."
     );
     let fixed_harness = request.agent.clone();
     let mut local_authorized = request.allow_unsafe_local;

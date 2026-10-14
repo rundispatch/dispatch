@@ -905,9 +905,9 @@ fn finish_run(
 /// but not advertised; they make the complete workflow testable offline.
 fn agent_id(value: &str) -> std::result::Result<String, String> {
     match value {
-        "claude" | "codex" | "cursor" => Ok(value.to_owned()),
+        "claude" | "codex" | "cursor" | "hermes" => Ok(value.to_owned()),
         fake if fake.starts_with("fake-") => Ok(fake.to_owned()),
-        _ => Err("possible values: claude, codex, cursor".into()),
+        _ => Err("possible values: claude, codex, cursor, hermes".into()),
     }
 }
 
