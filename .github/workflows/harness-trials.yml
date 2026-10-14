@@ -1,0 +1,136 @@
+name: Harness trials
+
+# Real agents through every path Dispatch offers them, one cell per harness and
+# path, with scripts/harness-trial.sh in the harness image. Never on pull
+# requests. Credentials come only from the protected harness-trials environment;
+# a cell without them reports "skipped". Only the fixture reaches the model
+# providers, sent by the agents themselves; Dispatch uploads nothing.
+on:
+  schedule:
+    - cron: "27 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      harnesses:
+        description: Harnesses to run (claude codex cursor hermes)
+        required: false
+        default: claude codex cursor hermes
+        type: string
+      paths:
+        description: Paths to run (attach native worktree)
+        required: false
+        default: attach native worktree
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cells:
+    runs-on: ubuntu-22.04
+    outputs:
+      harnesses: ${{ steps.pick.outputs.harnesses }}
+      paths: ${{ steps.pick.outputs.paths }}
+    steps:
+      - id: pick
+        env:
+          TRIAL_HARNESSES: ${{ inputs.harnesses || 'claude codex cursor hermes' }}
+          TRIAL_PATHS: ${{ inputs.paths || 'attach native worktree' }}
+        run: |
+          # Spaces or commas; each name must be one the runner accepts.
+          pick() {
+            allowed="$1" names="$(printf '%s' "$2" | tr ',' ' ')"
+            [ -n "${names// /}" ] || { echo "no names given" >&2; exit 1; }
+            for name in $names; do
+              case " $allowed " in *" $name "*) ;; *) echo "unknown: $name (one of: $allowed)" >&2; exit 1 ;; esac
+            done
+            # shellcheck disable=SC2086 # split the names into jq arguments
+            jq -nc '$ARGS.positional' --args $names
+          }
+          harnesses="$(pick "claude codex cursor hermes" "$TRIAL_HARNESSES")"
+          paths="$(pick "attach native worktree" "$TRIAL_PATHS")"
+          echo "harnesses=$harnesses" >> "$GITHUB_OUTPUT"
+          echo "paths=$paths" >> "$GITHUB_OUTPUT"
+
+  trial:
+    name: ${{ matrix.harness }} ${{ matrix.path }}
+    needs: cells
+    runs-on: ubuntu-22.04
+    environment: harness-trials
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: ${{ fromJSON(needs.cells.outputs.harnesses) }}
+        path: ${{ fromJSON(needs.cells.outputs.paths) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache Cargo (Linux test image)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-target
+            ${{ runner.temp }}/cargo-registry
+          key: cargo-ubuntu-22.04-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-ubuntu-22.04-
+
+      - name: Build Dispatch and the harness image
+        env:
+          DISPATCH_DOCKER_TARGET_DIR: ${{ runner.temp }}/cargo-target
+          DISPATCH_DOCKER_CARGO_REGISTRY: ${{ runner.temp }}/cargo-registry
+        run: |
+          mkdir -p "$DISPATCH_DOCKER_TARGET_DIR" "$DISPATCH_DOCKER_CARGO_REGISTRY"
+          scripts/test-in-docker.sh cargo build --release --locked
+          docker build -q -t dispatch-harness -f ci/harness.Dockerfile ci
+
+      - name: Run the trial
+        shell: bash
+        env:
+          HARNESS: ${{ matrix.harness }}
+          TRIAL_PATH: ${{ matrix.path }}
+          DISPATCH_BIN: ${{ runner.temp }}/cargo-target/release/dispatch
+          TRIAL_OUT: ${{ runner.temp }}/harness-trials
+          TRIAL_TIMEOUT_SECS: "600"
+          # Each cell sees only its own harness's credentials.
+          ANTHROPIC_API_KEY: ${{ matrix.harness == 'claude' && secrets.ANTHROPIC_API_KEY || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ matrix.harness == 'claude' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          OPENAI_API_KEY: ${{ matrix.harness == 'codex' && secrets.OPENAI_API_KEY || '' }}
+          CURSOR_API_KEY: ${{ matrix.harness == 'cursor' && secrets.CURSOR_API_KEY || '' }}
+          OPENROUTER_API_KEY: ${{ matrix.harness == 'hermes' && secrets.OPENROUTER_API_KEY || '' }}
+        run: |
+          mkdir -p "$TRIAL_OUT"
+          # An unset secret is an empty variable; pass only the ones that are
+          # set, so the runner itself reports "skipped: no credentials".
+          creds=()
+          for name in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY CURSOR_API_KEY OPENROUTER_API_KEY; do
+            if [ -n "${!name}" ]; then creds+=(-e "$name"); fi
+          done
+          status=0
+          docker run --rm \
+            -v "$PWD:/src:ro" -v "$DISPATCH_BIN:/opt/dispatch/dispatch:ro" -v "$TRIAL_OUT:/trials" \
+            -e DISPATCH_BIN=/opt/dispatch/dispatch -e TRIAL_OUT=/trials -e TRIAL_TIMEOUT_SECS \
+            "${creds[@]}" -w /src \
+            dispatch-harness scripts/harness-trial.sh "$HARNESS" "$TRIAL_PATH" \
+            > "$RUNNER_TEMP/summary.txt" || status=$?
+          cat "$RUNNER_TEMP/summary.txt"
+          case "$status" in
+            0) outcome=pass ;; 1) outcome=fail ;; 2) outcome="not offered" ;; 3) outcome=skipped ;;
+            *) outcome="error (exit $status)" ;;
+          esac
+          {
+            echo "### $HARNESS $TRIAL_PATH: $outcome"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/summary.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Not offered and skipped are outcomes, not failures of the job.
+          case "$status" in 0|2|3) ;; *) exit "$status" ;; esac
+
+      - name: Upload the record and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trial-${{ matrix.harness }}-${{ matrix.path }}
+          path: ${{ runner.temp }}/harness-trials/${{ matrix.harness }}-${{ matrix.path }}/
+          if-no-files-found: warn
