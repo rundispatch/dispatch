@@ -248,3 +248,45 @@ themselves; parallel Opus sessions reach the limit sooner.
 - `ddd90ba` test: a 0.4.12 test asserted a hook reply contains no "S0", but the
   reply names a random Work ID (fails about 1 run in 70).
 | P1 discovery | register a worktree that appeared after watching began even when its `claude session` lock names a dead process (a `claude -p` run between ticks), with its session recorded already ended; keep tracking a worktree whose hook registration timed out; the 3 s grace accepted | 674/0/5 | first run on `8d651e9` (P3 + P4 + fix): 688 passed, **1 failed** (`watch_acceptance` `states-live`: the fixture's own `git commit` exited 128, the `index.lock` race fixed in `8cde666`), the scenario alone 4/4; final run on `5aa8633`: 700/0/5 | all passed | `d6a9766` | CONTINUE (symbols, 17 files underneath); merged checks passed | `52a149a` |
+
+### Real-agent trial, no hooks (2026-10-13)
+
+`~/dispatch-dev/trial-0413/`: a fresh Git project with a check, **no Dispatch
+hooks for this state** (the user-wide hooks report to `~/.dispatch`, which does
+not watch it), Claude Code 2.1.296, the candidate built from the clone.
+
+- `claude -p --worktree pre` before `dispatch start`: listed in the inventory
+  with its stale lock, never registered; `watch --json` carries it in
+  `inventory` with `dispatch attach --workspace …`, plain `watch` prints
+  "found, not tracked".
+- `claude -p --worktree quick` after the start: discovered while it ran
+  (observed session `lock:quick@<pid>`, "Files changed 1 now", "Tracked for
+  18s", start observation "the same as its S0"). **Defect:** it exited before
+  liveness first looked, nothing had recorded its process, and the session
+  stayed open with the lock naming a dead pid. Fixed in `6e2a27f`: discovery
+  records the running session's process as the Work's agent; a regression test
+  fails without it.
+- Interactive `claude --worktree live` on the fixed candidate: discovered
+  within seconds; `agent running (pid …)`; "Files changed 0 now", then "1 now"
+  after a one-line edit; after `/exit` (keep): `idle`, session `ended`, "session
+  ended — finish …, or resume it; or close it …", one `runtime.agent_gone` and
+  one `runtime.session_ended`. No hooks involved.
+
+**Fix from the trial:** `6e2a27f` (integrator): discovery records a running
+session's process as the Work's agent, so liveness sees its end however soon
+it comes; `tests/discovery.rs` gains a test that fails without it.
+
+| R docs | one sentence on the trial's finding, in the release notes and `attach.md` | 700/0/5 | 701/0/5 on `6e2a27f` | all passed | `64493ce` | CONTINUE; merged checks passed | `af447fa` |
+
+### Final release validation (integrator)
+
+On a fresh `git archive` of `af447fa` with its own `CARGO_TARGET_DIR`: fmt and
+clippy pass; `cargo test --locked` 701 passed, 0 failed, 5 ignored (44 test
+binaries); the release build reports `dispatch 0.4.13`. Against that binary,
+0.4.12's P0 script still holds (R1 ambiguity refused, R2 stale, R3's three
+merged-check lines, R4 not offered for removal, R5 close). A state made by the
+pinned 0.4.12 (runtime Work closed with `close --reason workspace-removed`, a
+pending result, an applied one, a rejected one with a feedback reason, a result
+closed with `--reason already-present`) reads back under 0.4.13 with outcomes,
+schema, feedback rows, event counts and `history` identical. The no-hooks
+real-agent trial passed on the candidate (above).
