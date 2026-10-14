@@ -67,9 +67,29 @@ code and is not proof of task-specific correctness. No script or tool is install
 Use `/checks` or `dispatch setup --checks` to do this independently. Advanced
 `checks.verify` configuration remains supported.
 
+**The first `dispatch start`** in a project without checks:
+- On a terminal, it shows the checks Dispatch detected, with "Continue without
+  checks" focused. Enter alone starts watching and writes nothing; "Save these
+  checks" (↑, Enter) writes them to `dispatch.yml` first. Esc starts nothing.
+- Without a terminal (a script, CI, an agent's shell), it starts watching at once
+  and says that no checks are configured.
+
+Either way nothing of the project runs, and Work is not allowed to run checks by
+itself.
+
+**Saving checks without a terminal.** `dispatch setup --checks --verify 'cargo test'
+--verify 'cargo clippy -- -D warnings'` writes exactly those commands, in that order,
+to `checks.verify`, and keeps the rest of `dispatch.yml`. It never lets Work run them
+by itself; that needs `dispatch setup --checks` in a terminal, or
+`--allow-unsafe-local` on a single `finish`. On a terminal, `--verify` pre-fills the
+same menu.
+
 `dispatch setup --checks` can also let Work in the project run its checks by
-themselves: Work that a runtime reports then has them run when its worktree is
-removed, and accept runs them on the merged tree.
+themselves: Work that a runtime reports, or that Dispatch finds, then has them run
+when its worktree is removed, and accept runs them on the merged tree.
+- Checks run project code, including code an agent wrote, on your machine with
+  your permissions, not in a sandbox. They run in the Work's workspace and, at
+  accept, in the merged scratch tree.
 - The screen shows the exact commands, and focus starts on Cancel.
 - The permission lives in Dispatch's state, never in the repository, and names
   those exact commands. If `checks.verify` changes, it no longer holds until you
@@ -370,7 +390,9 @@ one row per Work. Work is named by its worktree folder, else its task, else its
 short ID. Work that needs you (a question, ready, blocked, a removed or lost
 worktree) comes first, then Work in progress, then Work that is done, which
 shows `–` as its verdict. Below the table, the selected Work's details: how it
-came to be listed, its verdict and reasons (or how it landed), its checks, the
+came to be listed, its progress while it is in progress (`files: 3 changed ·
+tracked for 12m · agent running (pid 4242)`), its verdict and reasons (or how
+it landed), its checks, the
 Work it touches, what it began against (a Dispatch snapshot is called that, not
 a commit), and the next thing to do. Below 90 columns each Work is a two-line
 card. The selection follows the Work, not the row: if the selected Work leaves
@@ -401,17 +423,60 @@ the verdict: it blocks nothing, and once one piece lands the other is judged
 against the project as before. **`dispatch stop`** ends watching. `dispatch serve` is
 the same owner in the foreground, with the view.
 
+**Work in progress shows what it changes now.** While a project is watched,
+`dispatch watch` and `dispatch status` show how many files attached Work has
+changed so far, as the project owner last counted them (`files: 3 changed`), and
+how long Dispatch has tracked it (`tracked for 12m`). Until the owner has looked,
+and whenever nothing watches the project, the count reads `files: unknown`, never
+0. Runtime is shown as `unknown` until the Work is finished. A finished result
+keeps the numbers recorded when it was delivered.
+
 Watching needs no agent profile. It covers:
 - the Work Dispatch launched;
 - the Work you attached;
-- sessions a runtime reports.
+- sessions a runtime reports;
+- Claude Code worktrees it finds by itself (below).
 
 It never scans for agent processes. Wrapped attach and the TUI need no owner at
 all.
 
-**Work that appears by itself.** `dispatch setup` → **Runtime integrations…** installs
+**Work that appears without hooks.** While a project is watched, Dispatch looks
+at its Git worktrees on every tick (`git worktree list`; it never walks your
+directories). A worktree Claude Code made under `.claude/worktrees/` that appears
+after watching began, and is locked by a `claude session`, becomes Work by
+itself, for `claude --worktree` and `claude -p --worktree` alike. When that
+session already ended before Dispatch looked (a short `claude -p --worktree`
+run), the Work shows its session ended. Its starting state (S0) is the worktree's
+merge base with the project, with full confidence, because everything in a
+worktree that appeared while you watched is its session's. `watch` shows it as
+`S0 merge-base 1a2b3c4d (full; found by Dispatch)`. If you have the hooks
+installed too, whichever sees the worktree first creates the Work and the other
+joins it. There is only ever one Work per worktree.
+
+**Found, not tracked.** Claude worktrees that were already there when you ran
+`dispatch start`, and new ones without a `claude session` lock (a subagent or
+background worktree, or one with no lock), are not turned into Work, because
+Dispatch cannot know what they held before. `dispatch watch` lists them under the
+Work, `dispatch status` in a "Found, not tracked" section, and `dispatch watch
+--json` in the `inventory` field of the `watcher` record, each with the command
+that attaches it: `dispatch attach --workspace <path>`. Worktrees you made
+yourself (`git worktree add`) are never listed. The list belongs to the watch: it
+survives the owner being restarted after a crash, and `dispatch stop` clears it.
+
+**Agent running.** Claude Code locks a worktree it made with the process ID of
+its session. While that exact process runs, the Work shows `agent running (pid
+N)`; a reused pid never counts. When the process is gone, or the lock is
+released, Dispatch records the end of the session, `claude -p` included. The
+Work then reads `idle`, with "session ended — finish, resume or close". It is
+never finished, applied or closed by this. A process Dispatch never saw running
+proves nothing, and nothing is recorded. Other agents' worktrees are not
+recognized: `dispatch attach -- <agent>` gives any agent a workspace of its own.
+
+**Work that appears with hooks.** `dispatch setup` → **Runtime integrations…** installs
 Claude Code's hooks into `~/.claude/settings.json`: `SessionStart`, `SessionEnd`,
-`WorktreeRemove`, and `PreToolUse` for the `ExitWorktree` tool only.
+`WorktreeRemove`, and `PreToolUse` for the `ExitWorktree` tool only. Discovery
+needs none of them; they add an S0 taken before the session's first edit, and the
+exact changes kept when Claude Code removes a worktree.
 - **Consent:** the screen shows exactly what is added, and focus starts on Cancel.
   A backup of the previous settings is kept, and **Remove** takes out exactly what
   was added. These hooks observe; they involve no account, model or funding.

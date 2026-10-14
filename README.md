@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.12 — experimental developer preview**
+**Dispatch 0.4.13 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -73,12 +73,37 @@ for any of this.
 $ dispatch start
 ✓ Watching ~/src/project
   Dispatch is running in the background. See it: dispatch watch · Stop: dispatch stop
+  No checks are configured, so Work here is not verified. Add them: dispatch setup --checks, or dispatch setup --checks --verify '<command>'
 ```
 
-**Work that appears by itself.** With Claude Code's hooks installed (`dispatch
+The first `dispatch start` on a terminal, in a project without checks, first
+shows the checks it detected, with "Continue without checks" focused, so Enter
+alone writes nothing. Without a terminal it starts watching at once, as above.
+`dispatch setup --checks --verify '<command>'` saves exact commands without a
+terminal. Letting Work run them by itself is never granted without a terminal.
+
+**Work that appears without hooks.** In a watched project, a Claude Code
+worktree that appears after watching began (`claude --worktree` or `claude -p
+--worktree`) becomes Work by itself, with no hooks installed.
+- Dispatch lists the project's Git worktrees on every tick and never walks your
+  directories. A worktree counts when Claude Code made it under
+  `.claude/worktrees/` and a `claude session` holds its lock.
+- S0 is its merge base with the project, with full confidence: everything in a
+  worktree that appeared while you watched is its session's.
+- While the session's process runs, the Work shows `agent running`. When it is
+  gone, or its lock is released, the Work says the session ended, `claude -p`
+  included. Dispatch records only what it observed, and finishes nothing.
+- Claude worktrees that were already there when watching began, or that have no
+  session lock, are listed as "found, not tracked", with `dispatch attach
+  --workspace <path>`.
+- Other agents' worktrees are not recognized: `dispatch attach -- <agent>`
+  gives any agent its own workspace.
+
+**Work that appears with hooks.** With Claude Code's hooks installed (`dispatch
 setup` → Runtime integrations, shown and approved first), a Claude Code session
 in its own worktree of a watched project (`claude --worktree`) becomes Work by
-itself.
+itself the moment it starts. Whichever sees a worktree first, hook or discovery,
+creates its Work, and the other joins it.
 - S0 is the worktree as the session found it, before its first edit.
 - Later sessions in the same worktree join the same Work.
 - When Claude Code removes the worktree, Dispatch first keeps its exact
@@ -102,7 +127,8 @@ itself.
   - **pending:** its starting state is saved, and the watching owner finishes
     creating the Work moments later;
   - **not tracked:** its starting state could not be captured in time, or the
-    worktree kept changing while it was being captured.
+    worktree kept changing while it was being captured. Discovery may still
+    track the worktree when it finds it later.
 
   Work is never left half-created.
 
@@ -132,8 +158,11 @@ interaction was reported. Documented queries in
 your own state directory. Nothing leaves your machine. "Invalidated" there
 means Dispatch's own later verdict, not a confirmed conflict.
 
-Watching covers Work Dispatch launched, that you attached, and sessions whose
-runtime reports them. It does not scan for agent processes. After a reboot, run
+Watching covers Work Dispatch launched, that you attached, sessions whose
+runtime reports them, and Claude Code worktrees it finds. Working Work shows
+the files it has changed so far and how long it has been tracked; until the
+owner has counted, files read `unknown`, never 0. It does not scan for agent
+processes. After a reboot, run
 `dispatch start` again. `dispatch serve` does the same watching in the
 foreground, and `check` and `status` answer on demand.
 
@@ -283,6 +312,7 @@ and preserve your goal. You can also configure resources first:
 ```bash
 dispatch setup                 # provider login guidance and explicit funding consent
 dispatch setup --checks        # approve a known project check
+dispatch setup --checks --verify 'cargo test'   # or save an exact one, no terminal needed; grants nothing
 dispatch                      # direct goal → work → verification → review
 ```
 
@@ -394,7 +424,7 @@ The local backend is the supported real-agent path in this candidate. Docker exe
 ## Core commands
 
 ```text
-dispatch setup [codex|claude | --checks]
+dispatch setup [codex|claude | --checks [--verify command]...]
 dispatch resources
 dispatch run "<task>" [--source path] [--agent claude|codex|cursor]
 dispatch run "<task>" --json|--jsonl
@@ -568,7 +598,7 @@ No network service is required to create, execute, inspect, accept, or reject a 
 - Experimental developer preview, not a stable 1.0 service.
 - Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent remains available as an explicit `--agent cursor` choice without a funding contract. Agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current and applies only attached work you allowed to integrate; it never launches, refreshes or discovers agents.
+- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current and applies only attached work you allowed to integrate; it never launches, refreshes, finishes on a session's end or signals agents. It recognizes only Claude Code's worktrees by itself, and scans no processes.
 
 ## Development
 

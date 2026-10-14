@@ -95,6 +95,7 @@ every fact compares S0 against the world now, and Δ is workspace minus S0.
 | Attach form | S0 | Δ | Provenance / confidence |
 |---|---|---|---|
 | Git worktree, wrapped or foreign | the tree of `merge_base(root HEAD, workspace HEAD)`, exported and turned into a private baseline repository under `runs/<id>/baseline` | everything in the workspace that differs from S0 (committed and uncommitted, untracked included, ignore rules honored) | `BaselineProvenance::GitMergeBase { commit }`, **`AttachConfidence::Full`**: edits made before attach are in Δ because S0 is a real commit |
+| Claude Code worktree the owner found, which appeared while the project was watched (see "Work that appears without hooks") | the tree of the worktree's merge base with the root, materialized the same way | as above | `BaselineProvenance::Discovered { commit }`, **`AttachConfidence::Full`**: the worktree did not exist when watching began, so everything in it is its session's |
 | Git worktree, no merge base with the root | refused: *"no common history between the workspace and the integration root."* | — | — |
 | Plain directory, wrapped only | a snapshot of the workspace taken at attach (`source::create_snapshot`) | workspace minus that snapshot | `BaselineProvenance::SnapshotAtAttach`, **`AttachConfidence::Partial`**: edits made *before* attach are invisible to Δ, and this is what the record says |
 | Plain directory, foreign | refused: *"a plain directory can be attached only by wrapping the agent command."* | — | — |
@@ -125,8 +126,10 @@ see "Terminal and signals" below), so for wrapped attach the provenance line is 
 printed at attach time; `dispatch explain <id>` shows it afterwards for either form.
 For an attached run, `explain` prints an **Attached work** section instead of a
 selection explanation (there is none): the workspace and root, the S0 line
-(`S0: commit <sha> (merge base with the root)` or `S0: snapshot of the workspace at
-attach; earlier edits are not attributed`), `confidence`, `agent`, `owner`, the
+(`S0: commit <sha> (merge base with the root)`, `S0: commit <sha> (merge base with the
+root; found by Dispatch, the worktree appeared while the project was watched)` or
+`S0: snapshot of the workspace at attach; earlier edits are not attributed`),
+`confidence`, `agent`, `owner`, the
 capability flags, and `finished: <reason>` once finished. It is followed by the
 ordinary **Coherence** section when the world moved or the verdict is not `CONTINUE`,
 and by the one-line `Coherence: CONTINUE — world unchanged` verdict otherwise. The
@@ -373,7 +376,9 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
      (next bullet). Then observe the source at the start, once, for runtime-registered
      Work that is still `not_observed` and was published after this owner started (see
      "The source at the start"); each such Work costs one events query per owner
-     lifetime.
+     lifetime. Then list the root's worktrees for discovery, and read the session
+     locks of the runtime-made Work it follows for liveness (see "Work that appears
+     without hooks").
   2. Follow every active attached run whose live owner state is not `Live` (a live
      wrapper is that wrapper's own business). Its signal is a hash of its patch so
      far, taken with the trusted baseline repository into the owner's scratch
@@ -400,7 +405,13 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
      per-source lock every applier uses). After its own successful apply, the owner
      re-observes immediately instead of waiting for the next tick — the apply is its
      own doorbell.
-  6. In the foreground, render the project view (below) every tick, because a run
+  6. Count the files in each followed run's patch so far (the scratch patch of step 2;
+     no new snapshot) and keep the counts in `watchers/<key>.live.json`, rewritten only
+     when they change. `status` and `watch` read them as files changed now. Readers
+     ignore the file unless an owner holds the project and its record names the pid
+     that wrote it, so a count left by a killed owner reads as unknown. The owner
+     removes it when it stops.
+  7. In the foreground, render the project view (below) every tick, because a run
      attached, finished or applied by *another* process changes the view without any
      verdict or apply of the owner's own.
 
@@ -430,7 +441,19 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
 
     `--json`, `--plain` and output that is not a terminal stay passive.
   - `--json` adds a `{"type":"watcher", "watcher"}` object whenever the header
-    changes.
+    changes. When worktrees are found, not tracked, it also carries `inventory`:
+    `[{path, first_seen, base?, lock?, attach}]`, re-emitted when the list changes.
+  - **Work in progress** (`working` or `idle`) has a Progress detail on a terminal:
+    `files: 3 changed · tracked for 12m · agent running (pid 4242)`. Files read
+    `unknown` before the owner has counted them, or when no owner watches the
+    project, and `none changed yet` for a count of zero. The tracked time is from the
+    attachment's start. "Agent running" appears only
+    while the recorded agent process is alive with the same start (`ExactLive`).
+    Piped rows and `--json` work records carry no count.
+  - **Found, not tracked.** Worktrees discovery lists (see "Work that appears without
+    hooks") are shown under the Work, one line each with `dispatch attach --workspace
+    <path>`, also when there is no Work. They are not selectable. Piped, each is a
+    line `found, not tracked · dispatch attach --workspace <path>`.
   - **Interactions between Work.** Each tick the owner also compares every piece
     of Work not yet integrated. How is in
     [coherence.md](coherence.md#work-against-work-interactions-interactionsrs).
@@ -448,7 +471,12 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
     - The owner keeps its view in `watchers/<key>.interactions.json`, written
       atomically and removed when it exits. Readers ignore it unless an owner
       holds the project.
-  - `dispatch status` ends with the same line (`Project: …`).
+  - `dispatch status` ends with the same line (`Project: …`), followed by a "Found, not
+    tracked" section when there is something to list. For attached Work that is not
+    finished, its Candidate block reads `Runtime unknown`, `Tracked for 12m` and
+    `Files changed <n> now`, or `unknown` as above. There is no Diff line until the
+    Work is finished, and its Workspace section adds `agent running (pid N)` while the
+    agent runs.
 - **Adoption.** An active attached run whose stored `owner_state` is `Live` but whose
   owner process (`attachment.owner`, the wrapper) is now gone (`identity_state`:
   `Gone`/`Reused`) is adopted: `serve` takes over its observation, commits
@@ -470,12 +498,13 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   <project commit>` for native work on a Git source (the working tree as it was at
   that commit), `directory snapshot` for a plain directory, and `merge-base <commit>
   (full)`, `snapshot at attach (partial)` or `workspace at start <commit>` for
-  attached work.
+  attached work, and `merge-base <commit> (full; found by Dispatch)` for Work the owner
+  found without a hook.
 
   The origin is:
   - `native` for work Dispatch ran;
   - `isolated` for work in a workspace Dispatch made;
-  - `discovered` for work a runtime's session registered;
+  - `discovered` for work a runtime's session registered, or that the owner found;
   - `attached` for any other attached work.
 
   The verdict is
@@ -542,6 +571,11 @@ the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
 
 ## Work a runtime registers
 
+A runtime's session in its own worktree becomes Work in a watched project in two
+ways: through Claude Code's hooks, described here, or without any hook, when the
+owner finds the worktree ("Work that appears without hooks", below). Either way
+there is one Work per worktree.
+
 With Claude Code's hooks installed (`dispatch setup` → Runtime integrations), the
 runtime tells Dispatch about its sessions (`dispatch hook claude`, which reads the
 runtime's event on stdin):
@@ -560,13 +594,15 @@ runtime's event on stdin):
     - **pending:** S0 is durable (`registration.json`) but not yet published.
       The watching owner, or the next hook for that worktree, publishes it.
     - **untracked:** S0 was not durable by the deadline, or the worktree kept
-      changing while it was captured. The session is told so, and nothing
-      publishes it afterwards.
+      changing while it was captured. The session is told so, and no hook
+      publishes it afterwards. Discovery may still track the worktree when it
+      finds it later, from its merge base (below).
 
     The owner removes the leftovers of failed registrations once their budget
     has passed, and logs each one. `attach.created` records `registration_ms`
-    and `via` (`hook` or `owner`). The plan with the full rules is
-    `docs/plan-0.4.10.md` §3.
+    and `via` (`hook`, `owner`, or `discovery` for Work found without a hook,
+    whose `registration_ms` is counted from the session's process start). The
+    plan with the full rules is `docs/plan-0.4.10.md` §3.
   - later sessions in that worktree (resume, clear, compact, a fork into it, a
     replayed event) are recorded on the same Work;
   - the watching owner observes the source at the start once, after the Work is
@@ -580,8 +616,9 @@ runtime's event on stdin):
     Dispatch records it on the unfinished Work of that project holding the same
     open session, publishing a pending registration of that session first. An end
     that matches neither changes nothing;
-  - `claude -p` sessions report no end at all, so their Work never says the session
-    ended: finish or close it explicitly;
+  - `claude -p` sessions report no end at all. Their end is recorded only from the
+    worktree's lock ("Liveness from the session lock", below), once the owner has
+    seen the session running. Otherwise finish or close their Work explicitly;
   - a resume into a worktree Dispatch has not seen is partial, since earlier edits
     may predate S0.
 - **A fresh session in the checkout itself** is told that Dispatch cannot tell its
@@ -595,7 +632,7 @@ runtime's event on stdin):
     - It is stored at `<state>/projects/<sha256(root)>.json` and names the root
       and the exact effective `checks.verify` commands. It is never stored in the
       repository, so a repository cannot grant itself host execution.
-    - Work registered while it holds is created with local authority
+    - Work registered or found while it holds is created with local authority
       (`attach.authorized {by: "project consent"}`).
     - When `checks.verify` changes, it no longer holds until the person approves
       the new commands.
@@ -625,6 +662,83 @@ runtime's event on stdin):
     persists, the owner may be stuck: `dispatch stop` ends it, and close then goes
     ahead without those changes. If that last Δ was empty, the Work closes by itself
     with no changes.
+
+### Work that appears without hooks
+
+`orchestrator::discovery`, on every owner tick, with no hook installed:
+- **What is looked at.** `git worktree list --porcelain` for the root. No directory is
+  walked: per worktree, Dispatch reads its `.git` file and the two files Claude Code
+  keeps in `.git/worktrees/<name>/`. A plain-directory root has no worktrees.
+- **What counts as Claude's.** A linked worktree under `<root>/.claude/worktrees/`
+  whose Git directory holds `CLAUDE_BASE`. Recognizing it belongs to the Claude
+  adapter (`runtime::claude::made_by_claude`). Worktrees a person made (`git worktree
+  add`) are never registered, listed or logged. Missing and prunable entries are
+  skipped. Other agents' layouts are not recognized; `dispatch attach -- <agent>` gives
+  any agent a workspace of its own.
+- **The first scan of a watch** puts every Claude worktree without Work into the
+  inventory, `watchers/<key>.inventory.json` (path, first seen, `CLAUDE_BASE`, the lock
+  reason verbatim, and which watch took it). Nothing is registered on that scan: what
+  those worktrees held before is unknown. The inventory survives an owner restarted after
+  a crash and is removed when watching stops (`dispatch stop`, Ctrl+C on `serve`), so the
+  next `dispatch start` takes a new one.
+- **Later scans.** A worktree that appears after the first scan:
+  - locked `claude session <name> (pid <pid> start <time>)` by a process that runs with
+    that start: registered;
+  - locked that way by a process that is gone, as a `claude -p` run between two ticks
+    leaves it: registered, with its session recorded as ended (`end_reason:
+    "process_gone"`), so it reads `idle` at once;
+  - locked that way, but the process's start cannot be read: looked at again next tick;
+  - any other lock, or none (a subagent's or background session's worktree, whose lock
+    has not been observed): listed in the inventory after a 3 s grace, since Claude Code
+    writes `CLAUDE_BASE` a moment before it locks a new worktree. Each is noted once in
+    the owner's log.
+- **Registration** takes the workspace lock without waiting, publishes a hook's pending
+  registration first, and registers nothing if Work exists by then. It uses the hook's
+  assembly and publication path:
+  - S0 is the merge base of the worktree and the root, provenance `Discovered { commit
+    }`, confidence full, owner the runtime;
+  - the one session is `lock:<name>@<pid>`, `source: "discovered"`, started at the
+    lock's start;
+  - `attach.created` records `via: "discovery"`;
+  - authority to run checks comes from the project's check consent, as for a hook.
+
+  `status` and `explain` show it as found by Dispatch. A failed registration is noted
+  once per owner process and retried every tick.
+- **One Work per worktree.** A worktree with Work is neither listed nor registered. A
+  hook's `SessionStart` before or after joins the same Work. A listed worktree that is
+  removed leaves the list, and one made again at that path is new. Work whose worktree
+  Dispatch saw removed leaves the path free once that Work is finished. Work that
+  finished while its worktree stayed keeps it: a later session there is not turned into
+  Work without a hook, since Dispatch could not know where it began.
+- **Removal without hooks.** With no `WorktreeRemove` hook, a worktree Claude Code
+  removes is seen missing by the owner, as in "Workspace removal" above.
+
+### Liveness from the session lock
+
+`orchestrator::liveness`, on every owner tick, for unfinished attached Work whose
+workspace the runtime made (`workspace_owner: runtime`) and is still a Claude worktree:
+- **Running.** When the lock names a process that runs with the lock's start, the owner
+  records its exact identity on the attachment once (`agent_process`,
+  `runtime.agent_running`). `status`, `explain` and `watch` show `agent running (pid N)`.
+  Work discovery registers already carries that process from registration, since
+  discovery has just seen it run, so a `claude -p` session that ends before the next tick
+  still has its end recorded (found in the 0.4.13 real-agent trial).
+- **Gone.** After that, the open sessions are ended as a hook's `SessionEnd` would end
+  them (`runtime.session_ended`), and the identity is cleared (`runtime.agent_gone`):
+  - `process_gone` when the lock still names that pid and the process is gone, or a
+    process with another start now has the pid;
+  - `lock_released` when the lock was removed, or another session's lock replaced it.
+    Sessions that began before the new lock's start are ended; the new process is
+    recorded if it runs.
+
+  The Work then reads `idle`, with "session ended — finish, resume or close".
+- **Nothing else.** A lock never seen running, or a process whose start cannot be read,
+  proves nothing, and nothing is recorded. A session a hook already ended stays as it
+  was, so there is one end. Nothing is finished, applied, closed or signalled. A
+  person's attach (`workspace_owner: user`), with or without `--pid`, is never touched.
+- **Cost.** One `ps` per followed lock per tick, plus one identity lookup when a new
+  process is recorded. The identity is written under the run's lock only when it
+  changes; a busy run is left for the next tick.
 
 ## The gate rule for attached runs
 
@@ -726,6 +840,10 @@ In addition to the existing coherence, application and review events (see
 | `attach.finished` | `finish` (either explicit or on agent exit) freezes Δ | `{"reason": <FinishReason>}` |
 | `attach.adopted` | `serve` takes over observation of an orphaned run | `{"owner_state": "adopted"}` |
 | `attach.authorized` | Work gains local authority: from the project's check consent, or from a person's `finish --allow-unsafe-local` | `{"unsafe_local": true, "by": "project consent" \| "human"}` |
+| `runtime.session_started` | a hook records a new session on existing Work | `{"session": <RuntimeSession>}` |
+| `runtime.session_ended` | a hook's `SessionEnd`, or the owner from the session lock ("Liveness from the session lock") | `{"provider", "session_id", "reason"}`; the owner's reasons are `process_gone` and `lock_released` |
+| `runtime.agent_running` | the owner records the process a session lock names, once it runs | `{"agent_process": <ProcessIdentity>, "previous"}` |
+| `runtime.agent_gone` | the owner clears it, once that process is gone or its lock released | `{"agent_process": null, "previous": <ProcessIdentity>}` |
 | `workspace.removed` | the workspace is gone: kept exactly by the hook, or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes"}` |
 | `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
 | `work.closed` | a person closed Work (`dispatch close`, or `c` in `watch`). Before 0.4.12, a person rejected unfinished Work whose workspace was gone | `{"reason": "unfinished" \| "workspace_removed" \| "already_present" \| "superseded", "by": "human", "world_digest"?, "replacement"?}` |
@@ -832,9 +950,14 @@ directory, exactly as it already refuses any newer schema.
 - `serve` never launches, kills or refreshes anything. It finishes Work only when
   the project's check consent holds and a runtime removed the Work's workspace
   with its exact Δ kept. Otherwise wrapped attach and a human (`dispatch finish`)
-  are the only things that finish a Work.
+  are the only things that finish a Work. A session that ended, by a hook or by its
+  lock, never finishes it.
 - No foreign process is ever signaled. `--pid` and the wrapper's own child PID are
   liveness-only.
+- Discovery recognizes only Claude Code's worktree layout, and liveness reads only a
+  `claude session …` lock. Both were observed with Claude Code 2.1.296 on macOS; the
+  lock of a subagent or background-session worktree, and the format on Linux, were not.
+  There is no process scanning or association by working directory.
 - `mid_run: stop` does not apply to attached work in this version; a `Stop` verdict on
   attached work is recorded, not enforced.
 - One workspace holds exactly one active attached Work; there is no per-process
