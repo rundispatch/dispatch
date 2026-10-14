@@ -134,6 +134,33 @@ The same script runs on the host, in the harness test image and in GitHub
 Actions. A real agent is invoked only when the harness's credentials are
 present; otherwise the cell reads `skipped: no credentials`.
 
+**Interface (fixed in P0, shared by P1 and P5):**
+
+- **Invocation:** `scripts/harness-trial.sh <harness> <path>`.
+  - `<harness>` is one of `claude`, `codex`, `cursor` or `hermes`.
+  - `<path>` is one of `attach`, `native` or `worktree`.
+- **Environment:**
+  - `DISPATCH_BIN` is the Dispatch binary, `dispatch` on `PATH` by default.
+  - `TRIAL_OUT` is the output root, `./harness-trials` by default.
+  - `TRIAL_TIMEOUT_SECS` is the wall-clock limit for each agent invocation,
+    600 by default.
+- **Output:**
+  - `$TRIAL_OUT/<harness>-<path>/record.json` (schema in §3 A) next to the
+    evidence files;
+  - one summary line on stdout.
+- **Exit status:** 0 pass, 1 fail, 2 not offered, 3 skipped (no CLI or no
+  credentials).
+- **Credentials, from the environment only and never written into the
+  record:**
+  - claude: `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (from
+    `claude setup-token`);
+  - codex: `OPENAI_API_KEY`, fed to `codex login --with-api-key` in a fresh
+    `CODEX_HOME`;
+  - cursor: `CURSOR_API_KEY`;
+  - hermes: the provider key its config names (set in P0).
+
+  On a developer machine, an existing login counts as credentials.
+
 ### C. Other harnesses' worktrees (P2, gated by P0's evidence)
 
 - **Recognition where the signals are reliable.** For each harness whose
