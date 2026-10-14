@@ -6,6 +6,9 @@
 
 **Dispatch 0.4.13 — experimental developer preview**
 
+<p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch; once one lands, the other no longer fits, and dispatch accept refuses it as REFRESH, leaving the source unchanged."></a></p>
+<p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
+
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
 runs the agent in an isolated copy of that snapshot, keeps the patch it produced,
