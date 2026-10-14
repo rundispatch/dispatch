@@ -163,6 +163,21 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Release notes and the website
+
+`.github/release-notes.md` becomes the GitHub Release body. End it with one
+line that tells rundispatch.sh whether it can update itself:
+
+- `Site impact: none` when nothing the website documents changes: no command,
+  flag, output line, default, verdict, next step or claim it shows.
+- `Site impact: <what changes>` otherwise, for example
+  `Site impact: STOP now points to dispatch close`.
+
+The website's release sync captures its examples again from the release
+binary. It publishes the update by itself only when those captures are
+unchanged, its checks pass and this line says `none`. Anything else, including
+a missing line, waits for a person to review.
+
 ## Definition of a good change
 
 A good Dispatch patch makes the system more correct, reliable, understandable, efficient, or smaller without needlessly increasing conceptual surface.
