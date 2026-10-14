@@ -31,7 +31,7 @@ moves testing off the developer's Mac:
 |---|---|---|---|---|
 | Claude Code | 2.1.296 | `-p`, `--output-format stream-json` | `--worktree`: `.claude/worktrees/<name>`, `CLAUDE_BASE` marker, lock naming the session's pid and start time | Native adapter; hooks; discovered without hooks (0.4.13) |
 | Codex CLI | 0.155.1 | `codex exec --json` | `codex exec --worktree`, "a new managed Git worktree"; location and markers not yet observed | Native adapter (`exec --ephemeral --sandbox … --json`); attach |
-| Cursor Agent | 2026.09.28 | `-p --output-format stream-json` | `-w/--worktree [name]` at `~/.cursor/worktrees/<repo>/<name>`, outside the project; `--worktree-base <ref>` | Native adapter `cursor`, unchanged since v0.1.0, generic JSONL parsing; wrapped attach trialed in 0.4.6–0.4.9; no native run in any plan log |
+| Cursor Agent | 2026.09.28 (self-updated to 2026.10.14 during P0) | `-p --output-format stream-json` | `-w/--worktree [name]` at `~/.cursor/worktrees/<repo>/<name>`, outside the project; `--worktree-base <ref>` | Native adapter `cursor`, unchanged since v0.1.0, generic JSONL parsing; wrapped attach trialed in 0.4.6–0.4.9; no native run in any plan log |
 | Hermes Agent | 0.18.2 | `-z <prompt>`, `chat -q … -Q`, `--usage-file <path>` | `--worktree`; location and markers not yet observed | No adapter; attach only |
 
 Every harness can already be used through `dispatch attach -- <cli>`, which
@@ -65,18 +65,38 @@ Each was observed while landing 0.4.13 through Dispatch:
   backend (`execution.backend: docker`). The containers in this plan are for
   testing; they add no backend.
 
-### What P0 must answer, per harness
+### What P0 observed (2026-10-14)
 
-- Where the harness's own worktree goes, and what marks it as made by that
-  harness: a file in `.git/worktrees/<name>/`, a lock reason, a branch name or a
-  path.
-- Whether anything names the running process (a lock with pid and start time,
-  or a session file), and what is left when the process exits.
-- The exact non-interactive output: the final message, usage, errors and
-  version. Captured as transcripts for the adapter tests.
-- How it authenticates in a Linux container: API-key environment, a mounted
-  login directory, or a CI token.
-- Whether hooks exist that report session start and end, and their payloads.
+Evidence is in `~/dispatch-dev/p0-0414/runs/<harness>-{worktree,native}/`. For
+each harness, it ran task B once in its own worktree mode while the pinned
+0.4.13 watched, and once as a native run through 0.4.13. `probe-worktree.sh`
+and `probe-native.sh` reproduce them.
+
+| | Claude Code 2.1.296 | Codex 0.155.1 | Cursor Agent 2026.10.14 | Hermes 0.18.2 |
+|---|---|---|---|---|
+| Own worktree | `<project>/.claude/worktrees/<name>`, branch `worktree-<name>` | `exec --enable worktrees --worktree`, a feature flag: `~/.codex/worktrees/<4 hex>/<project dir>`, detached at HEAD | `-p --worktree <name>`: `~/.cursor/worktrees/<project dir>/<name>`, `git worktree add -b <name>` from HEAD | pending: no provider configured |
+| Marker in `.git/worktrees/<id>/` | `CLAUDE_BASE` | `codex-thread.json` (`ownerThreadId`) and `config.worktree` | none | pending |
+| Process signal | lock with pid and start time | none | none; a `worker-server` process outlives the agent | pending |
+| 0.4.13 discovery | Work within 10 s | not seen | not seen | — |
+| Native run via 0.4.13 | completed | completed; usage total right, categories empty, no model in the stream | completed; `cacheReadTokens` dropped, categories empty | no adapter |
+| Hooks | yes | yes (`~/.codex/hooks.json`: `SessionStart`, `Stop`, …), deferred | not checked | yes (`hermes hooks`) |
+| Container credentials | `ANTHROPIC_API_KEY`, or `claude setup-token` | `codex login --with-api-key` | `CURSOR_API_KEY` | provider key |
+
+**Other observations:**
+
+- **Codex default model.** The configured default here (`gpt-6.1-sol`) is
+  refused under a ChatGPT login (`turn.failed`, HTTP 400). The trials pass
+  `-m gpt-6-sol`.
+- **Cursor self-update.** Cursor updated itself in the middle of a run
+  (2026.09.28 to 2026.10.14), so CI images must disable that.
+- **Hermes.** `-z` without a provider exits 1. Its `--usage-file` records
+  `"failed": true` and the message, with null counts.
+- **The test image, on this Mac (linux/aarch64): 697 passed, 4 failed.**
+  - One test needs a `docker` CLI in a trusted path.
+  - Three need permission denials, which root ignores, so the image must run
+    tests as a non-root user.
+
+  This was the first time the suite ran in a Linux container.
 
 ## 3. Contracts
 
