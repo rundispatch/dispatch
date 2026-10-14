@@ -726,6 +726,13 @@ pub enum BaselineProvenance {
     WorkspaceAtStart {
         commit: String,
     },
+    /// Found by the project owner in a worktree a runtime made while the
+    /// project was watched, without a hook (`orchestrator::discovery`): the
+    /// merge base of the worktree and the root. The worktree appeared after
+    /// watching began, so every change in it is its session's.
+    Discovered {
+        commit: String,
+    },
 }
 
 /// `Partial`: edits made before attach are invisible to Δ and the record

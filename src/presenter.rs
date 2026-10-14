@@ -29,6 +29,7 @@ use ratatui::{
 };
 use ratatui_textarea::TextArea;
 pub use setup::standalone as resource_setup;
+pub use setup::start_checks;
 use std::{
     future::Future,
     io::{self, IsTerminal, Write},

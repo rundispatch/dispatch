@@ -7,6 +7,17 @@ pinned Dispatch release. You integrate their work one contribution at a time.
 releases, from 0.4.9, were built with Claude Code's own worktrees and Dispatch's
 hooks, which section 5 keeps as an alternative.
 
+0.4.13 was built the same way with Dispatch 0.4.12, but by four workers *at the
+same time*. Each was an interactive Claude Code session wrapped with `attach --root
+<clone> -- claude` (section 4), in auto mode. Their Work was still reviewed and
+landed one at a time (section 7). Checking each against what had landed already
+caught real integration problems: a test that named every field of a type another
+worker extended, so the merged tree did not compile; a flaky test, whose failure made
+the merged checks refuse an accept; and the owner's `git status` taking Git's
+`index.lock`, so a test's own `git commit` failed under the load of parallel suites.
+With parallel workers, run each worker's full suite once, at hand-off, rather than
+continuously.
+
 The paths are examples. Keep each one outside `/tmp` and outside any build
 directory, and use the same binary and state directory in every command.
 `DISPATCH_HOME` can stand in for `--state-dir`, but the hooks in section 5 name
@@ -182,7 +193,10 @@ hooks turn each session into Work. Such a worktree starts from a commit, never
 from uncommitted changes, so commit each accepted contribution (section 7,
 step 6) before starting the next worker. With a 0.4.12 or later supervisor, a
 worker that still began from older source is reported once, in `status` and
-`watch`.
+`watch`. With a 0.4.13 or later supervisor, a worktree made while the clone is
+watched becomes Work without the hooks, from its merge base with the clone; the
+hooks add an S0 taken at the session's start and the exact changes kept when
+Claude Code removes the worktree.
 
 `dispatch setup` → **Runtime integrations…** installs four Claude Code hooks
 user-wide, in `~/.claude/settings.json`. They point at the binary that ran

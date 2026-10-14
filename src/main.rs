@@ -42,6 +42,11 @@ enum Command {
         /// Choose and explicitly approve project verification commands.
         #[arg(long, conflicts_with = "provider")]
         checks: bool,
+        /// An exact check command, repeatable. Without a terminal they are
+        /// saved to dispatch.yml as given; letting Work run them by
+        /// themselves still needs `dispatch setup --checks` in a terminal.
+        #[arg(long, value_name = "COMMAND", requires = "checks")]
+        verify: Vec<String>,
         #[arg(value_parser = ["codex", "claude"])]
         provider: Option<String>,
     },
@@ -446,11 +451,16 @@ async fn run() -> Result<()> {
             println!("{}", dispatch::setup::status(&state)?);
             Ok(())
         }
-        Command::Setup { provider, checks } => {
+        Command::Setup {
+            provider,
+            checks,
+            verify,
+        } => {
             dispatch::presenter::resource_setup(
                 &state,
                 provider,
                 checks,
+                verify,
                 dispatch::presenter::Options {
                     plain: cli.plain,
                     ascii: cli.ascii,
@@ -639,7 +649,14 @@ async fn run() -> Result<()> {
             json,
             background,
         } => orchestrator::serve::serve(&state, root, json, background).await,
-        Command::Start { root } => orchestrator::background::start(&state, root, cli.verbose),
+        Command::Start { root } => {
+            let options = dispatch::presenter::Options {
+                plain: cli.plain,
+                ascii: cli.ascii,
+                no_color: cli.no_color,
+            };
+            orchestrator::background::start(&state, root, cli.verbose, options).await
+        }
         Command::Stop { root } => orchestrator::background::stop(&state, root),
         Command::Watch { root, json } => {
             use std::io::IsTerminal;

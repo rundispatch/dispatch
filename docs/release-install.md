@@ -51,6 +51,52 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.13
+
+No migration; the schema stays at 24. New fields live in the existing run JSON, and existing
+records are not rewritten.
+- **No rollback without a backup.** Once a 0.4.13 owner has found Work, 0.4.12 cannot read the
+  state directory: `status` and `history` fail on the `discovered` provenance. Back up the
+  whole state directory before upgrading, and roll back only by restoring it.
+- **Additive JSON.**
+  - The attachment's `provenance` can be `{"discovered": {"commit"}}`: Work the owner found
+    in a Claude Code worktree that appeared while the project was watched. Its S0 is that
+    commit, the worktree's merge base with the project, with `confidence: "full"`. Its
+    observed session has `session_id` `lock:<name>@<pid>` and `source: "discovered"`.
+  - `attach.created` records `via: "discovery"` for that Work. Its `registration_ms` is
+    measured from the session's process start, as the lock records it, not from a hook.
+  - New events `runtime.agent_running` and `runtime.agent_gone`, each with
+    `{agent_process, previous}`, when the owner records or clears the process a session lock
+    names.
+  - `runtime.session_ended` has two more reasons: `process_gone` (the lock was left by a
+    process that is gone) and `lock_released`. A session discovery found already ended carries
+    `end_reason: "process_gone"` on the attachment, with no separate event.
+  - `watch --json`'s `watcher` record carries `inventory`, a list of `{path, first_seen,
+    base?, lock?, attach}`, only when something is found, not tracked.
+  - The owner keeps two more files beside its record: `watchers/<key>.inventory.json`, the
+    watch's list of worktrees found, not tracked, and `watchers/<key>.live.json`, its file
+    counts for the Work it follows. `dispatch stop` removes both. Readers ignore the counts
+    unless the owner that wrote them holds the project.
+- **`status` changed for working attached Work.** Instead of `Runtime 0.0s`,
+  `Files changed 0` and `Diff +0 / -0`, it prints `Runtime unknown`, a new
+  `Tracked for 12m` line, and `Files changed <n> now` or `unknown`. There is no Diff line
+  until the Work is finished. Under Workspace it adds `agent running (pid N)` while a
+  recorded agent process runs. After `Project:` it adds a "Found, not tracked" section when
+  there is something to list. Delivered results print as before. `status --json` is
+  unchanged.
+- **`start` and `setup`.**
+  - `dispatch start` on a terminal, in a project without `checks.verify`, now offers the
+    checks it detected before it starts watching. "Continue without checks" is focused, and
+    Esc starts nothing. Without a terminal it watches at once, as before, and prints one line
+    saying no checks are configured.
+  - `dispatch setup --checks --verify '<command>'`, repeatable, saves exactly those commands
+    without a terminal. It never grants consent. `dispatch setup --checks` without a terminal
+    and without `--verify` fails, naming `--verify`. Provider setup is unchanged.
+- **Restart the owner.** Run `dispatch stop && dispatch start` so the project owner is 0.4.13.
+  An older owner discovers nothing, records no liveness, and counts no files, so `status`
+  shows files as `unknown`. Worktrees present when the 0.4.13 owner first scans are listed,
+  not tracked.
+
 ### Upgrading to 0.4.12
 
 No migration; the schema stays at 24. New fields live in the existing run JSON, and existing

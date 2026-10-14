@@ -69,12 +69,15 @@ pub struct AttachRequest {
 /// Work a runtime's session start registers (`registration`): S0 is `commit`,
 /// the workspace's exact world captured before the session's first turn. A
 /// resume into a workspace Dispatch has not seen may follow edits made before
-/// it, so it is partial.
+/// it, so it is partial. Work the project owner found without a hook
+/// (`discovery`) begins at the worktree's merge base with the root instead.
 pub struct RuntimeStart {
     pub session: RuntimeSession,
     pub resumed: bool,
-    /// The commit `source::world_commit` made of the workspace.
+    /// The commit `source::world_commit` made of the workspace, or the merge
+    /// base when `discovered`.
     pub commit: String,
+    pub discovered: bool,
 }
 
 /// The `source_fingerprint` of attached Work outside strict mode: not a
@@ -118,6 +121,9 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
             BaselineProvenance::SnapshotAtAttach => "snapshot at attach".to_owned(),
             BaselineProvenance::WorkspaceAtStart { commit } => {
                 format!("commit {commit} (the workspace at start)")
+            }
+            BaselineProvenance::Discovered { commit } => {
+                format!("commit {commit} (merge base; found after watching began)")
             }
         };
         let confidence_text = match run.attachment.as_ref().unwrap().confidence {
@@ -287,20 +293,26 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
     } else if let Some(runtime) = runtime {
         let snapshot = source::materialize_baseline_from_commit(workspace, &runtime.commit, &dir)
             .map_err(|error| error.context("could not record S0"))?;
-        let confidence = if runtime.resumed {
-            AttachConfidence::Partial
+        let commit = runtime.commit.clone();
+        let (provenance, confidence) = if runtime.discovered {
+            // The worktree appeared after watching began: every change in it
+            // is its runtime's.
+            (
+                BaselineProvenance::Discovered { commit },
+                AttachConfidence::Full,
+            )
+        } else if runtime.resumed {
+            (
+                BaselineProvenance::WorkspaceAtStart { commit },
+                AttachConfidence::Partial,
+            )
         } else {
-            AttachConfidence::Full
+            (
+                BaselineProvenance::WorkspaceAtStart { commit },
+                AttachConfidence::Full,
+            )
         };
-        (
-            snapshot,
-            BaselineProvenance::WorkspaceAtStart {
-                commit: runtime.commit.clone(),
-            },
-            confidence,
-            workspace.clone(),
-            None,
-        )
+        (snapshot, provenance, confidence, workspace.clone(), None)
     } else {
         let (snapshot, provenance, confidence) = match merge_base {
             Some(commit) => {
@@ -514,7 +526,8 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
 /// Who published runtime-registered Work, and when its hook started.
 pub(crate) struct Registered {
     pub started_at: DateTime<Utc>,
-    /// `hook` or `owner`.
+    /// `hook`, `owner`, or `discovery` when the owner found the session
+    /// without a hook; then `started_at` is the session's start.
     pub via: &'static str,
 }
 

@@ -2,12 +2,23 @@
 use super::*;
 use crate::setup::{self, Proposal};
 
+/// `verify`: exact check commands the person gave (`--verify`). Without a
+/// terminal they are saved as given; on one they pre-fill the checks menu.
 pub async fn standalone(
     state: &State,
     provider: Option<String>,
     project_checks: bool,
+    verify: Vec<String>,
     mut options: Options,
 ) -> Result<()> {
+    if project_checks && !suitable() {
+        anyhow::ensure!(
+            !verify.is_empty(),
+            "choosing checks needs a terminal; without one, save exact commands with \
+             dispatch setup --checks --verify '<command>'"
+        );
+        return save_given_checks(state, &std::env::current_dir()?, &verify);
+    }
     anyhow::ensure!(
         suitable(),
         "setup requires a terminal for explicit funding confirmation; use dispatch resources for noninteractive status"
@@ -15,9 +26,75 @@ pub async fn standalone(
     options.plain |= std::env::var("TERM").is_ok_and(|v| v == "dumb");
     let mut ui = Ui::new(options)?;
     if project_checks {
-        project_checks_menu(&mut ui, state, &std::env::current_dir()?).await
+        project_checks_menu(&mut ui, state, &std::env::current_dir()?, &verify).await
     } else {
         accounts(&mut ui, state, provider).await
+    }
+}
+
+/// `dispatch setup --checks --verify …` without a terminal: save exactly
+/// these commands. Consent is never granted here; one given for other
+/// commands no longer holds.
+fn save_given_checks(state: &State, source: &std::path::Path, verify: &[String]) -> Result<()> {
+    use crate::consent;
+    let path = setup::save_typed_checks(source, verify, setup::project_config_bytes(source)?)?;
+    let listed: Vec<String> = verify.iter().map(|c| format!("  {}", c.trim())).collect();
+    let standing = match consent::consent(state, &consent::project_root(source)?)? {
+        consent::CheckConsent::Valid(_) => {
+            "Work here already runs exactly these checks by themselves."
+        }
+        _ => {
+            "They do not run by themselves: allowing that needs dispatch setup --checks in a \
+             terminal. A single finish can run them with --allow-unsafe-local."
+        }
+    };
+    println!(
+        "{}",
+        sanitize(&format!(
+            "✓ Checks saved to {}:\n{}\n{standing}",
+            path.display(),
+            listed.join("\n")
+        ))
+    );
+    Ok(())
+}
+
+/// `dispatch start` on a terminal, in a project without checks: offer the
+/// detected ones, listed exactly. `Some(saved)` goes on to watch; `None`
+/// means the person backed out and nothing starts. Granting consent stays
+/// `dispatch setup --checks`.
+pub async fn start_checks(source: &std::path::Path, mut options: Options) -> Result<Option<bool>> {
+    let commands = setup::check_choices(source);
+    if commands.is_empty() {
+        return Ok(Some(false));
+    }
+    let expected = setup::project_config_bytes(source)?;
+    options.plain |= std::env::var("TERM").is_ok_and(|v| v == "dumb");
+    let mut ui = Ui::new(options)?;
+    ui.auto_apply_mode = false;
+    let listed = commands
+        .iter()
+        .map(|command| format!("  {command}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        "This project has no checks. Dispatch found:\n{listed}\nSaving them writes \
+         checks.verify in dispatch.yml; it does not let Work run them by themselves."
+    );
+    let rows = [
+        Choice::new("Save these checks"),
+        Choice::new("Continue without checks"),
+    ];
+    // Focus starts on Continue: `start` watches, and Enter alone never
+    // writes to the project.
+    match ui.select(&body, &rows, 1).await? {
+        Some(0) => {
+            setup::save_checks(source, &commands, expected)?;
+            ui.commit(&format!("Checks saved to dispatch.yml:\n{listed}"))?;
+            Ok(Some(true))
+        }
+        Some(_) => Ok(Some(false)),
+        None => Ok(None),
     }
 }
 
@@ -379,8 +456,25 @@ async fn login(ui: &mut Ui, provider: &str) -> Result<()> {
 /// `dispatch setup --checks`. With checks chosen, also where the person lets
 /// Work in this project run them by themselves, or stops it: consent for
 /// exactly these commands, kept in Dispatch's state, never in the project.
-async fn project_checks_menu(ui: &mut Ui, state: &State, source: &std::path::Path) -> Result<()> {
+/// Commands given with `--verify` are offered first, exactly as given.
+async fn project_checks_menu(
+    ui: &mut Ui,
+    state: &State,
+    source: &std::path::Path,
+    given: &[String],
+) -> Result<()> {
     use crate::consent;
+    if !given.is_empty() {
+        let expected = setup::project_config_bytes(source)?;
+        let listed: Vec<String> = given.iter().map(|c| format!("  {}", c.trim())).collect();
+        let body = format!("Save these checks?\n{}", listed.join("\n"));
+        let rows = [Choice::new("Save these checks"), Choice::new("Cancel")];
+        if ui.select(&body, &rows, 0).await? != Some(0) {
+            return ui.commit("Nothing changed.");
+        }
+        setup::save_typed_checks(source, given, expected)?;
+        ui.commit(&format!("Approved checks saved:\n{}", listed.join("\n")))?;
+    }
     let root = consent::project_root(source)?;
     let commands = consent::effective_checks(&root)?;
     if commands.is_empty() {
@@ -418,10 +512,8 @@ async fn project_checks_menu(ui: &mut Ui, state: &State, source: &std::path::Pat
         }
         Some(1) => {
             let body = format!(
-                "Let Work in this project run these checks by themselves?\n{listed}\n\
-                 They run with your permissions when a runtime registers Work here and when its \
-                 worktree is removed. Nothing is applied by this. If the checks change, Dispatch \
-                 asks again."
+                "Let Work in this project run these checks by themselves?\n{listed}\n{}",
+                consent::SCOPE
             );
             let rows = [Choice::new("Allow"), Choice::new("Cancel")];
             if ui.select(&body, &rows, 1).await? != Some(0) {
@@ -444,7 +536,7 @@ pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> 
     let body = "Choose checks\nA check runs project code with your permissions. Choosing a command approves it for this project; it does not prove task-specific correctness.";
     match ui.select(body, &choices, 0).await? {
         Some(i) if i < commands.len() => {
-            setup::save_checks(source, commands[i], expected)?;
+            setup::save_checks(source, &[commands[i]], expected)?;
             ui.commit(&format!("Approved check saved: {}", commands[i]))
         }
         Some(i) if i == commands.len() => {
@@ -454,7 +546,7 @@ pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> 
             else {
                 anyhow::bail!("check selection cancelled")
             };
-            setup::save_typed_check(source, &typed, expected)?;
+            setup::save_typed_checks(source, std::slice::from_ref(&typed), expected)?;
             ui.commit(&format!("Approved check saved: {}", typed.trim()))
         }
         Some(i) if i == commands.len() + 1 => Ok(()),

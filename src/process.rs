@@ -84,7 +84,7 @@ pub fn process_group_exists(group: Option<i32>) -> Option<bool> {
     }
 }
 
-fn pid_exists(pid: u32) -> bool {
+pub(crate) fn pid_exists(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(pid) = i32::try_from(pid) else {

@@ -391,7 +391,10 @@ implements `mid_run: stop`, and it never applies to attached work. See
 
 - Every `coherence.poll_secs` it takes `world::signal`: for Git, `HEAD`, the hash of
   `git status --porcelain=v2 -z --untracked-files=all`, and size and modification time of
-  the reported files (at most 5,000); for plain directories a metadata walk. If the signal
+  the reported files (at most 5,000); for plain directories a metadata walk. Dispatch's
+  Git commands run with `GIT_OPTIONAL_LOCKS=0`, so this `git status` never refreshes the
+  source's index under `index.lock`, and a person's own `git commit` cannot collide with
+  it (before 0.4.13, from 0.4.5, it could). If the signal
   is unchanged nothing else happens.
 - If it moved, it observes the world, writes the work so far as a patch
   (`source::snapshot_delta`, temporary Git index, no validation, to `delta-live.patch`
