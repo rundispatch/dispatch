@@ -327,6 +327,17 @@ fn item(
         "native" => format!("{agent} · launched by Dispatch"),
         "isolated" => format!("{agent} · attached; Dispatch made its workspace"),
         "discovered"
+            if run
+                .attachment
+                .as_ref()
+                .and_then(orchestrator::discovery::unobserved)
+                .is_some() =>
+        {
+            format!(
+                "{agent} session in its own worktree, found by Dispatch; its end is not observable"
+            )
+        }
+        "discovered"
             if run.attachment.as_ref().is_some_and(|attachment| {
                 matches!(
                     attachment.provenance,
@@ -2512,6 +2523,34 @@ mod tests {
             lines(&item, "Progress")[0].ends_with(" · agent running (pid 4242)"),
             "{:?}",
             item.details
+        );
+    }
+
+    /// Discovered Work of an agent whose session end Dispatch cannot see says
+    /// so; Claude's discovered Work does not.
+    #[test]
+    fn discovered_work_says_when_its_end_is_not_observable() {
+        let discovered = |agent: &str| {
+            let mut run = working(worktree("01M4DRXH", "w", 1));
+            let attachment = run.attachment.as_mut().unwrap();
+            attachment.provenance = BaselineProvenance::Discovered {
+                commit: "e4a15cd9ffffffff".into(),
+            };
+            attachment.agent = Some(agent.into());
+            attachment.sessions[0].provider = agent.into();
+            items(&[run]).remove(0).origin
+        };
+        assert_eq!(
+            discovered("codex"),
+            "codex session in its own worktree, found by Dispatch; its end is not observable"
+        );
+        assert_eq!(
+            discovered("cursor"),
+            "cursor session in its own worktree, found by Dispatch; its end is not observable"
+        );
+        assert_eq!(
+            discovered("claude"),
+            "claude session in its own worktree, found by Dispatch"
         );
     }
 

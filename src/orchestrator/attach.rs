@@ -437,9 +437,11 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         finish_reason: None,
         workspace_owner: if managed_workspace.is_some() {
             WorkspaceOwner::Dispatch
-        } else if runtime.is_some() && workspace.starts_with(root.join(".claude").join("worktrees"))
+        } else if runtime.is_some_and(|runtime| runtime.discovered)
+            || (runtime.is_some() && workspace.starts_with(root.join(".claude").join("worktrees")))
         {
-            // Where Claude Code documents it makes `--worktree` workspaces.
+            // Where Claude Code documents it makes `--worktree` workspaces,
+            // or one discovery recognized by its runtime's sign.
             WorkspaceOwner::Runtime
         } else {
             WorkspaceOwner::User

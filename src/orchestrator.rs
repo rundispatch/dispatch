@@ -2969,6 +2969,11 @@ fn workspace_details(run: &RunRecord, attachment: &crate::AttachmentRecord) -> V
         lines.push(format!(
             "  session ended — finish to freeze its changes (dispatch finish {id}), or resume it; or close it: {close} unfinished"
         ));
+    } else if unfinished && let Some(runtime) = discovery::unobserved(attachment) {
+        lines.push(format!(
+            "  the end of a {} session is not observable — when it is done, finish to freeze its changes (dispatch finish {id}); or close it: {close} unfinished",
+            runtime.name
+        ));
     }
     let mut start = source_at_start(attachment).into_iter();
     if let Some(first) = start.next() {

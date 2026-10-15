@@ -23,6 +23,8 @@ struct Project {
     _temp: tempfile::TempDir,
     root: PathBuf,
     state: PathBuf,
+    /// `HOME` for Dispatch, when the test gives it one of its own.
+    home: Option<PathBuf>,
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -107,12 +109,26 @@ impl Project {
         Self {
             root: fs::canonicalize(&root).unwrap(),
             state: temp.path().join("state"),
+            home: None,
             _temp: temp,
         }
     }
 
+    /// A project whose Dispatch runs with a `HOME` of the test's own.
+    fn with_home() -> Self {
+        let mut project = Self::new();
+        let home = project._temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        project.home = Some(fs::canonicalize(home).unwrap());
+        project
+    }
+
     fn dispatch(&self, args: &[&str]) -> Output {
-        Command::new(assert_cmd::cargo_bin!("dispatch"))
+        let mut command = Command::new(assert_cmd::cargo_bin!("dispatch"));
+        if let Some(home) = &self.home {
+            command.env("HOME", home);
+        }
+        command
             .arg("--state-dir")
             .arg(&self.state)
             .args(args)
@@ -663,4 +679,243 @@ fn a_discovered_session_that_ends_at_once_is_still_seen_to_end() {
         run["outcome"]["lifecycle"], "working",
         "ending a session finishes nothing"
     );
+}
+
+/// Found in the 0.4.14 trials: `dispatch finish` moments after a discovered
+/// `claude -p` session's process exited, before the owner looked again, left
+/// the session open for good. Finished while its process still runs, the
+/// session's end is recorded once the process is gone.
+#[test]
+fn a_session_that_outlives_finish_is_still_seen_to_end() {
+    let p = Project::new();
+    p.watch();
+    let mut agent = Command::new("sleep").arg("30").spawn().unwrap();
+    let worktree = p.claude_worktree("late", Some(&session_lock("late", agent.id())));
+    wait_until("the session's Work", || p.runs_in(&worktree).len() == 1);
+    let id = p.runs_in(&worktree)[0]["id"].as_str().unwrap().to_owned();
+    let finished = p.dispatch(&["finish", &id]);
+    assert!(finished.status.success(), "{}", text(&finished));
+    agent.kill().unwrap();
+    agent.wait().unwrap();
+    // The end is recorded, then the agent let go of, in one owner tick.
+    wait_until("the session's end", || {
+        let attachment = &p.runs_in(&worktree)[0]["attachment"];
+        attachment["sessions"][0]["end_reason"] == "process_gone"
+            && attachment["agent_process"].is_null()
+    });
+    let run = p.runs_in(&worktree).remove(0);
+    assert_eq!(run["outcome"]["lifecycle"], "finished");
+    let ended: Vec<Value> = p
+        .events(&id)
+        .into_iter()
+        .filter(|event| event["event_type"] == "runtime.session_ended")
+        .collect();
+    assert_eq!(ended.len(), 1, "{ended:?}");
+}
+
+/// What Codex 0.155.1 left in a worktree's Git metadata (`docs/plan-0.4.14.md`
+/// §3 C).
+const CODEX_THREAD: &str = "01a13b38-0758-7861-93a0-594c6fc24aa2";
+
+impl Project {
+    /// A linked worktree at `path`, outside the project, from `HEAD`:
+    /// detached when `branch` is `None`.
+    fn add_worktree_at(&self, path: &Path, branch: Option<&str>) -> PathBuf {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path_arg = path.to_str().unwrap();
+        match branch {
+            Some(branch) => git(
+                &self.root,
+                &["worktree", "add", "--quiet", "-b", branch, path_arg],
+            ),
+            None => git(
+                &self.root,
+                &["worktree", "add", "--quiet", "--detach", path_arg],
+            ),
+        };
+        fs::canonicalize(path).unwrap()
+    }
+
+    /// Where `codex exec --worktree` makes one: `~/.codex/worktrees/<id>/<project>`.
+    fn codex_path(&self, id: &str) -> PathBuf {
+        let temp = fs::canonicalize(self._temp.path()).unwrap();
+        temp.join("codex-home/worktrees").join(id).join("project")
+    }
+
+    fn mark_codex(&self, worktree: &Path, marker: &str) {
+        fs::write(self.gitdir(worktree).join("codex-thread.json"), marker).unwrap();
+    }
+
+    /// A worktree as Codex makes it: detached, outside the project, marked.
+    fn codex_worktree(&self, id: &str) -> PathBuf {
+        let worktree = self.add_worktree_at(&self.codex_path(id), None);
+        self.mark_codex(
+            &worktree,
+            &format!(r#"{{"version":1,"ownerThreadId":"{CODEX_THREAD}"}}"#),
+        );
+        worktree
+    }
+
+    /// `$HOME/<under>/<name>`, the project's own directory name in `under`.
+    fn in_home(&self, under: &str, name: &str) -> PathBuf {
+        let home = self.home.as_ref().expect("a project with a home");
+        home.join(under).join("project").join(name)
+    }
+
+    fn status(&self, id: &str) -> String {
+        text(&self.dispatch(&["status", id]))
+    }
+}
+
+/// Work whose agent's runtime names no process: never "agent running", no
+/// recorded agent process, its one session open, no session end however many
+/// ticks pass, and the hint that the end cannot be seen.
+fn assert_end_unobservable(p: &Project, worktree: &Path, name: &str) {
+    ticks();
+    let [run] = p.runs_in(worktree).try_into().unwrap();
+    let id = run["id"].as_str().unwrap();
+    assert_eq!(run["outcome"]["lifecycle"], "working", "{run}");
+    assert_eq!(run["attachment"]["agent_process"], Value::Null, "{run}");
+    let [session] = run["attachment"]["sessions"]
+        .as_array()
+        .unwrap()
+        .clone()
+        .try_into()
+        .unwrap();
+    assert_eq!(session["ended_at"], Value::Null, "{session}");
+    let kinds: Vec<Value> = p
+        .events(id)
+        .into_iter()
+        .map(|event| event["event_type"].clone())
+        .collect();
+    assert!(
+        !kinds.contains(&"runtime.session_ended".into()),
+        "{kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"runtime.agent_running".into()),
+        "{kinds:?}"
+    );
+    let status = p.status(id);
+    assert!(!status.contains("agent running"), "{status}");
+    assert!(
+        status.contains(&format!(
+            "the end of a {name} session is not observable — when it is done, finish to freeze \
+             its changes (dispatch finish {id}); or close it: dispatch close {id} --reason unfinished"
+        )),
+        "{status}"
+    );
+}
+
+/// Found in the 0.4.14 P0 trial: the 0.4.13 owner never mentioned the
+/// worktree `codex exec --worktree` made. Its marker, wherever the worktree
+/// is, makes it Work, with the thread as its session.
+#[test]
+fn a_codex_worktree_made_while_watched_becomes_work_with_its_thread() {
+    let p = Project::new();
+    p.watch();
+    let base = git(&p.root, &["rev-parse", "HEAD"]);
+    // Git has made it and Codex not yet marked it; the project moves on.
+    let worktree = p.add_worktree_at(&p.codex_path("7db1"), None);
+    fs::write(p.root.join("elsewhere.txt"), "the project moved\n").unwrap();
+    git(&p.root, &["add", "-A"]);
+    git(&p.root, &["commit", "--quiet", "-m", "moved"]);
+    ticks();
+    assert!(p.runs().is_empty());
+    assert!(p.listed().is_empty());
+    p.mark_codex(
+        &worktree,
+        &format!(r#"{{"version":1,"ownerThreadId":"{CODEX_THREAD}"}}"#),
+    );
+
+    wait_until("discovered Work", || p.runs_in(&worktree).len() == 1);
+    let [run] = p.runs().try_into().unwrap();
+    let attachment = &run["attachment"];
+    assert_eq!(
+        attachment["provenance"],
+        serde_json::json!({"discovered": {"commit": base}})
+    );
+    assert_eq!(attachment["confidence"], "full");
+    assert_eq!(attachment["workspace_owner"], "runtime");
+    assert_eq!(attachment["agent"], "codex");
+    let session = &attachment["sessions"][0];
+    assert_eq!(session["provider"], "codex");
+    assert_eq!(session["session_id"], CODEX_THREAD);
+    assert_eq!(session["source"], "discovered");
+    let log = p.owner_log();
+    assert!(
+        log.contains(&format!("found a Codex session in {}", worktree.display())),
+        "{log}"
+    );
+    assert!(log.contains("its end is not observable"), "{log}");
+    assert_end_unobservable(&p, &worktree, "Codex");
+    assert!(p.listed().is_empty());
+}
+
+#[test]
+fn a_codex_worktree_there_before_watching_is_listed_not_tracked() {
+    let p = Project::new();
+    let worktree = p.codex_worktree("0a1b");
+    p.watch();
+    assert_eq!(p.listed(), ["project"]);
+    let inventory = p.inventory().unwrap();
+    assert_eq!(inventory["entries"][0]["path"], worktree.to_str().unwrap());
+    ticks();
+    assert!(p.runs().is_empty());
+    let log = p.owner_log();
+    assert!(
+        log.contains(
+            "1 worktree(s) an agent's runtime made were already here; listed, not tracked"
+        ),
+        "{log}"
+    );
+}
+
+/// Found in the 0.4.14 P0 trial: `cursor-agent --worktree <name>` leaves no
+/// marker and no lock. Only its documented place, on its own branch, is Cursor
+/// Agent's.
+#[test]
+fn a_cursor_worktree_in_its_documented_place_on_its_branch_becomes_work() {
+    let p = Project::with_home();
+    p.watch();
+    let base = git(&p.root, &["rev-parse", "HEAD"]);
+    let worktree = p.add_worktree_at(
+        &p.in_home(".cursor/worktrees", "p0-cursor"),
+        Some("p0-cursor"),
+    );
+
+    wait_until("discovered Work", || p.runs_in(&worktree).len() == 1);
+    let [run] = p.runs().try_into().unwrap();
+    let attachment = &run["attachment"];
+    assert_eq!(
+        attachment["provenance"],
+        serde_json::json!({"discovered": {"commit": base}})
+    );
+    assert_eq!(attachment["agent"], "cursor");
+    assert_eq!(attachment["sessions"][0]["provider"], "cursor");
+    assert_eq!(attachment["sessions"][0]["session_id"], "p0-cursor");
+    assert_end_unobservable(&p, &worktree, "Cursor Agent");
+}
+
+/// Nothing but a reliable sign makes Work: not Cursor's place on another
+/// branch, another place under `~/.cursor`, a person's own worktree, or a
+/// Codex marker that cannot be read.
+#[test]
+fn worktrees_without_a_reliable_sign_never_become_work() {
+    let p = Project::with_home();
+    p.watch();
+    let other_branch = p.add_worktree_at(&p.in_home(".cursor/worktrees", "b"), Some("not-b"));
+    let elsewhere = p.add_worktree_at(&p.in_home(".cursor/elsewhere", "c"), Some("c"));
+    let plain = p.add_worktree_at(&p._temp.path().join("plain"), Some("plain"));
+    let malformed = p.add_worktree_at(&p.codex_path("dead"), None);
+    p.mark_codex(&malformed, r#"{"version":1,"ownerThread":"x"}"#);
+    // A worktree that does become Work, so the owner has seen the others.
+    let codex = p.codex_worktree("beef");
+    wait_until("the Codex Work", || p.runs_in(&codex).len() == 1);
+    ticks();
+    assert_eq!(p.runs().len(), 1);
+    for worktree in [&other_branch, &elsewhere, &plain, &malformed] {
+        assert!(p.runs_in(worktree).is_empty(), "{}", worktree.display());
+    }
+    assert!(p.listed().is_empty());
 }

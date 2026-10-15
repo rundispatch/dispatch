@@ -425,7 +425,7 @@ fn one_spaced(text: &str) -> String {
 }
 
 /// The metadata directory a linked worktree's `.git` file points to.
-fn linked_gitdir(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(super) fn linked_gitdir(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
     let file = std::fs::read_to_string(worktree.join(".git")).ok()?;
     let gitdir = std::path::PathBuf::from(file.strip_prefix("gitdir:")?.trim());
     Some(if gitdir.is_absolute() {
