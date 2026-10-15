@@ -1,4 +1,4 @@
-   Compiling dispatch v0.1.3-rc.1 (/Users/jese/bin/dispatch)
+   Compiling dispatch v0.1.3-rc.1 (<checkout>)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 4.59s
      Running unittests src/lib.rs (/tmp/dispatch-rc/current/target/debug/deps/dispatch-943f65540ab25209)
 

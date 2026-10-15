@@ -1,4 +1,4 @@
-   Compiling dispatch v0.1.3-rc.1 (/Users/jese/bin/dispatch)
+   Compiling dispatch v0.1.3-rc.1 (<checkout>)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 10.76s
      Running unittests src/lib.rs (/tmp/dispatch-rc/current/target/debug/deps/dispatch-943f65540ab25209)
 
@@ -445,10 +445,10 @@ deadline
 
 fixture failure: {'version': 1, 'lifecycle': 'finished', 'work_result': 'failed', 'verification': 'not_run', 'review': 'not_requested', 'application': 'not_applied', 'phase': 'finished', 'waiting_on': 'none'} [None]
 Traceback (most recent call last):
-  File "/Users/jese/bin/dispatch/tests/fixtures/phase6_portfolio.py", line 318, in <module>
+  File "<checkout>/tests/fixtures/phase6_portfolio.py", line 318, in <module>
     if __name__=='__main__': scenario(sys.argv[1],sys.argv[2])
                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/jese/bin/dispatch/tests/fixtures/phase6_portfolio.py", line 158, in scenario
+  File "<checkout>/tests/fixtures/phase6_portfolio.py", line 158, in scenario
     assert len(result['attempts'])<=1
                ~~~~~~^^^^^^^^^^^^
 TypeError: 'NoneType' object is not subscriptable

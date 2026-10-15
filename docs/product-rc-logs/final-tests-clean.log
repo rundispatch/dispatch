@@ -541,12 +541,12 @@ pty_narrow:
 planning diagnostic: None
 fixture failure: {'version': 1, 'lifecycle': 'working', 'work_result': 'pending', 'verification': 'not_run', 'review': 'not_requested', 'application': 'not_applied', 'phase': 'verifying', 'waiting_on': 'none'} []
 Traceback (most recent call last):
-  File "/Users/jese/bin/dispatch/tests/fixtures/phase8_planning.py", line 432, in <module>
+  File "<checkout>/tests/fixtures/phase8_planning.py", line 432, in <module>
     scenario(sys.argv[1],name)
-  File "/Users/jese/bin/dispatch/tests/fixtures/phase8_planning.py", line 320, in scenario
+  File "<checkout>/tests/fixtures/phase8_planning.py", line 320, in scenario
     ui.wait('Review changes');ui.mark('review')
     ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/jese/bin/dispatch/tests/fixtures/review_refinement.py", line 113, in wait
+  File "<checkout>/tests/fixtures/review_refinement.py", line 113, in wait
     raise AssertionError("waiting for " + repr(text) + "\n" + self.clean[-7000:])
 AssertionError: waiting for 'Review changes'
   
@@ -579,12 +579,12 @@ pty_question_deadline:
 planning diagnostic: run 01M2V3RN74DG46XG08MRQZN7HM interrupted while waiting for shared subscription capacity
 fixture failure: {'version': 1, 'lifecycle': 'finished', 'work_result': 'failed', 'verification': 'not_run', 'review': 'not_requested', 'application': 'not_applied', 'phase': 'finished', 'waiting_on': 'none'} []
 Traceback (most recent call last):
-  File "/Users/jese/bin/dispatch/tests/fixtures/phase8_planning.py", line 432, in <module>
+  File "<checkout>/tests/fixtures/phase8_planning.py", line 432, in <module>
     scenario(sys.argv[1],name)
-  File "/Users/jese/bin/dispatch/tests/fixtures/phase8_planning.py", line 315, in scenario
+  File "<checkout>/tests/fixtures/phase8_planning.py", line 315, in scenario
     ui.wait('Your answer');ui.mark('question')
     ^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/jese/bin/dispatch/tests/fixtures/review_refinement.py", line 113, in wait
+  File "<checkout>/tests/fixtures/review_refinement.py", line 113, in wait
     raise AssertionError("waiting for " + repr(text) + "\n" + self.clean[-7000:])
 AssertionError: waiting for 'Your answer'
   
