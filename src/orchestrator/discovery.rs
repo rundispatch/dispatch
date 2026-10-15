@@ -6,8 +6,9 @@
 //! that appears later with a `claude session` lock becomes Work through the
 //! same registration and publication path as a hook's, its session already
 //! ended when that process is gone; one with any other lock, or none, is
-//! listed. One that a runtime in `UNOBSERVED` made becomes Work as soon as it
-//! appears, its session open for good: nothing shows when it ends.
+//! listed. One Hermes made is the same with its `hermes pid=` lock. One that a
+//! runtime in `UNOBSERVED` made becomes Work as soon as it appears, its
+//! session open for good: nothing shows when it ends.
 //!
 //! A worktree that has Work is the Work's: it is neither listed nor
 //! registered again, unless that Work finished after its worktree was
@@ -30,7 +31,7 @@ use crate::{
     process::ProcessIdentity,
     runtime::{
         claude::{self, Liveness, Lock, WorktreeSignals},
-        codex, cursor,
+        codex, cursor, hermes,
     },
     source,
     state::{State, write_atomically},
@@ -147,6 +148,8 @@ struct Found {
 /// Who made a worktree, by the sign its runtime left.
 enum Made {
     Claude(WorktreeSignals),
+    /// Hermes, and the worktree's name, which is its session.
+    Hermes(String),
     /// A runtime in `UNOBSERVED`, and the session the worktree names.
     Unobserved {
         runtime: &'static Unobserved,
@@ -185,7 +188,7 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
         first_seen: Utc::now(),
         base: match &found.made {
             Made::Claude(signals) => signals.base.clone(),
-            Made::Unobserved { .. } => None,
+            Made::Hermes(_) | Made::Unobserved { .. } => None,
         },
         lock: found.lock.clone(),
     };
@@ -225,8 +228,21 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
         if has_work(&found.path) || inventory.entries.iter().any(|e| e.path == found.path) {
             continue;
         }
-        let signals = match &found.made {
-            Made::Claude(signals) => signals,
+        // The process a session's lock names, and whether it runs.
+        let (name, locked) = match &found.made {
+            Made::Claude(signals) => match &signals.lock {
+                Some(lock @ Lock::Session { pid, .. }) => {
+                    ("Claude Code", Some((*pid, claude::liveness(lock))))
+                }
+                _ => ("Claude Code", None),
+            },
+            Made::Hermes(_) => {
+                let pid = found.lock.as_deref().and_then(hermes::lock_pid);
+                (
+                    "Hermes",
+                    pid.map(|pid| (pid, hermes::liveness(pid, &found.path))),
+                )
+            }
             // It appeared after watching began; its liveness is Unknown.
             Made::Unobserved {
                 runtime,
@@ -237,20 +253,20 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
                 continue;
             }
         };
-        if let Some(lock @ Lock::Session { pid, .. }) = &signals.lock {
-            match claude::liveness(lock) {
+        if let Some((pid, liveness)) = locked {
+            match liveness {
                 // A running session's process is recorded as the Work's
                 // agent, so that liveness sees it end even if it ends before
                 // liveness first looks.
                 Liveness::Running => {
-                    let session = session(lock, false);
-                    register(state, root, &found.path, "Claude Code", session, Some(*pid));
+                    let session = locked_session(found, false);
+                    register(state, root, &found.path, name, session, Some(pid));
                 }
                 // It appeared after watching began and its session already
                 // ended: a `claude -p` run between two ticks leaves its lock.
                 Liveness::Gone => {
-                    let session = session(lock, true);
-                    register(state, root, &found.path, "Claude Code", session, None);
+                    let session = locked_session(found, true);
+                    register(state, root, &found.path, name, session, None);
                 }
                 // Unknown proves nothing: look again next tick.
                 Liveness::Unknown => {}
@@ -261,7 +277,7 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
             continue;
         }
         note(&format!(
-            "{} was made by Claude Code without a session's lock ({}); listed, not \
+            "{} was made by {name} without a session's lock ({}); listed, not \
              tracked. Track it: dispatch attach --workspace {}",
             found.path.display(),
             found.lock.as_deref().unwrap_or("not locked"),
@@ -323,6 +339,24 @@ fn register(
                 ));
             }
         }
+    }
+}
+
+/// The observed session of a worktree whose lock names its process; `ended`
+/// now, when that process was seen gone.
+fn locked_session(found: &Found, ended: bool) -> Result<RuntimeSession> {
+    match &found.made {
+        Made::Claude(WorktreeSignals {
+            lock: Some(lock), ..
+        }) => session(lock, ended),
+        // Since Git made the worktree, as Hermes's lock records no start.
+        Made::Hermes(name) => {
+            let mut session = unobserved_session("hermes", name, &found.path);
+            session.ended_at = ended.then(Utc::now);
+            session.end_reason = ended.then(|| "process_gone".into());
+            Ok(session)
+        }
+        _ => anyhow::bail!("not a session lock"),
     }
 }
 
@@ -394,6 +428,8 @@ fn runtime_worktrees(root: &Path) -> Result<Vec<Found>> {
         let signals = claude::worktree_signals(&path);
         let made = if claude::made_by_claude(root, &path, &signals) {
             Made::Claude(signals)
+        } else if let Some(name) = hermes::session(root, &path, branch) {
+            Made::Hermes(name)
         } else {
             let Some((runtime, session_id)) = UNOBSERVED.iter().find_map(|runtime| {
                 let session = (runtime.session)(root, &path, branch, home.as_deref())?;

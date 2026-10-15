@@ -14,6 +14,7 @@
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub mod hermes;
 
 use std::{
     path::{Path, PathBuf},

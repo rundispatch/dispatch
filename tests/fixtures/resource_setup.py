@@ -167,4 +167,21 @@ for line in sys.stdin:
         ui.wait('hooks installed');ui.wait('6) Back');ui.send('6\r');ui.finish()
     installed=claude_settings.read_text()
     assert 'hook claude' in installed and str(used) in installed and 'SessionStart' in installed, installed
+    # Hermes's session-end hook, in a config.yaml of the person's own: rows
+    # 1 Claude Code hooks, 2 the Hermes hook, 3 Back. Enter on consent cancels;
+    # install then removal leave the file's bytes as they were.
+    hermes_home=root/'hermes-home';hermes_home.mkdir()
+    hermes_config=hermes_home/'config.yaml';theirs=b'# mine\nmodel:\n  default: x  # keep\n'
+    hermes_config.write_bytes(theirs)
+    with Session([binary,'--state-dir',str(used),'--plain','setup'],source,captures,'hermes-hook',env=dict(hooks_env,HERMES_HOME=str(hermes_home)),width=100,height=36) as ui:
+        ui.wait('5) Runtime integrations');ui.send('5\r');ui.wait('Hermes hook: not installed');ui.wait('2) Install the Hermes hook');ui.send('2\r')
+        ui.wait('on_session_finalize');ui.wait('--accept-hooks');ui.wait('2) Cancel');ui.mark('hermes-consent');ui.send('\r')
+        ui.wait('6) Back');assert hermes_config.read_bytes()==theirs, 'Enter alone installed the Hermes hook'
+        ui.send('5\r');ui.wait('2) Install the Hermes hook');ui.send('2\r');ui.wait('2) Cancel');ui.send('1\r')
+        ui.wait('Hermes hook installed');ui.wait('6) Back')
+        assert hermes_config.read_bytes().startswith(theirs) and b'hook hermes' in hermes_config.read_bytes()
+        ui.send('5\r');ui.wait('Hermes hook: installed');ui.wait('2) Remove the Hermes hook');ui.send('2\r');ui.wait('2) Cancel');ui.send('1\r')
+        ui.wait('Hermes hook removed');ui.wait('6) Back');ui.send('6\r');ui.finish()
+    assert hermes_config.read_bytes()==theirs
+    assert not (hermes_home/'shell-hooks-allowlist.json').exists()
     print('CLI/TUI setup journeys passed; zero model calls; no database or grants created')
