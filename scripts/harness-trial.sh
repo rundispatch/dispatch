@@ -167,10 +167,17 @@ agent_command() {
       [ -n "$MODEL" ] && CMD+=(--model "$MODEL")
       [ -n "$wt" ] && CMD+=(--worktree "$wt") ;;
     hermes)
-      CMD=(hermes --yolo --usage-file "$OUT/tasks/$1/usage.json")
-      [ -n "$MODEL" ] && CMD+=(-m "$MODEL")
-      [ -n "$wt" ] && CMD+=(--worktree)
-      CMD+=(-z) ;;
+      if [ -n "$wt" ]; then
+        # One-shot mode (-z) ignores --worktree (Hermes 0.18.2, run_oneshot);
+        # only chat makes one: <repo>/.worktrees/<name>, branch hermes/<name>.
+        CMD=(hermes chat -Q --yolo --worktree)
+        [ -n "$MODEL" ] && CMD+=(-m "$MODEL")
+        CMD+=(-q)
+      else
+        CMD=(hermes --yolo --usage-file "$OUT/tasks/$1/usage.json")
+        [ -n "$MODEL" ] && CMD+=(-m "$MODEL")
+        CMD+=(-z)
+      fi ;;
   esac
   CMD+=("$task")
 }

@@ -136,7 +136,7 @@ Evidence under `~/dispatch-dev/conformance-0414/trials/`, on the machine that ra
 | cursor | attach | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-attach/` |
 | cursor | native | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-native/` |
 | cursor | worktree | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-worktree/` |
-| hermes | attach | skipped: B: the harness stopped (1): No inference provider configured. Run 'hermes model' to choose a provider and model, or set an API key (OPENROUTER_API_KEY, OPENAI_… | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-attach/` |
-| hermes | native | skipped: B: the harness stopped (1): hermes -z: agent failed: No inference provider configured. Run 'hermes model' to choose a provider and model, or set an API key (OP… | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-native/` |
-| hermes | worktree | skipped: B: the harness stopped (1): No inference provider configured. Run 'hermes model' to choose a provider and model, or set an API key (OPENROUTER_API_KEY, OPENAI_… | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-worktree/` |
+| hermes | attach | pass | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-attach/` |
+| hermes | native | pass | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-native/` |
+| hermes | worktree | fail: B: Work: expected Work created; observed no Work within the wait; the harness's worktrees: none | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-worktree/` |
 <!-- conformance-table:end -->

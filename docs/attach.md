@@ -1004,8 +1004,9 @@ directory, exactly as it already refuses any newer schema.
   2.1.296 on macOS; the lock of a subagent or background-session worktree, and the
   format on Linux, were not. Codex's marker and Cursor's location were observed with
   Codex 0.155.1 and Cursor Agent 2026.10.14 on macOS. The end of a Codex or Cursor
-  session is not observable. Hermes's worktrees are not recognized: its worktree mode
-  was not observed, because no provider was configured. There is no process scanning
+  session is not observable. Hermes's worktrees are not recognized: Hermes 0.18.2's
+  `chat --worktree` works in `<repo>/.worktrees/hermes-<id>` and removes it, with its
+  changes, when the session ends. There is no process scanning
   or association by working directory.
 - `mid_run: stop` does not apply to attached work in this version; a `Stop` verdict on
   attached work is recorded, not enforced.

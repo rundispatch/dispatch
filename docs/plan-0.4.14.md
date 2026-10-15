@@ -432,7 +432,7 @@ root, and one needed a host `docker`.
 | Claude Code 2.1.296 | pass | pass | pass |
 | Codex 0.155.1 (gpt-6-sol) | pass | pass | pass |
 | Cursor Agent 2026.10.14 | pass | pass | pass |
-| Hermes Agent 0.18.2 | skipped (no provider) | skipped | skipped |
+| Hermes Agent 0.18.2 (OpenAI Codex provider, gpt-6.1-sol; configured after the main run) | pass | pass | fail: Hermes's `chat --worktree` removes its worktree, with the changes, at session end; not recognized |
 
 Evidence: `~/dispatch-dev/conformance-0414/trials/`. The earlier run at
 `2705b4c` (0.4.13 version string) is in `trials-2705b4c/`.
@@ -458,3 +458,22 @@ Evidence: `~/dispatch-dev/conformance-0414/trials/`. The earlier run at
   secrets in the repository settings:
   - `stability.yml` (20 runs, and the nightly stress run);
   - `harness-trials.yml` on GitHub.
+
+### Hermes, after the user configured a provider (2026-10-15)
+
+- The first provider tried was Anthropic through the user's Claude subscription.
+  Anthropic refused it: third-party apps draw on "extra usage". The second
+  choice, OpenAI Codex, worked.
+- **Two findings came from the refusals:**
+  - `hermes -z` exits 0 when the provider refuses, prints the message on stdout,
+    and leaves `failure` out of the usage file. The adapter already marked such
+    runs failed, but recorded an empty reason; fixed in `0e76728`.
+  - `hermes -z` ignores `--worktree`. The runner now uses `hermes chat -q …
+    --worktree` for the worktree path. Hermes then works in
+    `<repo>/.worktrees/hermes-<id>`, adds `.worktrees/` to the checkout's
+    `.gitignore`, and removes the worktree and its branch, with the agent's
+    changes, at session end.
+- **Recognizing Hermes worktrees needs more than a marker.** Dispatch would have
+  to keep the Δ before Hermes removes the worktree. This is left for a later
+  release.
+- **Conformance:** attach pass, native pass, worktree fail.

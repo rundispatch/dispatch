@@ -78,9 +78,9 @@ contract. They never compare the agents or their code.
   - **Hermes Agent** (new): `dispatch run --agent hermes` runs `hermes -z <task>` with
     `--usage-file` and `--yolo`. `harnesses.hermes` in `dispatch.yml` takes `model`, `provider`,
     `executable` and `extra_args`; `dispatch doctor` reports Hermes. Usage comes from the
-    per-attempt usage file, and null counts stay unknown. Its tests use Hermes's own failure
-    output and a usage file shaped like its documented fields: the adapter has not yet run
-    against a real successful Hermes session.
+    per-attempt usage file, and null counts stay unknown. When a provider refuses a call,
+    Hermes 0.18.2 exits 0 and prints the provider's message on stdout; Dispatch still records
+    the run as failed, with that message.
 - **Harness conformance.** `scripts/harness-trial.sh <harness> <path>` runs one shared scenario
   through an agent's wrapped attach, native run or own worktree mode, with its own state
   directory, and writes a record and the evidence. [`docs/harness-conformance.md`](docs/harness-conformance.md)
@@ -115,8 +115,9 @@ contract. They never compare the agents or their code.
     one test per CPU.
 
 Not in 0.4.14: the end of a Codex or Cursor session is not observable, and there are no Codex or
-Cursor hooks. Hermes's own worktrees are not recognized yet: its worktree mode could not be
-observed, because no provider was configured. A Hermes native run under the Docker backend
+Cursor hooks. Hermes's own worktrees are not recognized: in Hermes 0.18.2, `hermes chat
+--worktree` works in `<repo>/.worktrees/hermes-<id>` and removes that worktree, with its changes,
+when the session ends, and `hermes -z` ignores `--worktree`. A Hermes native run under the Docker backend
 cannot record usage, because the attempt's output directory is not mounted. There is still no
 process scanning, and nothing is finished, closed or cleaned up automatically.
 
@@ -136,8 +137,8 @@ named as a CI cache key (P6b, after the version bump). All three are recorded as
 `coherence.overridden`, with the person's explanation.
 
 Conformance with this release: Claude Code 2.1.296, Codex 0.155.1 and Cursor Agent 2026.10.14
-passed all three paths (attach, native, their own worktree mode) on 2026-10-15. Hermes Agent was
-skipped on all three: no provider was configured. The table and evidence are in
+passed all three paths (attach, native, their own worktree mode) on 2026-10-15. Hermes Agent
+0.18.2 passed attach and native; its own worktree mode failed, as described above. The table and evidence are in
 [`docs/harness-conformance.md`](docs/harness-conformance.md).
 
 Site impact: `dispatch check` gains `--merged` and `--allow-unsafe-local`; `dispatch accept` gains `--expect`; `finish`, `check` and `diff --stat` print a `Δ <digest>` line and `check --json` adds `delta_digest`; `finish`, `check --merged` and `accept` print one line per check command; `--agent hermes` and a `harnesses.hermes` config section; doctor lists Hermes; Codex and Cursor Agent worktrees become Work in a watched project (new `status` hint, `watch` origin and owner-log lines), so "only Claude Code's worktrees are recognized" no longer holds; the `start`/`stop` errors say 120 s instead of 10 s; Cursor's token total and semantics change.
