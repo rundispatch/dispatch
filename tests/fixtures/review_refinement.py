@@ -51,6 +51,9 @@ class Session:
         self.position = 0
         self.markers = {}
         self.cleanup_pids = []
+        # Seconds the terminal takes to say where the cursor is; replies due.
+        self.cursor_reply_delay = 0
+        self.replies = []
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         captures = Path(captures)
         captures.mkdir(parents=True, exist_ok=True)
@@ -89,7 +92,11 @@ raise SystemExit(code if code >= 0 else 128-code)
     def pump(self, duration=0.05):
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
-            if not select.select([self.master], [], [], max(0, deadline-time.monotonic()))[0]:
+            while self.replies and self.replies[0] <= time.monotonic():
+                self.replies.pop(0)
+                os.write(self.master, b"\x1b[1;1R")
+            wake = min([deadline] + self.replies[:1])
+            if not select.select([self.master], [], [], max(0, wake-time.monotonic()))[0]:
                 continue
             try:
                 chunk = os.read(self.master, 65536)
@@ -99,7 +106,7 @@ raise SystemExit(code if code >= 0 else 128-code)
                 break
             self.output.extend(chunk)
             for _ in range(chunk.count(b"\x1b[6n")):
-                os.write(self.master, b"\x1b[1;1R")
+                self.replies.append(time.monotonic() + self.cursor_reply_delay)
             decoded = self.decoder.decode(chunk)
             self.cast.write(json.dumps([round(time.monotonic()-self.started, 6), "o", decoded]) + "\n")
             self.cast.flush()

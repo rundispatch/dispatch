@@ -58,18 +58,13 @@ fn text(output: &Output) -> String {
     )
 }
 
+/// Waits for what it waits for: only a hang reaches the bound.
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !ready() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-/// Long enough for several owner ticks (`poll_secs: 1`) and discovery's
-/// grace for a new worktree without a lock.
-fn ticks() {
-    std::thread::sleep(Duration::from_secs(5));
 }
 
 /// The lock a running `claude --worktree <name>` session holds.
@@ -137,11 +132,34 @@ impl Project {
             .unwrap()
     }
 
+    /// `dispatch start`. Its owner runs with `-vv`, so each owner tick,
+    /// discovery's scan and liveness included, ends with a `tick:` line in
+    /// the owner's log (`ticks`).
+    fn start(&self) -> Output {
+        self.dispatch(&["-vv", "start"])
+    }
+
     /// `dispatch start`, returning once the owner's first scan is done.
     fn watch(&self) {
-        let output = self.dispatch(&["start"]);
+        let output = self.start();
         assert!(output.status.success(), "{}", text(&output));
         wait_until("the first scan", || self.inventory().is_some());
+    }
+
+    /// Owner ticks ended so far, by the owner's log.
+    fn ticks_ended(&self) -> usize {
+        fs::read_to_string(self.watcher_file("log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(" tick: "))
+            .count()
+    }
+
+    /// Wait until several owner ticks have run from start to end since now.
+    /// The tick under way now may have begun earlier, so it does not count.
+    fn ticks(&self) {
+        let ended = self.ticks_ended();
+        wait_until("three owner ticks", || self.ticks_ended() > ended + 3);
     }
 
     fn watcher_file(&self, suffix: &str) -> PathBuf {
@@ -170,8 +188,18 @@ impl Project {
         names
     }
 
+    /// The owner's log, without the diagnostics `-vv` adds.
     fn owner_log(&self) -> String {
-        fs::read_to_string(self.watcher_file("log")).unwrap_or_default()
+        let log = fs::read_to_string(self.watcher_file("log")).unwrap_or_default();
+        log.lines()
+            .filter(|line| {
+                !matches!(
+                    line.split_whitespace().nth(1),
+                    Some("TRACE" | "DEBUG" | "INFO")
+                )
+            })
+            .map(|line| format!("{line}\n"))
+            .collect()
     }
 
     /// Where Claude Code makes worktree `name`.
@@ -260,6 +288,9 @@ impl Project {
             .arg("--state-dir")
             .arg(&self.state)
             .args(["hook", "claude"])
+            // The registration deadline is not under test here: only a hang
+            // reaches this budget, so a slow machine still registers.
+            .env("DISPATCH_REGISTRATION_BUDGET_MS", "600000")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -370,7 +401,7 @@ fn a_worktree_made_while_watched_with_a_running_session_becomes_one_work() {
 
     // Its session still runs, but its Work is finished: never registered
     // again, nor listed.
-    ticks();
+    p.ticks();
     assert_eq!(p.runs().len(), 1);
     assert!(p.listed().is_empty());
 }
@@ -400,7 +431,7 @@ fn worktrees_there_at_the_first_scan_are_listed_not_registered_for_the_whole_wat
     let record: Value = serde_json::from_slice(&fs::read(p.watcher_file("json")).unwrap()).unwrap();
     assert_eq!(inventory["watch_started_at"], record["started_at"]);
     assert_eq!(inventory["watch_owner"], record["identity"]);
-    ticks();
+    p.ticks();
     assert!(p.runs().is_empty());
 
     // The owner dies without stopping the watch; the next owner keeps the
@@ -409,11 +440,11 @@ fn worktrees_there_at_the_first_scan_are_listed_not_registered_for_the_whole_wat
     // SAFETY: the owner this test started.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     let restarted = || {
-        let output = p.dispatch(&["start"]);
+        let output = p.start();
         output.status.success() && text(&output).contains("✓ Watching")
     };
     wait_until("a restarted owner", restarted);
-    ticks();
+    p.ticks();
     assert!(p.runs().is_empty());
     assert_eq!(p.inventory().unwrap(), inventory);
 
@@ -427,7 +458,7 @@ fn worktrees_there_at_the_first_scan_are_listed_not_registered_for_the_whole_wat
         p.inventory().unwrap()["watch_started_at"],
         record["started_at"]
     );
-    ticks();
+    p.ticks();
     assert!(p.runs().is_empty());
 }
 
@@ -484,7 +515,7 @@ fn only_a_session_lock_registers_and_human_worktrees_are_never_listed() {
         &unlocked,
         Some(&session_lock("unlocked", std::process::id())),
     );
-    ticks();
+    p.ticks();
     assert_eq!(p.runs().len(), 1);
     assert_eq!(p.listed(), ["other", "unlocked"]);
     // Each was noted once, however many ticks saw it.
@@ -513,7 +544,7 @@ fn a_hook_and_discovery_give_one_work_whichever_sees_the_worktree_first() {
     let reply = p.session_start(&found, "s-found");
     assert_eq!(reply.trim(), "");
 
-    ticks();
+    p.ticks();
     let [hooked_run] = p.runs_in(&hooked).try_into().unwrap();
     assert_eq!(
         hooked_run["attachment"]["provenance"]
@@ -587,7 +618,7 @@ fn a_worktree_removed_and_made_again_at_one_path_is_new_only_when_dispatch_saw_i
     // Closed while its worktree stays and its session runs: not again.
     let closed = p.dispatch(&["close", &second, "--reason", "unfinished"]);
     assert!(closed.status.success(), "{}", text(&closed));
-    ticks();
+    p.ticks();
     assert_eq!(p.runs_in(&path).len(), 2);
     assert!(p.listed().is_empty());
 }
@@ -598,9 +629,9 @@ fn a_worktree_removed_and_made_again_at_one_path_is_new_only_when_dispatch_saw_i
 fn a_plain_directory_is_watched_without_discovery_errors() {
     let p = Project::new();
     fs::remove_dir_all(p.root.join(".git")).unwrap();
-    let output = p.dispatch(&["start"]);
+    let output = p.start();
     assert!(output.status.success(), "{}", text(&output));
-    ticks();
+    p.ticks();
     let log = p.owner_log();
     assert!(!log.contains("worktree"), "{log}");
     assert!(p.inventory().is_none());
@@ -625,7 +656,7 @@ fn a_registration_in_flight_is_left_alone_and_a_failure_is_noted_once_then_retri
         0
     );
     let held = p.running("held");
-    ticks();
+    p.ticks();
     assert!(p.runs().is_empty());
     assert!(p.listed().is_empty());
     drop(file);
@@ -635,7 +666,7 @@ fn a_registration_in_flight_is_left_alone_and_a_failure_is_noted_once_then_retri
     let config = fs::read_to_string(p.root.join("dispatch.yml")).unwrap();
     fs::write(p.root.join("dispatch.yml"), "coherence: [\n").unwrap();
     let broken = p.running("broken");
-    ticks();
+    p.ticks();
     assert!(p.runs_in(&broken).is_empty());
     let log = p.owner_log();
     assert_eq!(
@@ -659,7 +690,7 @@ fn a_registration_in_flight_is_left_alone_and_a_failure_is_noted_once_then_retri
 fn a_discovered_session_that_ends_at_once_is_still_seen_to_end() {
     let p = Project::new();
     p.watch();
-    let mut agent = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut agent = Command::new("sleep").arg("600").spawn().unwrap();
     let worktree = p.claude_worktree("quick", Some(&session_lock("quick", agent.id())));
     wait_until("the session's Work", || p.runs_in(&worktree).len() == 1);
     let run = p.runs_in(&worktree).remove(0);
@@ -689,7 +720,7 @@ fn a_discovered_session_that_ends_at_once_is_still_seen_to_end() {
 fn a_session_that_outlives_finish_is_still_seen_to_end() {
     let p = Project::new();
     p.watch();
-    let mut agent = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut agent = Command::new("sleep").arg("600").spawn().unwrap();
     let worktree = p.claude_worktree("late", Some(&session_lock("late", agent.id())));
     wait_until("the session's Work", || p.runs_in(&worktree).len() == 1);
     let id = p.runs_in(&worktree)[0]["id"].as_str().unwrap().to_owned();
@@ -771,7 +802,7 @@ impl Project {
 /// recorded agent process, its one session open, no session end however many
 /// ticks pass, and the hint that the end cannot be seen.
 fn assert_end_unobservable(p: &Project, worktree: &Path, name: &str) {
-    ticks();
+    p.ticks();
     let [run] = p.runs_in(worktree).try_into().unwrap();
     let id = run["id"].as_str().unwrap();
     assert_eq!(run["outcome"]["lifecycle"], "working", "{run}");
@@ -820,7 +851,7 @@ fn a_codex_worktree_made_while_watched_becomes_work_with_its_thread() {
     fs::write(p.root.join("elsewhere.txt"), "the project moved\n").unwrap();
     git(&p.root, &["add", "-A"]);
     git(&p.root, &["commit", "--quiet", "-m", "moved"]);
-    ticks();
+    p.ticks();
     assert!(p.runs().is_empty());
     assert!(p.listed().is_empty());
     p.mark_codex(
@@ -842,11 +873,10 @@ fn a_codex_worktree_made_while_watched_becomes_work_with_its_thread() {
     assert_eq!(session["provider"], "codex");
     assert_eq!(session["session_id"], CODEX_THREAD);
     assert_eq!(session["source"], "discovered");
+    // The owner notes the Work once it is published, so the note may follow.
+    let found = format!("found a Codex session in {}", worktree.display());
+    wait_until("the owner's note", || p.owner_log().contains(&found));
     let log = p.owner_log();
-    assert!(
-        log.contains(&format!("found a Codex session in {}", worktree.display())),
-        "{log}"
-    );
     assert!(log.contains("its end is not observable"), "{log}");
     assert_end_unobservable(&p, &worktree, "Codex");
     assert!(p.listed().is_empty());
@@ -860,7 +890,7 @@ fn a_codex_worktree_there_before_watching_is_listed_not_tracked() {
     assert_eq!(p.listed(), ["project"]);
     let inventory = p.inventory().unwrap();
     assert_eq!(inventory["entries"][0]["path"], worktree.to_str().unwrap());
-    ticks();
+    p.ticks();
     assert!(p.runs().is_empty());
     let log = p.owner_log();
     assert!(
@@ -912,7 +942,7 @@ fn worktrees_without_a_reliable_sign_never_become_work() {
     // A worktree that does become Work, so the owner has seen the others.
     let codex = p.codex_worktree("beef");
     wait_until("the Codex Work", || p.runs_in(&codex).len() == 1);
-    ticks();
+    p.ticks();
     assert_eq!(p.runs().len(), 1);
     for worktree in [&other_branch, &elsewhere, &plain, &malformed] {
         assert!(p.runs_in(worktree).is_empty(), "{}", worktree.display());

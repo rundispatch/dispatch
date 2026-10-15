@@ -74,11 +74,12 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
 
-  # The suite on a slow machine: one CPU in the test image. A test that
-  # assumes a fast machine, or a product wait that gives up while the work is
-  # still progressing, fails here first.
-  slow-machine:
-    name: tests on one CPU (ubuntu-22.04)
+  # The suite on a loaded machine: stress mode in the test image (2 CPUs, 16
+  # busy loops competing for them, 8 test threads). A test that assumes a fast
+  # machine, or a product wait that gives up while the work is still
+  # progressing, fails here first. The tests are built without the load.
+  stress:
+    name: tests under load (ubuntu-22.04)
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -93,11 +94,11 @@ jobs:
             ${{ runner.temp }}/cargo-registry
           key: cargo-ubuntu-22.04-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-ubuntu-22.04-
-      - name: Build the tests, then run them with one CPU
+      - name: Build the tests, then run them in stress mode
         env:
           DISPATCH_DOCKER_TARGET_DIR: ${{ runner.temp }}/cargo-target
           DISPATCH_DOCKER_CARGO_REGISTRY: ${{ runner.temp }}/cargo-registry
         run: |
           mkdir -p "$DISPATCH_DOCKER_TARGET_DIR" "$DISPATCH_DOCKER_CARGO_REGISTRY"
           scripts/test-in-docker.sh cargo test --locked --no-run
-          DISPATCH_DOCKER_CPUS=1 scripts/test-in-docker.sh cargo test --locked
+          DISPATCH_DOCKER_STRESS=1 scripts/test-in-docker.sh cargo test --locked --no-fail-fast

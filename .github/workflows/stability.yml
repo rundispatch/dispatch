@@ -115,3 +115,54 @@ jobs:
       - name: Fail when any run failed
         if: steps.repeat.outputs.failed_runs != '0'
         run: exit 1
+
+  # One nightly run on a loaded machine, as CI's stress job runs it on every
+  # pull request (scripts/test-in-docker.sh, DISPATCH_DOCKER_STRESS=1).
+  stress:
+    name: stability under load (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache Cargo (Linux test image)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-target
+            ${{ runner.temp }}/cargo-registry
+          key: cargo-ubuntu-22.04-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-ubuntu-22.04-
+      - name: Build the tests, then run the suite once in stress mode
+        id: stress
+        env:
+          DISPATCH_DOCKER_TARGET_DIR: ${{ runner.temp }}/cargo-target
+          DISPATCH_DOCKER_CARGO_REGISTRY: ${{ runner.temp }}/cargo-registry
+        run: |
+          mkdir -p "$DISPATCH_DOCKER_TARGET_DIR" "$DISPATCH_DOCKER_CARGO_REGISTRY" stability-logs
+          scripts/test-in-docker.sh cargo test --locked --no-run
+          status=0
+          DISPATCH_DOCKER_STRESS=1 scripts/test-in-docker.sh cargo test --locked --no-fail-fast \
+            > stability-logs/stress.log 2>&1 || status=$?
+          {
+            if [ "$status" -eq 0 ]; then
+              echo "## Stability under load: clean"
+            else
+              echo "## Stability under load: failed (exit $status)"
+              echo
+              sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' stability-logs/stress.log | sort -u |
+                while read -r name; do echo "- \`$name\`"; done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the failing run's log
+        if: steps.stress.outputs.status != '' && steps.stress.outputs.status != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stability-failures-stress
+          path: stability-logs/stress.log
+          if-no-files-found: error
+
+      - name: Fail when the run failed
+        if: steps.stress.outputs.status != '0'
+        run: exit 1

@@ -5,7 +5,7 @@ cancels); accept applies, and a stale accept is refused with what to do next;
 Work that appears while watching shows up without taking the selection; q
 leaves. Effects are checked in the recorded state, and what the person sees is
 checked on the screen as a terminal would show it."""
-import codecs, json, os, re, subprocess, sys, tempfile, time
+import codecs, json, os, re, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 sys.dont_write_bytecode=True
 from review_refinement import Session, WAIT, has_color
@@ -282,6 +282,17 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             ui.send('r');screen.see('Reject Make the second artifact (Work %s)?'%short(other,stale))
             ui.send('\x1b');screen.see('Make the second artifact: nothing changed.')
             screen.resize(200,30);ui.send('k');screen.see('› Make the first artifact','r reject · d review')
+            # A key pressed as the terminal says it resized is read then, not
+            # when the next key comes: crossterm 0.29 left such a key waiting.
+            for key,which in (('j','second'),('k','first'))*3:
+                os.killpg(ui.process.pid,signal.SIGWINCH);time.sleep(.005);ui.send(key)
+                screen.see('› Make the %s artifact'%which)
+            # A terminal slow to say where the cursor is, as on a loaded
+            # machine: the view waits for it, past crossterm's 2 s.
+            # The header's right edge is drawn anew only at the new width.
+            ui.cursor_reply_delay=3;screen.resize(120,30)
+            screen.see('› Make the first artifact','need you');ui.cursor_reply_delay=0
+            screen.resize(200,30);screen.see('› Make the first artifact','r reject · d review')
             ui.send('a');screen.see('Make the first artifact: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.')
             # Refused: nothing applied, and the refusal is recorded as such.
             assert meta(stale)['outcome']['application']=='blocked_by_source_drift',meta(stale)['outcome']

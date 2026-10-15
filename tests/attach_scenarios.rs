@@ -896,9 +896,13 @@ fn serve_restart_recovers_active_work_honestly() {
 
     // Third serve: adopts the orphaned Work exactly once.
     let mut serve3 = ServeProcess::spawn(&f);
+    // The event commits first; metadata.json is its projection, written next.
     wait_until(
         Duration::from_secs(300),
-        || f.event_count(&attached_id, "attach.adopted") > 0,
+        || {
+            f.event_count(&attached_id, "attach.adopted") > 0
+                && f.metadata(&attached_id)["attachment"]["owner_state"] == "adopted"
+        },
         "serve never adopted the orphaned attached Work",
     );
     assert_eq!(f.event_count(&attached_id, "attach.adopted"), 1);

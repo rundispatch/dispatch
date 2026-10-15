@@ -7,9 +7,16 @@
 # live in named volumes; CI sets DISPATCH_DOCKER_TARGET_DIR and
 # DISPATCH_DOCKER_CARGO_REGISTRY to host directories instead, for actions/cache.
 # DISPATCH_DOCKER_CPUS limits the container's CPUs (docker run --cpus), to run
-# the suite on a slow machine, e.g. DISPATCH_DOCKER_CPUS=1. --init gives the
-# container an init that reaps orphaned processes, as a real system does;
-# without it, exited orphans stay zombies and look alive to the tests.
+# the suite on a slow machine, e.g. DISPATCH_DOCKER_CPUS=1.
+# DISPATCH_DOCKER_STRESS=1 runs it on a loaded machine instead, as CI does on
+# every pull request: 2 CPUs (or DISPATCH_DOCKER_CPUS), 16 busy loops in the
+# container competing for them, and 8 test threads. CPUs alone do not load
+# it: the test harness runs one test per CPU. Build first without it, e.g.
+#   scripts/test-in-docker.sh cargo test --locked --no-run
+#   DISPATCH_DOCKER_STRESS=1 scripts/test-in-docker.sh cargo test --locked
+# --init gives the container an init that reaps orphaned processes, as a real
+# system does; without it, exited orphans stay zombies and look alive to the
+# tests.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -25,10 +32,20 @@ if [ "$#" -eq 0 ]; then
 fi
 
 cpus="${DISPATCH_DOCKER_CPUS:+--cpus=$DISPATCH_DOCKER_CPUS}"
+loops=0
+threads=
+if [ "${DISPATCH_DOCKER_STRESS:-0}" = 1 ]; then
+  cpus="--cpus=${DISPATCH_DOCKER_CPUS:-2}"
+  loops=16
+  threads="--env=RUST_TEST_THREADS=8"
+fi
 
-# $cpus is empty or one word; unquoted so that empty adds no argument.
+# $cpus and $threads are empty or one word; unquoted so that empty adds no
+# argument. The busy loops are the command's children and end with it.
 # shellcheck disable=SC2086
-exec docker run --rm --init $cpus \
+exec docker run --rm --init $cpus $threads \
   -v "$PWD:/src:ro" -v "$target:/target" -v "$registry:/usr/local/cargo/registry" \
   -e CARGO_TARGET_DIR=/target \
-  dispatch-test sh -c 'tar -C /src --exclude=./target -cf - . | tar -C /work -xf - && exec "$@"' sh "$@"
+  dispatch-test sh -c 'tar -C /src --exclude=./target -cf - . | tar -C /work -xf - || exit
+    i=0; while [ "$i" -lt "$1" ]; do (while :; do :; done) & i=$((i+1)); done
+    shift; exec "$@"' sh "$loops" "$@"
