@@ -1,5 +1,5 @@
 //! Worktrees a runtime made, found in a watched project without hooks
-//! (`docs/plan-0.4.13.md` §3 B, `docs/plan-0.4.14.md` §3 C). Each owner tick
+//! (`docs/plan-0.4.13.md` §3 B, `docs/plan-0.4.14.md` §3 C). The fast owner loop
 //! lists the root's Git worktrees, never walking a directory, and asks the
 //! runtime's adapter which ones it made. Those already there when the watch
 //! began go into the `Inventory` and are only listed. One Claude Code made
@@ -119,6 +119,14 @@ pub(crate) static UNOBSERVED: [Unobserved; 2] = [
     },
 ];
 
+/// Runtimes that can remove their own worktrees, taking uncommitted work with
+/// them. Their attached Work needs a fresh last-seen patch while it exists.
+pub(crate) const VANISHING_WORKTREES: &[&str] = &["hermes"];
+
+pub(crate) fn can_vanish(agent: Option<&str>) -> bool {
+    agent.is_some_and(|agent| VANISHING_WORKTREES.contains(&agent))
+}
+
 /// The runtime of discovered Work whose session's end is not observable.
 pub(crate) fn unobserved(attachment: &AttachmentRecord) -> Option<&'static Unobserved> {
     if !matches!(attachment.provenance, BaselineProvenance::Discovered { .. }) {
@@ -146,7 +154,7 @@ enum Made {
     },
 }
 
-/// One owner tick for `root`, with the runs the owner loaded.
+/// One fast owner pass for `root`, with the runs the owner loaded.
 pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()> {
     // A plain directory has no worktrees.
     if !root.join(".git").exists() {

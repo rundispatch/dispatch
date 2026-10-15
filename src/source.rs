@@ -722,6 +722,50 @@ pub fn snapshot_delta_indexed(
     write_atomically(out_patch, &patch)
 }
 
+/// Follow a workspace after the first snapshot only when its contents differ
+/// from the retained temporary index. `retained_patch` may differ from the
+/// output so a caller can discard a capture interrupted by worktree removal.
+/// The worktree column of porcelain status sees a second edit to a file that
+/// was already changed in the patch.
+pub(crate) fn snapshot_delta_if_changed_indexed(
+    baseline_path: &Path,
+    workspace: &Path,
+    out_patch: &Path,
+    index_path: &Path,
+    retained_patch: &Path,
+) -> Result<bool> {
+    if index_path.exists() && retained_patch.exists() {
+        let mut status = comparison_git_command(baseline_path, workspace);
+        status.env("GIT_INDEX_FILE", index_path).args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ]);
+        status.args(dispatch_exclusion_pathspecs());
+        let output = checked_output(status, "failed to inspect the work in progress")?;
+        let changed = output.stdout.split(|byte| *byte == 0).any(|entry| {
+            entry.starts_with(b"??") || entry.get(1).is_some_and(|status| *status != b' ')
+        });
+        if !changed {
+            return Ok(false);
+        }
+    }
+    match snapshot_delta_indexed(baseline_path, workspace, out_patch, index_path) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            // Staging may have succeeded before patch publication failed. A
+            // retained index from that attempt would make the next status
+            // look clean while out_patch still held the older contents.
+            let _ = fs::remove_file(index_path);
+            Err(error)
+        }
+    }
+}
+
 /// Hash the complete logical source tree, excluding Git and Dispatch state.
 /// Content, paths, symlink targets, file kinds, and permission bits are covered;
 /// timestamps are intentionally ignored. An entry that disappears during the
@@ -2942,6 +2986,65 @@ mod tests {
         let patch = same();
         assert!(!patch.contains("src/lib.rs") && !patch.contains("new.txt"));
         assert!(patch.contains("deleted file mode"));
+    }
+
+    #[test]
+    fn a_failed_patch_publication_does_not_lose_the_next_follow() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("file.txt"), "before\n");
+        initialize_user_repository(&source);
+        let snapshot = create_snapshot(&source, &temp.path().join("run")).unwrap();
+        let workspace = temp.path().join("candidate");
+        create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+        let index = temp.path().join("kept.index");
+        let patch = temp.path().join("delta-live.patch");
+
+        assert!(
+            snapshot_delta_if_changed_indexed(
+                &snapshot.baseline_path,
+                &workspace,
+                &patch,
+                &index,
+                &patch
+            )
+            .unwrap()
+        );
+        let before = fs::read(&patch).unwrap();
+        write(&workspace.join("file.txt"), "after the edit\n");
+
+        // Let Git stage the edit, but make publishing its patch fail. Restore
+        // the previous patch afterward, as it would remain after a write error.
+        let old = temp.path().join("old.patch");
+        fs::rename(&patch, &old).unwrap();
+        fs::create_dir(&patch).unwrap();
+        assert!(
+            snapshot_delta_if_changed_indexed(
+                &snapshot.baseline_path,
+                &workspace,
+                &patch,
+                &index,
+                &patch
+            )
+            .is_err()
+        );
+        fs::remove_dir(&patch).unwrap();
+        fs::rename(&old, &patch).unwrap();
+        assert_eq!(fs::read(&patch).unwrap(), before);
+
+        assert!(
+            snapshot_delta_if_changed_indexed(
+                &snapshot.baseline_path,
+                &workspace,
+                &patch,
+                &index,
+                &patch
+            )
+            .unwrap()
+        );
+        let updated = fs::read_to_string(&patch).unwrap();
+        assert!(updated.contains("+after the edit"), "{updated}");
     }
 
     #[test]

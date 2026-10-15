@@ -13,6 +13,8 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -28,6 +30,7 @@ use super::{
 use crate::{
     ApplicationState, BaselineProvenance, Config, Decision, EventRecord, LifecycleState,
     OwnerState, ReviewState, RunMode, RunRecord, SourceAtStart, SourceKind, Validity, WorkResult,
+    WorkspaceOwner,
     coherence::{
         self, WorkView,
         interactions::{self, Analysis, Edge, Footprint, Participant, Projection},
@@ -93,7 +96,8 @@ async fn run(
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut view = View::default();
-    let mut last_error: Option<String> = None;
+    let errors = Arc::new(Mutex::new(HashSet::new()));
+    let _fast = FastLoop::start(state, &owner.root, background, Arc::clone(&errors))?;
 
     loop {
         tokio::select! {
@@ -122,18 +126,13 @@ async fn run(
             tracing::info!("tick: {}", tick.cost);
         }
         if background {
-            if tick.error.is_some() && tick.error != last_error {
-                eprintln!(
-                    "{} {}",
-                    Utc::now().to_rfc3339(),
-                    tick.error.as_deref().unwrap_or_default()
-                );
+            if let Some(error) = &tick.error {
+                log_error(background, &errors, error);
             }
-            last_error = tick.error;
             continue;
         }
         if let Some(error) = &tick.error {
-            eprintln!("serve: {error}");
+            log_error(background, &errors, error);
         }
         if json
             && tick.moved
@@ -147,6 +146,199 @@ async fn run(
         view.render(None, &tick.runs, json, owner.projection(), &[]);
         let _ = io::stdout().flush();
     }
+}
+
+/// The short loop owns its scratch and stops before `serve` releases the
+/// project. A thread lets it scan while the async owner awaits project checks.
+struct FastLoop {
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl FastLoop {
+    fn start(
+        state: &State,
+        root: &Path,
+        background: bool,
+        errors: Arc<Mutex<HashSet<String>>>,
+    ) -> Result<Self> {
+        let scratch = tempfile::Builder::new()
+            .prefix("dispatch-fast-owner-")
+            .tempdir()
+            .context("failed to create the fast owner's scratch directory")?;
+        let state = state.clone();
+        let root = root.to_owned();
+        let (stop, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("dispatch-fast-owner".into())
+            .spawn(move || {
+                let mut ready = false;
+                loop {
+                    for error in fast_pass(&state, &root, scratch.path(), &mut ready) {
+                        log_error(background, &errors, &format!("{error:#}"));
+                    }
+                    if !matches!(
+                        receiver.recv_timeout(Duration::from_secs(1)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .context("failed to start the fast owner loop")?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for FastLoop {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn log_error(background: bool, seen: &Mutex<HashSet<String>>, error: &str) {
+    if background {
+        let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !seen.insert(error.to_owned()) {
+            return;
+        }
+        eprintln!("{} {error}", Utc::now().to_rfc3339());
+    } else {
+        eprintln!("serve: {error}");
+    }
+}
+
+/// Dispatch-made candidates are kept by Dispatch; a runtime cannot remove
+/// those workspaces as it can remove one of its own.
+fn needs_fast_follow(attachment: &crate::AttachmentRecord) -> bool {
+    super::discovery::can_vanish(attachment.agent.as_deref())
+        && attachment.workspace_owner != WorkspaceOwner::Dispatch
+}
+
+/// The fast scratch may not exist yet. Keep the last completed capture.
+fn freshest_patch<'a>(scratch: &'a Path, live: &'a Path) -> Option<&'a Path> {
+    [scratch, live]
+        .into_iter()
+        .filter_map(|path| {
+            let written = fs::metadata(path)
+                .ok()
+                .filter(|metadata| metadata.is_file())?
+                .modified()
+                .ok()?;
+            Some((written, path))
+        })
+        .max_by_key(|(written, _)| *written)
+        .map(|(_, path)| path)
+}
+
+/// List and register through discovery's one path, then follow only Work
+/// whose runtime may delete its worktree. No verdict or interaction runs here.
+fn fast_pass(state: &State, root: &Path, scratch: &Path, ready: &mut bool) -> Vec<anyhow::Error> {
+    let mut errors = Vec::new();
+    let runs = match load_source_runs(state, root) {
+        Ok(runs) => runs,
+        Err(error) => return vec![error],
+    };
+    match super::discovery::scan(state, root, &runs) {
+        Ok(()) if !*ready => match super::background::mark_discovery_ready(state, root) {
+            Ok(()) => *ready = true,
+            Err(error) => errors.push(error),
+        },
+        Ok(()) => {}
+        Err(error) => errors.push(error),
+    }
+    let runs = match load_source_runs(state, root) {
+        Ok(runs) => runs,
+        Err(error) => {
+            errors.push(error);
+            return errors;
+        }
+    };
+    for run in &runs {
+        if run.mode != RunMode::Attached || run.outcome.lifecycle != LifecycleState::Working {
+            continue;
+        }
+        let Some(attachment) = run.attachment.as_ref() else {
+            continue;
+        };
+        // A live wrapper owns its own Work until it exits.
+        if !needs_fast_follow(attachment)
+            || attachment.workspace_removed.is_some()
+            || live_owner_state(attachment.owner.as_ref()) == OwnerState::Live
+        {
+            continue;
+        }
+        let patch = scratch.join(format!("{}.patch", run.id));
+        let next = patch.with_extension("next.patch");
+        let run_dir = state.run_dir(&run.id);
+        let previous = run_dir.join("delta-live.patch");
+        if !attachment.workspace.exists() {
+            if let Err(error) = super::attach::note_workspace_gone(
+                state,
+                &run.id,
+                freshest_patch(&patch, &previous),
+            ) {
+                errors.push(error);
+            }
+            continue;
+        }
+        let index = patch.with_extension("index");
+        let result = source::snapshot_delta_if_changed_indexed(
+            &run.baseline_path,
+            &attachment.workspace,
+            &next,
+            &index,
+            &patch,
+        )
+        .and_then(|changed| {
+            if changed {
+                // A worktree removed during the capture must leave the last
+                // complete patch in place for `note_workspace_gone`.
+                if !attachment.workspace.exists() {
+                    let _ = fs::remove_file(&next);
+                    return Ok(());
+                }
+                fs::rename(&next, &patch)?;
+            }
+            let live = state.run_dir(&run.id).join("delta-live.patch");
+            if !changed && live.exists() {
+                return Ok(());
+            }
+            let bytes = fs::read(&patch)?;
+            if !attachment.workspace.exists() {
+                return Ok(());
+            }
+            if fs::read(&live).ok().as_deref() != Some(bytes.as_slice()) {
+                crate::state::write_atomically(&live, &bytes)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            // A failed live publication must be retried even if Git staged
+            // the edit successfully in the temporary index.
+            let _ = fs::remove_file(&index);
+            let _ = fs::remove_file(&next);
+            if attachment.workspace.exists() {
+                errors.push(error);
+            }
+        }
+        if !attachment.workspace.exists()
+            && let Err(error) = super::attach::note_workspace_gone(
+                state,
+                &run.id,
+                freshest_patch(&patch, &previous),
+            )
+        {
+            errors.push(error);
+        }
+    }
+    errors
 }
 
 /// `dispatch watch [--root <path>] [--json]`: the project view, live, read
@@ -384,11 +576,8 @@ impl Owner {
         tick.cost.runs = runs.len();
         tick.adopted = adopt_orphans(state, &runs, &mut tick);
         self.observe_starts(state, &runs, &mut tick);
-        // Worktrees a runtime made, found without hooks, and whether their
-        // agents still run (`docs/plan-0.4.13.md` §3 B and C).
-        if let Err(error) = super::discovery::scan(state, &self.root, &runs) {
-            tick.report(&error);
-        }
+        // Agent liveness remains at the coherence cadence; the separate fast
+        // loop now lists and registers worktrees without waiting for checks.
         if let Err(error) = super::liveness::observe(state, &self.root, &runs) {
             tick.report(&error);
         }
@@ -651,13 +840,15 @@ impl Owner {
             // waiting, so the owner holds it only when something moved.
             let scratch = self.scratch.path().join(format!("{}.patch", candidate.id));
             if !attachment.workspace.exists() {
-                // Gone without a word: keep the last Δ this owner followed.
-                if let Err(error) =
-                    super::attach::note_workspace_gone(state, &candidate.id, Some(&scratch))
-                {
-                    tick.report(&error);
+                // The fast loop owns last-seen capture for vanishing trees.
+                if !needs_fast_follow(attachment) {
+                    if let Err(error) =
+                        super::attach::note_workspace_gone(state, &candidate.id, Some(&scratch))
+                    {
+                        tick.report(&error);
+                    }
+                    tick.persisted = true;
                 }
-                tick.persisted = true;
                 continue;
             }
             let started = Instant::now();
@@ -704,17 +895,24 @@ impl Owner {
             let Some(attachment) = run.attachment.clone() else {
                 continue;
             };
-            if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
+            if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live
+                || attachment.workspace_removed.is_some()
+            {
                 continue;
             }
             let started = Instant::now();
-            let delta_path = state.run_dir(&run.id).join("delta-live.patch");
-            if let Err(error) =
-                source::snapshot_delta(&run.baseline_path, &attachment.workspace, &delta_path)
-            {
-                tick.report(&error);
-                continue;
-            }
+            let delta_path = if needs_fast_follow(&attachment) {
+                scratch.clone()
+            } else {
+                let delta_path = state.run_dir(&run.id).join("delta-live.patch");
+                if let Err(error) =
+                    source::snapshot_delta(&run.baseline_path, &attachment.workspace, &delta_path)
+                {
+                    tick.report(&error);
+                    continue;
+                }
+                delta_path
+            };
             let world = match world::observe(root, &run.baseline_path, &run.baseline_commit, kind) {
                 Ok(world) => world,
                 Err(error) => {
