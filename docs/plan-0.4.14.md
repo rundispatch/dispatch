@@ -436,3 +436,25 @@ root, and one needed a host `docker`.
 
 Evidence: `~/dispatch-dev/conformance-0414/trials/`. The earlier run at
 `2705b4c` (0.4.13 version string) is in `trials-2705b4c/`.
+
+### Final validation (integrator, 2026-10-15, on `bc17785`)
+
+- **GitHub CI, run 38748890945:** green on all three jobs.
+  - `tests under load (ubuntu-22.04)`, 20 min;
+  - `checks (ubuntu-22.04)`, 13 min;
+  - `checks (macos-15)`, 30 min.
+
+  The P6b push before it (`34a2445`) was green on the same three jobs.
+- **Natively on the dev Mac, final tree:** `cargo test --locked --no-fail-fast`
+  passed 734, failed 0, ignored 5 (47 binaries), at load 5–8.
+- **State compatibility:**
+  - The 0.4.14 candidate ran `check --merged` and `accept --expect` on this
+    release's own state, which the pinned 0.4.13 watcher kept serving and
+    reading throughout.
+  - The schema is unchanged at 24.
+  - Packet R checked that 0.4.13 reads a state written by 0.4.14.
+- **Not yet run.** These run only from the default branch, so they need the
+  merge first; `harness-trials` also needs the protected environment and its
+  secrets in the repository settings:
+  - `stability.yml` (20 runs, and the nightly stress run);
+  - `harness-trials.yml` on GitHub.
