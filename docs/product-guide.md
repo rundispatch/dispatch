@@ -140,11 +140,23 @@ Coherence section when the source moved or the run is a refresh.
   and the next command: `dispatch accept`, `dispatch refresh`, `dispatch reject`,
   or for STOP `dispatch close <id> --reason already-present`. It changes
   nothing and exits 0 whenever the evaluation succeeds, whatever the verdict.
+  It ends with `Δ <12 hex>`, the start of the SHA-256 of the patch, which
+  `finish` and `diff --stat` print too.
+- `dispatch check <id> --merged` also runs your checks on the source as it is
+  now with the Work's change applied, in a scratch copy, as accept would, and
+  prints one line per command: `PASS` or `FAIL`, exit code, duration and logs.
+  For unfinished attached Work it takes the change from the workspace now, new
+  files included, as `finish` would. It applies nothing, changes no verdict, and
+  exits 1 if a check fails. It needs the authority `finish` has, or
+  `--allow-unsafe-local` for that check alone. Accept still runs its own
+  merged checks, because the source can move after.
 - `dispatch accept [run]` prints `Merged checks:` before it applies: passed, with
-  the logs, or not run and why (the source has not moved, no checks are
-  configured, and so on). Without an ID it acts only when exactly one result
-  waits for review for the source, and so does `dispatch reject`; with several
-  they change nothing and list each one's command.
+  the logs and one line per command, or not run and why (the source has not
+  moved, no checks are configured, and so on). `--expect <digest>` accepts only
+  the Δ you reviewed: if the frozen Δ's digest does not start with it, nothing
+  happens and both digests are named. Without an ID it acts only when exactly
+  one result waits for review for the source, and so does `dispatch reject`;
+  with several they change nothing and list each one's command.
 - `dispatch close <id> --reason <reason>` retires a result without judging it:
   `already-present` when its whole patch is already in the source, or
   `superseded --replacement <id>` when other finished Work replaces it. It
@@ -435,7 +447,7 @@ Watching needs no agent profile. It covers:
 - the Work Dispatch launched;
 - the Work you attached;
 - sessions a runtime reports;
-- Claude Code worktrees it finds by itself (below).
+- Claude Code, Codex and Cursor Agent worktrees it finds by itself (below).
 
 It never scans for agent processes. Wrapped attach and the TUI need no owner at
 all.
@@ -463,14 +475,27 @@ that attaches it: `dispatch attach --workspace <path>`. Worktrees you made
 yourself (`git worktree add`) are never listed. The list belongs to the watch: it
 survives the owner being restarted after a crash, and `dispatch stop` clears it.
 
+**Codex and Cursor Agent worktrees.** They are found the same way, each by the
+one reliable sign it leaves. A Codex worktree (`codex exec --worktree`) counts
+wherever it is, by the `codex-thread.json` Codex keeps in its Git metadata. A
+Cursor Agent worktree (`cursor-agent --worktree <name>`) counts at exactly
+`~/.cursor/worktrees/<project folder, lowercased>/<name>`, on branch `<name>`.
+One that appears after watching began becomes Work with S0 at its merge base;
+one that was already there is listed as found, not tracked. Neither agent
+records anything that names its running process, so Dispatch cannot see their
+sessions end. Their Work never reads `agent running` and never turns idle by
+itself, and `status` says so: when the agent is done, `dispatch finish <id>`, or
+`dispatch close <id> --reason unfinished`.
+
 **Agent running.** Claude Code locks a worktree it made with the process ID of
 its session. While that exact process runs, the Work shows `agent running (pid
 N)`; a reused pid never counts. When the process is gone, or the lock is
 released, Dispatch records the end of the session, `claude -p` included. The
 Work then reads `idle`, with "session ended — finish, resume or close". It is
 never finished, applied or closed by this. A process Dispatch never saw running
-proves nothing, and nothing is recorded. Other agents' worktrees are not
-recognized: `dispatch attach -- <agent>` gives any agent a workspace of its own.
+proves nothing, and nothing is recorded. The end is recorded even when you
+`finish` the Work first. Other agents' worktrees are not recognized:
+`dispatch attach -- <agent>` gives any agent a workspace of its own.
 
 **Work that appears with hooks.** `dispatch setup` → **Runtime integrations…** installs
 Claude Code's hooks into `~/.claude/settings.json`: `SessionStart`, `SessionEnd`,

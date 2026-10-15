@@ -164,8 +164,16 @@ local backend the run itself was approved for local execution (the run's
 unchanged. These conditions live in one function, `integration::checks_skipped`,
 which names the reason (`ChecksSkipped`: `ConfigUnreadable`, `Strict`, `Unmoved`,
 `Disabled`, `NotConfigured`, `NoAuthority`, `EmptyPatch`). `verify_integration`
-returns the verdict together with `MergedChecks` (`Skipped(reason)`, `Passed(log dir)`
-or `Failed`), which accept prints.
+returns the verdict together with `MergedChecks` (`Skipped(reason)`, `Passed(run)` or
+`Failed(run or none)`), which accept prints, followed by one line per command.
+
+The steps below are `integration::run_merged`, the one merged-check runner. Accept's
+gate and `dispatch check --merged` both call it. `check --merged` is an explicit
+request, so it ignores `coherence.accept: strict` and `integration_checks: false` and
+runs whether or not the world moved, but it still needs a non-empty `checks.verify`,
+a non-empty Δ and authority: the Work's own `unsafe_local`, standing consent for
+exactly these commands, or `--allow-unsafe-local` on that check alone. It changes no
+verdict and applies nothing.
 
 1. Copy the current source into a scratch directory under the run directory
    (`coherence-scratch-<id>`): for Git sources exactly the non-ignored files, so there
@@ -185,10 +193,25 @@ or `Failed`), which accept prints.
    `ERROR: test_admin_token (…) / TypeError: validate() missing 1 required positional
    argument: 'token'`.
 
-There is no cooperative cancellation of these checks. They run while the per-run and
-per-source apply locks are held, so another accept of the same run or source waits.
+There is no cooperative cancellation of these checks. At accept they run while the
+per-run and per-source apply locks are held, so another accept of the same run or
+source waits. `check --merged` takes no run lock.
+
+Each run is recorded as one `coherence.merged_checks` event (see "Events"). Its
+`source` is observed just before the scratch copy is made, under
+`GIT_OPTIONAL_LOCKS=0`: `{"git": {"head", "dirty"}}` or the plain directory.
+Merged checks are not cached and a failing check is not retried.
 
 ## The accept path
+
+`dispatch accept <id> --expect <digest>` first resolves the run as accept would and
+compares the frozen Δ's SHA-256 (the `Δ <12 hex>` that `finish`, `check` and `diff
+--stat` print) with the given prefix of 12 to 64 hex characters, before any lock, gate
+or apply. A mismatch refuses with `the frozen Δ of <id> is <digest>, not the expected Δ
+<expected>; nothing was applied`. A finished run's Δ is never written again, so the run
+accept then judges has exactly the compared Δ; unfinished Work is refused. The full
+digest is recorded on the `review.accepted` or `review.rejected` event as
+`delta_digest`.
 
 `apply_locked` (used by `dispatch accept`, the review view and `dispatch apply`) takes
 the per-run and per-source locks and calls `coherence::gate`:
@@ -575,6 +598,7 @@ also gets the run's `outcome`, as for all events.
 | `run.stopped` | After a watcher stop. | `failure: "stale_work"`, `reason` |
 | `auto_apply.skipped` | An auto-apply attempt was not eligible (see "Automatic application" above). | `{"reason": <string>}` |
 | `auto_apply.blocked` | The gate, or its stricter authorization predicate, refused an auto-apply attempt. | `{"reason": <string>, "coherence": <Validity or null>}` |
+| `coherence.merged_checks` | Merged checks ran, at accept (a transition) or for `dispatch check --merged` (an observation that does not move the state revision). Not recorded for auto-apply's merged checks. | `by` (`accept` or `check`), `source`, `delta_digest`, `passed`, `duration_ms`, `results` (each command's `status`, `exit_code`, `duration_ms` and logs), `logs`; `patch` for `check` |
 
 ## Configuration
 
@@ -679,7 +703,7 @@ How to read it:
 - Integration checks use your `checks.verify` on a scratch copy of the non-ignored files with no build cache
   (a `cargo test` builds from scratch unless the command points `CARGO_TARGET_DIR` elsewhere), hold the apply locks while running, and cannot be cancelled.
   They do not run for a local-backend run that was not approved for local execution.
-- `dispatch check`, `status`, `explain`, the finish summary and a native result's summary evaluate L0 and L1 only, fresh and never stored; integration checks run at accept. `check`, finish and the native summary also print `At accept: …`, what accept would verify now, and a `Next` step driven by the verdict: REFRESH and STOP never offer accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
+- `dispatch check`, `status`, `explain`, the finish summary and a native result's summary evaluate L0 and L1 only, fresh and never stored; integration checks run at accept, or on request with `dispatch check --merged`, which records the run but changes no verdict. `check`, finish and the native summary also print `At accept: …`, what accept would verify now, and a `Next` step driven by the verdict: REFRESH and STOP never offer accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
 - Plain-directory sources cannot honor `.gitignore`; ignored build output counts as world change (the patch usually still applies).
 - Nested repositories and submodules are not analysed.
 - A source that moved since S0 does not stop a native run, including the continuation after a clarification answer: every attempt starts from the run's original snapshot, the mid-run watcher reports what the move means for the work, and the accept gate judges the result against the source as it is then. (Before 0.4.4 a continuation stopped with `source_drift` whenever the tree differed.)

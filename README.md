@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.13 — experimental developer preview**
+**Dispatch 0.4.14 — experimental developer preview**
 
 <p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch; once one lands, the other no longer fits, and dispatch accept refuses it as REFRESH, leaving the source unchanged."></a></p>
 <p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
@@ -99,6 +99,15 @@ worktree that appears after watching began (`claude --worktree` or `claude -p
 - Claude worktrees that were already there when watching began, or that have no
   session lock, are listed as "found, not tracked", with `dispatch attach
   --workspace <path>`.
+- Codex and Cursor Agent worktrees are recognized the same way, each by the one
+  reliable sign it leaves: for Codex (`codex exec --worktree`), wherever the
+  worktree is, `codex-thread.json` in its Git metadata; for Cursor Agent
+  (`cursor-agent --worktree <name>`), exactly
+  `~/.cursor/worktrees/<project folder, lowercased>/<name>` on branch `<name>`.
+  Neither records anything that names its running agent, so Dispatch cannot see
+  their sessions end. Their Work never reads `agent running` and never turns
+  idle by itself; when the agent is done, `dispatch finish <id>`, or `dispatch
+  close <id> --reason unfinished`.
 - Other agents' worktrees are not recognized: `dispatch attach -- <agent>`
   gives any agent its own workspace.
 
@@ -162,10 +171,10 @@ your own state directory. Nothing leaves your machine. "Invalidated" there
 means Dispatch's own later verdict, not a confirmed conflict.
 
 Watching covers Work Dispatch launched, that you attached, sessions whose
-runtime reports them, and Claude Code worktrees it finds. Working Work shows
-the files it has changed so far and how long it has been tracked; until the
-owner has counted, files read `unknown`, never 0. It does not scan for agent
-processes. After a reboot, run
+runtime reports them, and Claude Code, Codex and Cursor Agent worktrees it
+finds. Working Work shows the files it has changed so far and how long it has
+been tracked; until the owner has counted, files read `unknown`, never 0. It
+does not scan for agent processes. After a reboot, run
 `dispatch start` again. `dispatch serve` does the same watching in the
 foreground, and `check` and `status` answer on demand.
 
@@ -200,10 +209,28 @@ it is now. Nothing about it is trusted from an earlier moment.
   a `finish` shows the same verdict and `At accept` line, and its heading follows the
   verdict: `Ready for review`, `Finished, but stale (REFRESH)` or
   `Finished, already in the source (STOP)`.
+- `dispatch check <id> --merged` also runs your `checks.verify` on the source as it
+  is now with the Work's change applied, in a scratch copy, exactly as accept would,
+  and prints one line per command (PASS/FAIL, exit code, duration, logs). For
+  unfinished attached Work, the change is taken from the workspace now, new
+  untracked files included, as `finish` would take it; the live patch is not
+  touched. Nothing is applied and no verdict changes; one `coherence.merged_checks`
+  event records the source state (Git HEAD and whether it had uncommitted changes,
+  or a plain directory), the Δ digest and each command's result and duration. It
+  exits 1 if a check fails. It needs the same authority as `finish`: the Work's own
+  `--allow-unsafe-local`, standing consent for exactly these checks (`dispatch
+  setup --checks`), or `--allow-unsafe-local` for this check alone, which is not
+  recorded on the Work. Accept still runs its own merged checks, because the source
+  can move after.
+- `finish`, `check` and `diff --stat` print `Δ <12 hex>`, the start of the SHA-256
+  of the patch bytes. `dispatch accept <id> --expect <digest>` (12 or more hex
+  characters) refuses before anything else, naming both digests, if the frozen Δ
+  is not the one you reviewed. The accepted digest is recorded with the review
+  (`review.accepted.delta_digest`).
 - `dispatch accept [run]` applies the result and then records your acceptance. It
   first prints `Merged checks:`, whether your checks ran on the merged result and
-  passed, or why they did not run. If the tree is byte-identical to the snapshot,
-  behavior is unchanged. If it moved, the verdict gates the apply. A `REFRESH` or
+  passed, or why they did not run, then one line per command when they ran. If
+  the tree is byte-identical to the snapshot, behavior is unchanged. If it moved, the verdict gates the apply. A `REFRESH` or
   `STOP` leaves the source untouched, shows the application as blocked by source
   drift, and records no acceptance: the result stays pending until you refresh,
   reject or close it.
@@ -393,8 +420,8 @@ Each run uses exactly one agent:
   only narrow the choice. If no eligible profile matches, the run is refused
   with each profile's reason; it never falls back to an unchecked agent.
 - With no profiles configured (no `resources.yml`, or `allocation_enabled:
-  false`), `--agent claude|codex|cursor` runs that agent with its own login and
-  no funding contract is checked.
+  false`), `--agent claude|codex|cursor|hermes` runs that agent with its own
+  login and no funding contract is checked.
 - With neither, `dispatch run` refuses: run `dispatch setup`, or pass `--agent`.
 
 There is no ranking, benchmark data or automatic fallback to another agent.
@@ -429,15 +456,15 @@ The local backend is the supported real-agent path in this candidate. Docker exe
 ```text
 dispatch setup [codex|claude | --checks [--verify command]...]
 dispatch resources
-dispatch run "<task>" [--source path] [--agent claude|codex|cursor]
+dispatch run "<task>" [--source path] [--agent claude|codex|cursor|hermes]
 dispatch run "<task>" --json|--jsonl
 dispatch status [run-id] [--json|--jsonl]
 dispatch diff [run-id]
-dispatch accept [run-id]
+dispatch accept [run-id] [--expect <Δ digest>]
 dispatch reject [run-id]
 dispatch close <run-id> --reason unfinished|workspace-removed|already-present|superseded [--replacement run-id]
 dispatch explain [run-id]
-dispatch check [run-id] [--json]
+dispatch check [run-id] [--json] [--merged [--allow-unsafe-local]]
 dispatch refresh [run-id] [--allow-unsafe-local] [--json|--jsonl]
 dispatch answer <run-id> <question-id> --revision n --answer text [--json]
 dispatch cancel <run-id> <question-id> --revision n [--json]
@@ -586,6 +613,10 @@ harnesses:
   cursor:
     model: null
     extra_args: []
+  hermes:
+    model: null
+    provider: null
+    extra_args: []
 ```
 
 Use the command that actually verifies the project, such as `pytest`, `npm test`, or `go test ./...`. Repository configuration cannot grant itself local-execution or environment-forwarding permission.
@@ -599,9 +630,9 @@ No network service is required to create, execute, inspect, accept, or reject a 
 ## Current boundaries
 
 - Experimental developer preview, not a stable 1.0 service.
-- Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent remains available as an explicit `--agent cursor` choice without a funding contract. Agent installation, authentication, quotas, and provider availability remain external prerequisites.
+- Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent and Hermes Agent remain available as an explicit `--agent cursor` or `--agent hermes` choice without a funding contract. The Hermes adapter has not yet run against a real successful Hermes session. Agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current and applies only attached work you allowed to integrate; it never launches, refreshes, finishes on a session's end or signals agents. It recognizes only Claude Code's worktrees by itself, and scans no processes.
+- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current and applies only attached work you allowed to integrate; it never launches, refreshes, finishes on a session's end or signals agents. It recognizes only Claude Code's, Codex's and Cursor Agent's worktrees by itself, sees only Claude Code's sessions end, and scans no processes.
 
 ## Development
 
@@ -612,5 +643,28 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+The tests need only Rust, `git`, `python3` and `sh`; no `docker` CLI.
+`scripts/test-in-docker.sh` runs the same validation in `ci/test.Dockerfile`, a
+pinned Rust 1.97.1 Linux image, as an ordinary user with your uid. Your checkout
+is mounted read-only, `target/` lives in a Docker volume, and the container runs
+with `--init`, so orphaned processes are reaped as on a real system. Give it a
+command to run that instead, for example `scripts/test-in-docker.sh cargo test
+--locked some_test`. `DISPATCH_DOCKER_CPUS=1` limits it to one CPU, as CI's
+`tests on one CPU` job does.
+<!-- TODO(integrator, P6b): one line on the stress mode, if it is documented here. -->
+
+CI runs the suite on every pull request and push to `main`, on Linux (in the test
+image) and macOS. A release runs the same suite on its tag before it builds any
+asset. `stability.yml` runs the suite 20 times a night on both platforms and lists
+every failing test with its count. `harness-trials.yml` runs real agents through
+`scripts/harness-trial.sh`, only by hand or weekly, never on pull requests, with
+keys from a protected environment. Only the fixture reaches the model providers,
+sent by the agents; Dispatch uploads nothing.
+
+Dispatch's promise is tested per agent: `scripts/harness-trial.sh <harness>
+<path>` runs one shared scenario through each path Dispatch offers an agent and
+records pass or fail against Dispatch's own contract. It never compares the
+agents. Results: [docs/harness-conformance.md](docs/harness-conformance.md).
 
 Detailed contributor guardrails live in [AGENTS.md](AGENTS.md).
