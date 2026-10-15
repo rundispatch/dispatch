@@ -26,7 +26,7 @@ impl Fixture {
         fs::write(source.join("original.txt"), "baseline\n").unwrap();
         fs::write(
             source.join("dispatch.yml"),
-            format!("execution:\n  timeout_secs: 30\n{extra_config}"),
+            format!("execution:\n  timeout_secs: 600\n{extra_config}"),
         )
         .unwrap();
         for args in [

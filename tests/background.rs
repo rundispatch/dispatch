@@ -106,7 +106,7 @@ fn alive(pid: i32) -> bool {
 }
 
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !ready() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(50));
@@ -116,12 +116,11 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
 #[test]
 fn start_returns_at_once_and_stop_ends_exactly_that_owner() {
     let project = Project::new();
-    let started = Instant::now();
     let output = project.dispatch(&["start"]);
     assert!(output.status.success(), "{}", text(&output));
-    assert!(started.elapsed() < Duration::from_secs(10));
     assert!(text(&output).contains("✓ Watching"), "{}", text(&output));
     assert!(project.lock_is_held());
+    // `start` returned while the owner it started keeps watching.
     let pid = project.owner_pid();
     assert!(alive(pid));
     assert!(!project.state.join("resources.yml").exists());
@@ -149,6 +148,48 @@ fn start_returns_at_once_and_stop_ends_exactly_that_owner() {
     let idle = project.dispatch(&["stop"]);
     assert!(idle.status.success());
     assert!(text(&idle).contains("Not watching"), "{}", text(&idle));
+}
+
+#[test]
+fn start_waits_for_an_owner_that_is_slow_to_become_ready() {
+    // A loaded machine: the owner takes longer than 10 s to be ready.
+    let project = Project::new();
+    let output = Command::new(assert_cmd::cargo_bin!("dispatch"))
+        .arg("--state-dir")
+        .arg(&project.state)
+        .arg("start")
+        .current_dir(&project.root)
+        .env("DISPATCH_REGISTRATION_FAULT", "owner_ready:delay=12000")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(text(&output).contains("✓ Watching"), "{}", text(&output));
+    assert!(alive(project.owner_pid()));
+}
+
+#[test]
+fn stop_waits_for_an_owner_that_is_slow_to_exit() {
+    // A loaded machine: the owner takes longer than 10 s to let go.
+    let project = Project::new();
+    let output = Command::new(assert_cmd::cargo_bin!("dispatch"))
+        .arg("--state-dir")
+        .arg(&project.state)
+        .arg("start")
+        .current_dir(&project.root)
+        .env("DISPATCH_REGISTRATION_FAULT", "owner_stopping:delay=12000")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let pid = project.owner_pid();
+    let stopped = project.dispatch(&["stop"]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    assert!(
+        text(&stopped).contains("stopped watching"),
+        "{}",
+        text(&stopped)
+    );
+    assert!(!project.lock_is_held());
+    wait_until("the owner to exit", || !alive(pid));
 }
 
 #[test]

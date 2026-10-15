@@ -45,7 +45,7 @@ impl Fixture {
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 60\n{checks}harnesses:\n  cursor:\n    executable: \"{}\"\n",
+                "execution:\n  timeout_secs: 600\n{checks}harnesses:\n  cursor:\n    executable: \"{}\"\n",
                 agent.display()
             ),
         )

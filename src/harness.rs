@@ -496,10 +496,7 @@ impl HarnessAdapter for CodexAdapter {
                 &self.executable(),
                 self.config.codex_account.as_ref(),
                 self.config.funding_source.as_deref().unwrap_or_default(),
-                request
-                    .timeout
-                    .unwrap_or(Duration::from_secs(5))
-                    .min(Duration::from_secs(5)),
+                request.timeout.unwrap_or(PROBE_TIMEOUT).min(PROBE_TIMEOUT),
             )
             .await?;
         }
@@ -780,6 +777,12 @@ fn detect_executable(executable: &Path) -> DetectionResult {
     }
 }
 
+/// How long one read-only probe of a provider CLI (its version, account or
+/// models) may take before its answer is unknown. It bounds a hung CLI, not a
+/// slow one: a cold start of a CLI took 19 s on a loaded Mac, and the earlier
+/// 5 s turned that into "version unavailable".
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(crate) async fn probe_version(executable: &Path) -> Result<Option<String>> {
     let temporary = tempfile::Builder::new()
         .prefix("dispatch-version-")
@@ -799,7 +802,6 @@ pub(crate) async fn probe_version(executable: &Path) -> Result<Option<String>> {
         command = command.env("PATH", path.to_string_lossy());
     }
     let config = ExecutionConfig {
-        timeout_secs: 5,
         forwarded_env: vec!["PATH".into()],
         ..ExecutionConfig::default()
     };
@@ -809,7 +811,7 @@ pub(crate) async fn probe_version(executable: &Path) -> Result<Option<String>> {
         temporary.path().join("stdout.log"),
         temporary.path().join("stderr.log"),
     )
-    .with_timeout(Duration::from_secs(5));
+    .with_timeout(PROBE_TIMEOUT);
     let output = Executor::new(config)
         .execute(request)
         .await

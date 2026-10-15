@@ -59,6 +59,7 @@ pub async fn serve(
     let (config, _config_path) = Config::discover(&root, None)?;
     let poll = Duration::from_secs(config.coherence.poll_secs.max(1));
     let mut owner = Owner::new(root.clone(), kind)?;
+    super::registration::fault("owner_ready");
     super::background::write_record(state, &root, background)?;
     if background {
         eprintln!(
@@ -69,6 +70,7 @@ pub async fn serve(
         );
     }
     let result = run(state, &mut owner, poll, json, background).await;
+    super::registration::fault("owner_stopping");
     super::background::remove_record(state, &root);
     let _ = fs::remove_file(live_path(state, &root));
     if background {

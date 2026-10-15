@@ -126,7 +126,7 @@ printf '{{"type":"result","model":"%s"}}\n' "$model"
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 60\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\ncoherence:\n{coherence}",
+                "execution:\n  timeout_secs: 600\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\ncoherence:\n{coherence}",
                 check.display(),
                 agent.display()
             ),
@@ -259,7 +259,7 @@ impl Drop for OwnedChild {
 }
 
 fn wait_until(mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !ready()? {
         anyhow::ensure!(
             Instant::now() < deadline,

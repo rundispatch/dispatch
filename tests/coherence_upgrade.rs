@@ -35,7 +35,7 @@ impl Fixture {
         fs::write(source.join("original.txt"), "baseline\n").unwrap();
         fs::write(
             source.join("dispatch.yml"),
-            "execution:\n  timeout_secs: 30\n",
+            "execution:\n  timeout_secs: 600\n",
         )
         .unwrap();
         let output = cargo_bin_cmd!("dispatch")

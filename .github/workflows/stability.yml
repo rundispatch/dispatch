@@ -55,14 +55,6 @@ jobs:
         run: |
           rustup toolchain install 1.97.1 --profile minimal
           rustup default 1.97.1
-      - name: Docker CLI (macOS)
-        # The Docker backend's command test resolves `docker` from trusted
-        # system directories, and GitHub's macOS runners have none. The test
-        # only builds a command line; nothing here runs a container.
-        if: runner.os == 'macOS'
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
-        run: brew install docker
 
       - name: Build the tests once, then run the suite ${{ env.RUNS }} times
         id: repeat

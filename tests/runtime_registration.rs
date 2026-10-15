@@ -23,6 +23,20 @@ use sha2::{Digest, Sha256};
 /// nobody holding it, is the owner's to resolve.
 const OWNER_BUDGET_MS: &str = "1500";
 
+/// A hook's budget where the deadline is not under test: only a hang reaches
+/// it, so the session registers however slow the machine is.
+const NO_DEADLINE_MS: &str = "600000";
+
+/// A hook's budget where the worker must reach a boundary before the deadline:
+/// the product's own. On a loaded machine registration took longer than 3 s.
+fn racing_budget_ms() -> String {
+    registration::BUDGET.as_millis().to_string()
+}
+
+/// `SessionStart`'s hook timeout as `dispatch setup` installs it: the reply
+/// must come before Claude Code gives up on the hook.
+const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct Project {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -84,10 +98,31 @@ impl Project {
         project
     }
 
+    fn serve_lock(&self) -> PathBuf {
+        let key = hex::encode(Sha256::digest(self.root.to_string_lossy().as_bytes()));
+        self.state.join("locks").join(format!("serve-{key}.lock"))
+    }
+
+    /// Let go of the project's serve lock. A process another test forked
+    /// meanwhile holds it with us until it execs, which a loaded machine
+    /// delays: wait until nobody holds it.
+    fn release_watch(&mut self) {
+        self.watched = None;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let probe = fs::File::open(self.serve_lock()).unwrap();
+            // SAFETY: a non-blocking probe on a descriptor this test owns.
+            if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the serve lock stayed held");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Hold the project's serve lock, as an owner would.
     fn hold_watch(&mut self) {
-        let key = hex::encode(Sha256::digest(self.root.to_string_lossy().as_bytes()));
-        let path = self.state.join("locks").join(format!("serve-{key}.lock"));
+        let path = self.serve_lock();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let file = fs::OpenOptions::new()
             .create(true)
@@ -123,7 +158,7 @@ impl Project {
             .arg(&self.state)
             .args(["hook", "claude"])
             .env_remove("DISPATCH_REGISTRATION_FAULT")
-            .env_remove("DISPATCH_REGISTRATION_BUDGET_MS")
+            .env("DISPATCH_REGISTRATION_BUDGET_MS", NO_DEADLINE_MS)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -177,10 +212,10 @@ impl Project {
                     "DISPATCH_REGISTRATION_FAULT",
                     "after_registration_json:sleep",
                 ),
-                ("DISPATCH_REGISTRATION_BUDGET_MS", "3000"),
+                ("DISPATCH_REGISTRATION_BUDGET_MS", &racing_budget_ms()),
             ],
         ));
-        assert!(began.elapsed() < Duration::from_secs(10));
+        assert!(began.elapsed() < HOOK_TIMEOUT);
         let [(id, files)] = self.registrations().try_into().unwrap();
         assert_eq!(notice, registration::notice_pending(&id));
         assert!(files.contains(&"registration.json".to_owned()), "{files:?}");
@@ -281,14 +316,14 @@ impl Project {
     /// Run the project owner until `done` holds, then stop it, and return its
     /// log.
     fn owner(&mut self, what: &str, done: impl Fn(&Self) -> bool) -> String {
-        self.watched = None;
+        self.release_watch();
         let output = self.dispatch(&["start"]);
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(300);
         while !done(self) {
             assert!(
                 Instant::now() < deadline,
@@ -381,7 +416,7 @@ fn killed_after_the_workspace_lock_nothing_is_captured_and_the_owner_removes_it(
     let (mut p, id) = killed_at("after_lock");
     assert_eq!(p.registrations()[0].1, ["registration.lock"]);
     // Younger than the budget, a registration may still be running.
-    p.watched = None;
+    p.release_watch();
     let output = Command::new(assert_cmd::cargo_bin!("dispatch"))
         .arg("--state-dir")
         .arg(&p.state)
@@ -473,7 +508,7 @@ fn past_the_deadline_without_durable_s0_the_session_is_told_it_is_untracked() {
             ("DISPATCH_REGISTRATION_BUDGET_MS", "2000"),
         ],
     ));
-    assert!(began.elapsed() < Duration::from_secs(10));
+    assert!(began.elapsed() < HOOK_TIMEOUT);
     assert_eq!(notice, registration::NOTICE_UNTRACKED);
     let [(id, files)] = p.registrations().try_into().unwrap();
     assert_eq!(files, ["decision", "registration.lock"]);
@@ -594,12 +629,12 @@ fn a_deadline_that_finds_the_publish_under_way_waits_for_it_then_says_pending() 
         "startup",
         &[
             ("DISPATCH_REGISTRATION_FAULT", "after_decision:sleep"),
-            ("DISPATCH_REGISTRATION_BUDGET_MS", "3000"),
+            ("DISPATCH_REGISTRATION_BUDGET_MS", &racing_budget_ms()),
         ],
     ));
     // The budget, then a quarter of it waiting for the publish.
-    assert!(began.elapsed() >= Duration::from_millis(3750));
-    assert!(began.elapsed() < Duration::from_secs(10));
+    assert!(began.elapsed() >= registration::BUDGET * 5 / 4);
+    assert!(began.elapsed() < HOOK_TIMEOUT);
     let [(id, _)] = p.registrations().try_into().unwrap();
     assert_eq!(notice, registration::notice_pending(&id));
     assert_eq!(p.decision(&id).as_deref(), Some("publishing"));

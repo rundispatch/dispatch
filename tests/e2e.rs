@@ -19,7 +19,7 @@ fn non_git_native_run_applies_safely_end_to_end() {
     fs::write(source.join("original.txt"), "unchanged baseline\n").unwrap();
     fs::write(
         source.join("dispatch.yml"),
-        "execution:\n  timeout_secs: 30\nchecks:\n  verify:\n    - test -f dispatch-fake-good.txt || test -f dispatch-fake-bad.txt\n",
+        "execution:\n  timeout_secs: 600\nchecks:\n  verify:\n    - test -f dispatch-fake-good.txt || test -f dispatch-fake-bad.txt\n",
     )
     .unwrap();
     let run = |task: &str, agent: &str| {
@@ -124,7 +124,7 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
     fs::write(source.join("input.txt"), "baseline\n").unwrap();
     fs::write(
         source.join("dispatch.yml"),
-        "execution:\n  timeout_secs: 30\n",
+        "execution:\n  timeout_secs: 600\n",
     )
     .unwrap();
 
@@ -150,7 +150,7 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
         drain(child.stderr.take().unwrap()),
     ];
 
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(300);
     let metadata_path = loop {
         if let Some(path) = first_metadata_path(&state) {
             let metadata: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -167,7 +167,7 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
 
     // SAFETY: this targets only the Dispatch child spawned by this test.
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
-    let exit_deadline = Instant::now() + Duration::from_secs(8);
+    let exit_deadline = Instant::now() + Duration::from_secs(300);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;

@@ -97,6 +97,9 @@ impl Project {
             .arg("--state-dir")
             .arg(&self.state)
             .args(["hook", "claude"])
+            // The registration deadline is not under test here: only a hang
+            // reaches this budget, so a slow machine still registers.
+            .env("DISPATCH_REGISTRATION_BUDGET_MS", "600000")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -417,13 +420,23 @@ fn a_worktree_that_vanishes_unannounced_is_noted_and_cannot_be_finished() {
     )
     .unwrap();
     // Let the owner follow the edit, then delete the worktree behind its back.
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // The owner writes the Work's live patch only after it has taken the
+    // patch it would keep as last seen, so that file says it has followed.
+    let followed = p.run_dir(&id).join("delta-live.patch");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while !fs::read_to_string(&followed).is_ok_and(|patch| patch.contains("+    2")) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner never followed the edit"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     git(
         &p.root,
         &["worktree", "remove", "--force", ".claude/worktrees/x"],
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     while p.only_run()["attachment"]["workspace_removed"].is_null() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -656,7 +669,7 @@ impl Project {
 
     /// Wait for the owner to change the only run until `ready` holds.
     fn until(&self, what: &str, ready: impl Fn(&Value) -> bool) -> Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             let run = self.only_run();
             if ready(&run) {
@@ -748,7 +761,7 @@ fn an_empty_worktree_that_vanishes_unannounced_closes_with_no_changes() {
     // patch it would keep as last seen, so that file says it has followed.
     let id = p.only_run()["id"].as_str().unwrap().to_owned();
     let followed = p.run_dir(&id).join("delta-live.patch");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     while !followed.is_file() {
         assert!(
             std::time::Instant::now() < deadline,

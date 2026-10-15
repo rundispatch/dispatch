@@ -128,7 +128,8 @@ pub(crate) fn budget() -> Duration {
 
 /// Debug builds only: `DISPATCH_REGISTRATION_FAULT=<boundary>` ends this
 /// process at `boundary` at once, with no reply and no cleanup;
-/// `<boundary>:sleep` stalls there instead.
+/// `<boundary>:sleep` stalls there instead, and `<boundary>:delay=<ms>` is a
+/// slow machine: it pauses there that long, then goes on.
 pub(crate) fn fault(boundary: &str) {
     #[cfg(debug_assertions)]
     if let Ok(fault) = std::env::var("DISPATCH_REGISTRATION_FAULT") {
@@ -139,6 +140,13 @@ pub(crate) fn fault(boundary: &str) {
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
+        }
+        if let Some(ms) = fault
+            .strip_prefix(boundary)
+            .and_then(|rest| rest.strip_prefix(":delay="))
+            .and_then(|ms| ms.parse().ok())
+        {
+            std::thread::sleep(Duration::from_millis(ms));
         }
     }
     let _ = boundary;

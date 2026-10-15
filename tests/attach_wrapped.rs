@@ -195,7 +195,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn wait_until(mut ready: impl FnMut() -> bool, message: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !ready() {
         assert!(Instant::now() < deadline, "{message}");
         thread::sleep(Duration::from_millis(50));

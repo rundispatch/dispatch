@@ -32,7 +32,7 @@ fn fixture(
     fs::write(
         source.join("dispatch.yml"),
         format!(
-            "execution:\n  timeout_secs: 30\nchecks:\n  verify:\n    - {check}\nharnesses:\n  cursor:\n    executable: \"{}\"\n    model: requested-model\n",
+            "execution:\n  timeout_secs: 600\nchecks:\n  verify:\n    - {check}\nharnesses:\n  cursor:\n    executable: \"{}\"\n    model: requested-model\n",
             agent.display()
         ),
     )?;

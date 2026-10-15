@@ -24,7 +24,7 @@ from pathlib import Path
 # Longest wait for any expected screen or exit. Waits return as soon as the
 # condition holds, so a generous limit only matters on a slow machine; set
 # DISPATCH_TEST_WAIT_SECS to change it.
-WAIT = float(os.environ.get("DISPATCH_TEST_WAIT_SECS", "60"))
+WAIT = float(os.environ.get("DISPATCH_TEST_WAIT_SECS", "300"))
 
 def has_color(output):
     for parameters in re.findall(rb"\x1b\[([0-9;]*)m", output):
@@ -146,7 +146,7 @@ raise SystemExit(code if code >= 0 else 128-code)
     def close(self):
         if self.process.poll() is None:
             os.killpg(self.process.pid, signal.SIGKILL)
-            self.process.wait(timeout=5)
+            self.process.wait(timeout=WAIT)
         for pid in self.cleanup_pids:
             try: os.kill(pid, signal.SIGKILL)
             except ProcessLookupError: pass
@@ -262,7 +262,7 @@ def run_fixture(binary, source, state, scenario):
             session.send("e\r")
             session.wait("fixture reviewer ready")
             pids_path = state.parent / "reviewer-processes.json"
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + WAIT
             while not pids_path.exists() and time.monotonic() < deadline: session.pump()
             pids = json.loads(pids_path.read_text())
             session.cleanup_pids = pids
@@ -271,7 +271,7 @@ def run_fixture(binary, source, state, scenario):
             assert current()["outcome"]["review"] == "pending"
             assert [path.read_bytes() for path in immutable] == fingerprints
             for pid in pids:
-                deadline = time.monotonic() + 3
+                deadline = time.monotonic() + WAIT
                 while time.monotonic() < deadline:
                     try: os.kill(pid, 0)
                     except ProcessLookupError: break
@@ -311,7 +311,7 @@ def run_fixture(binary, source, state, scenario):
                 elif scenario != "crash":
                     if scenario == "concurrent-review":
                         peer = subprocess.run([binary, "--state-dir", str(state), "reject", run["id"]],
-                                              cwd=source, capture_output=True, timeout=10)
+                                              cwd=source, capture_output=True, timeout=WAIT)
                         assert peer.returncode == 0, peer.stderr.decode()
                     session.send("reviewer-input\na\r")
                     session.wait("fixture reviewer finished")

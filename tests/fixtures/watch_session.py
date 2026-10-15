@@ -153,10 +153,13 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
     git=lambda *a:subprocess.run(['git','-C',str(repo),'-c','user.name=T','-c','user.email=t@e.invalid',*a],check=True,capture_output=True)
     git('init','-q');git('add','-A');git('commit','-qm','init');git('worktree','add','-q','-b','wt','.claude/worktrees/auth-ctx')
     worktree=(repo/'.claude/worktrees/auth-ctx').resolve()
+    # The registration deadline is not under test here: only a hang reaches
+    # this budget, so a slow machine still registers.
+    no_deadline=dict(os.environ,DISPATCH_REGISTRATION_BUDGET_MS='600000')
     subprocess.run([binary,'--state-dir',str(state),'start','--root',str(repo)],check=True,capture_output=True)
     try:
         hook=json.dumps({'hook_event_name':'SessionStart','session_id':'s1','source':'startup','cwd':str(worktree)})
-        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True)
+        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True,env=no_deadline)
         found=[p.parent.name for p in (state/'runs').glob('*/metadata.json') if json.loads(p.read_text()).get('attachment',{}) and json.loads(p.read_text())['attachment']['workspace']==str(worktree)]
         assert len(found)==1,found; work=found[0]
         (worktree/'lib.txt').write_text('two\n')
@@ -178,7 +181,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
         git('worktree','add','-q','-b','spare','.claude/worktrees/spare')
         spare_tree=(repo/'.claude/worktrees/spare').resolve()
         hook=json.dumps({'hook_event_name':'SessionStart','session_id':'s2','source':'startup','cwd':str(spare_tree)})
-        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True)
+        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True,env=no_deadline)
         spare=[p.parent.name for p in (state/'runs').glob('*/metadata.json')
                if (json.loads(p.read_text()).get('attachment') or {}).get('workspace')==str(spare_tree)]
         assert len(spare)==1,spare; spare=spare[0]; tag=short(spare,work)

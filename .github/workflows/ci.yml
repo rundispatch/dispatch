@@ -67,17 +67,37 @@ jobs:
         run: |
           rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
           rustup default 1.97.1
-      - name: Docker CLI (macOS)
-        # The Docker backend's command test resolves `docker` from trusted
-        # system directories, and GitHub's macOS runners have none. The test
-        # only builds a command line; nothing here runs a container.
-        if: runner.os == 'macOS'
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
-        run: brew install docker
       - name: Standard validation (macOS)
         if: runner.os == 'macOS'
         run: |
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
+
+  # The suite on a slow machine: one CPU in the test image. A test that
+  # assumes a fast machine, or a product wait that gives up while the work is
+  # still progressing, fails here first.
+  slow-machine:
+    name: tests on one CPU (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Cache Cargo (Linux test image)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-target
+            ${{ runner.temp }}/cargo-registry
+          key: cargo-ubuntu-22.04-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-ubuntu-22.04-
+      - name: Build the tests, then run them with one CPU
+        env:
+          DISPATCH_DOCKER_TARGET_DIR: ${{ runner.temp }}/cargo-target
+          DISPATCH_DOCKER_CARGO_REGISTRY: ${{ runner.temp }}/cargo-registry
+        run: |
+          mkdir -p "$DISPATCH_DOCKER_TARGET_DIR" "$DISPATCH_DOCKER_CARGO_REGISTRY"
+          scripts/test-in-docker.sh cargo test --locked --no-run
+          DISPATCH_DOCKER_CPUS=1 scripts/test-in-docker.sh cargo test --locked

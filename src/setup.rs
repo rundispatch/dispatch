@@ -88,7 +88,7 @@ pub async fn discover(provider: &str, executable: PathBuf) -> Result<Discovery> 
         ensure!(provider == "codex", "unsupported provider");
         use crate::harness::codex;
         let observed = codex::Funding::from_probe(
-            &codex::read_account(&executable, std::time::Duration::from_secs(5)).await?,
+            &codex::read_account(&executable, crate::harness::PROBE_TIMEOUT).await?,
         );
         ensure!(
             observed.auth_mode.as_deref() == Some("chatgpt"),
@@ -111,7 +111,7 @@ pub async fn discover(provider: &str, executable: PathBuf) -> Result<Discovery> 
         );
         // An unlisted model list is not a funding fact; setup still offers
         // typing a model ID.
-        let models = codex::list_models(&executable, std::time::Duration::from_secs(5))
+        let models = codex::list_models(&executable, crate::harness::PROBE_TIMEOUT)
             .await
             .unwrap_or_default();
         Ok(Discovery {
@@ -373,10 +373,17 @@ fn atomic_config(path: &Path, expected: Option<&[u8]>, bytes: &[u8]) -> Result<(
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "another setup write is in progress; re-open Resources"
-        );
+        // Another writer holds the lock only for one small write, but a
+        // process forked meanwhile holds it with them until it execs, which a
+        // loaded machine delays: wait for it, up to a hang.
+        let started = std::time::Instant::now();
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            ensure!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "another setup write is in progress; re-open Resources"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     ensure!(
         read_config(path)?.as_deref() == expected,
@@ -482,6 +489,29 @@ pub fn project_config_bytes(source: &Path) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_setup_write_waits_for_the_lock_to_be_let_go() -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("resources.yml");
+        // Held a little longer than at once, as by a process forked while a
+        // writer held it, not yet exec'd on a loaded machine.
+        let held = fs::File::create(path.with_extension("setup-lock"))?;
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            drop(held);
+        });
+        atomic_config(&path, None, b"version: 1\n")?;
+        release.join().unwrap();
+        assert_eq!(fs::read(&path)?, b"version: 1\n");
+        Ok(())
+    }
     fn discovery() -> Discovery {
         Discovery {
             executable: "/fixture/codex".into(),

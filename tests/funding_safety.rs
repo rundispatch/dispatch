@@ -46,6 +46,7 @@ cases! {
     codex_refusal_is_sticky_until_reauthorized => ("codex", "codex_sticky"),
     claude_refusal_is_sticky_until_reauthorized => ("claude", "claude_sticky"),
     claude_version_probe_timeout_is_not_a_change => ("claude", "claude_slow_version"),
+    claude_slow_cli_is_observed_not_unknown => ("claude", "claude_slow_cli"),
     claude_observed_version_change_is_refused_and_sticky => ("claude", "claude_version_changed"),
     claude_unanswered_account_probe_refuses_that_launch_only => ("claude", "claude_slow_account"),
 }
