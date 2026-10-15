@@ -27,8 +27,8 @@ worktree.
 |---|---|---|---|---|
 | Worktree | `<repo>/.claude/worktrees/<name>`, branch `worktree-<name>` | `~/.codex/worktrees/<4 hex>/<repo>`, detached | `~/.cursor/worktrees/<repo lowercased>/<name>`, branch `<name>` | `<repo>/.worktrees/hermes-<8 hex>`, branch `hermes/<same>`; only from `hermes chat --worktree` (`-z` ignores the flag) |
 | After the session | kept; `-p` leaves its lock | kept | kept | **removed, with its branch and the agent's changes**; `.worktrees/` is added to the checkout's `.gitignore` |
-| Process signal | lock with pid and start time | none | none | not yet observed |
-| Pre-removal hook | `WorktreeRemove` (used since 0.4.6) | hooks exist (`SessionStart`, `Stop`); timing unknown | none known | shell hooks exist (`hermes hooks`); events unknown |
+| Process signal | lock with pid and start time | none | none | lock `hermes pid=<pid>`, no start time (P0) |
+| Pre-removal hook | `WorktreeRemove` (used since 0.4.6) | not needed: worktrees are kept | none known | `on_session_finalize` shell hook, runs before removal (P0) |
 
 - **Discovery today** runs inside the owner tick (`coherence.poll_secs`: 10 s by
   default, 5 s in the 0.4.14 build). A worktree that lives less than a tick can
@@ -40,10 +40,11 @@ worktree.
   gone when it ends unless the agent commits them somewhere else. Keeping the Δ
   rescues work, beyond tracking it.
 
-### What P0 found so far (2026-10-15, no agent runs)
+### What P0 found (2026-10-15)
 
-These come from Hermes's source and local measurements; the details are in
-`~/dispatch-dev/p0-0415/hermes-source.md`.
+These come from Hermes's source, local measurements and one confirming Hermes
+session; the details are in `~/dispatch-dev/p0-0415/hermes-source.md` and
+`~/dispatch-dev/p0-0415/hook-confirm/`.
 
 - **Hermes locks its worktree** with `git worktree lock --reason "hermes pid=<pid>"`.
   That is a liveness signal, but with a pid only and no start time. Guard
@@ -60,7 +61,21 @@ These come from Hermes's source and local measurements; the details are in
   - TUI path: removal runs after the TUI process exits.
   - So a Hermes shell hook (in `~/.hermes/config.yaml`, under Hermes's own
     first-use consent) can take the exact Δ while the worktree still exists.
-    One short real run still has to confirm this, and show the payload.
+- **One real session confirmed it** (`hermes chat -Q --yolo --worktree -q`,
+  Hermes 0.18.2, 16 s, the agent's edit left uncommitted):
+  - Both hooks ran while the worktree was still registered, still locked
+    `hermes pid=<pid>`, and still held the agent's uncommitted change. Hermes
+    removed it, and its branch, right after.
+  - `on_session_finalize` (`"reason": "shutdown"`) is the session's end.
+    `on_session_end` fires at the end of every turn, so it is not.
+  - The payload's `cwd` is the main checkout, not the worktree. The worktree's
+    path reaches the hook as `TERMINAL_CWD` in its environment. The payload
+    carries `session_id`; the hook's parent pid is the pid in the lock.
+  - Hooks run synchronously (`subprocess.run`, 60 s default timeout, 300 s
+    maximum), so removal waits for the hook (from source, not timed).
+  - Hermes records consent in `~/.hermes/shell-hooks-allowlist.json` on first
+    use (`--accept-hooks` when not on a terminal). The probe's config change and
+    allowlist were removed afterwards.
 - **Discovery is cheap.** `git worktree list --porcelain` takes 11 ms on this
   repository and 21 ms with 60 linked worktrees, so a one-second loop costs
   about 1–2% of a core. No adaptive interval is needed.
@@ -68,26 +83,28 @@ These come from Hermes's source and local measurements; the details are in
   problem does not arise for it. Its `Stop` hook marks the end of a turn, not of
   the session. Codex hooks stay out of scope.
 
-## 3. What P0 must answer
+## 3. What P0 had to answer
 
-P0's probes are short ad hoc runs of real agents (Hermes and Codex), kept to the
-few needed. The harness conformance trials run only when the user approves them
+Answered in §2, except where noted.
+
+P0's probes are short ad hoc runs of real agents, kept to the few needed. The
+harness conformance trials run only when the user approves them
 (`harness-trials.yml` is disabled until then).
 
 - **Hermes:**
-  - How long its worktrees live, measured over several sessions.
-  - Whether any hook event fires before its cleanup, with what payload, and
-    whether it can block cleanup.
-  - Whether its cleanup is `git worktree remove --force`, a plain `rm`, or
-    something else.
-  - Whether anything names its process.
-- **Codex:** the `Stop` hook's payload and timing relative to the worktree.
-  Does it fire while the worktree still exists?
-- **Cost on a large repository** (Dispatch itself, and one with 50+ linked
-  worktrees):
-  - a one-second `git worktree list --porcelain` plus the marker reads;
-  - a one- to two-second live-Δ capture of a busy worktree (tracked and
-    untracked files).
+  - How long its worktrees live: as long as the session (16 s in the probe).
+    Not measured over several sessions; with the hook, capture no longer
+    depends on it.
+  - Whether a hook fires before cleanup: yes, `on_session_finalize`, and
+    cleanup waits for it.
+  - How it cleans up: `git worktree unlock`, `git worktree remove --force`,
+    `git branch -D`.
+  - What names its process: the worktree lock, `hermes pid=<pid>`.
+- **Codex:** out of scope, since Codex does not remove its worktrees.
+- **Cost on a large repository:**
+  - The one-second listing: measured, 11 to 21 ms.
+  - The one- to two-second live-Δ capture of a busy worktree: not measured.
+    P2 measures it and reports it here.
 
 ## 4. Contracts
 
@@ -125,6 +142,11 @@ few needed. The harness conformance trials run only when the user approves them
 - **Only where P0 shows it:** a harness whose hook fires before removal gets
   exact capture, as Claude's `WorktreeRemove` does. It is adapter-owned, and
   installed by `dispatch setup` like Claude's hooks.
+- **Hermes shows it.** `dispatch setup` adds one `on_session_finalize` shell
+  hook to `~/.hermes/config.yaml`. The hook finds its worktree from
+  `TERMINAL_CWD` and its process from its parent pid, and records the exact Δ
+  before Hermes removes the worktree. Hermes's own first-use consent stays in
+  place; Dispatch never writes Hermes's allowlist.
 - **Otherwise,** contract B's last-seen Δ is the answer, and the docs say so.
 
 ### E. Conformance
