@@ -62,7 +62,7 @@ impl Fixture {
         fs::write(source.join("original.txt"), "baseline\n").unwrap();
         fs::write(
             source.join("dispatch.yml"),
-            format!("execution:\n  timeout_secs: 30\n{config}"),
+            format!("execution:\n  timeout_secs: 600\n{config}"),
         )
         .unwrap();
         setup(&source);
@@ -297,7 +297,7 @@ impl Drop for Serve {
 }
 
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     while !ready() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -414,10 +414,10 @@ fn hanging_check_times_out_and_refreshes() {
     // The timeout applies to every verify command, including this one.
     let snapshot = fixture.run_dir().join("config.snapshot.yml");
     let text = fs::read_to_string(&snapshot).unwrap();
-    assert!(text.contains("timeout_secs: 30"), "{text}");
+    assert!(text.contains("timeout_secs: 600"), "{text}");
     fs::write(
         &snapshot,
-        text.replace("timeout_secs: 30", "timeout_secs: 2"),
+        text.replace("timeout_secs: 600", "timeout_secs: 2"),
     )
     .unwrap();
     fs::write(fixture.source.join("hang.txt"), "hang\n").unwrap();

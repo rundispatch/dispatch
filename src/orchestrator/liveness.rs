@@ -4,6 +4,11 @@
 //! when it is gone, or its lock released, records the end of the sessions it
 //! ran, through the same path a hook's `SessionEnd` takes. The Work then reads
 //! `idle`. Nothing here finishes, applies, closes or signals anything.
+//!
+//! Codex's and Cursor Agent's worktrees name no process (`discovery::
+//! UNOBSERVED`): their liveness is `Unknown` for good, so their Work never
+//! reads "agent running" and no end of their sessions is ever recorded. No
+//! process is guessed at: Cursor's lingering `worker-server` is not the agent.
 
 use std::path::Path;
 
@@ -39,8 +44,10 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
     };
     // Only a workspace the runtime made: a person's attach, with or without
     // `--pid`, is theirs. Removed workspaces are the removal's business.
+    // Finished Work is followed while it still records its agent: a session
+    // that outlives `finish`, even by a moment, still has its end recorded.
     if run.mode != RunMode::Attached
-        || run.outcome.lifecycle == LifecycleState::Finished
+        || (run.outcome.lifecycle == LifecycleState::Finished && attachment.agent_process.is_none())
         || attachment.workspace_owner != WorkspaceOwner::Runtime
         || attachment.workspace_removed.is_some()
     {
@@ -154,10 +161,9 @@ fn set_agent_process(
     let Some(attachment) = run.attachment.as_mut() else {
         return Ok(());
     };
-    if run.outcome.lifecycle == LifecycleState::Finished
-        || attachment.agent_process.as_ref() != old
-        || attachment.agent_process == new
-    {
+    // Finished Work takes on no new agent; it only lets go of the one it had.
+    let new = new.filter(|_| run.outcome.lifecycle != LifecycleState::Finished);
+    if attachment.agent_process.as_ref() != old || attachment.agent_process == new {
         return Ok(());
     }
     let event_type = if new.is_some() {
@@ -312,6 +318,15 @@ mod tests {
 
         fn agent(&self) -> Option<ProcessIdentity> {
             self.run().attachment.unwrap().agent_process
+        }
+
+        /// As `finish` leaves it: finished, its recorded agent kept.
+        fn finish(&self) {
+            let mut run = self.run();
+            run.outcome.lifecycle = LifecycleState::Finished;
+            let mut db = Database::open(self.state.db_path()).unwrap();
+            db.sync_run(&run).unwrap();
+            self.state.save_run(&run).unwrap();
         }
 
         fn edit(&self, change: impl FnOnce(&mut crate::AttachmentRecord)) {
@@ -521,6 +536,61 @@ mod tests {
         stop(second);
         p.tick();
         assert_eq!(p.sessions()[1], ("s2".into(), ended("process_gone")));
+    }
+
+    /// Found in the 0.4.14 trials: `dispatch finish` run moments after a
+    /// discovered `claude -p` session exited, before liveness looked again,
+    /// left that session open for good. Its end is recorded whichever comes
+    /// first, the finish or the process's end.
+    #[test]
+    fn a_session_that_ends_after_or_just_before_finish_still_ends() {
+        // Finished while the agent runs; it ends later.
+        let p = project();
+        let child = sleeper();
+        p.lock_child(&child);
+        p.tick();
+        p.finish();
+        p.tick();
+        assert_eq!(p.sessions(), [("s1".into(), None)]);
+        assert_eq!(p.agent().map(|agent| agent.pid), Some(child.id()));
+        stop(child);
+        p.tick();
+        assert_eq!(p.sessions(), [("s1".into(), ended("process_gone"))]);
+        assert_eq!(p.agent(), None);
+        assert_eq!(p.events("runtime.session_ended"), 1);
+        p.tick();
+        assert_eq!(p.events("runtime.session_ended"), 1);
+
+        // It ended, then was finished before liveness looked again.
+        let p = project();
+        let child = sleeper();
+        p.lock_child(&child);
+        p.tick();
+        stop(child);
+        p.finish();
+        p.tick();
+        assert_eq!(p.sessions(), [("s1".into(), ended("process_gone"))]);
+        assert_eq!(p.agent(), None);
+        assert_eq!(p.run().outcome.lifecycle, LifecycleState::Finished);
+    }
+
+    /// Finished Work never takes on a new agent: a later session's lock only
+    /// ends the sessions that began before it.
+    #[test]
+    fn finished_work_takes_on_no_new_agent() {
+        let p = project();
+        let first = sleeper();
+        p.lock_child(&first);
+        p.tick();
+        p.finish();
+        let second = sleeper();
+        p.lock_child(&second);
+        p.tick();
+        assert_eq!(p.sessions(), [("s1".into(), ended("lock_released"))]);
+        assert_eq!(p.agent(), None);
+        assert_eq!(p.events("runtime.agent_running"), 1);
+        stop(first);
+        stop(second);
     }
 
     #[test]

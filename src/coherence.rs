@@ -234,7 +234,7 @@ impl fmt::Display for CoherenceBlocked {
         write!(f, ". The source was left unchanged. ")?;
         match &self.checks {
             // The reasons name the failing check and its logs.
-            Some(MergedChecks::Failed) => {}
+            Some(MergedChecks::Failed(_)) => {}
             Some(checks) => write!(f, "Merged checks: {checks}. ")?,
             None => write!(
                 f,

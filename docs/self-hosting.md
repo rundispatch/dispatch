@@ -18,6 +18,17 @@ the merged checks refuse an accept; and the owner's `git status` taking Git's
 With parallel workers, run each worker's full suite once, at hand-off, rather than
 continuously.
 
+0.4.14 had workers on three harnesses, each wrapped the same way: Claude Code, Codex
+(P3, the adapters) and Cursor Agent (P5, CI). The Cursor worker stopped at its plan's
+request limit, and a Claude Code session finished P5 in the same workspace. From P3 on,
+every packet landed with `dispatch accept <id> --expect <Δ>` (section 7) instead of the
+integrator's `land.sh`, and `dispatch check <id> --merged` replaced its `verify.sh` for
+P3, P2, P6, P6b and R. Under the load of several parallel suites on one Mac, and of other
+jobs on it, tests and Dispatch itself gave up on fixed waits that were too short. That led
+to P6, which lengthened the product's waits and made the tests wait for what they test.
+It also led to P6b, whose stress mode found two more product defects: a key pressed during
+a resize could be held back, and a resize could end `dispatch watch`.
+
 The paths are examples. Keep each one outside `/tmp` and outside any build
 directory, and use the same binary and state directory in every command.
 `DISPATCH_HOME` can stand in for `--state-dir`, but the hooks in section 5 name
@@ -285,19 +296,25 @@ Run these from the integration clone. `D` below stands for
    Work that did not begin from the current source, what differed at the
    start. `D watch` shows the whole project.
 2. **Review it in its workspace:** for example, `git -C <workspace> status`
-   and `git -C <workspace> diff`. Read the worker's report, and run fmt,
-   clippy and the full suite yourself on HEAD plus the patch.
+   and `git -C <workspace> diff`. Read the worker's report. Then `D check <id>
+   --merged` runs `checks.verify` on HEAD plus the Work's change as it is now,
+   untracked files included, in a scratch copy, and prints one line per
+   command. Note the `Δ` it prints. From 0.4.14; before, run fmt, clippy and the
+   full suite yourself on HEAD plus the patch.
 3. **Get the human's approval.** Recommend accept, revise or reject. A person
    decides; an agent's opinion is not the approval.
 4. **Finish it:** wrapped Work (`attach --`) finishes by itself when the agent
    exits. Other Work: `D finish <id> --allow-unsafe-local` freezes Δ and runs
    the checks in the Work's workspace. The summary shows the verdict against
-   the clone now and what accept would verify. Then `D diff <id>` prints the
-   frozen patch; confirm it is the one you reviewed. Before `finish`, `diff`
-   shows no changes.
-5. **Accept it:** `D accept <id>` validates the patch against the clone as it
-   is now. It prints whether the checks ran on the merged tree, and why not.
-   Then it applies the patch. Always pass the ID.
+   the clone now and what accept would verify, and its `Δ`. Before `finish`,
+   `diff` shows no changes.
+5. **Accept it:** `D accept <id> --expect <Δ from step 2>` refuses, applying
+   nothing, if the frozen Δ is not the one you reviewed, for example because the
+   worker changed something after `check --merged`. Otherwise it validates the
+   patch against the clone as it is now, prints whether the checks ran on the
+   merged tree (one line per command), or why not, and applies the patch.
+   Always pass the ID. Before 0.4.14, compare `D diff <id>` with what you
+   reviewed instead.
 6. **Commit it in the integration clone:**
    ```sh
    git status --short     # only the patch: dispatch.yml and .claude/ are excluded

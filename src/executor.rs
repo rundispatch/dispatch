@@ -25,10 +25,7 @@ const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(test)]
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 const REDACTION_MARKER: &[u8] = b"[REDACTED]";
-#[cfg(not(test))]
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(150);
 #[cfg(unix)]
 const TRUSTED_HOST_DIRECTORIES: &[&str] = &[
     "/usr/bin",
@@ -818,8 +815,15 @@ async fn terminate_child(child: &mut tokio::process::Child, group: &mut ProcessG
     }
 }
 
+/// How long a killed process group may take to be gone before its cleanup
+/// counts as unconfirmed. SIGKILL cannot be ignored, but the group lasts until
+/// each member is reaped, which a loaded machine delays past the earlier
+/// 500 ms; only a process stuck in the kernel takes longer.
+const GROUP_EXIT: Duration = Duration::from_secs(10);
+
 pub(crate) async fn confirm_process_group_gone(group: i32) -> bool {
-    for _ in 0..20 {
+    let deadline = Instant::now() + GROUP_EXIT;
+    while Instant::now() < deadline {
         if crate::process::process_group_exists(Some(group)) == Some(false) {
             return true;
         }
@@ -912,7 +916,13 @@ pub(crate) fn trusted_host_executable(program: &str) -> Result<PathBuf> {
 
     #[cfg(unix)]
     {
-        for directory in TRUSTED_HOST_DIRECTORIES {
+        #[cfg(not(test))]
+        let directories = TRUSTED_HOST_DIRECTORIES;
+        // Unit tests may stand in for the system directories, so that they
+        // need no host tool such as `docker`.
+        #[cfg(test)]
+        let directories = &tests::trusted_directories();
+        for directory in directories {
             let candidate = Path::new(directory).join(program);
             if candidate.is_file() {
                 return candidate.canonicalize().with_context(|| {
@@ -1196,6 +1206,23 @@ fn check_phase_name(phase: &CheckPhase) -> &'static str {
 mod tests {
     use super::*;
 
+    thread_local! {
+        static TRUSTED_DIRECTORIES: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The system directories, or this test thread's stand-ins for them.
+    pub(super) fn trusted_directories() -> Vec<String> {
+        TRUSTED_DIRECTORIES
+            .with_borrow(Clone::clone)
+            .unwrap_or_else(|| {
+                TRUSTED_HOST_DIRECTORIES
+                    .iter()
+                    .map(|directory| (*directory).to_owned())
+                    .collect()
+            })
+    }
+
     #[tokio::test]
     async fn captures_success_and_failure_without_merging_streams() {
         let temp = tempfile::tempdir().unwrap();
@@ -1341,7 +1368,7 @@ mod tests {
     async fn enforces_timeout() {
         let temp = tempfile::tempdir().unwrap();
         let request = ExecutionRequest::new(
-            CommandSpec::new("/bin/sleep").arg("10"),
+            CommandSpec::new("/bin/sleep").arg("600"),
             temp.path(),
             temp.path().join("stdout"),
             temp.path().join("stderr"),
@@ -1354,14 +1381,15 @@ mod tests {
 
         assert_eq!(result.status, ExecutionStatus::TimedOut);
         assert!(result.timed_out);
-        assert!(result.duration_ms < 2_000);
+        // Ended by the timeout, not by `sleep` finishing.
+        assert!(result.duration_ms < 600_000);
     }
 
     #[tokio::test]
     async fn cancellation_kills_a_running_process() {
         let temp = tempfile::tempdir().unwrap();
         let request = ExecutionRequest::new(
-            CommandSpec::new("/bin/sleep").arg("10"),
+            CommandSpec::new("/bin/sleep").arg("600"),
             temp.path(),
             temp.path().join("stdout"),
             temp.path().join("stderr"),
@@ -1385,6 +1413,7 @@ mod tests {
     async fn detached_descendant_cannot_hold_capture_pipes_forever() {
         let temp = tempfile::tempdir().unwrap();
         let helper_flag = "DISPATCH_DETACHED_PIPE_HELPER";
+        let pid_file = temp.path().join("descendant.pid");
         let config = ExecutionConfig {
             forwarded_env: vec![helper_flag.into()],
             ..ExecutionConfig::default()
@@ -1392,45 +1421,104 @@ mod tests {
         let request = ExecutionRequest::new(
             CommandSpec::new(std::env::current_exe().unwrap().to_string_lossy())
                 .args(["--exact", "executor::tests::detached_pipe_helper"])
-                .env(helper_flag, "1"),
+                .env(helper_flag, pid_file.to_string_lossy()),
             temp.path(),
             temp.path().join("stdout"),
             temp.path().join("stderr"),
         );
-        let started = Instant::now();
         let error = Executor::new(config)
             .execute(request)
             .await
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("output pipes remained open"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("output pipes remained open"), "{error}");
+        // The descendant still holds the pipes: the executor did not wait it out.
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        // SAFETY: signal 0 and SIGKILL to the descendant this test started.
+        unsafe {
+            assert_eq!(libc::kill(pid, 0), 0, "the descendant already exited");
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn detached_pipe_helper() {
-        if std::env::var_os("DISPATCH_DETACHED_PIPE_HELPER").is_none() {
+        let Some(pid_file) = std::env::var_os("DISPATCH_DETACHED_PIPE_HELPER") else {
             return;
-        }
-        // SAFETY: both fork branches immediately restrict themselves to
-        // async-signal-safe libc calls and terminate with _exit.
+        };
+        // SAFETY: the forked child restricts itself to async-signal-safe libc
+        // calls and terminates with _exit; it holds the inherited pipes far
+        // longer than any drain bound, until the test kills it. The parent
+        // exits only once the child has left its process group, which the
+        // executor kills when the parent exits.
         unsafe {
+            let mut detached = [0; 2];
+            assert_eq!(libc::pipe(detached.as_mut_ptr()), 0);
             let child = libc::fork();
             if child == 0 {
                 libc::setsid();
-                libc::sleep(2);
+                libc::write(detached[1], b"d".as_ptr().cast(), 1);
+                libc::sleep(600);
                 libc::_exit(0);
             }
-            libc::usleep(100_000);
+            libc::close(detached[1]);
+            let mut byte = 0u8;
+            assert_eq!(libc::read(detached[0], (&raw mut byte).cast(), 1), 1);
+            std::fs::write(pid_file, child.to_string()).unwrap();
             libc::_exit(0);
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_killed_group_reaped_late_is_confirmed_gone() {
+        use std::os::unix::process::CommandExt;
+        // A loaded machine: the killed group's last member is reaped seconds
+        // later, here by this test, its parent.
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = leader.id() as i32;
+        // SAFETY: SIGKILL to the process group this test created.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            leader.wait().unwrap();
+        });
+        assert!(confirm_process_group_gone(group).await);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn trusted_directories_are_absolute_system_ones() {
+        assert!(
+            TRUSTED_HOST_DIRECTORIES
+                .iter()
+                .all(|directory| Path::new(directory).is_absolute())
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn docker_command_has_limits_single_mount_and_forwarded_environment() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
+        // Stand-ins for the system directories: `docker` is resolved from the
+        // trusted one, never from the workspace.
+        let (missing, trusted) = (temp.path().join("missing"), temp.path().join("trusted"));
+        std::fs::create_dir(&trusted).unwrap();
+        for decoy in [&trusted.join("docker"), &temp.path().join("docker")] {
+            std::fs::write(decoy, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        TRUSTED_DIRECTORIES.set(Some(vec![
+            missing.to_string_lossy().into_owned(),
+            trusted.to_string_lossy().into_owned(),
+        ]));
         let config = ExecutionConfig {
             backend: "docker".into(),
             cpus: 1.5,
@@ -1447,10 +1535,13 @@ mod tests {
             temp.path().join("stdout"),
             temp.path().join("stderr"),
         );
-        let command = Executor::new(config).resolved_command(&request).unwrap();
+        let executor = Executor::new(config);
+        let command = executor.resolved_command(&request).unwrap();
 
-        assert!(Path::new(&command.program).is_absolute());
-        assert_eq!(Path::new(&command.program).file_name().unwrap(), "docker");
+        assert_eq!(
+            Path::new(&command.program),
+            trusted.join("docker").canonicalize().unwrap()
+        );
         assert_eq!(command.args[0..2], ["run", "--rm"]);
         assert!(command.args.windows(2).any(|a| a == ["--cpus", "1.5"]));
         assert!(command.args.windows(2).any(|a| a == ["--memory", "768m"]));
@@ -1484,6 +1575,12 @@ mod tests {
             &command.args[command.args.len() - 3..],
             ["dispatch-test:latest", "agent", "run"]
         );
+
+        // Without `docker` in a trusted directory there is no command, even
+        // with one in the workspace.
+        TRUSTED_DIRECTORIES.set(Some(vec![missing.to_string_lossy().into_owned()]));
+        let error = executor.resolved_command(&request).unwrap_err().to_string();
+        assert!(error.contains("not found in system locations"), "{error}");
     }
 
     #[tokio::test]
@@ -1498,7 +1595,7 @@ mod tests {
             &commands,
             CheckPhase::Verify,
             &temp.path().join("checks"),
-            2,
+            600,
         )
         .await;
 

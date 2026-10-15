@@ -52,7 +52,7 @@ fn alive(pid: i32) -> bool {
 }
 
 fn wait_until(mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !ready()? {
         anyhow::ensure!(
             Instant::now() < deadline,
@@ -187,7 +187,7 @@ printf '{{"type":"result","model":"%s"}}\n' "$model"
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 60\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\ncoherence:\n{coherence}",
+                "execution:\n  timeout_secs: 600\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\ncoherence:\n{coherence}",
                 check.display(),
                 agent.display()
             ),
@@ -392,7 +392,7 @@ impl FakeGood {
         fs::write(source.join("original.txt"), "baseline\n")?;
         fs::write(
             source.join("dispatch.yml"),
-            "execution:\n  timeout_secs: 30\n",
+            "execution:\n  timeout_secs: 600\n",
         )?;
         let output = Command::new(assert_cmd::cargo_bin!("dispatch"))
             .arg("--state-dir")

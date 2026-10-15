@@ -437,9 +437,11 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         finish_reason: None,
         workspace_owner: if managed_workspace.is_some() {
             WorkspaceOwner::Dispatch
-        } else if runtime.is_some() && workspace.starts_with(root.join(".claude").join("worktrees"))
+        } else if runtime.is_some_and(|runtime| runtime.discovered)
+            || (runtime.is_some() && workspace.starts_with(root.join(".claude").join("worktrees")))
         {
-            // Where Claude Code documents it makes `--worktree` workspaces.
+            // Where Claude Code documents it makes `--worktree` workspaces,
+            // or one discovery recognized by its runtime's sign.
             WorkspaceOwner::Runtime
         } else {
             WorkspaceOwner::User
@@ -1948,8 +1950,20 @@ fn print_finish_summary(state: &State, run: &RunRecord) {
     println!("\n{}\n", ready_heading(run));
     println!("Task\n  {}\n", run.task);
     println!("Agent\n  {}\n", candidate.harness_id);
-    println!("Work {}\n{}\n", run.id, patch_line(candidate));
-    println!("Verification\n  {}\n", result_verification(candidate));
+    println!(
+        "Work {}\n{}\n  {}\n",
+        run.id,
+        patch_line(candidate),
+        super::delta_digest(&candidate.diff_path).map_or_else(
+            |_| "Δ unknown".to_owned(),
+            |digest| super::digest_line(&digest)
+        )
+    );
+    println!("Verification\n  {}", result_verification(candidate));
+    for check in &candidate.checks {
+        println!("{}", super::check_line(check));
+    }
+    println!();
     let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
     if awaits_review(run) {
         print_standing(state, run, validity);

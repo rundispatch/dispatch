@@ -416,6 +416,10 @@ pub(super) fn apply_locked(
                 checks,
             } => (Some(verified), Some(overridden), checks),
             AcceptGate::Blocked { validity, checks } => {
+                if !quiet && let Some(ran @ MergedChecks::Failed(Some(_))) = &checks {
+                    println!("Merged checks: {ran}");
+                    print_check_lines(ran);
+                }
                 return Err(CoherenceBlocked {
                     run_id: run.id.clone(),
                     landed_by: (validity.decision == Decision::Stop)
@@ -431,6 +435,7 @@ pub(super) fn apply_locked(
         };
         if !quiet {
             println!("Merged checks: {checks}");
+            print_check_lines(&checks);
         }
         let landing = observe_landing(state, &run, authority, validity.as_ref());
         let report = match &validity {
@@ -449,6 +454,26 @@ pub(super) fn apply_locked(
         };
         Ok((report, validity, overridden, landing, checks))
     });
+    // Each merged-check run is recorded with its per-command durations,
+    // whatever became of the accept.
+    let ran = match &applied {
+        Ok((.., checks)) => checks.ran(),
+        Err(error) => error
+            .downcast_ref::<CoherenceBlocked>()
+            .and_then(|blocked| blocked.checks.as_ref())
+            .and_then(MergedChecks::ran),
+    };
+    if let Some(ran) = ran.cloned() {
+        let digest = super::delta_digest(&sole_candidate(&run)?.diff_path)?;
+        let database = Database::open(state.db_path())?;
+        transition(
+            state,
+            &database,
+            &mut run,
+            "coherence.merged_checks",
+            ran.event_payload("accept", &digest),
+        )?;
+    }
     let (report, validity, overridden, landing, checks) = match applied {
         Ok(applied) => applied,
         Err(error) => {
@@ -504,6 +529,13 @@ pub(super) fn apply_locked(
         );
     }
     Ok((overridden, checks))
+}
+
+/// One line per merged-check command, when they ran.
+fn print_check_lines(checks: &MergedChecks) {
+    for result in checks.ran().map_or(&[][..], |ran| &ran.results) {
+        println!("{}", super::check_line(result));
+    }
 }
 
 /// Commit `auto_apply.skipped {reason}`. Nothing about the outcome changes:

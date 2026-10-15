@@ -1,0 +1,1 @@
+In auth.py, change validate to take a ctx argument first: def validate(ctx, token). Keep the token check, and add "tenant": ctx["tenant"] to the dict it returns, so it returns the tenant. Update test_app.py so all tests pass with python3 -B -m unittest -q. Change no other file.

@@ -12,6 +12,8 @@
 //! project someone chose to watch with `dispatch start`.
 
 pub mod claude;
+pub mod codex;
+pub mod cursor;
 
 use std::{
     path::{Path, PathBuf},

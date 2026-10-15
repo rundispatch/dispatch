@@ -51,6 +51,45 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.14
+
+No migration; the schema stays at 24. Existing records are not rewritten.
+- **Rollback.** Back up the whole state directory before upgrading, and roll back only by
+  restoring it. In a check on a scratch state directory, 0.4.13's `history` and `status` still
+  read Work that 0.4.14 had recorded: merged-check events, review digests and a discovered Codex
+  Work.
+- **Additive JSON and events.**
+  - `coherence.merged_checks`, with `by` (`check` or `accept`), `source` (`{"git": {head,
+    dirty}}` or the plain directory), `delta_digest`, `passed`, `duration_ms`, `results` (each
+    command with its `exit_code`, `status`, `duration_ms` and logs) and `logs`. `check --merged`
+    adds `patch`. An observation from `check --merged` does not move the run's state revision;
+    one from `accept` is part of the accept.
+  - `delta_digest`, the full SHA-256 of the patch bytes, on `check --json` and on the
+    `review.accepted` and `review.rejected` events. `check --merged --json` has exactly
+    `delta_digest`, `merged_checks`, `run_id` and `validity`.
+  - Discovered Work can have agent `codex` or `cursor`, with `workspace_owner: "runtime"` and
+    the provenance `discovered` from 0.4.13. Its one session has the Codex thread or the Cursor
+    worktree name as `session_id`, `source: "discovered"`, and `started_at` from when Git made
+    the worktree. It never has an `agent_process` or an end.
+  - New Cursor runs record `cache_read_tokens` and `cache_write_tokens` categories, and a total
+    labelled `uncached-input+output+cache-creation`. New Codex runs record cache-write and
+    reasoning-output counters; their total is unchanged.
+- **Waits and error texts.** `dispatch start` and `dispatch stop` wait up to 120 s for the
+  background owner. Their errors read `the background owner for <root> did not become ready in
+  120 s; see <log>` and `the watcher for <root> (pid N) did not stop within 120 s`. Provider
+  probes wait up to 60 s, and a setup write waits up to 30 s for another writer before
+  `another setup write is in progress`.
+- **`harnesses.hermes` in `dispatch.yml`** takes `model`, `provider`, `executable` and
+  `extra_args`. 0.4.14 refuses a `provider` that is not one plain identifier; 0.4.13 ignores the
+  section.
+- **New flags.** `dispatch check --merged [--allow-unsafe-local]` and
+  `dispatch accept --expect <digest>`. Output without them is unchanged, except the new `Δ` line
+  on `finish`, `check` and `diff --stat`, and the per-command lines on `finish` and `accept`.
+- **Restart the owner.** Run `dispatch stop && dispatch start` so the project owner is 0.4.14.
+  An older owner does not see Codex or Cursor worktrees, and does not record a session's end
+  after `finish`. Codex and Cursor worktrees present when the 0.4.14 owner first scans are
+  listed, not tracked.
+
 ### Upgrading to 0.4.13
 
 No migration; the schema stays at 24. New fields live in the existing run JSON, and existing

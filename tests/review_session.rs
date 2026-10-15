@@ -71,7 +71,7 @@ print('{"type":"result","model":"light-model"}')
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 30\nharnesses:\n  codex:\n    executable: '{}'\n{}",
+                "execution:\n  timeout_secs: 600\nharnesses:\n  codex:\n    executable: '{}'\n{}",
                 agent.display(),
                 if shape == "unverified" {
                     ""

@@ -223,6 +223,13 @@ fn is_exact(record: &WatcherRecord) -> bool {
     identity_state(&record.identity) == IdentityState::ExactLive
 }
 
+/// How long `start` waits for a live owner to become ready, and `stop` for
+/// it to exit. Either is a step of fixed work: opening the state and
+/// inspecting the project, or the tick under way when the signal came. A
+/// loaded machine took more than 10 s for them; only a hung owner takes
+/// minutes. A dead owner is noticed at once.
+const OWNER_WAIT: Duration = Duration::from_secs(120);
+
 /// What `start` says, once watching, in a project without checks.
 const NO_CHECKS: &str = "  No checks are configured, so Work here is not verified. Add them: \
     dispatch setup --checks, or dispatch setup --checks --verify '<command>'";
@@ -302,7 +309,7 @@ pub async fn start(
     let mut child = command
         .spawn()
         .context("failed to start the background owner")?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + OWNER_WAIT;
     loop {
         if let Some(record) = read_record(state, &root)
             && record.identity.pid == child.id()
@@ -338,8 +345,9 @@ pub async fn start(
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the background owner for {} did not become ready in 10 s; see {}",
+            "the background owner for {} did not become ready in {} s; see {}",
             root.display(),
+            OWNER_WAIT.as_secs(),
             log.display()
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -383,12 +391,13 @@ pub fn stop(state: &State, root: Option<PathBuf>) -> Result<()> {
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         return Err(std::io::Error::last_os_error()).context("failed to signal the watcher");
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + OWNER_WAIT;
     while let Watcher::Watched(_) = watcher(state, &root)? {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the watcher for {} (pid {pid}) did not stop within 10 s",
-            root.display()
+            "the watcher for {} (pid {pid}) did not stop within {} s",
+            root.display(),
+            OWNER_WAIT.as_secs()
         );
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -1,5 +1,5 @@
 //! Claude-owned print protocol and included-only invocation contract.
-use std::{collections::BTreeSet, fs, path::Path, time::Duration};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
@@ -377,8 +377,8 @@ pub(crate) async fn discover_account(
     probe.timeout = Some(
         request
             .timeout
-            .unwrap_or(Duration::from_secs(5))
-            .min(Duration::from_secs(5)),
+            .unwrap_or(super::PROBE_TIMEOUT)
+            .min(super::PROBE_TIMEOUT),
     );
     let result = executor
         .execute_with_cancel(probe, request.cancellation.clone())

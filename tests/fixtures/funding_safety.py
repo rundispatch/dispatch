@@ -120,9 +120,21 @@ def scenario(binary, name):
             # A version probe that times out observes nothing: the executable's
             # bytes and the account are unchanged, so the run launches and no
             # refusal is recorded.
-            (f.root / 'version-sleep').write_text('7')
+            (f.root / 'version-hang').write_text('')
             launched(f, run(f))
+            assert not (f.root / 'version-hang').exists(), 'the version was never probed'
             assert refusals(f) == [], refusals(f)
+        elif name == 'claude_slow_cli':
+            # A CLI that is slow to answer, as on a loaded machine, is not one
+            # that never answers: its account and version are observed.
+            (f.root / 'version-sleep').write_text('8')
+            (f.root / 'version-text').write_text('claude 9.9.9 (Claude Code)')
+            refused(f, run(f), 'Claude CLI version changed')
+            (f.root / 'version-sleep').unlink()
+            (f.root / 'version-text').unlink()
+            reauthorize(f)
+            (f.root / 'auth-sleep').write_text('8')
+            launched(f, run(f))
         elif name == 'claude_version_changed':
             # An observed different version is a change: refused, and sticky.
             (f.root / 'version-text').write_text('claude 9.9.9 (Claude Code)')
@@ -132,10 +144,10 @@ def scenario(binary, name):
             refused(f, run(f), 'was refused')
         elif name == 'claude_slow_account':
             # An account probe that does not answer refuses that launch only.
-            (f.root / 'auth-sleep').write_text('7')
+            (f.root / 'auth-hang').write_text('')
             refused(f, run(f), 'did not confirm its account')
+            assert not (f.root / 'auth-hang').exists(), 'the account was never probed'
             assert refusals(f) == [], refusals(f)
-            (f.root / 'auth-sleep').unlink()
             launched(f, run(f))
         else:
             raise SystemExit(f'unknown scenario {name}')

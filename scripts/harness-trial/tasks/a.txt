@@ -1,0 +1,1 @@
+In admin.py, make promote(token) first call user = validate(token), then audit.record(user), and still return {"promoted": True}. Change no other file.

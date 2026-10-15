@@ -673,7 +673,8 @@ runtime's event on stdin):
   whose Git directory holds `CLAUDE_BASE`. Recognizing it belongs to the Claude
   adapter (`runtime::claude::made_by_claude`). Worktrees a person made (`git worktree
   add`) are never registered, listed or logged. Missing and prunable entries are
-  skipped. Other agents' layouts are not recognized; `dispatch attach -- <agent>` gives
+  skipped. Codex's and Cursor Agent's worktrees are recognized too, by their own signs
+  (below). Other agents' layouts are not recognized; `dispatch attach -- <agent>` gives
   any agent a workspace of its own.
 - **The first scan of a watch** puts every Claude worktree without Work into the
   inventory, `watchers/<key>.inventory.json` (path, first seen, `CLAUDE_BASE`, the lock
@@ -713,10 +714,47 @@ runtime's event on stdin):
 - **Removal without hooks.** With no `WorktreeRemove` hook, a worktree Claude Code
   removes is seen missing by the owner, as in "Workspace removal" above.
 
+**Codex and Cursor Agent** (`discovery::UNOBSERVED`, `runtime::codex`,
+`runtime::cursor`). After Claude's test, each worktree from the same list is tried
+against one sign per runtime:
+- **Codex** (`codex exec --worktree`): `codex-thread.json` in the worktree's Git
+  directory, found through its `.git` file without running Git, with a non-empty
+  string `ownerThreadId`. The marker alone decides, wherever the worktree is; Codex
+  puts its own under `~/.codex/worktrees/<4 hex>/<project folder>`, detached at HEAD.
+  The session is the thread ID.
+- **Cursor Agent** (`cursor-agent --worktree <name>`): the path Git lists is exactly
+  `canonicalize(~/.cursor/worktrees)/<project folder, lowercased>/<name>`, and its
+  branch is exactly `refs/heads/<name>`. Cursor lowercases the folder name, so the
+  folder as written is not accepted, on macOS and Linux alike. One path is tested and
+  `~/.cursor` is never walked. The session is the worktree's name. Because the sign is
+  a place and a branch, a worktree a person makes by hand at that path on that branch
+  counts as Cursor's.
+
+Such a worktree follows Claude's rules for the first scan (listed, not tracked) and
+for one Work per worktree. One that appears later is registered as soon as its sign
+is there, with no grace period: S0 is its merge base with the root, `workspace_owner:
+runtime`, and the agent `codex` or `cursor`. Its one session has `source:
+"discovered"` and `started_at` from the mtime of the worktree's `.git` file, when Git
+made it. The owner's log says `found a Codex session in <path>; tracking it as Work
+<id>; its end is not observable: …`.
+
+Neither runtime records anything that names its running process, so their liveness is
+`Unknown` for good: no `agent_process`, no end, never `agent running`, never `idle` by
+itself. Cursor's lingering `worker-server` process is not the agent, and nothing is
+scanned for one. `status` and `explain` say so and name the next commands:
+
+```text
+the end of a Codex session is not observable — when it is done, finish to freeze its changes (dispatch finish <id>); or close it: dispatch close <id> --reason unfinished
+```
+
+`watch` shows its origin as `codex session in its own worktree, found by Dispatch; its
+end is not observable`. Hooks for these runtimes are not installed or read.
+
 ### Liveness from the session lock
 
-`orchestrator::liveness`, on every owner tick, for unfinished attached Work whose
-workspace the runtime made (`workspace_owner: runtime`) and is still a Claude worktree:
+`orchestrator::liveness`, on every owner tick, for attached Work whose workspace the
+runtime made (`workspace_owner: runtime`) and is still a Claude worktree, while it is
+unfinished or, once finished, while it still records its agent process:
 - **Running.** When the lock names a process that runs with the lock's start, the owner
   records its exact identity on the attachment once (`agent_process`,
   `runtime.agent_running`). `status`, `explain` and `watch` show `agent running (pid N)`.
@@ -732,6 +770,13 @@ workspace the runtime made (`workspace_owner: runtime`) and is still a Claude wo
     recorded if it runs.
 
   The Work then reads `idle`, with "session ended — finish, resume or close".
+- **After `finish`.** Finishing Work does not stop following its agent. When `finish`
+  comes before the session ends, or before the next tick sees it gone, the end is still
+  recorded the same way once that exact process is gone or its lock is released, and
+  the agent is cleared. Finished Work never takes on a new agent: a later lock ends the
+  earlier session (`lock_released`) and records no process. In 0.4.13, Work finished a
+  few seconds after its agent exited kept its session open for good (found by the
+  0.4.14 conformance trials). The finish, its verdict and its Δ are not touched.
 - **Nothing else.** A lock never seen running, or a process whose start cannot be read,
   proves nothing, and nothing is recorded. A session a hook already ended stays as it
   was, so there is one end. Nothing is finished, applied, closed or signalled. A
@@ -954,10 +999,15 @@ directory, exactly as it already refuses any newer schema.
   lock, never finishes it.
 - No foreign process is ever signaled. `--pid` and the wrapper's own child PID are
   liveness-only.
-- Discovery recognizes only Claude Code's worktree layout, and liveness reads only a
-  `claude session …` lock. Both were observed with Claude Code 2.1.296 on macOS; the
-  lock of a subagent or background-session worktree, and the format on Linux, were not.
-  There is no process scanning or association by working directory.
+- Discovery recognizes only Claude Code's, Codex's and Cursor Agent's worktrees, and
+  liveness reads only a `claude session …` lock. Claude's was observed with Claude Code
+  2.1.296 on macOS; the lock of a subagent or background-session worktree, and the
+  format on Linux, were not. Codex's marker and Cursor's location were observed with
+  Codex 0.155.1 and Cursor Agent 2026.10.14 on macOS. The end of a Codex or Cursor
+  session is not observable. Hermes's worktrees are not recognized: Hermes 0.18.2's
+  `chat --worktree` works in `<repo>/.worktrees/hermes-<id>` and removes it, with its
+  changes, when the session ends. There is no process scanning
+  or association by working directory.
 - `mid_run: stop` does not apply to attached work in this version; a `Stop` verdict on
   attached work is recorded, not enforced.
 - One workspace holds exactly one active attached Work; there is no per-process

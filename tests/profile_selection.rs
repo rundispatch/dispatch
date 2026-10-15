@@ -36,7 +36,7 @@ fn fixture(root: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBu
     fs::write(
         source.join("dispatch.yml"),
         format!(
-            "execution:\n  timeout_secs: 10\nchecks:\n  verify:\n    - test -f allocated.txt\nharnesses:\n  codex:\n    executable: \"{}\"\n",
+            "execution:\n  timeout_secs: 600\nchecks:\n  verify:\n    - test -f allocated.txt\nharnesses:\n  codex:\n    executable: \"{}\"\n",
             agent.display()
         ),
     )?;

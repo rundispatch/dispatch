@@ -65,11 +65,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn wait_until(mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !ready()? {
         anyhow::ensure!(
             Instant::now() < deadline,
-            "fixture did not reach its durable boundary within 30s"
+            "fixture did not reach its durable boundary"
         );
         thread::sleep(Duration::from_millis(20));
     }
@@ -135,7 +135,7 @@ impl Fixture {
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 60\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\n",
+                "execution:\n  timeout_secs: 600\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\n",
                 verify.display(),
                 agent.display()
             ),

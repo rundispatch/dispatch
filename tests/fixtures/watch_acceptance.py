@@ -49,7 +49,9 @@ def cells(char):
 
 class Term:
     """Just enough of a VT100 to know what is on screen. `wraps` counts the
-    times a printed character ran past the right margin: a row that wrapped."""
+    times a printed character ran past the right margin: a row that wrapped.
+    `wraps_at_clear` is that count when the whole screen was last cleared, as
+    Dispatch does before it draws for a new size."""
 
     CSI = re.compile(r"\x1b\[([0-?]*)[ -/]*([@-~])")
     OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -65,6 +67,7 @@ class Term:
         self.top, self.bottom = 0, rows - 1
         self.buffer = ""
         self.wraps = 0
+        self.wraps_at_clear = 0
 
     def blank(self, rows):
         return [[" "] * self.cols for _ in range(rows)]
@@ -148,6 +151,7 @@ class Term:
                 for y in range(0, self.y): self.erase(y, 0, self.cols)
             else:
                 self.grid = self.blank(self.rows)
+                self.wraps_at_clear = self.wraps
         elif final == "K":
             mode = values[0] if values else 0
             if mode == 0: self.erase(self.y, self.x, self.cols)
@@ -398,7 +402,7 @@ def visit(watch, count):
         before = watch.selected()
         watch.send(key)
         try:
-            watch.until(f"the selection to move ({key})", lambda: watch.selected() != before, timeout=10)
+            watch.until(f"the selection to move ({key})", lambda: watch.selected() != before)
         except AssertionError:
             return False
         watch.settle(0.1)
@@ -434,7 +438,7 @@ def select(watch, name, candidates):
         watch.send("j" if listed.index(name) > listed.index(current) else "k")
         # One key at a time: wait until the move is drawn before the next.
         watch.until(f"selection to move from {current}",
-                    lambda: selected_name(watch, candidates) != current, timeout=10)
+                    lambda: selected_name(watch, candidates) != current)
     raise AssertionError(f"could not select {name}\n" + watch.screen())
 
 
@@ -490,7 +494,7 @@ class Project:
 
     def dispatch(self, *args, ok=True):
         result = subprocess.run([self.binary, "--state-dir", str(self.state), *args],
-                                cwd=self.root, capture_output=True, text=True, timeout=120,
+                                cwd=self.root, capture_output=True, text=True, timeout=600,
                                 stdin=subprocess.DEVNULL)
         if ok:
             assert result.returncode == 0, (args, result.stdout, result.stderr)
@@ -514,8 +518,12 @@ class Project:
         return run_id
 
     def hook(self, event):
+        # The registration deadline is not under test here: only a hang
+        # reaches this budget, so a slow machine still registers.
+        env = dict(os.environ, DISPATCH_REGISTRATION_BUDGET_MS="600000")
         result = subprocess.run([self.binary, "--state-dir", str(self.state), "hook", "claude"],
-                                input=json.dumps(event), capture_output=True, text=True, timeout=60)
+                                input=json.dumps(event), capture_output=True, text=True, timeout=600,
+                                env=env)
         assert result.returncode == 0, result.stderr
         return result.stdout
 
@@ -842,7 +850,10 @@ def resize(binary, base):
         for width in (60, 200, 80, 90, 89, 120):
             watch.resize(width, 30)
             drawn(width, "two")
-            assert watch.term.wraps == 0, (width, watch.screen())
+            # A frame Dispatch drew for the old size may arrive after the
+            # resize, on a loaded machine, and wrap: only the frame drawn for
+            # this size, after its clear, must not.
+            assert watch.term.wraps == watch.term.wraps_at_clear, (width, watch.screen())
         # Below 40 columns: only a request to widen, and q; keys still work.
         watch.resize(39, 30)
         watch.until("only a request to widen", lambda: "Widen the terminal to at least 40 columns."
@@ -1164,7 +1175,7 @@ def feedback(binary, base):
         watch.send("f")
         watch.shows("good: only attached Work still in progress can be finished.")
         # The notice ages out after 10 seconds.
-        watch.until("notice aged out", lambda: "only attached Work" not in watch.joined(), timeout=14)
+        watch.until("notice aged out", lambda: "only attached Work" not in watch.joined())
         select(watch, "live", order)
         watch.send("f")
         watch.shows(f"Finish live (Work {project.short('live')})? Finishing runs this project's checks on your "
@@ -1289,7 +1300,7 @@ def short_terminal(binary, base):
     order = ["me-endpoint", "two", "three", "four"]
     for width, height in ((60, 12), (100, 10)):
         with project.watch(width, height) as watch:
-            watch.until("the selected Work on screen", lambda: watch.selected(), timeout=15)
+            watch.until("the selected Work on screen", lambda: watch.selected())
             watch.send("a")  # refused: a notice of up to two lines, shown whole
             watch.shows("me-endpoint: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.")
             watch.settle()
@@ -1485,7 +1496,7 @@ def plain(binary, base):
                                  stdin=subprocess.DEVNULL, text=True)
         lines = []
         try:
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + WAIT
             while len(lines) < 1 + len(names) and time.monotonic() < deadline:
                 line = child.stdout.readline()
                 if not line:

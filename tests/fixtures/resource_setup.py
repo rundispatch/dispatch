@@ -10,7 +10,9 @@ with tempfile.TemporaryDirectory(prefix='dispatch-setup-') as tmp:
     (source/'main.c').write_text('int main(void) { return 0; }\n')
     (root/'auth.json').write_text(json.dumps({'loggedIn':True,'authMethod':'claude.ai','apiProvider':'firstParty','email':'fixture@example.invalid','orgId':'fixture'}))
     for provider in ('codex','claude'):
-        script='''#!/usr/bin/env python3
+        # This interpreter, not one found on PATH: Dispatch probes a provider's
+        # version with only its directory and system directories on PATH.
+        script='#!'+sys.executable+'''
 import sys,json,pathlib,os
 root=pathlib.Path(__file__).resolve().parent.parent
 with (root/'probe-args').open('a') as log:log.write(json.dumps(sys.argv[1:])+'\\n')

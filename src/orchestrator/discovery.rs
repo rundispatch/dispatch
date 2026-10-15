@@ -1,11 +1,13 @@
 //! Worktrees a runtime made, found in a watched project without hooks
-//! (`docs/plan-0.4.13.md` §3 B). Each owner tick lists the root's Git
-//! worktrees, never walking a directory, and asks the runtime's adapter which
-//! ones it made. Those already there when the watch began go into the
-//! `Inventory` and are only listed. One that appears later with a `claude
-//! session` lock becomes Work through the same registration and publication
-//! path as a hook's, its session already ended when that process is gone; one
-//! with any other lock, or none, is listed.
+//! (`docs/plan-0.4.13.md` §3 B, `docs/plan-0.4.14.md` §3 C). Each owner tick
+//! lists the root's Git worktrees, never walking a directory, and asks the
+//! runtime's adapter which ones it made. Those already there when the watch
+//! began go into the `Inventory` and are only listed. One Claude Code made
+//! that appears later with a `claude session` lock becomes Work through the
+//! same registration and publication path as a hook's, its session already
+//! ended when that process is gone; one with any other lock, or none, is
+//! listed. One that a runtime in `UNOBSERVED` made becomes Work as soon as it
+//! appears, its session open for good: nothing shows when it ends.
 //!
 //! A worktree that has Work is the Work's: it is neither listed nor
 //! registered again, unless that Work finished after its worktree was
@@ -24,9 +26,12 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    LifecycleState, RunRecord, RuntimeSession,
+    AttachmentRecord, BaselineProvenance, LifecycleState, RunRecord, RuntimeSession,
     process::ProcessIdentity,
-    runtime::claude::{self, Liveness, Lock, WorktreeSignals},
+    runtime::{
+        claude::{self, Liveness, Lock, WorktreeSignals},
+        codex, cursor,
+    },
     source,
     state::{State, write_atomically},
 };
@@ -85,12 +90,60 @@ const GRACE: Duration = Duration::from_secs(3);
 /// Registrations that failed, by worktree, so each is noted once.
 static FAILED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
-/// A linked worktree of the root that Claude Code made.
+/// A runtime whose worktree names its session but nothing that shows when
+/// the session ends: its liveness is always `Unknown`, so Dispatch never says
+/// its agent runs and never records its end.
+pub(crate) struct Unobserved {
+    /// The agent, as its Work records it.
+    pub agent: &'static str,
+    /// The name a person knows it by.
+    pub name: &'static str,
+    /// The session the worktree names if this runtime made it, from the
+    /// project root, the worktree and its branch as Git lists them, and the
+    /// user's home.
+    session: fn(&Path, &Path, Option<&str>, Option<&Path>) -> Option<String>,
+}
+
+/// The runtimes recognized besides Claude Code, each by the one reliable sign
+/// it leaves (`runtime::codex`, `runtime::cursor`).
+pub(crate) static UNOBSERVED: [Unobserved; 2] = [
+    Unobserved {
+        agent: "codex",
+        name: "Codex",
+        session: |_, worktree, _, _| codex::thread(worktree),
+    },
+    Unobserved {
+        agent: "cursor",
+        name: "Cursor Agent",
+        session: cursor::session,
+    },
+];
+
+/// The runtime of discovered Work whose session's end is not observable.
+pub(crate) fn unobserved(attachment: &AttachmentRecord) -> Option<&'static Unobserved> {
+    if !matches!(attachment.provenance, BaselineProvenance::Discovered { .. }) {
+        return None;
+    }
+    let agent = attachment.agent.as_deref()?;
+    UNOBSERVED.iter().find(|runtime| runtime.agent == agent)
+}
+
+/// A linked worktree of the root that a runtime made.
 struct Found {
     path: PathBuf,
-    signals: WorktreeSignals,
+    made: Made,
     /// Its lock reason as Git lists it.
     lock: Option<String>,
+}
+
+/// Who made a worktree, by the sign its runtime left.
+enum Made {
+    Claude(WorktreeSignals),
+    /// A runtime in `UNOBSERVED`, and the session the worktree names.
+    Unobserved {
+        runtime: &'static Unobserved,
+        session_id: String,
+    },
 }
 
 /// One owner tick for `root`, with the runs the owner loaded.
@@ -99,7 +152,7 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
     if !root.join(".git").exists() {
         return Ok(());
     }
-    let found = claude_worktrees(root)?;
+    let found = runtime_worktrees(root)?;
     // The latest Work of each workspace, from the runs already loaded.
     let mut latest: HashMap<&Path, &RunRecord> = HashMap::new();
     for run in runs {
@@ -122,7 +175,10 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
     let listed = |found: &Found| InventoryEntry {
         path: found.path.clone(),
         first_seen: Utc::now(),
-        base: found.signals.base.clone(),
+        base: match &found.made {
+            Made::Claude(signals) => signals.base.clone(),
+            Made::Unobserved { .. } => None,
+        },
         lock: found.lock.clone(),
     };
 
@@ -144,7 +200,7 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
         write(state, root, &inventory)?;
         if !inventory.entries.is_empty() {
             note(&format!(
-                "{} worktree(s) Claude Code made were already here; listed, not tracked",
+                "{} worktree(s) an agent's runtime made were already here; listed, not tracked",
                 inventory.entries.len()
             ));
         }
@@ -161,12 +217,33 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
         if has_work(&found.path) || inventory.entries.iter().any(|e| e.path == found.path) {
             continue;
         }
-        if let Some(lock @ Lock::Session { .. }) = &found.signals.lock {
+        let signals = match &found.made {
+            Made::Claude(signals) => signals,
+            // It appeared after watching began; its liveness is Unknown.
+            Made::Unobserved {
+                runtime,
+                session_id,
+            } => {
+                let session = unobserved_session(runtime.agent, session_id, &found.path);
+                register(state, root, &found.path, runtime.name, Ok(session), None);
+                continue;
+            }
+        };
+        if let Some(lock @ Lock::Session { pid, .. }) = &signals.lock {
             match claude::liveness(lock) {
-                Liveness::Running => register(state, root, &found.path, lock, false),
+                // A running session's process is recorded as the Work's
+                // agent, so that liveness sees it end even if it ends before
+                // liveness first looks.
+                Liveness::Running => {
+                    let session = session(lock, false);
+                    register(state, root, &found.path, "Claude Code", session, Some(*pid));
+                }
                 // It appeared after watching began and its session already
                 // ended: a `claude -p` run between two ticks leaves its lock.
-                Liveness::Gone => register(state, root, &found.path, lock, true),
+                Liveness::Gone => {
+                    let session = session(lock, true);
+                    register(state, root, &found.path, "Claude Code", session, None);
+                }
                 // Unknown proves nothing: look again next tick.
                 Liveness::Unknown => {}
             }
@@ -191,16 +268,21 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
     Ok(())
 }
 
-/// Register the session `lock` names as Work in `workspace`, `ended` when
-/// its process is gone, noting a failure once.
-fn register(state: &State, root: &Path, workspace: &Path, lock: &Lock, ended: bool) {
-    // A running session's process is recorded as the Work's agent, so that
-    // liveness sees it end even if it ends before liveness first looks.
-    let agent = match lock {
-        Lock::Session { pid, .. } if !ended => Some(*pid),
-        _ => None,
-    };
-    let result = session(lock, ended).and_then(|session| {
+/// Register `session` of the runtime a person knows as `name` as Work in
+/// `workspace`, with its running `agent` process, noting a failure once.
+fn register(
+    state: &State,
+    root: &Path,
+    workspace: &Path,
+    name: &str,
+    session: Result<RuntimeSession>,
+    agent: Option<u32>,
+) {
+    let ended = session.as_ref().is_ok_and(|s| s.ended_at.is_some());
+    let observable = session
+        .as_ref()
+        .is_ok_and(|s| !UNOBSERVED.iter().any(|r| r.agent == s.provider));
+    let result = session.and_then(|session| {
         super::registration::discovered(state, root, workspace, session, agent)
     });
     let mut failed = FAILED
@@ -210,9 +292,17 @@ fn register(state: &State, root: &Path, workspace: &Path, lock: &Lock, ended: bo
         Ok(Some(run_id)) => {
             failed.remove(workspace);
             note(&format!(
-                "found a{} Claude Code session in {}; tracking it as Work {run_id}",
+                "found a{} {name} session in {}; tracking it as Work {run_id}{}",
                 if ended { "n ended" } else { "" },
-                workspace.display()
+                workspace.display(),
+                if observable {
+                    String::new()
+                } else {
+                    format!(
+                        "; its end is not observable: when it is done, dispatch finish \
+                         {run_id}, or dispatch close {run_id} --reason unfinished"
+                    )
+                }
             ));
         }
         // Someone else is registering it, or has: the next tick sees which.
@@ -220,7 +310,7 @@ fn register(state: &State, root: &Path, workspace: &Path, lock: &Lock, ended: bo
         Err(error) => {
             if failed.insert(workspace.to_owned()) {
                 note(&format!(
-                    "could not track the Claude Code session in {}: {error:#}",
+                    "could not track the {name} session in {}: {error:#}",
                     workspace.display()
                 ));
             }
@@ -248,19 +338,39 @@ fn session(lock: &Lock, ended: bool) -> Result<RuntimeSession> {
     })
 }
 
-/// The root's linked worktrees that Claude Code made, from `git worktree
-/// list`; missing and prunable ones are skipped.
-fn claude_worktrees(root: &Path) -> Result<Vec<Found>> {
+/// The session a runtime in `UNOBSERVED` began in `worktree`: since when is
+/// not recorded, so since Git made the worktree, its `.git` file written
+/// then; open, since its end is not observable.
+fn unobserved_session(agent: &str, session_id: &str, worktree: &Path) -> RuntimeSession {
+    let made = fs::metadata(worktree.join(".git")).and_then(|metadata| metadata.modified());
+    RuntimeSession {
+        provider: agent.into(),
+        session_id: session_id.into(),
+        source: "discovered".into(),
+        started_at: made.map_or_else(|_| Utc::now(), DateTime::<Utc>::from),
+        ended_at: None,
+        end_reason: None,
+        model: None,
+    }
+}
+
+/// The root's linked worktrees that a runtime made, from `git worktree
+/// list`; missing and prunable ones are skipped. Each is tested only at the
+/// path Git gives, wherever it is.
+fn runtime_worktrees(root: &Path) -> Result<Vec<Found>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut list = source::git_command(root);
     list.args(["worktree", "list", "--porcelain"]);
     let output = source::checked_output(list, "failed to list the project's worktrees")?;
     let text = String::from_utf8_lossy(&output.stdout);
     let mut found = Vec::new();
     for block in text.split("\n\n") {
-        let (mut path, mut lock, mut prunable) = (None, None, false);
+        let (mut path, mut branch, mut lock, mut prunable) = (None, None, None, false);
         for line in block.lines() {
             if let Some(listed) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(listed));
+            } else if let Some(listed) = line.strip_prefix("branch ") {
+                branch = Some(listed);
             } else if line == "locked" || line.starts_with("locked ") {
                 lock = Some(line["locked".len()..].trim_start().to_owned());
             } else if line == "prunable" || line.starts_with("prunable ") {
@@ -274,13 +384,25 @@ fn claude_worktrees(root: &Path) -> Result<Vec<Found>> {
             continue;
         }
         let signals = claude::worktree_signals(&path);
-        if claude::made_by_claude(root, &path, &signals) {
-            found.push(Found {
-                path,
-                signals,
-                lock: lock.filter(|reason| !reason.is_empty()),
-            });
-        }
+        let made = if claude::made_by_claude(root, &path, &signals) {
+            Made::Claude(signals)
+        } else {
+            let Some((runtime, session_id)) = UNOBSERVED.iter().find_map(|runtime| {
+                let session = (runtime.session)(root, &path, branch, home.as_deref())?;
+                Some((runtime, session))
+            }) else {
+                continue;
+            };
+            Made::Unobserved {
+                runtime,
+                session_id,
+            }
+        };
+        found.push(Found {
+            path,
+            made,
+            lock: lock.filter(|reason| !reason.is_empty()),
+        });
     }
     Ok(found)
 }

@@ -43,7 +43,7 @@ def pump(seconds=.1):
 # Longest wait for any expected screen or state. Waits return as soon as the
 # condition holds, so a generous limit only matters on a slow machine; set
 # DISPATCH_TEST_WAIT_SECS to change it.
-WAIT=float(os.environ.get('DISPATCH_TEST_WAIT_SECS','60'))
+WAIT=float(os.environ.get('DISPATCH_TEST_WAIT_SECS','300'))
 def wait(word,timeout=WAIT):
     global position
     end=time.time()+timeout

@@ -3,3 +3,4 @@
 /release-artifacts/
 *.tmp
 .DS_Store
+/harness-trials/

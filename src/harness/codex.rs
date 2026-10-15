@@ -19,6 +19,48 @@ use tokio::{
 
 use crate::executor::safe_local_environment;
 
+pub(super) fn parse_output(stdout: &str, _stderr: &str) -> super::HarnessTelemetry {
+    let mut telemetry = super::parse_jsonl_telemetry(stdout);
+    if let Some(usage) = telemetry
+        .events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "turn.completed")
+        .map(|event| &event["usage"])
+    {
+        telemetry.usage_categories = [
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ]
+        .into_iter()
+        .filter_map(|key| usage[key].as_u64().map(|value| (key.into(), value)))
+        .collect();
+    }
+    if let Some(failed) = telemetry
+        .events
+        .iter()
+        .find(|event| event["type"] == "turn.failed")
+    {
+        let message = failed["error"]["message"]
+            .as_str()
+            .or_else(|| failed["message"].as_str())
+            .unwrap_or("Codex turn failed");
+        let nested = serde_json::from_str::<Value>(message).ok();
+        telemetry.semantic_error = Some(
+            nested
+                .as_ref()
+                .and_then(|value| value.pointer("/error/message").and_then(Value::as_str))
+                .unwrap_or(message)
+                .to_owned(),
+        );
+        telemetry.failure = Some(crate::FailureKind::HarnessProcess);
+    }
+    telemetry
+}
+
 /// The Codex account the user authorized for a profile, recorded by setup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountEvidence {

@@ -5,7 +5,7 @@ cancels); accept applies, and a stale accept is refused with what to do next;
 Work that appears while watching shows up without taking the selection; q
 leaves. Effects are checked in the recorded state, and what the person sees is
 checked on the screen as a terminal would show it."""
-import codecs, json, os, re, subprocess, sys, tempfile, time
+import codecs, json, os, re, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 sys.dont_write_bytecode=True
 from review_refinement import Session, WAIT, has_color
@@ -153,10 +153,13 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
     git=lambda *a:subprocess.run(['git','-C',str(repo),'-c','user.name=T','-c','user.email=t@e.invalid',*a],check=True,capture_output=True)
     git('init','-q');git('add','-A');git('commit','-qm','init');git('worktree','add','-q','-b','wt','.claude/worktrees/auth-ctx')
     worktree=(repo/'.claude/worktrees/auth-ctx').resolve()
+    # The registration deadline is not under test here: only a hang reaches
+    # this budget, so a slow machine still registers.
+    no_deadline=dict(os.environ,DISPATCH_REGISTRATION_BUDGET_MS='600000')
     subprocess.run([binary,'--state-dir',str(state),'start','--root',str(repo)],check=True,capture_output=True)
     try:
         hook=json.dumps({'hook_event_name':'SessionStart','session_id':'s1','source':'startup','cwd':str(worktree)})
-        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True)
+        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True,env=no_deadline)
         found=[p.parent.name for p in (state/'runs').glob('*/metadata.json') if json.loads(p.read_text()).get('attachment',{}) and json.loads(p.read_text())['attachment']['workspace']==str(worktree)]
         assert len(found)==1,found; work=found[0]
         (worktree/'lib.txt').write_text('two\n')
@@ -178,7 +181,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
         git('worktree','add','-q','-b','spare','.claude/worktrees/spare')
         spare_tree=(repo/'.claude/worktrees/spare').resolve()
         hook=json.dumps({'hook_event_name':'SessionStart','session_id':'s2','source':'startup','cwd':str(spare_tree)})
-        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True)
+        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True,env=no_deadline)
         spare=[p.parent.name for p in (state/'runs').glob('*/metadata.json')
                if (json.loads(p.read_text()).get('attachment') or {}).get('workspace')==str(spare_tree)]
         assert len(spare)==1,spare; spare=spare[0]; tag=short(spare,work)
@@ -279,6 +282,17 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             ui.send('r');screen.see('Reject Make the second artifact (Work %s)?'%short(other,stale))
             ui.send('\x1b');screen.see('Make the second artifact: nothing changed.')
             screen.resize(200,30);ui.send('k');screen.see('› Make the first artifact','r reject · d review')
+            # A key pressed as the terminal says it resized is read then, not
+            # when the next key comes: crossterm 0.29 left such a key waiting.
+            for key,which in (('j','second'),('k','first'))*3:
+                os.killpg(ui.process.pid,signal.SIGWINCH);time.sleep(.005);ui.send(key)
+                screen.see('› Make the %s artifact'%which)
+            # A terminal slow to say where the cursor is, as on a loaded
+            # machine: the view waits for it, past crossterm's 2 s.
+            # The header's right edge is drawn anew only at the new width.
+            ui.cursor_reply_delay=3;screen.resize(120,30)
+            screen.see('› Make the first artifact','need you');ui.cursor_reply_delay=0
+            screen.resize(200,30);screen.see('› Make the first artifact','r reject · d review')
             ui.send('a');screen.see('Make the first artifact: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.')
             # Refused: nothing applied, and the refusal is recorded as such.
             assert meta(stale)['outcome']['application']=='blocked_by_source_drift',meta(stale)['outcome']

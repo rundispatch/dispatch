@@ -36,7 +36,9 @@ class Fixture:
         self.ready = self.root / "ready"
         os.mkfifo(self.ready)
         agent = self.root / self.provider
-        agent.write_text('''#!/usr/bin/env python3
+        # This interpreter, not one found on PATH: Dispatch probes a provider's
+        # version with only its directory and system directories on PATH.
+        agent.write_text('#!' + sys.executable + '''
 import json, pathlib, sys, os
 root=pathlib.Path(''' + repr(str(self.root)) + ''')
 if '--version' in sys.argv:
@@ -95,9 +97,11 @@ else:
 ''')
         if self.provider == 'claude':
             os.environ.setdefault('USER', 'dispatch-fixture-user')
-            # version-sleep delays the version answer by that many seconds and
-            # version-text replaces it; auth-sleep delays auth status.
+            # version-sleep delays every version answer by that many seconds
+            # and version-text replaces it; auth-sleep delays auth status.
+            # version-hang and auth-hang make the next probe never answer.
             script = agent.read_text().replace("print('codex phase5 fixture');sys.exit()", """import time
+    if (root/'version-hang').exists(): (root/'version-hang').unlink();time.sleep(3600)
     if (root/'version-sleep').exists(): time.sleep(float((root/'version-sleep').read_text()))
     print((root/'version-text').read_text() if (root/'version-text').exists() else 'claude phase6 fixture');sys.exit()""")
             script = script.replace('prompt=sys.stdin.read()', """if 'auth' in sys.argv and 'status' in sys.argv:
@@ -106,8 +110,9 @@ else:
     count_path=root/'auth-count'
     n=int(count_path.read_text())+1 if count_path.exists() else 1
     count_path.write_text(str(n))
-    if (root/'auth-sleep').exists():
-        import time; time.sleep(float((root/'auth-sleep').read_text()))
+    import time
+    if (root/'auth-hang').exists(): (root/'auth-hang').unlink();time.sleep(3600)
+    if (root/'auth-sleep').exists(): time.sleep(float((root/'auth-sleep').read_text()))
     boundary=root/'auth-boundary'
     if boundary.exists() and n==int(boundary.read_text()):
         auth=json.loads((root/'auth.json').read_text());auth['email']='changed@example.invalid'
@@ -141,7 +146,7 @@ def emit(text):
             os.environ['HOME'] = str(home)
         agent.chmod(0o755)
         (self.source / 'dispatch.yml').write_text(
-            f"execution:\n  timeout_secs: 30\nchecks:\n  verify: ['test -f result.txt']\nharnesses:\n  {self.provider}:\n    executable: '{agent}'\n")
+            f"execution:\n  timeout_secs: 600\nchecks:\n  verify: ['test -f result.txt']\nharnesses:\n  {self.provider}:\n    executable: '{agent}'\n")
         (self.state / 'resources.yml').write_text('''version: 1
 allocation_enabled: true
 capacity:

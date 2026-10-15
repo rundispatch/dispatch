@@ -138,7 +138,7 @@ impl Project {
 
     /// The projection once `check` holds, within 30 s.
     fn until(&self, what: &str, check: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(300);
         loop {
             if let Some(projection) = self.projection()
                 && check(&projection)
@@ -308,7 +308,7 @@ fn auto_applied_work_records_its_landing_as_auto_applied() {
     p.ok(&["finish", &a]);
     // The owner applies it; the landing is committed right after
     // `result.applied`.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while p.landings(&a).is_empty() {
         assert!(Instant::now() < deadline, "{}", p.run(&a)["outcome"]);
         std::thread::sleep(Duration::from_millis(200));

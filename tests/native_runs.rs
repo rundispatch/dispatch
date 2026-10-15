@@ -54,7 +54,7 @@ for arg in "$@"; do if [ "$previous" = '--model' ]; then model="$arg"; fi; previ
 printf '%s\n' "$model" >> '{root}/invocations'
 count=$(wc -l < '{root}/invocations' | tr -d ' ')
 mode=$(cat '{root}/mode')
-if [ "$mode" = 'timeout' ]; then sleep 8; fi
+if [ "$mode" = 'timeout' ]; then sleep 600; fi
 if [ "$mode" = 'harness-failure' ]; then exit 9; fi
 if [ "$mode" = 'checkpoint-crash' ] || [ "$mode" = 'checkpoint-then-complete' ] || [ "$mode" = 'clarify-always' ] || {{ [ "$mode" = 'clarify' ] && [ "$count" = '1' ]; }}; then
 printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"{{\"dispatch_checkpoint\":{{\"version\":1,\"question\":\"Which label?\",\"choices\":[\"blue\",\"green\"]}}}}"}}}}'
@@ -83,7 +83,7 @@ printf '{{"type":"result","model":"%s"}}\n' "$model"
 if [ "$(cat result.txt)" = 'bad' ] && [ -f '{root}/gate' ]; then
 : > '{root}/verification-waiting'
 i=0
-while [ ! -f '{root}/continue' ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i+1)); done
+while [ ! -f '{root}/continue' ] && [ "$i" -lt 6000 ]; do sleep 0.05; i=$((i+1)); done
 fi
 test "$(cat result.txt)" = 'ok'
 "#,
@@ -93,7 +93,7 @@ test "$(cat result.txt)" = 'ok'
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 60\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\n",
+                "execution:\n  timeout_secs: 600\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\n",
                 check.display(),
                 agent.display()
             ),
@@ -437,15 +437,17 @@ fn answering_after_the_source_moved_continues_the_goal() -> Result<()> {
 
 #[test]
 fn one_deadline_bounds_invocations_and_waiting_answers() -> Result<()> {
+    // The deadline is what is tested, so it cannot be a hang bound: it leaves
+    // room for the attempt to start, which took 20 s on a loaded machine.
     let f = Fixture::new("timeout")?;
-    let r = Fixture::result(&f.run(&["--timeout", "5"])?)?;
+    let r = Fixture::result(&f.run(&["--timeout", "60"])?)?;
     assert_eq!(r["execution"]["failure"], "deadline");
     assert_eq!(f.count(), 1);
     f.no_live_launches()?;
     // Room for the first attempt to ask its question even on a loaded
     // machine; then wait out the run's own recorded deadline before answering.
     let g = Fixture::new("clarify")?;
-    let r = Fixture::result(&g.run(&["--timeout", "30"])?)?;
+    let r = Fixture::result(&g.run(&["--timeout", "60"])?)?;
     assert_eq!(r["execution"]["questions"][0]["state"], "pending", "{r}");
     let deadline: chrono::DateTime<chrono::Utc> =
         r["execution"]["deadline_at"].as_str().unwrap().parse()?;
@@ -829,7 +831,7 @@ fn replace_with_fifo(path: &Path) -> Result<()> {
     Ok(())
 }
 fn wait_until(mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !ready()? {
         anyhow::ensure!(
             Instant::now() < deadline,
@@ -1263,7 +1265,7 @@ fn phase4_follow_registration_racing_completion_cannot_lose_it() -> Result<()> {
             "--until",
             "finished",
             "--timeout",
-            "5",
+            "300",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

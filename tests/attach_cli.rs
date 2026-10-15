@@ -1236,6 +1236,21 @@ fn closing_work_whose_worktree_vanished_waits_for_a_watching_owner() {
     assert_eq!(f.event_count(&id, "work.closed"), 0);
 
     drop(serve_lock);
+    // A process another test forked meanwhile holds the lock with us until it
+    // execs, which a loaded machine delays: wait until nobody holds it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let probe = fs::File::open(locks.join(format!("serve-{key}.lock"))).unwrap();
+        // SAFETY: a non-blocking probe on a descriptor this test owns.
+        if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the serve lock stayed held"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let out = Fixture::stdout(&f.dispatch(&close).success());
     assert!(
         out.contains(

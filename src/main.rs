@@ -127,6 +127,15 @@ enum Command {
         /// Print the verdict as JSON.
         #[arg(long)]
         json: bool,
+        /// Also run checks.verify on the current source with the Work's
+        /// change as of now, in a scratch copy. Applies nothing and changes
+        /// no verdict; accept still runs its own.
+        #[arg(long)]
+        merged: bool,
+        /// Allow this check to run checks.verify on the host, when neither
+        /// the Work nor standing consent already does.
+        #[arg(long, requires = "merged")]
+        allow_unsafe_local: bool,
     },
     /// Redo a stale result as a new run on the current source (a new agent launch).
     Refresh(RefreshArgs),
@@ -404,6 +413,11 @@ struct AcceptArgs {
     /// that no longer applies, or a failing check.
     #[arg(long)]
     despite_refresh: bool,
+
+    /// Accept only if the frozen change's digest starts with this (12 or
+    /// more hex characters, as `Δ` shows it); otherwise nothing happens.
+    #[arg(long, value_name = "DIGEST", value_parser = delta_prefix)]
+    expect: Option<String>,
 }
 
 #[tokio::main]
@@ -586,8 +600,20 @@ async fn run() -> Result<()> {
         Command::Explain { run_id } => {
             orchestrator::explain(&state, run_id.as_deref(), &std::env::current_dir()?)
         }
-        Command::Check { run_id, json } => {
-            orchestrator::check(&state, run_id.as_deref(), &std::env::current_dir()?, json)
+        Command::Check {
+            run_id,
+            json,
+            merged,
+            allow_unsafe_local,
+        } => {
+            orchestrator::check(
+                &state,
+                run_id.as_deref(),
+                &std::env::current_dir()?,
+                json,
+                merged.then_some(orchestrator::MergedCheck { allow_unsafe_local }),
+            )
+            .await
         }
         Command::Refresh(args) => {
             let auto_apply = args.auto_apply;
@@ -739,6 +765,7 @@ async fn run() -> Result<()> {
                 },
                 args.review.feedback.reasons,
                 explanation,
+                args.expect.as_deref(),
             )
         }
         Command::Reject(args) => {
@@ -750,6 +777,7 @@ async fn run() -> Result<()> {
                 orchestrator::ReviewDecision::Reject,
                 args.feedback.reasons,
                 explanation,
+                None,
             )
         }
         Command::Close(args) => {
@@ -877,9 +905,18 @@ fn finish_run(
 /// but not advertised; they make the complete workflow testable offline.
 fn agent_id(value: &str) -> std::result::Result<String, String> {
     match value {
-        "claude" | "codex" | "cursor" => Ok(value.to_owned()),
+        "claude" | "codex" | "cursor" | "hermes" => Ok(value.to_owned()),
         fake if fake.starts_with("fake-") => Ok(fake.to_owned()),
-        _ => Err("possible values: claude, codex, cursor".into()),
+        _ => Err("possible values: claude, codex, cursor, hermes".into()),
+    }
+}
+
+/// A Δ digest prefix: 12 to 64 hex characters, compared in lower case.
+fn delta_prefix(value: &str) -> std::result::Result<String, String> {
+    if (12..=64).contains(&value.len()) && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(value.to_ascii_lowercase())
+    } else {
+        Err("a digest is 12 to 64 hex characters, as `Δ` shows it".into())
     }
 }
 

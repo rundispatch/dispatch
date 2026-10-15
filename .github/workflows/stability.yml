@@ -1,0 +1,168 @@
+name: Stability
+
+# The twenty-clean-runs bar: the whole suite, run repeatedly on both shipped
+# platforms. Failures are listed with counts in the step summary, and each
+# failing run's log is uploaded. Nothing is retried.
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Full-suite runs per platform
+        required: false
+        default: 20
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  stability:
+    name: stability (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    env:
+      RUNS: ${{ inputs.runs || 20 }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache Cargo (Linux test image)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-target
+            ${{ runner.temp }}/cargo-registry
+          key: cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.os }}-
+      - name: Cache Cargo (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.os }}-
+      - name: Install Rust (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+
+      - name: Build the tests once, then run the suite ${{ env.RUNS }} times
+        id: repeat
+        env:
+          DISPATCH_DOCKER_TARGET_DIR: ${{ runner.temp }}/cargo-target
+          DISPATCH_DOCKER_CARGO_REGISTRY: ${{ runner.temp }}/cargo-registry
+        run: |
+          case "$RUNS" in ''|*[!0-9]*|0*) echo "runs must be a positive integer: $RUNS" >&2; exit 1 ;; esac
+          # Linux runs in the test image, macOS natively.
+          suite() {
+            if [ "$RUNNER_OS" = Linux ]; then scripts/test-in-docker.sh "$@"; else "$@"; fi
+          }
+          mkdir -p "$DISPATCH_DOCKER_TARGET_DIR" "$DISPATCH_DOCKER_CARGO_REGISTRY" stability-logs
+          suite cargo test --locked --no-run
+
+          : > failures.txt
+          failed_runs=0
+          for i in $(seq 1 "$RUNS"); do
+            log="stability-logs/run-$i.log"
+            status=0
+            suite cargo test --locked --no-fail-fast > "$log" 2>&1 || status=$?
+            if [ "$status" -eq 0 ]; then
+              echo "run $i/$RUNS: ok"
+              rm "$log"
+              continue
+            fi
+            failed_runs=$((failed_runs + 1))
+            echo "run $i/$RUNS: failed (exit $status)"
+            names="$(sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' "$log" | sort -u)"
+            if [ -n "$names" ]; then
+              printf '%s\n' "$names" >> failures.txt
+            else
+              echo "(failed without a failing test line; see run-$i.log)" >> failures.txt
+            fi
+          done
+
+          {
+            echo "## Stability on ${{ matrix.os }}: $((RUNS - failed_runs))/$RUNS clean runs"
+            if [ "$failed_runs" -gt 0 ]; then
+              echo
+              echo "| Failing test | Runs failed |"
+              echo "| --- | ---: |"
+              sort failures.txt | uniq -c | sort -rn | while read -r count name; do
+                echo "| \`$name\` | $count |"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "failed_runs=$failed_runs" >> "$GITHUB_OUTPUT"
+
+      - name: Upload failing run logs
+        if: steps.repeat.outputs.failed_runs != '' && steps.repeat.outputs.failed_runs != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stability-failures-${{ matrix.os }}
+          path: stability-logs/run-*.log
+          if-no-files-found: error
+
+      - name: Fail when any run failed
+        if: steps.repeat.outputs.failed_runs != '0'
+        run: exit 1
+
+  # One nightly run on a loaded machine, as CI's stress job runs it on every
+  # pull request (scripts/test-in-docker.sh, DISPATCH_DOCKER_STRESS=1).
+  stress:
+    name: stability under load (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache Cargo (Linux test image)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-target
+            ${{ runner.temp }}/cargo-registry
+          key: cargo-ubuntu-22.04-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-ubuntu-22.04-
+      - name: Build the tests, then run the suite once in stress mode
+        id: stress
+        env:
+          DISPATCH_DOCKER_TARGET_DIR: ${{ runner.temp }}/cargo-target
+          DISPATCH_DOCKER_CARGO_REGISTRY: ${{ runner.temp }}/cargo-registry
+        run: |
+          mkdir -p "$DISPATCH_DOCKER_TARGET_DIR" "$DISPATCH_DOCKER_CARGO_REGISTRY" stability-logs
+          scripts/test-in-docker.sh cargo test --locked --no-run
+          status=0
+          DISPATCH_DOCKER_STRESS=1 scripts/test-in-docker.sh cargo test --locked --no-fail-fast \
+            > stability-logs/stress.log 2>&1 || status=$?
+          {
+            if [ "$status" -eq 0 ]; then
+              echo "## Stability under load: clean"
+            else
+              echo "## Stability under load: failed (exit $status)"
+              echo
+              sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' stability-logs/stress.log | sort -u |
+                while read -r name; do echo "- \`$name\`"; done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the failing run's log
+        if: steps.stress.outputs.status != '' && steps.stress.outputs.status != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stability-failures-stress
+          path: stability-logs/stress.log
+          if-no-files-found: error
+
+      - name: Fail when the run failed
+        if: steps.stress.outputs.status != '0'
+        run: exit 1

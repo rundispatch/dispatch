@@ -1,5 +1,7 @@
 pub mod claude;
 pub mod codex;
+mod cursor;
+mod hermes;
 
 use std::{
     env,
@@ -25,6 +27,7 @@ pub const SUPPORTED_HARNESSES: &[&str] = &[
     "claude",
     "codex",
     "cursor",
+    "hermes",
     "fake-good",
     "fake-bad",
     "fake-timeout",
@@ -206,6 +209,10 @@ pub trait HarnessAdapter: Send + Sync {
     fn parse_output(&self, stdout: &str, _stderr: &str) -> HarnessTelemetry {
         parse_jsonl_telemetry(stdout)
     }
+
+    fn parse_output_in(&self, stdout: &str, stderr: &str, _output_dir: &Path) -> HarnessTelemetry {
+        self.parse_output(stdout, stderr)
+    }
 }
 
 /// The adapter's preflight refused to launch the agent: for an included-only
@@ -287,10 +294,12 @@ pub async fn run_harness(
     let telemetry = {
         let stdout = execution.raw_stdout_lossy();
         let stderr = execution.raw_stderr_lossy();
-        adapter.parse_output(&stdout, &stderr)
+        adapter.parse_output_in(&stdout, &stderr, &request.output_dir)
     };
-    if execution.status == ExecutionStatus::Succeeded
-        && let Some(error) = &telemetry.semantic_error
+    if matches!(
+        execution.status,
+        ExecutionStatus::Succeeded | ExecutionStatus::Failed
+    ) && let Some(error) = &telemetry.semantic_error
     {
         execution.status = ExecutionStatus::Failed;
         execution.error = Some(format!("harness reported an error: {error}"));
@@ -338,6 +347,7 @@ pub fn adapter_for(id: &str, configs: &HarnessesConfig) -> Result<Box<dyn Harnes
         "claude" => Box::new(ClaudeAdapter::new(configs.claude.clone())),
         "codex" => Box::new(CodexAdapter::new(configs.codex.clone())),
         "cursor" => Box::new(CursorAdapter::new(configs.cursor.clone())),
+        "hermes" => Box::new(HermesAdapter::new(configs.hermes.clone())),
         "fake-good" => Box::new(FakeAdapter::good()),
         "fake-bad" => Box::new(FakeAdapter::bad()),
         "fake-timeout" => Box::new(FakeAdapter::timeout()),
@@ -474,6 +484,10 @@ impl HarnessAdapter for CodexAdapter {
         structured_final(stdout, "codex")
     }
 
+    fn parse_output(&self, stdout: &str, stderr: &str) -> HarnessTelemetry {
+        codex::parse_output(stdout, stderr)
+    }
+
     async fn preflight(&self, _executor: &Executor, request: &HarnessRunRequest) -> Result<()> {
         // Only a run bound to an included-only profile carries a funding
         // contract; an explicit `--agent codex` run has none to check.
@@ -482,10 +496,7 @@ impl HarnessAdapter for CodexAdapter {
                 &self.executable(),
                 self.config.codex_account.as_ref(),
                 self.config.funding_source.as_deref().unwrap_or_default(),
-                request
-                    .timeout
-                    .unwrap_or(Duration::from_secs(5))
-                    .min(Duration::from_secs(5)),
+                request.timeout.unwrap_or(PROBE_TIMEOUT).min(PROBE_TIMEOUT),
             )
             .await?;
         }
@@ -557,6 +568,14 @@ impl HarnessAdapter for CursorAdapter {
         probe_version(&self.executable()).await
     }
 
+    fn final_result(&self, stdout: &str) -> std::result::Result<String, String> {
+        cursor::final_result(stdout)
+    }
+
+    fn parse_output(&self, stdout: &str, stderr: &str) -> HarnessTelemetry {
+        cursor::parse_output(stdout, stderr)
+    }
+
     fn build_command(&self, request: &HarnessRunRequest) -> Result<CommandSpec> {
         let mut args = vec![
             "-p".into(),
@@ -568,6 +587,69 @@ impl HarnessAdapter for CursorAdapter {
         push_model_and_extra_args(&mut args, &self.config);
         args.push(request.prompt.clone());
         Ok(CommandSpec::new(path_string(&self.executable())).args(args))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HermesAdapter {
+    config: HarnessConfig,
+}
+
+impl HermesAdapter {
+    pub fn new(config: HarnessConfig) -> Self {
+        Self { config }
+    }
+
+    fn executable(&self) -> PathBuf {
+        self.config
+            .executable
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("hermes"))
+    }
+}
+
+#[async_trait]
+impl HarnessAdapter for HermesAdapter {
+    fn id(&self) -> &'static str {
+        "hermes"
+    }
+
+    fn model(&self) -> Option<&str> {
+        self.config.model.as_deref()
+    }
+
+    async fn detect(&self) -> DetectionResult {
+        detect_executable(&self.executable())
+    }
+
+    async fn version(&self) -> Result<Option<String>> {
+        probe_version(&self.executable()).await
+    }
+
+    fn build_command(&self, request: &HarnessRunRequest) -> Result<CommandSpec> {
+        let mut args = vec![
+            "-z".into(),
+            request.prompt.clone(),
+            "--usage-file".into(),
+            path_string(&request.output_dir.join("usage.json")),
+            "--yolo".into(),
+        ];
+        if let Some(model) = &self.config.model {
+            args.extend(["--model".into(), model.clone()]);
+        }
+        if let Some(provider) = &self.config.provider {
+            args.extend(["--provider".into(), provider.clone()]);
+        }
+        args.extend(self.config.extra_args.iter().cloned());
+        Ok(CommandSpec::new(path_string(&self.executable())).args(args))
+    }
+
+    fn final_result(&self, stdout: &str) -> std::result::Result<String, String> {
+        hermes::final_result(stdout)
+    }
+
+    fn parse_output_in(&self, stdout: &str, stderr: &str, output_dir: &Path) -> HarnessTelemetry {
+        hermes::parse_output(stdout, stderr, output_dir)
     }
 }
 
@@ -695,6 +777,12 @@ fn detect_executable(executable: &Path) -> DetectionResult {
     }
 }
 
+/// How long one read-only probe of a provider CLI (its version, account or
+/// models) may take before its answer is unknown. It bounds a hung CLI, not a
+/// slow one: a cold start of a CLI took 19 s on a loaded Mac, and the earlier
+/// 5 s turned that into "version unavailable".
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(crate) async fn probe_version(executable: &Path) -> Result<Option<String>> {
     let temporary = tempfile::Builder::new()
         .prefix("dispatch-version-")
@@ -714,7 +802,6 @@ pub(crate) async fn probe_version(executable: &Path) -> Result<Option<String>> {
         command = command.env("PATH", path.to_string_lossy());
     }
     let config = ExecutionConfig {
-        timeout_secs: 5,
         forwarded_env: vec!["PATH".into()],
         ..ExecutionConfig::default()
     };
@@ -724,7 +811,7 @@ pub(crate) async fn probe_version(executable: &Path) -> Result<Option<String>> {
         temporary.path().join("stdout.log"),
         temporary.path().join("stderr.log"),
     )
-    .with_timeout(Duration::from_secs(5));
+    .with_timeout(PROBE_TIMEOUT);
     let output = Executor::new(config)
         .execute(request)
         .await
@@ -932,11 +1019,18 @@ fn field_f64(value: &Value, names: &[&str]) -> Option<f64> {
 /// Strict final boundary for plans and scoped dependency reports; never scan fragments.
 fn structured_final(stdout: &str, harness: &str) -> std::result::Result<String, String> {
     (|| -> Result<String> {
-        let events = stdout
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(serde_json::from_str::<Value>)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let events = if harness == "claude" {
+            stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        };
         let last = events.last().context("missing final event")?;
         let text = if harness == "claude" {
             anyhow::ensure!(
@@ -1047,6 +1141,7 @@ mod tests {
             read_only: false,
             model: Some("test-model".into()),
             effort: Some("high".into()),
+            provider: None,
             executable: Some(PathBuf::from("custom-agent")),
             extra_args: vec!["--extra".into()],
             allocation_service_mode: None,

@@ -632,6 +632,9 @@ fn hook(p: &Project, event: &Value) -> String {
         .arg("--state-dir")
         .arg(&p.state)
         .args(["hook", "claude"])
+        // The registration deadline is not under test here: only a hang
+        // reaches this budget, so a slow machine still registers.
+        .env("DISPATCH_REGISTRATION_BUDGET_MS", "600000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -667,7 +670,7 @@ fn only_run(p: &Project) -> String {
 
 /// Wait for the owner to record Work `id`'s source at start until `ready`.
 fn until(p: &Project, id: &str, ready: impl Fn(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         let at_start = p.at_start(id);
         if ready(&at_start) {

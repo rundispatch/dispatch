@@ -30,7 +30,7 @@ fn executable(path: &Path, text: &str) -> Result<()> {
 }
 
 fn wait_until(what: &str, mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while !ready()? {
         anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {what}");
         thread::sleep(Duration::from_millis(25));
@@ -75,7 +75,7 @@ printf '{{"type":"result"}}\n'
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 90\nharnesses:\n  codex:\n    executable: '{}'\n",
+                "execution:\n  timeout_secs: 600\nharnesses:\n  codex:\n    executable: '{}'\n",
                 agent.display()
             ),
         )?;

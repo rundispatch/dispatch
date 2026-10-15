@@ -1108,18 +1108,36 @@ class Point(Base):
         assert_eq!(got.into_iter().collect::<Vec<_>>(), ["d", "h"]);
     }
 
+    /// This thread's CPU time: what extraction itself costs, however many
+    /// other processes compete for the CPU.
+    #[cfg(unix)]
+    fn thread_cpu() -> std::time::Duration {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: writes only the timespec passed in.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) },
+            0
+        );
+        std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn extract_orchestrator_is_fast_enough() {
         let src =
             std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestrator.rs")).unwrap();
-        let start = std::time::Instant::now();
+        let start = thread_cpu();
         let fs = extract(Lang::Rust, &src).unwrap();
-        let elapsed = start.elapsed();
+        let elapsed = thread_cpu() - start;
         assert!(!fs.has_error);
         assert!(fs.decls.len() > 50);
         assert!(elapsed.as_millis() < 500, "took {elapsed:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn one_megabyte_files_complete() {
         let rust: String = (0..8000)
@@ -1130,15 +1148,12 @@ class Point(Base):
             .collect();
         for (lang, src, count) in [(Lang::Rust, rust, 8000), (Lang::Python, python, 12000)] {
             assert!(src.len() > 900_000, "{lang:?} {}", src.len());
-            let start = std::time::Instant::now();
+            let start = thread_cpu();
             let fs = extract(lang, src.as_bytes()).unwrap();
+            let elapsed = thread_cpu() - start;
             assert!(!fs.has_error);
             assert_eq!(fs.decls.len(), count);
-            assert!(
-                start.elapsed().as_secs() < 5,
-                "{lang:?} took {:?}",
-                start.elapsed()
-            );
+            assert!(elapsed.as_secs() < 5, "{lang:?} took {elapsed:?}");
         }
     }
 

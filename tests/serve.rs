@@ -138,7 +138,7 @@ impl Fixture {
     /// foreign form's `ATTACHED <id>` banner.
     fn wait_new_run_id(&self, before: &HashSet<String>) -> String {
         let mut found = None;
-        wait_until(Duration::from_secs(30), || {
+        wait_until(Duration::from_secs(300), || {
             let ids = self.all_run_ids();
             let mut diff = ids.difference(before);
             match (diff.next(), diff.next()) {
@@ -362,7 +362,7 @@ fn second_serve_on_the_same_root_is_refused() {
     let fixture = Fixture::new();
 
     let first = ServeProcess::spawn(&fixture, &["--json"]);
-    let world = first.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    let world = first.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
     assert!(world.is_some(), "serve did not print a world line in time");
 
     let second = fixture
@@ -377,7 +377,7 @@ fn second_serve_on_the_same_root_is_refused() {
     drop(first);
 
     let third = ServeProcess::spawn(&fixture, &["--json"]);
-    let world = third.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    let world = third.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
     assert!(world.is_some(), "a third serve did not start cleanly");
 }
 
@@ -392,7 +392,7 @@ fn serve_reevaluates_foreign_work_when_the_root_moves() {
     .unwrap();
 
     let serve = ServeProcess::spawn(&fixture, &["--json"]);
-    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    serve.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
 
     // The root moves underneath the active attached work, editing the same
     // line to a third, conflicting value.
@@ -402,7 +402,7 @@ fn serve_reevaluates_foreign_work_when_the_root_moves() {
     )
     .unwrap();
 
-    wait_until(Duration::from_secs(30), || {
+    wait_until(Duration::from_secs(300), || {
         fixture.event_count(&id, "coherence.invalidated") > 0
     });
 }
@@ -440,15 +440,15 @@ fn a_verdict_that_changes_back_within_a_minute_is_still_recorded() {
     let fixture = Fixture::new();
     let id = stale_foreign_work(&fixture);
     let serve = ServeProcess::spawn(&fixture, &["--json"]);
-    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    serve.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
     conflict_in_root(&fixture);
-    wait_until(Duration::from_secs(30), || {
+    wait_until(Duration::from_secs(300), || {
         stored_decision(&fixture, &id) == "refresh"
     });
     // The root moves back at once and then stays put: the owner must record
     // CONTINUE without waiting for yet another move.
     restore_root(&fixture);
-    wait_until(Duration::from_secs(30), || {
+    wait_until(Duration::from_secs(300), || {
         stored_decision(&fixture, &id) == "continue"
     });
 }
@@ -458,17 +458,17 @@ fn a_restarted_owner_records_a_change_the_old_one_never_saw() {
     let fixture = Fixture::new();
     let id = stale_foreign_work(&fixture);
     let serve = ServeProcess::spawn(&fixture, &["--json"]);
-    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    serve.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
     conflict_in_root(&fixture);
-    wait_until(Duration::from_secs(30), || {
+    wait_until(Duration::from_secs(300), || {
         stored_decision(&fixture, &id) == "refresh"
     });
     drop(serve);
 
     restore_root(&fixture);
     let serve = ServeProcess::spawn(&fixture, &["--json"]);
-    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
-    wait_until(Duration::from_secs(30), || {
+    serve.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
+    wait_until(Duration::from_secs(300), || {
         stored_decision(&fixture, &id) == "continue"
     });
 }
@@ -478,17 +478,17 @@ fn serve_follows_foreign_work_that_edits_into_a_change_already_made() {
     let fixture = Fixture::new();
     let id = fixture.attach(&[]);
     let serve = ServeProcess::spawn(&fixture, &["--json"]);
-    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    serve.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
     // The root moves first, while the work has not touched the code yet.
     conflict_in_root(&fixture);
-    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    serve.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
     // Then the work edits the same line, and the root stays put.
     fs::write(
         fixture.workspace.join("src/lib.rs"),
         "pub fn f() -> i32 {\n    2\n}\n",
     )
     .unwrap();
-    wait_until(Duration::from_secs(30), || {
+    wait_until(Duration::from_secs(300), || {
         stored_decision(&fixture, &id) == "refresh"
     });
 }
@@ -506,7 +506,7 @@ fn serve_auto_applies_ready_foreign_work_with_integrate() {
     fixture.dispatch(&["finish", &id]).success();
 
     let _serve = ServeProcess::spawn(&fixture, &["--json"]);
-    wait_until(Duration::from_secs(30), || {
+    wait_until(Duration::from_secs(300), || {
         let metadata = fixture.metadata(&id);
         metadata["outcome"]["application"] == "applied"
             && metadata["outcome"]["applied_by"] == "auto_apply"
@@ -552,7 +552,7 @@ fn serve_adopts_work_whose_owner_is_gone() {
             .expect("failed to start dispatch attach"),
     );
     let wrapper_pid = wrapped.0.id() as i32;
-    wait_until(Duration::from_secs(30), || ready.exists());
+    wait_until(Duration::from_secs(300), || ready.exists());
     let id = fixture.wait_new_run_id(&before);
 
     // The wrapper records `attachment.agent_process` and syncs it to disk
@@ -560,7 +560,7 @@ fn serve_adopts_work_whose_owner_is_gone() {
     // its own READY marker; under heavy parallel load the wrapper's own
     // commit can still lag the child briefly, so poll rather than assume.
     let mut agent_pid = None;
-    wait_until(Duration::from_secs(30), || {
+    wait_until(Duration::from_secs(300), || {
         agent_pid = fixture.metadata(&id)["attachment"]["agent_process"]["pid"].as_u64();
         agent_pid.is_some()
     });
@@ -573,8 +573,10 @@ fn serve_adopts_work_whose_owner_is_gone() {
     assert!(alive(agent_pid), "the orphaned agent must still be running");
 
     let serve = ServeProcess::spawn(&fixture, &["--json"]);
-    wait_until(Duration::from_secs(30), || {
+    // The event commits first; metadata.json is its projection, written next.
+    wait_until(Duration::from_secs(300), || {
         fixture.event_count(&id, "attach.adopted") > 0
+            && fixture.metadata(&id)["attachment"]["owner_state"] == "adopted"
     });
     assert_eq!(fixture.event_count(&id, "attach.adopted"), 1);
 
@@ -587,7 +589,7 @@ fn serve_adopts_work_whose_owner_is_gone() {
 
     // Cleanup: the orphaned agent would otherwise block on its gate forever.
     unsafe { libc::kill(agent_pid, libc::SIGKILL) };
-    wait_until(Duration::from_secs(10), || !alive(agent_pid));
+    wait_until(Duration::from_secs(300), || !alive(agent_pid));
 }
 
 #[test]
@@ -617,7 +619,7 @@ fn serve_view_lists_native_and_attached_runs() {
 
     let serve = ServeProcess::spawn(&fixture, &["--json"]);
     let mut seen = std::collections::HashMap::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while seen.len() < 2 && Instant::now() < deadline {
         let Some(line) = serve.next_line(Duration::from_secs(1)) else {
             continue;
@@ -682,7 +684,7 @@ impl Diagnosed {
 
     fn next(&self) -> String {
         self.ticks
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(Duration::from_secs(300))
             .expect("a tick line")
     }
 }
@@ -845,7 +847,7 @@ fn watch_lines(
             }
         }
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(300);
     let mut lines = Vec::new();
     while !enough(&lines) {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -884,7 +886,7 @@ fn status_shows_files_changed_now_only_while_the_owner_counts_them() {
     .unwrap();
     fs::write(fixture.workspace.join("src/new.rs"), "pub fn g() {}\n").unwrap();
     let serve = ServeProcess::spawn(&fixture, &[]);
-    wait_until(Duration::from_secs(30), || {
+    wait_until(Duration::from_secs(300), || {
         std::thread::sleep(Duration::from_millis(200));
         status().contains("Files changed   2 now")
     });

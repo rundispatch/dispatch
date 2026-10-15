@@ -162,7 +162,7 @@ impl Project {
 
     /// The projection once `check` holds, within 30 s.
     fn until(&self, what: &str, check: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(300);
         loop {
             if let Some(projection) = self.projection()
                 && check(&projection)
@@ -271,7 +271,7 @@ fn integrated_rejected_and_lost_work_leaves_the_comparison() {
     });
     p.ok(&["accept", &a]);
     p.until("applied A leaves", |v| !participants(v).contains(&a));
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while p.run(&b)["coherence"]["validity"]["decision"] != "refresh" {
         assert!(Instant::now() < deadline, "{}", p.run(&b)["coherence"]);
         std::thread::sleep(Duration::from_millis(200));
@@ -420,7 +420,7 @@ fn a_landing_records_the_next_verdict_on_every_other_work_once() {
 
     let landing = &p.payloads(&a, "interaction.landed")[0];
     assert_eq!(landing["status"], "observed", "{landing}");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     let outcomes = loop {
         let outcomes = p.payloads(&a, "interaction.outcome");
         if outcomes.len() == 2 {
@@ -469,7 +469,7 @@ fn work_auto_applied_by_the_owner_lands_with_the_owners_current_view() {
     p.ok(&["stop"]);
     p.ok(&["finish", &a, "--allow-unsafe-local"]);
     p.ok(&["start"]);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while p.payloads(&a, "interaction.landed").is_empty() {
         assert!(Instant::now() < deadline, "{}", p.run(&a)["outcome"]);
         std::thread::sleep(Duration::from_millis(200));

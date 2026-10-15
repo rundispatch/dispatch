@@ -100,6 +100,7 @@ pub struct HarnessesConfig {
     pub claude: HarnessConfig,
     pub codex: HarnessConfig,
     pub cursor: HarnessConfig,
+    pub hermes: HarnessConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -108,6 +109,7 @@ pub struct HarnessConfig {
     #[serde(skip)]
     pub read_only: bool,
     pub model: Option<String>,
+    pub provider: Option<String>,
     pub effort: Option<String>,
     pub executable: Option<PathBuf>,
     pub extra_args: Vec<String>,
@@ -129,6 +131,7 @@ impl HarnessesConfig {
         match harness {
             "claude" => &self.claude,
             "cursor" => &self.cursor,
+            "hermes" => &self.hermes,
             _ => &self.codex,
         }
     }
@@ -206,26 +209,37 @@ impl Config {
             ("claude", &self.harnesses.claude),
             ("codex", &self.harnesses.codex),
             ("cursor", &self.harnesses.cursor),
+            ("hermes", &self.harnesses.hermes),
         ] {
             validate_model(harness.model.as_deref())
                 .with_context(|| format!("invalid harnesses.{name}.model"))?;
             validate_effort(harness.effort.as_deref())
                 .with_context(|| format!("invalid harnesses.{name}.effort"))?;
+            if name == "hermes" {
+                validate_identifier(harness.provider.as_deref(), "provider")
+                    .context("invalid harnesses.hermes.provider")?;
+            }
         }
         Ok(())
     }
 
     pub fn example_yaml() -> &'static str {
-        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    effort: null\n    extra_args: []\n  codex:\n    model: null\n    effort: null\n    extra_args: []\n  cursor:\n    model: null\n    effort: null\n    extra_args: []\n"
+        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    effort: null\n    extra_args: []\n  codex:\n    model: null\n    effort: null\n    extra_args: []\n  cursor:\n    model: null\n    effort: null\n    extra_args: []\n  hermes:\n    model: null\n    provider: null\n    extra_args: []\n"
     }
 }
 
 pub fn validate_model(model: Option<&str>) -> Result<()> {
-    if let Some(model) = model {
-        anyhow::ensure!(!model.trim().is_empty(), "model must not be empty");
+    validate_identifier(model, "model")
+}
+
+/// One value passed to a harness as a single argument: not empty, not an
+/// option, no whitespace. `what` names it in the error.
+fn validate_identifier(value: Option<&str>, what: &str) -> Result<()> {
+    if let Some(value) = value {
+        anyhow::ensure!(!value.trim().is_empty(), "{what} must not be empty");
         anyhow::ensure!(
-            !model.starts_with('-') && !model.chars().any(char::is_whitespace),
-            "model must be one non-option identifier"
+            !value.starts_with('-') && !value.chars().any(char::is_whitespace),
+            "{what} must be one non-option identifier"
         );
     }
     Ok(())
@@ -415,6 +429,17 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn an_invalid_hermes_provider_is_named_as_a_provider() {
+        let mut config = Config::default();
+        config.harnesses.hermes.provider = Some("bad id!".into());
+        let error = format!("{:#}", config.validate().unwrap_err());
+        assert_eq!(
+            error,
+            "invalid harnesses.hermes.provider: provider must be one non-option identifier"
+        );
     }
 
     #[test]

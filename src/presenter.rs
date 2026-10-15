@@ -599,7 +599,7 @@ impl Editor {
     }
 }
 
-type NativeTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+type NativeTerminal = Terminal<Native>;
 fn activity_hint(elapsed: Duration, ascii: bool) -> String {
     let frames = if ascii {
         ["|", "/", "-", "\\"]
@@ -880,6 +880,86 @@ fn diff_lines<'a>(text: &'a str, palette: &Theme) -> Vec<Line<'a>> {
         .collect()
 }
 
+/// The next terminal event. Crossterm 0.29 waits for input edge-triggered, and
+/// returns a resize without reading input that became ready with it: a key
+/// pressed as the terminal resized would wait in the terminal for the next
+/// key. Input still waiting after a resize is fetched by asking where the
+/// cursor is, since the reply is new input and crossterm then reads both.
+fn read_event() -> Result<Event> {
+    let event = event::read()?;
+    #[cfg(unix)]
+    if matches!(event, Event::Resize(..)) {
+        let mut fd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, and no wait.
+        if unsafe { libc::poll(&mut fd, 1, 0) } == 1 && fd.revents & libc::POLLIN != 0 {
+            // A late reply still wakes it; none leaves the key waiting.
+            let _ = crossterm::cursor::position();
+        }
+    }
+    Ok(event)
+}
+
+/// How long the terminal may take to say where the cursor is.
+const CURSOR_WAIT: Duration = Duration::from_secs(60);
+
+/// Crossterm, waiting `CURSOR_WAIT` for the cursor position. An inline
+/// viewport asks for it whenever the terminal's size changes, and crossterm
+/// gives the reply 2 s: on a loaded machine a slow reply ended the session.
+/// Asking again waits on, since a late reply answers the next question.
+struct Native(CrosstermBackend<io::Stdout>);
+
+impl ratatui::backend::Backend for Native {
+    type Error = io::Error;
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.0.draw(content)
+    }
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.0.append_lines(n)
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.0.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.0.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+        let deadline = Instant::now() + CURSOR_WAIT;
+        loop {
+            match self.0.get_cursor_position() {
+                // Crossterm's "could not be read within a normal duration".
+                Err(error) if error.kind() == io::ErrorKind::Other && Instant::now() < deadline => {
+                }
+                result => return result,
+            }
+        }
+    }
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(&mut self, at: P) -> io::Result<()> {
+        self.0.set_cursor_position(at)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.0.clear()
+    }
+    fn clear_region(&mut self, clear: ratatui::backend::ClearType) -> io::Result<()> {
+        self.0.clear_region(clear)
+    }
+    fn size(&self) -> io::Result<ratatui::layout::Size> {
+        self.0.size()
+    }
+    fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+        self.0.window_size()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        ratatui::backend::Backend::flush(&mut self.0)
+    }
+}
+
 struct Screen {
     terminal: NativeTerminal,
     inspection: bool,
@@ -920,7 +1000,7 @@ impl Screen {
                 execute!(io::stdout(), terminal::EnterAlternateScreen)?;
             }
             let terminal = Terminal::with_options(
-                CrosstermBackend::new(io::stdout()),
+                Native(CrosstermBackend::new(io::stdout())),
                 TerminalOptions {
                     viewport: if inspection {
                         Viewport::Fullscreen
@@ -1228,7 +1308,7 @@ impl Ui {
             }
         }
         if event::poll(Duration::ZERO)? {
-            Ok(Some(event::read()?))
+            Ok(Some(read_event()?))
         } else {
             Ok(Some(Event::FocusGained))
         }
@@ -1416,7 +1496,7 @@ impl Ui {
         }
         for _ in 0..256 {
             if !self.closed && event::poll(Duration::ZERO)? {
-                let _ = event::read()?;
+                let _ = read_event()?;
             } else {
                 return Ok(());
             }
