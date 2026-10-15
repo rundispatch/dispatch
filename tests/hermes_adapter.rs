@@ -68,3 +68,22 @@ fn hermes_failure_preserves_null_as_unknown() {
     );
     assert!(adapter.final_result("").is_err());
 }
+
+#[test]
+fn a_provider_refusal_reported_only_on_stdout_keeps_its_message() {
+    // Hermes Agent 0.18.2, observed 2026-10-15: the provider refused the call,
+    // `hermes -z` exited 0, printed the provider's message on stdout, wrote
+    // nothing to stderr, and left `failure` out of the usage file.
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("usage.json"), r#"{"estimated_cost_usd":null,"cost_status":null,"cost_source":null,"input_tokens":null,"output_tokens":null,"cache_read_tokens":null,"cache_write_tokens":null,"reasoning_tokens":null,"total_tokens":null,"api_calls":1,"model":null,"provider":null,"session_id":null,"completed":false,"failed":true,"service_tier":null}"#).unwrap();
+    let adapter = HermesAdapter::new(HarnessConfig::default());
+    for stdout in [
+        "HTTP 400: Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.\n",
+        "API call failed after 3 retries: HTTP 404: model: clause-opus-5-5\n",
+    ] {
+        let usage = adapter.parse_output_in(stdout, "", temp.path());
+        assert_eq!(usage.semantic_error.as_deref(), Some(stdout.trim()));
+        assert_eq!(usage.failure, Some(dispatch::FailureKind::HarnessProcess));
+        assert_eq!(usage.tokens, None);
+    }
+}

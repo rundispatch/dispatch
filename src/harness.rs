@@ -648,8 +648,8 @@ impl HarnessAdapter for HermesAdapter {
         hermes::final_result(stdout)
     }
 
-    fn parse_output_in(&self, _stdout: &str, stderr: &str, output_dir: &Path) -> HarnessTelemetry {
-        hermes::parse_output(stderr, output_dir)
+    fn parse_output_in(&self, stdout: &str, stderr: &str, output_dir: &Path) -> HarnessTelemetry {
+        hermes::parse_output(stdout, stderr, output_dir)
     }
 }
 

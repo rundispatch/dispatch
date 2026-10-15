@@ -15,7 +15,7 @@ pub(super) fn final_result(stdout: &str) -> std::result::Result<String, String> 
     Ok(text.to_owned())
 }
 
-pub(super) fn parse_output(stderr: &str, output_dir: &Path) -> HarnessTelemetry {
+pub(super) fn parse_output(stdout: &str, stderr: &str, output_dir: &Path) -> HarnessTelemetry {
     let mut telemetry = HarnessTelemetry::default();
     let Ok(raw) = fs::read_to_string(output_dir.join("usage.json")) else {
         return telemetry;
@@ -39,12 +39,16 @@ pub(super) fn parse_output(stderr: &str, output_dir: &Path) -> HarnessTelemetry 
     telemetry.tokens = usage["total_tokens"].as_u64();
     telemetry.token_semantics = telemetry.tokens.map(|_| "hermes-reported-total".into());
     telemetry.model = usage["model"].as_str().map(str::to_owned);
+    // Hermes 0.18.2 exits 0 when the provider refuses a call, prints the
+    // provider's message on stdout, and leaves `failure` out of the usage file;
+    // its own setup errors go to stderr and `failure`.
     if usage["failed"] == true {
         telemetry.semantic_error = Some(
-            usage["failure"]
-                .as_str()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| stderr.trim())
+            [usage["failure"].as_str().unwrap_or(""), stderr, stdout]
+                .into_iter()
+                .map(str::trim)
+                .find(|message| !message.is_empty())
+                .unwrap_or("Hermes reported a failed run without a message")
                 .to_owned(),
         );
         telemetry.failure = Some(crate::FailureKind::HarnessProcess);
