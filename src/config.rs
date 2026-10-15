@@ -216,7 +216,7 @@ impl Config {
             validate_effort(harness.effort.as_deref())
                 .with_context(|| format!("invalid harnesses.{name}.effort"))?;
             if name == "hermes" {
-                validate_model(harness.provider.as_deref())
+                validate_identifier(harness.provider.as_deref(), "provider")
                     .context("invalid harnesses.hermes.provider")?;
             }
         }
@@ -229,11 +229,17 @@ impl Config {
 }
 
 pub fn validate_model(model: Option<&str>) -> Result<()> {
-    if let Some(model) = model {
-        anyhow::ensure!(!model.trim().is_empty(), "model must not be empty");
+    validate_identifier(model, "model")
+}
+
+/// One value passed to a harness as a single argument: not empty, not an
+/// option, no whitespace. `what` names it in the error.
+fn validate_identifier(value: Option<&str>, what: &str) -> Result<()> {
+    if let Some(value) = value {
+        anyhow::ensure!(!value.trim().is_empty(), "{what} must not be empty");
         anyhow::ensure!(
-            !model.starts_with('-') && !model.chars().any(char::is_whitespace),
-            "model must be one non-option identifier"
+            !value.starts_with('-') && !value.chars().any(char::is_whitespace),
+            "{what} must be one non-option identifier"
         );
     }
     Ok(())
@@ -423,6 +429,17 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn an_invalid_hermes_provider_is_named_as_a_provider() {
+        let mut config = Config::default();
+        config.harnesses.hermes.provider = Some("bad id!".into());
+        let error = format!("{:#}", config.validate().unwrap_err());
+        assert_eq!(
+            error,
+            "invalid harnesses.hermes.provider: provider must be one non-option identifier"
+        );
     }
 
     #[test]
