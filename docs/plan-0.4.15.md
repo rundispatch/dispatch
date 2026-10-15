@@ -40,6 +40,34 @@ worktree.
   gone when it ends unless the agent commits them somewhere else. Keeping the Δ
   rescues work, beyond tracking it.
 
+### What P0 found so far (2026-10-15, no agent runs)
+
+These come from Hermes's source and local measurements; the details are in
+`~/dispatch-dev/p0-0415/hermes-source.md`.
+
+- **Hermes locks its worktree** with `git worktree lock --reason "hermes pid=<pid>"`.
+  That is a liveness signal, but with a pid only and no start time. Guard
+  against pid reuse: the process must have started no later than the worktree
+  was created.
+- **Hermes removes its worktree only when there are no unpushed commits.**
+  - With commits, it keeps the worktree and says so.
+  - Without them, it runs `git worktree remove --force` and `git branch -D`,
+    and uncommitted changes are lost. That happened in the 0.4.14 trial.
+- **Hermes fires its session-end hooks before it removes the worktree.**
+  - Chat path: `_cleanup_worktree` is registered with `atexit` right after
+    setup, and `_run_cleanup` (`on_session_end`, `on_session_finalize`) is
+    registered later. Exit handlers run in reverse order.
+  - TUI path: removal runs after the TUI process exits.
+  - So a Hermes shell hook (in `~/.hermes/config.yaml`, under Hermes's own
+    first-use consent) can take the exact Δ while the worktree still exists.
+    One short real run still has to confirm this, and show the payload.
+- **Discovery is cheap.** `git worktree list --porcelain` takes 11 ms on this
+  repository and 21 ms with 60 linked worktrees, so a one-second loop costs
+  about 1–2% of a core. No adaptive interval is needed.
+- **Codex does not remove its worktrees,** so this release's vanishing-worktree
+  problem does not arise for it. Its `Stop` hook marks the end of a turn, not of
+  the session. Codex hooks stay out of scope.
+
 ## 3. What P0 must answer
 
 P0's probes are short ad hoc runs of real agents (Hermes and Codex), kept to the
@@ -113,7 +141,7 @@ few needed. The harness conformance trials run only when the user approves them
 | P0 | §3 probes; the evidence amends §2 and §4 | — |
 | P1 | A, fast discovery | P0 (cost) |
 | P2 | B and C, vanishing worktrees and Hermes | P0 |
-| P3 | D, hooks, only where P0 found a pre-removal event | P0 |
+| P3 | D, Hermes session-end hook capture: `dispatch setup` installs it, the same capture path as Claude's `WorktreeRemove` (gated on the confirming run) | P0 |
 | R | docs, version, `Site impact:` line; a conformance rerun only if the user approves it (real agents use their tokens) | all |
 
 - **Workers on several harnesses again.** Hermes now works through OpenAI Codex
