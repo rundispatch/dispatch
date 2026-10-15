@@ -1,0 +1,1 @@
+In README.md, add an "## Auth" section after the title that says to call validate with a request token. Do not name any file in it. Change no other file.
