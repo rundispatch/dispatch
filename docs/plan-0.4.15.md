@@ -25,7 +25,7 @@ worktree.
 
 | | Claude Code 2.1.296 | Codex 0.155.1 | Cursor Agent 2026.10.14 | Hermes Agent 0.18.2 |
 |---|---|---|---|---|
-| Worktree | `<repo>/.claude/worktrees/<name>`, branch `worktree-<name>` | `~/.codex/worktrees/<4 hex>/<repo>`, detached | `~/.cursor/worktrees/<repo lowercased>/<name>`, branch `<name>` | `<repo>/.worktrees/hermes-<8 hex>`, branch `hermes/<same>`; only from `hermes chat --worktree` (`-z` ignores the flag) |
+| Worktree | `<repo>/.claude/worktrees/<name>`, branch `worktree-<name>` | `~/.codex/worktrees/<4 hex>/<repo>`, detached | `~/.cursor/worktrees/<repo lowercased>/<name>`, branch `<name>` | `<repo>/.worktrees/hermes-<8 hex>`, branch `hermes/hermes-<same 8 hex>`; only from `hermes chat --worktree` (`-z` ignores the flag) |
 | After the session | kept; `-p` leaves its lock | kept | kept | **removed, with its branch and the agent's changes**; `.worktrees/` is added to the checkout's `.gitignore` |
 | Process signal | lock with pid and start time | none | none | lock `hermes pid=<pid>`, no start time (P0) |
 | Pre-removal hook | `WorktreeRemove` (used since 0.4.6) | not needed: worktrees are kept | none known | `on_session_finalize` shell hook, runs before removal (P0) |
@@ -51,7 +51,10 @@ session; the details are in `~/dispatch-dev/p0-0415/hermes-source.md` and
   against pid reuse: the process must have started no later than the worktree
   was created.
 - **Hermes removes its worktree only when there are no unpushed commits.**
-  - With commits, it keeps the worktree and says so.
+  - With commits, it keeps the worktree and says so. Unpushed means not on
+    any remote-tracking ref; a repository with no remote-tracking refs counts
+    as having none, so there even committed work is removed (from source,
+    `_worktree_has_unpushed_commits`).
   - Without them, it runs `git worktree remove --force` and `git branch -D`,
     and uncommitted changes are lost. That happened in the 0.4.14 trial.
 - **Hermes fires its session-end hooks before it removes the worktree.**
@@ -114,9 +117,11 @@ harness conformance trials run only when the user approves them
   about once a second and does only list, recognize and register, through the
   same recognizers and registration path. It is not a second discovery path.
 - Git runs with `GIT_OPTIONAL_LOCKS=0`, as it does everywhere since 0.4.13.
-- The loop's cost, measured in P0, is reported in the plan. If it is too high
-  on a large repository, the interval adapts to what the listing costs;
-  correctness never depends on the interval.
+- The loop's cost was measured in P0 (§2): 11 to 21 ms a listing. The interval
+  is fixed at about a second (D2), with no new setting; correctness never
+  depends on it.
+- The loop keeps its cadence while the coherence tick is busy, for example
+  while the owner runs a project's checks for Work finished by consent.
 
 ### B. Vanishing worktrees
 
@@ -133,8 +138,12 @@ harness conformance trials run only when the user approves them
 ### C. Hermes recognizer
 
 - A worktree at `<root>/.worktrees/hermes-<8 hex>` on branch
-  `refs/heads/hermes/<same 8 hex>` is Hermes-made.
-- S0 is the merge base. Liveness follows P0's evidence, `Unknown` otherwise.
+  `refs/heads/hermes/hermes-<same 8 hex>` is Hermes-made (observed:
+  `.worktrees/hermes-dbc09083` on `refs/heads/hermes/hermes-dbc09083`).
+- S0 is the merge base, as for every discovered worktree.
+- Liveness comes from the lock `hermes pid=<pid>`: running while that process
+  lives and started no later than the worktree was made, gone when it does not,
+  `Unknown` otherwise.
 - It lives in `src/runtime/hermes.rs`, as one more entry in the recognizer list.
 
 ### D. Exact capture through hooks (gated by P0)
@@ -161,14 +170,16 @@ harness conformance trials run only when the user approves them
 | Packet | Contract | Depends on |
 |---|---|---|
 | P0 | §3 probes; the evidence amends §2 and §4 | — |
-| P1 | A, fast discovery | P0 (cost) |
-| P2 | B and C, vanishing worktrees and Hermes | P0 |
-| P3 | D, Hermes session-end hook capture: `dispatch setup` installs it, the same capture path as Claude's `WorktreeRemove` (gated on the confirming run) | P0 |
+| P1 | A, and B while the worktree exists: the fast loop, and a fresh Δ for Work whose runtime's worktrees can vanish | P0 |
+| P2 | B once the worktree is gone: Work finished from its last-seen Δ (D1), and how status, watch and review show it | P0 |
+| P3 | C and D, everything Hermes: the recognizer, its liveness, and the `on_session_finalize` hook that `dispatch setup` installs | P0 |
 | R | docs, version, `Site impact:` line; a conformance rerun only if the user approves it (real agents use their tokens) | all |
 
-- **Workers on several harnesses again.** Hermes now works through OpenAI Codex
-  and can take a packet; Cursor's free plan resets monthly.
-- **Overlap is fine.** P1 and P2 both touch the owner loop; Dispatch reports
+- **Workers (D3):** P1 on Codex, P2 on Hermes, P3 and R on Claude Code.
+- **Split by file, so no two packets create the same file:** P1 owns the
+  owner's loops (`serve.rs`), P2 the finish and review path (`attach.rs` and
+  the status wording), P3 `src/runtime/hermes.rs` and the setup integration.
+  Small overlaps remain (`discovery.rs`, `liveness.rs`); Dispatch reports
   where they interact.
 
 ## 6. Deliberately not built
