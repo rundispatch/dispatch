@@ -65,6 +65,20 @@ def ended(state, run):
     return all(s.get("ended_at") for s in sessions)
 
 
+def end_not_observable(out, run):
+    """Dispatch's own word, in its owner log, that it cannot see the end of
+    the session in Work `run` (a runtime that names no process)."""
+    watchers = os.path.join(out, "state", "watchers")
+    if not os.path.isdir(watchers):
+        return False
+    for name in sorted(os.listdir(watchers)):
+        if name.endswith(".log"):
+            with open(os.path.join(watchers, name), errors="replace") as log:
+                if any(run in line and "its end is not observable" in line for line in log):
+                    return True
+    return False
+
+
 def interacts(status, b):
     rows = (status or {}).get("interactions") or []
     return [r for r in rows if r.get("with") == b and r.get("symbol") == "validate"]
@@ -234,10 +248,17 @@ def task_record(out, path, t, repo, fixture_tree):
         defects.append({"step": f"{t.upper()}: Δ", "expected": f"S0 + Δ = the agent's tree {agent_tree}",
                         "observed": delta})
     rec["session"] = session_of(m, attempt)
-    rec["session"]["recorded"] = bool(rec["session"]["started_at"] and rec["session"]["ended_at"])
+    started, ended = rec["session"]["started_at"], rec["session"]["ended_at"]
+    # Codex and Cursor name no process, so Dispatch cannot see their sessions
+    # end and says so (docs/attach.md). That is the contract, not a defect, as
+    # long as Dispatch declared it and recorded no end it did not observe.
+    unobservable = path == "worktree" and not ended and end_not_observable(out, run)
+    rec["session"]["end_observable"] = not unobservable
+    rec["session"]["recorded"] = bool(started and (ended or unobservable))
     if not rec["session"]["recorded"]:
-        defects.append({"step": f"{t.upper()}: session", "expected": "start and end recorded",
-                        "observed": f"start {rec['session']['started_at']}, end {rec['session']['ended_at']}"})
+        defects.append({"step": f"{t.upper()}: session",
+                        "expected": "start and end recorded, or the end declared not observable",
+                        "observed": f"start {started}, end {ended}"})
     rec["usage"] = usage_of(attempt)
     rec["verification"] = (status.get("outcome") or {}).get("verification")
     rec["harness_version_recorded"] = attempt.get("harness_version")
