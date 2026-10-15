@@ -23,9 +23,11 @@ continuously.
 request limit, and a Claude Code session finished P5 in the same workspace. From P3 on,
 every packet landed with `dispatch accept <id> --expect <Δ>` (section 7) instead of the
 integrator's `land.sh`, and `dispatch check <id> --merged` replaced its `verify.sh` for
-P3, P2 and P6. Under the load of several parallel suites on one Mac, tests and Dispatch
-itself gave up on fixed waits that were too short: that led to P6, which lengthened the
-product's waits and made the tests wait for what they test.
+P3, P2, P6, P6b and R. Under the load of several parallel suites on one Mac, and of other
+jobs on it, tests and Dispatch itself gave up on fixed waits that were too short. That led
+to P6, which lengthened the product's waits and made the tests wait for what they test.
+It also led to P6b, whose stress mode found two more product defects: a key pressed during
+a resize could be held back, and a resize could end `dispatch watch`.
 
 The paths are examples. Keep each one outside `/tmp` and outside any build
 directory, and use the same binary and state directory in every command.

@@ -94,17 +94,25 @@ contract. They never compare the agents or their code.
     An owner that exits is still reported at once.
   - Confirming that a stopped agent's process group is gone takes up to 10 s, instead of 500 ms.
   - A setup write waits up to 30 s for another writer, instead of refusing at once.
+  - `dispatch watch` and the review screens no longer lose a key pressed as the terminal is
+    resized, and they wait up to 60 s, not 2 s, for the terminal to report its cursor on a
+    resize, so a busy machine no longer ends them.
 - **For contributors.**
   - The suite runs in a pinned Linux image: `scripts/test-in-docker.sh` runs fmt, clippy and
     test in `ci/test.Dockerfile` as an ordinary user, with `--init` so orphans are reaped. The
     tests need only Rust, `git`, `python3` and `sh`; no `docker` CLI.
-  - CI runs the suite on Linux (in that image) and macOS, plus a `tests on one CPU` job.
+  - CI runs the suite on Linux (in that image) and macOS, plus `tests under load` on every pull
+    request and push.
   - A release runs the suite on its tag before it builds any asset.
   - `stability.yml` runs the suite 20 times nightly on both platforms and lists each failing
     test with its count. `harness-trials.yml` runs real agents through the conformance runner,
     by hand or weekly and never on pull requests, with keys from a protected environment. Only
     the fixture reaches the model providers, sent by the agents; Dispatch uploads nothing.
-  - TODO(integrator, P6b): one line on the stress mode (what it runs, and where it runs).
+  - `DISPATCH_DOCKER_STRESS=1 scripts/test-in-docker.sh cargo test --locked` runs the suite on a
+    loaded machine (2 CPUs, 16 busy loops, 8 test threads). CI's `tests under load` job does
+    the same on every pull request, and `stability.yml` adds one such run each night. CPU
+    limits alone reproduced none of the timing failures, because the test harness then runs
+    one test per CPU.
 
 Not in 0.4.14: the end of a Codex or Cursor session is not observable, and there are no Codex or
 Cursor hooks. Hermes's own worktrees are not recognized yet: its worktree mode could not be
@@ -121,9 +129,15 @@ Built with Dispatch: each packet's worker ran in a workspace Dispatch made. Clau
 packets and Codex built the adapters. A Cursor Agent worker started the CI packet, stopped at its
 plan's request limit, and Claude Code finished it in the same workspace. From P3 on, every packet
 landed with `dispatch accept --expect`, in place of the integrator's `land.sh`, and
-`dispatch check --merged` replaced its `verify.sh` for P3, P2 and P6. Twice a person
-accepted over a file-level REFRESH whose only broken fact was the plan document, which the
-patch named only in code comments. Both are recorded as `coherence.overridden`, with the
-person's explanation.
+`dispatch check --merged` replaced its `verify.sh` for P3, P2, P6, P6b and R. Three times a
+person accepted over a file-level REFRESH whose only broken fact was a file the patch named
+without depending on it: the plan document, named in code comments (P2, P4), and `Cargo.lock`,
+named as a CI cache key (P6b, after the version bump). All three are recorded as
+`coherence.overridden`, with the person's explanation.
+
+Conformance with this release: Claude Code 2.1.296, Codex 0.155.1 and Cursor Agent 2026.10.14
+passed all three paths (attach, native, their own worktree mode) on 2026-10-15. Hermes Agent was
+skipped on all three: no provider was configured. The table and evidence are in
+[`docs/harness-conformance.md`](docs/harness-conformance.md).
 
 Site impact: `dispatch check` gains `--merged` and `--allow-unsafe-local`; `dispatch accept` gains `--expect`; `finish`, `check` and `diff --stat` print a `Δ <digest>` line and `check --json` adds `delta_digest`; `finish`, `check --merged` and `accept` print one line per check command; `--agent hermes` and a `harnesses.hermes` config section; doctor lists Hermes; Codex and Cursor Agent worktrees become Work in a watched project (new `status` hint, `watch` origin and owner-log lines), so "only Claude Code's worktrees are recognized" no longer holds; the `start`/`stop` errors say 120 s instead of 10 s; Cursor's token total and semantics change.

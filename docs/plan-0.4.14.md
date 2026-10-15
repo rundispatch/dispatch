@@ -1,6 +1,6 @@
 # Plan: Dispatch 0.4.14, every agent checked the same way
 
-**Draft, 2026-10-14.** Base: `4573303` (Dispatch 0.4.13 plus the README explainer and the `Site impact` rule in AGENTS.md). Packets run in
+**Executed 2026-10-14 to 2026-10-15; see §8.** Base: `4573303` (Dispatch 0.4.13 plus the README explainer and the `Site impact` rule in AGENTS.md). Packets run in
 parallel through a pinned Dispatch 0.4.13, as in `docs/plan-0.4.13.md`.
 
 ## 1. Objective
@@ -323,3 +323,116 @@ and `land.sh`. The log records whether the scripts were still needed.
 - **D4. Overlapping packets.** Recommended: yes, as in §4.
 - **D5. Test images.** Publish to GHCR, or build per run with layer caching.
   Recommended: build per run first; publish only if build time hurts.
+
+The user chose every recommendation (D1–D5) on 2026-10-14. During the build
+they also chose:
+- P5 finished by Claude after Cursor's free plan ran out;
+- P1 on Claude, because Hermes had no provider;
+- validating on GitHub CI through draft PR #22, while unrelated jobs held the
+  dev Mac near load 200;
+- packet P6 after the user set the standard "all CI should pass";
+- stress mode as the CI guard on every pull request.
+
+## 8. Execution log
+
+### Setup (2026-10-14)
+
+| Item | Value |
+|---|---|
+| Supervisor | Dispatch 0.4.13 release binary, SHA-256 `00495cef…` (matches its `BUILD.json`), read-only, state `~/dispatch-dev/state-0414` |
+| Integration clone | `~/dispatch-dev/integration-0414`, branch `release-0.4.14` from `4573303`; `/dispatch.yml` and `/.claude/` excluded at the root only |
+| Workers | Root-wrapped `dispatch attach -- <agent>` sessions in herdr tabs: Claude Code in `--permission-mode auto`, Codex 0.155.1 (`-m gpt-6-sol`, workspace-write sandbox), Cursor Agent with `--force` |
+| Validation | Draft PR #22 on GitHub CI (Linux in the test image, macOS natively, later the stress job), plus Dispatch's own merged checks at each accept |
+
+**P0 (integrator):**
+- the probes in §2;
+- the fixture from the explainer's provenance run;
+- the test-image skeleton;
+- the runner interface (§3 B).
+
+The first container run of the suite found 4 Linux-only failures: three ran as
+root, and one needed a host `docker`.
+
+### Landing record
+
+| Packet | Commit | Work | Worker | Verdict at accept | How it landed |
+|---|---|---|---|---|---|
+| P5 | `e16f58e` | `01M4XKDRKYK7DZMPFEWPMQ6W35` | Cursor Agent, then Claude Code | CONTINUE | `land.sh` tree match. The first accept was refused by one PTY test failing on the merged tree at load ~180; the retry at load ~45 passed |
+| P4 | `60092f1` | `01M4XK1P84AN460DYTYYSCYE3H` | Claude Code | REFRESH (file-level: `docs/plan-0.4.14.md`) | `land.sh` tree match; `--despite-refresh` on the user's explanation; merged checks passed |
+| integrator | `6f6b490` | — | — | — | Docker CLI on the macOS jobs (the first CI run with P5 failed one test on macOS); later removed by P6 |
+| P3 | `8909f26` | `01M4XKPCD84TFRBYBKHBK018Z9` | Codex | CONTINUE (symbols) | `check --merged` (candidate), then `accept --expect 3641b0113705`; `land.sh` cross-check matched |
+| P2 | `55b9ea1` | `01M4XKKGX22580FBCJX4VXA0G2` | Claude Code | REFRESH (file-level: `docs/plan-0.4.14.md`) | `check --merged` failed 7 `native_runs` deadline tests at load ~60; an accept was refused on a `coherence_override` timing test at load ~176; the third attempt passed at load ~10. `accept --expect 58c1314b2e71 --despite-refresh` |
+| P1 | `587a970` | `01M4XM5H7RK6Q11WQ2VW6EATHA` | Claude Code | CONTINUE | `accept --expect 832036317fa1`; `land.sh` cross-check matched |
+| P6 | `7b9723d` | `01M4Y4J7GXND5XSCESB4M1NWBE` | Claude Code | CONTINUE | `check --merged` on the live Δ, then `accept --expect 34e9f1493268` after finish |
+| integrator | `2705b4c` | — | — | — | `harnesses.hermes.provider` errors named the provider "model" (found by R) |
+| integrator | `2b3f377` | — | — | — | the conformance judge accepts an end Dispatch declares not observable (found by the conformance rerun) |
+| R | `2394d5c` | `01M4YW8PPXWSVSG2D1GKNB4H1K` | Claude Code | CONTINUE | `check --merged`, then `accept --expect 6a7ecf201e43` |
+| P6b | `34a2445` | `01M4YW8EW12X20WYVKMHSV6YT1` | Claude Code | REFRESH (file-level: `Cargo.lock`, R's version bump) | `check --merged`, then `accept --expect 81e74158762c --despite-refresh` |
+
+- **Usage:** Codex reported 226,562 tokens for P3 at exit (186,570 input plus
+  15,568,512 cached, 39,992 output). The Claude and Cursor workers' usage is
+  unknown.
+- **No Hermes worker:** no provider was configured.
+
+### What the build and its checks caught
+
+**In the harnesses (P0 and the conformance runs):**
+- 0.4.13 did not see Codex or Cursor worktrees.
+- Cursor's cache-read tokens were dropped.
+- A Codex model rejection was reported as a generic failure.
+- Cursor lowercases the project folder in its worktree path.
+- In 0.4.13, a discovered session's end was lost when `finish` came first.
+
+**In the test infrastructure:**
+- Three tests assumed a non-root user, and one needed a host `docker`.
+- `cargo` ran as PID 1 in the container and never reaped orphans.
+
+**Timing (P6, P6b):**
+- Dozens of failures depended on machine speed. Four were product waits that
+  were too short:
+  - provider probes;
+  - `start`/`stop`;
+  - process-group exit;
+  - the setup lock.
+- A key pressed during a resize was held back.
+- A resize could end `watch` on a busy machine.
+
+**In the integrator's own work:**
+- The judge disagreed with P2's design for unobservable session ends.
+- The Hermes provider error named the provider "model".
+
+### Coherence on Dispatch's own build
+
+- **No REFRESH caught real stale work.**
+- **Three REFRESH verdicts were judged false and overridden:**
+  - the plan document named in comments (P2, P4);
+  - `Cargo.lock` named as a CI cache key (P6b).
+
+  They are recorded as `coherence.overridden` and noted in
+  `docs/coherence-validation.md`.
+- **Same file, different functions:** P2 and P3 edited different functions of
+  `src/orchestrator.rs` and were correctly reported as not interacting.
+- **Symbol facts:** they were exercised (P3 was judged at the symbol level after
+  P4 landed), but no symbol fact broke.
+
+### Integrator trust gaps (§2), closed or not
+
+| Gap | Result |
+|---|---|
+| 1. Merged checks before accept | Closed: `check --merged` replaced `verify.sh` for P3, P2, P6, P6b and R |
+| 2. Review tied to what lands | Closed: `accept --expect` for every packet from P3 on. `land.sh` ran only as a cross-check, for P3 and P1 |
+| 3. Readable check results | Closed: per-command lines in `finish`, `check --merged` and `accept` |
+| 4. Merged-check cost | Measured: 10–14 min per full suite at low load, 20 min at load ~180. Durations are recorded in `coherence.merged_checks` |
+| 5. Symbol facts exercised | Partly: overlapping packets ran, and symbol-level judgments occurred, but no stale work arose |
+
+### Conformance (final, 2026-10-15, Dispatch 0.4.14 at `34a2445`)
+
+| Harness | attach | native | own worktree |
+|---|---|---|---|
+| Claude Code 2.1.296 | pass | pass | pass |
+| Codex 0.155.1 (gpt-6-sol) | pass | pass | pass |
+| Cursor Agent 2026.10.14 | pass | pass | pass |
+| Hermes Agent 0.18.2 | skipped (no provider) | skipped | skipped |
+
+Evidence: `~/dispatch-dev/conformance-0414/trials/`. The earlier run at
+`2705b4c` (0.4.13 version string) is in `trials-2705b4c/`.

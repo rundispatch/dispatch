@@ -650,9 +650,10 @@ pinned Rust 1.97.1 Linux image, as an ordinary user with your uid. Your checkout
 is mounted read-only, `target/` lives in a Docker volume, and the container runs
 with `--init`, so orphaned processes are reaped as on a real system. Give it a
 command to run that instead, for example `scripts/test-in-docker.sh cargo test
---locked some_test`. `DISPATCH_DOCKER_CPUS=1` limits it to one CPU, as CI's
-`tests on one CPU` job does.
-<!-- TODO(integrator, P6b): one line on the stress mode, if it is documented here. -->
+--locked some_test`. `DISPATCH_DOCKER_STRESS=1 scripts/test-in-docker.sh cargo
+test --locked` runs the suite on a loaded machine (2 CPUs, 16 busy loops, 8 test
+threads), as CI's `tests under load` job does on every pull request. Build first
+without it: `scripts/test-in-docker.sh cargo test --locked --no-run`.
 
 CI runs the suite on every pull request and push to `main`, on Linux (in the test
 image) and macOS. A release runs the same suite on its tag before it builds any

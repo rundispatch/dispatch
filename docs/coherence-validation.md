@@ -25,9 +25,9 @@ of the product. The technical reference is [coherence.md](coherence.md).
 | While a project is watched, Work not yet integrated is compared and interactions are reported: the same declaration or file, textual overlap, a contract one changes and the other uses, a file one changes and the other relies on. Advisory: no verdict changes and nothing is blocked | Shipped in 0.4.8; exact to the declaration for Rust and Python, to the file elsewhere; `tests/interactions.rs` |
 | How often a reported interaction is followed by an invalid verdict is measured locally | Shipped in 0.4.9; `tests/measurement_landing.rs`, `tests/measurement_queries.rs`. No results from real use are published, and "invalidated" is Dispatch's own later verdict, not a confirmed conflict |
 | Every eligible runtime session in a watched project ends registered, pending or told it is not tracked, with no half-created Work | Shipped in 0.4.10; `tests/runtime_registration.rs`, `tests/runtime_hooks.rs`; stress trial in `docs/plan-0.4.10.md` |
-| The B/A/C scenario holds with real agents: the interaction is reported, accepting B applies it, A is REFRESH with B's broken `validate` fact, C stays CONTINUE | Runner shipped in 0.4.14 (`scripts/harness-trial.sh`, results in `docs/harness-conformance.md`). Local trial on 2026-10-14 with Dispatch 0.4.13: pass for Claude Code 2.1.296 on attach, native and its own worktree, and for Codex 0.155.1 on attach. Cursor was not measured (usage limit), and neither was Hermes (no provider). Pass or fail against Dispatch's contract only; agents are never compared |
+| The B/A/C scenario holds with real agents: the interaction is reported, accepting B applies it, A is REFRESH with B's broken `validate` fact, C stays CONTINUE | Runner shipped in 0.4.14 (`scripts/harness-trial.sh`, results in `docs/harness-conformance.md`). Local trial on 2026-10-15 with Dispatch 0.4.14: pass for Claude Code 2.1.296, Codex 0.155.1 and Cursor Agent 2026.10.14 on attach, native and each one's own worktree mode. Hermes Agent 0.18.2 was skipped on all three paths: no provider was configured. For Codex and Cursor worktrees, the session's end is not observable by design; the runner accepts that only where Dispatch declares it. Pass or fail against Dispatch's contract only; agents are never compared |
 | While a project is watched, Codex and Cursor Agent worktrees that appear become Work with S0 at the merge base, recognized only by Codex's `codex-thread.json` marker or Cursor's documented location and branch | Shipped in 0.4.14; `tests/discovery.rs`; recognized from P0's real Codex 0.155.1 and Cursor Agent 2026.10.14 worktrees on macOS. Their sessions' end is not observable, so their liveness stays unknown |
-| `dispatch check --merged` runs the merged checks accept would run, before accept, and changes nothing; `accept --expect` lands only the reviewed Δ | Shipped in 0.4.14; `tests/merged_check.rs`. Used by the 0.4.14 integrator: `accept --expect` for every packet from P3 on, `check --merged` for P3, P2 and P6 |
+| `dispatch check --merged` runs the merged checks accept would run, before accept, and changes nothing; `accept --expect` lands only the reviewed Δ | Shipped in 0.4.14; `tests/merged_check.rs`. Used by the 0.4.14 integrator: `accept --expect` for every packet from P3 on, `check --merged` for P3, P2, P6, P6b and R |
 
 Every public statement must fit this table. When a row changes, change the
 README and the website in the same release.
@@ -36,14 +36,22 @@ README and the website in the same release.
 
 These are observations from one build, not rates.
 
-- **Two human overrides of a file-level REFRESH.** P2 and P4 were each REFRESH
-  with one reason: `fact_broken: docs/plan-0.4.14.md changed since the work
-  started`. Each patch named the plan only in code comments. A person accepted
-  both with `--despite-refresh`, so the merged checks had to pass first. Both are
-  recorded as `coherence.overridden`, and each explanation says the plan had
-  changed only in sections the packet did not rely on. The person judged them
-  false REFRESH from a file mentioned by path: the cost of file-level facts that
-  falsifier 4 below is about.
+- **Three human overrides of a file-level REFRESH.** Each had one reason: a
+  file the patch named without depending on it had changed.
+  - P2 and P4: `fact_broken: docs/plan-0.4.14.md changed since the work started`.
+    Each patch named the plan only in code comments, and the plan had changed only
+    in sections the packet did not rely on.
+  - P6b: `fact_broken: Cargo.lock changed since the work started`. The patch named
+    `Cargo.lock` only as a CI cache key, and the change was the release's version
+    bump.
+
+  A person accepted all three with `--despite-refresh`, so the merged checks had to
+  pass first. All three are recorded as `coherence.overridden` with the person's
+  explanation. The person judged them false REFRESH from a file mentioned by path:
+  the cost of file-level facts that falsifier 4 below is about. No REFRESH in this
+  build caught real stale work. Packets that edited the same file in different
+  functions (P2 and P3 in `src/orchestrator.rs`) were correctly reported as not
+  interacting.
 
 ## The question that decides the thesis
 

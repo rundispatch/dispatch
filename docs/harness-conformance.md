@@ -123,20 +123,20 @@ python3 scripts/harness-trial/trial.py table --write docs/harness-conformance.md
 ## Results
 
 <!-- conformance-table:begin -->
-Evidence under `/private/tmp/claude-502/-Users-jese-dispatch-dev-state-0414-workspaces-01M4XM5H7RK6Q11WQ2VW6EATHA/db70b09a-9619-4aeb-8156-e945ef1615ff/scratchpad/trials/`, on the machine that ran the trials.
+Evidence under `~/dispatch-dev/conformance-0414/trials/`, on the machine that ran the trials.
 
 | Harness | Path | Result | Dispatch | Harness | Date | Evidence |
 |---|---|---|---|---|---|---|
-| claude | attach | pass | dispatch 0.4.13 | 2.1.296 (Claude Code) | 2026-10-14 | `claude-attach/` |
-| claude | native | pass | dispatch 0.4.13 | 2.1.296 (Claude Code) | 2026-10-14 | `claude-native/` |
-| claude | worktree | pass | dispatch 0.4.13 | 2.1.296 (Claude Code) | 2026-10-14 | `claude-worktree/` |
-| codex | attach | pass | dispatch 0.4.13 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-14 | `codex-attach/` |
-| codex | native | not run | | | | |
-| codex | worktree | not run | | | | |
-| cursor | attach | skipped: B: the harness stopped (1): ActionRequiredError: You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more. / Error: command fai… | dispatch 0.4.13 | 2026.10.14-0f9edde | 2026-10-14 | `cursor-attach/` |
-| cursor | native | skipped: B: the harness stopped (1): ActionRequiredError: You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more. / Error: command fai… | dispatch 0.4.13 | 2026.10.14-0f9edde | 2026-10-14 | `cursor-native/` |
-| cursor | worktree | skipped: B: the harness stopped (1): ActionRequiredError: You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more. / Error: command fai… | dispatch 0.4.13 | 2026.10.14-0f9edde | 2026-10-14 | `cursor-worktree/` |
-| hermes | attach | skipped: B: the harness stopped (1): No inference provider configured. Run 'hermes model' to choose a provider and model, or set an API key (OPENROUTER_API_KEY, OPENAI_… | dispatch 0.4.13 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-14 | `hermes-attach/` |
-| hermes | native | not offered: error: invalid value 'hermes' for '--agent <AGENT>': possible values: claude, codex, cursor | dispatch 0.4.13 | unknown | 2026-10-14 | `hermes-native/` |
-| hermes | worktree | skipped: B: the harness stopped (1): No inference provider configured. Run 'hermes model' to choose a provider and model, or set an API key (OPENROUTER_API_KEY, OPENAI_… | dispatch 0.4.13 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-14 | `hermes-worktree/` |
+| claude | attach | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `claude-attach/` |
+| claude | native | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `claude-native/` |
+| claude | worktree | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `claude-worktree/` |
+| codex | attach | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `codex-attach/` |
+| codex | native | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `codex-native/` |
+| codex | worktree | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `codex-worktree/` |
+| cursor | attach | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-attach/` |
+| cursor | native | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-native/` |
+| cursor | worktree | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-worktree/` |
+| hermes | attach | skipped: B: the harness stopped (1): No inference provider configured. Run 'hermes model' to choose a provider and model, or set an API key (OPENROUTER_API_KEY, OPENAI_… | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-attach/` |
+| hermes | native | skipped: B: the harness stopped (1): hermes -z: agent failed: No inference provider configured. Run 'hermes model' to choose a provider and model, or set an API key (OP… | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-native/` |
+| hermes | worktree | skipped: B: the harness stopped (1): No inference provider configured. Run 'hermes model' to choose a provider and model, or set an API key (OPENROUTER_API_KEY, OPENAI_… | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-worktree/` |
 <!-- conformance-table:end -->
