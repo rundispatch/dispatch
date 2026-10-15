@@ -1411,16 +1411,15 @@ pub(super) async fn finish_locked(
         .attachment
         .as_ref()
         .and_then(|attachment| attachment.workspace_removed.clone());
-    if let Some(removal) = &removal {
-        anyhow::ensure!(
-            removal.exact,
-            "the workspace of {} was removed before Dispatch could keep its final changes; \
-             only the changes last seen are kept, at {}, and they cannot be finished. \
+    if removal.as_ref().is_some_and(|removal| !removal.exact) {
+        let kept = super::last_seen_patch(&run).with_context(|| {
+            format!(
+                "the workspace of {} was removed and nothing was kept; it cannot be finished. \
              Close this work: dispatch close {} --reason workspace-removed",
-            run.id,
-            run_dir.join("delta-last-seen.patch").display(),
-            run.id
-        );
+                run.id, run.id
+            )
+        })?;
+        crate::state::write_durably(&diff_path, &fs::read(kept)?)?;
     }
     // A removed workspace is rebuilt from S0 and its kept Δ, so the checks
     // still run on exactly the work.
@@ -1429,10 +1428,21 @@ pub(super) async fn finish_locked(
         .tempdir()
         .context("failed to prepare a workspace for the checks")?;
     let (workspace, diff_stats) = match &removal {
-        Some(_) => (
-            source::rebuild_workspace(&run.baseline_path, &diff_path, &rebuilt.path().join("w"))?,
-            Ok(run.candidates[0].diff_stats.clone()),
-        ),
+        Some(_) => {
+            let workspace = source::rebuild_workspace(
+                &run.baseline_path,
+                &diff_path,
+                &rebuilt.path().join("w"),
+            )?;
+            // Derive statistics from the rebuilt tree too: the live patch's
+            // statistics were not necessarily retained when removal was noticed.
+            let stats = source::collect_diff(
+                &run.baseline_path,
+                &workspace,
+                &rebuilt.path().join("delta.patch"),
+            );
+            (workspace, stats)
+        }
         None => (
             workspace.clone(),
             source::collect_diff(&run.baseline_path, &workspace, &diff_path),
@@ -1512,7 +1522,7 @@ pub(super) async fn finish_locked(
             candidate_label: None,
             event_type: "attach.finished".into(),
             timestamp: Utc::now(),
-            payload: serde_json::json!({"reason": reason}),
+            payload: serde_json::json!({"reason": reason, "workspace_removed": removal}),
             ..EventRecord::default()
         },
         &mut run,
@@ -1568,6 +1578,7 @@ pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u6
         attachment.workspace_removed = Some(WorkspaceRemoval {
             at: now,
             exact: true,
+            last_seen_at: None,
         });
     }
     if files_changed == 0 {
@@ -1636,7 +1647,7 @@ pub(super) async fn finish_by_consent(state: &State, run_id: &str) -> Result<boo
 
 /// The project owner found the workspace of active Work gone without being
 /// told first: only the Δ it last followed survives, kept beside the run as
-/// `delta-last-seen.patch`. It can be read, never finished.
+/// `delta-last-seen.patch`. A person can explicitly finish from those changes.
 pub(crate) fn note_workspace_gone(
     state: &State,
     run_id: &str,
@@ -1657,14 +1668,22 @@ pub(crate) fn note_workspace_gone(
         return Ok(());
     }
     let now = Utc::now();
+    let mut last_seen_at = None;
+    let last_seen = match last_seen.filter(|path| path.is_file()) {
+        Some(path) => {
+            let mut file = fs::File::open(path)?;
+            last_seen_at = Some(DateTime::<Utc>::from(file.metadata()?.modified()?));
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            Some(bytes)
+        }
+        None => None,
+    };
     attachment.workspace_removed = Some(WorkspaceRemoval {
         at: now,
         exact: false,
+        last_seen_at,
     });
-    let last_seen = match last_seen.filter(|path| path.is_file()) {
-        Some(path) => Some(fs::read(path)?),
-        None => None,
-    };
     if let Some(bytes) = &last_seen {
         crate::state::write_durably(&state.run_dir(run_id).join("delta-last-seen.patch"), bytes)?;
     }
@@ -1683,7 +1702,7 @@ pub(crate) fn note_workspace_gone(
             candidate_label: None,
             event_type: "workspace.removed".into(),
             timestamp: now,
-            payload: serde_json::json!({"exact": false, "no_changes": empty}),
+            payload: serde_json::json!({"exact": false, "no_changes": empty, "last_seen_at": last_seen_at}),
             ..EventRecord::default()
         },
         &mut run,
@@ -1949,6 +1968,9 @@ fn print_finish_summary(state: &State, run: &RunRecord) {
     let candidate = &run.candidates[0];
     println!("\n{}\n", ready_heading(run));
     println!("Task\n  {}\n", run.task);
+    if let Some(label) = super::last_seen_changes(run) {
+        println!("Changes\n  {label}\n");
+    }
     println!("Agent\n  {}\n", candidate.harness_id);
     println!(
         "Work {}\n{}\n  {}\n",
@@ -1969,4 +1991,131 @@ fn print_finish_summary(state: &State, run: &RunRecord) {
         print_standing(state, run, validity);
     }
     print_review_commands(run, validity);
+}
+
+#[cfg(test)]
+mod last_seen_tests {
+    use super::*;
+
+    fn attached() -> (tempfile::TempDir, State, RunRecord) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file.txt"), "before\n").unwrap();
+        fs::write(root.join("dispatch.yml"), "checks:\n  verify: ['true']\n").unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                source::git_command(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ]);
+        let workspace = temp.path().join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "work",
+            workspace.to_str().unwrap(),
+        ]);
+        let state = State {
+            root: temp.path().join("state"),
+        };
+        state.initialize().unwrap();
+        let run = create(
+            &state,
+            AttachRequest {
+                workspace: workspace.clone(),
+                root: Some(root),
+                task: None,
+                agent: None,
+                pid: None,
+                command: None,
+                allow_unsafe_local: true,
+                auto_apply: false,
+                runtime: None,
+            },
+        )
+        .unwrap();
+        fs::write(workspace.join("file.txt"), "after\n").unwrap();
+        (temp, state, run)
+    }
+
+    #[tokio::test]
+    async fn last_seen_time_is_the_patch_mtime_and_consent_does_not_finish_it() {
+        let (temp, state, run) = attached();
+        crate::consent::grant(&state, &run.source_path).unwrap();
+        let scratch = temp.path().join("followed.patch");
+        source::collect_diff(
+            &run.baseline_path,
+            &run.candidates[0].workspace_path,
+            &scratch,
+        )
+        .unwrap();
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&scratch)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        fs::remove_dir_all(&run.candidates[0].workspace_path).unwrap();
+        note_workspace_gone(&state, &run.id, Some(&scratch)).unwrap();
+        let kept = state.load_run(&run.id).unwrap();
+        let value = serde_json::to_value(&kept).unwrap();
+        assert_eq!(
+            value["attachment"]["workspace_removed"]["last_seen_at"],
+            "2023-11-14T22:13:20Z"
+        );
+        assert!(!finish_by_consent(&state, &run.id).await.unwrap());
+        assert_eq!(
+            state.load_run(&run.id).unwrap().outcome.lifecycle,
+            LifecycleState::Working
+        );
+        // A complete old run record with no capture-time field still loads.
+        let mut old = value;
+        old["attachment"]["workspace_removed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_seen_at");
+        let restored: RunRecord = serde_json::from_value(old).unwrap();
+        let restored = serde_json::to_value(restored).unwrap();
+        assert!(restored["attachment"]["workspace_removed"]["last_seen_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_removed_workspace_without_a_last_seen_patch_can_only_be_closed() {
+        let (_temp, state, run) = attached();
+        fs::remove_dir_all(&run.candidates[0].workspace_path).unwrap();
+        note_workspace_gone(&state, &run.id, None).unwrap();
+        let error = finish_quietly(&state, &run.id, false).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("nothing was kept"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "dispatch close {} --reason workspace-removed",
+                run.id
+            )),
+            "{message}"
+        );
+        assert_eq!(
+            state.load_run(&run.id).unwrap().outcome.lifecycle,
+            LifecycleState::Working
+        );
+    }
 }
