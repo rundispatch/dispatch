@@ -185,9 +185,9 @@ agent_command() {
 runs() { [ -d "$DISPATCH_HOME/runs" ] && ls "$DISPATCH_HOME/runs"; }
 
 # The tree of a directory's files as Git would commit them, ignored files left
-# out, written into the fixture repository only.
+# out, written into the fixture repository only. $2 is the index to use.
 dir_tree() {
-  local idx="$OUT/tasks/tmp.index"
+  local idx="${2:-$OUT/tasks/tmp.index}"
   rm -f "$idx"
   (cd "$1" && GIT_DIR="$REPO/.git" GIT_WORK_TREE="$1" GIT_INDEX_FILE="$idx" git add -A . &&
     GIT_DIR="$REPO/.git" GIT_INDEX_FILE="$idx" git write-tree)
@@ -204,10 +204,35 @@ patched_tree() {
   rm -f "$idx"
 }
 
+# Hermes removes its worktree as it exits, before the runner can read it. While
+# the agent runs, keep the last tree taken of each linked worktree the task made,
+# in tasks/$1/last-seen/<name>: its path, its tree, and when it was taken. Stops
+# once run-agent.sh records the agent's exit.
+keep_last_seen() {
+  local TD="$1" wt gitdir tree at
+  mkdir -p "$TD/last-seen"
+  while [ ! -e "$TD/agent.status" ] && kill -0 $$ 2>/dev/null; do
+    git -C "$REPO" worktree list --porcelain | sed -n 's/^worktree //p' |
+      grep -Fxv -f "$TD/worktrees-before.txt" |
+      while IFS= read -r wt; do
+        gitdir="$(sed -n 's/^gitdir: //p' "$wt/.git" 2>/dev/null)"
+        [ -n "$gitdir" ] || continue
+        at="$(date -u +%FT%TZ)"
+        tree="$(dir_tree "$wt" "$TD/last-seen.index")" || continue
+        # Hermes unlocks the worktree before removing it: a tree taken while
+        # the lock stood was taken whole.
+        [ -e "$gitdir/locked" ] || continue
+        printf '%s\n%s\n%s\n' "$wt" "$tree" "$at" >"$TD/last-seen/tmp"
+        mv "$TD/last-seen/tmp" "$TD/last-seen/$(basename "$wt")"
+      done
+    sleep 0.5
+  done
+}
+
 # Runs task $1 and leaves its facts in tasks/$1/. Returns non-zero when the
 # scenario cannot go on.
 run_task() {
-  local t="$1" TD="$OUT/tasks/$1" before id ws bp bc diff s0 agent delta
+  local t="$1" TD="$OUT/tasks/$1" before id ws bp bc diff s0 agent delta seen keeper=""
   mkdir -p "$TD"
   before="$(runs)"
   git -C "$REPO" worktree list --porcelain | sed -n 's/^worktree //p' >"$TD/worktrees-before.txt"
@@ -222,7 +247,12 @@ run_task() {
         --task-file "$HERE/tasks/$t.txt" ;;
     worktree)
       agent_command "$t" "trial-$t"
-      (cd "$REPO" && "$HERE/run-agent.sh" "$TD/agent" "$TIMEOUT" "${CMD[@]}") ;;
+      if [ "$H" = hermes ]; then
+        keep_last_seen "$TD" &
+        keeper=$!
+      fi
+      (cd "$REPO" && "$HERE/run-agent.sh" "$TD/agent" "$TIMEOUT" "${CMD[@]}")
+      [ -z "$keeper" ] || wait "$keeper" ;;
   esac
   date -u +%FT%TZ >"$TD/ended-at.txt"
   git -C "$REPO" worktree list --porcelain | sed -n 's/^worktree //p' >"$TD/worktrees-after.txt"
@@ -253,8 +283,18 @@ run_task() {
   { read -r ws && read -r bp && read -r bc && read -r diff; } < <(python3 "$TRIAL" work "$DISPATCH_HOME" "$id")
   echo "$ws" >"$TD/workspace.txt"
   # The agent's own change, read from its workspace before Dispatch freezes or
-  # applies anything; then S0 and S0 + Δ as Dispatch recorded them.
-  agent="$(dir_tree "$ws")" && echo "$agent" >"$TD/agent-tree.txt"
+  # applies anything, or the runner's last-seen copy once the agent removed it;
+  # then S0 and S0 + Δ as Dispatch recorded them.
+  seen="$TD/last-seen/$(basename "$ws")"
+  if [ -d "$ws" ]; then
+    agent="$(dir_tree "$ws")" && echo "$agent" >"$TD/agent-tree.txt" &&
+      echo workspace >"$TD/agent-tree-source.txt"
+  elif [ -n "$ws" ] && [ -f "$seen" ] && [ "$(sed -n 1p "$seen")" = "$ws" ]; then
+    agent="$(sed -n 2p "$seen")" && echo "$agent" >"$TD/agent-tree.txt" &&
+      echo "last seen by the runner, $(sed -n 3p "$seen")" >"$TD/agent-tree-source.txt"
+  else
+    agent=""
+  fi
   if [ "$P" = worktree ]; then
     # As a person would: once Dispatch shows the session ended (bounded), finish.
     waited=0

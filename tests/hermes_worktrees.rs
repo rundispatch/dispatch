@@ -301,12 +301,7 @@ fn a_hermes_worktree_becomes_work_whose_agent_runs_and_then_is_idle() {
     assert_eq!(state_word(&status), "working", "{status}");
 
     hermes.exit();
-    // Liveness records the end, then lets go of the agent: wait for both.
-    wait_until("the session's end", || {
-        let run = p.run(&p.worktree());
-        run["attachment"]["sessions"][0]["end_reason"] == "process_gone"
-            && run["attachment"]["agent_process"].is_null()
-    });
+    session_ended(&p);
     let run = p.run(&p.worktree());
     assert_eq!(run["outcome"]["lifecycle"], "working");
     let status = text(&p.dispatch(&["status", &id]));
@@ -347,9 +342,53 @@ fn the_finalize_hook_keeps_the_exact_changes_before_hermes_removes_the_worktree(
     hermes.remove_worktree();
     hermes.exit();
     assert!(!worktree.exists());
+    session_ended(&p);
     let run = p.run(&worktree);
     assert_eq!(run["attachment"]["workspace_removed"]["exact"], true);
     assert_eq!(run["outcome"]["lifecycle"], "working");
+}
+
+/// Without the hook the owner notes the worktree gone while Hermes still
+/// runs; the session's end is still recorded once the process is gone.
+#[test]
+fn a_session_outliving_its_removed_worktree_still_ends() {
+    let p = Project::new();
+    p.watch();
+    let mut hermes = Hermes::new(&p, &p.root);
+    hermes.make_worktree();
+    let id = discovered(&p, &hermes);
+    let worktree = p.worktree();
+    fs::write(worktree.join("notes.txt"), "two\n").unwrap();
+    let live = p.state.join("runs").join(&id).join("delta-live.patch");
+    wait_until("the edit in the live changes", || {
+        fs::read_to_string(&live).is_ok_and(|patch| patch.contains("+two"))
+    });
+    // Removed locked, in one step: a tick between Hermes's unlock and its
+    // removal would end the session as `lock_released` instead.
+    hermes.ok(&format!(
+        "git worktree remove --force --force .worktrees/hermes-{ID}\n\
+         git branch -D hermes/hermes-{ID}"
+    ));
+    wait_until("the removal noted", || {
+        p.run(&worktree)["attachment"]["workspace_removed"]["exact"] == false
+    });
+    let run = p.run(&worktree);
+    assert_eq!(run["outcome"]["lifecycle"], "working");
+    assert_eq!(run["attachment"]["sessions"][0]["ended_at"], Value::Null);
+    assert_eq!(run["attachment"]["agent_process"]["pid"], hermes.pid());
+
+    hermes.exit();
+    session_ended(&p);
+    assert_eq!(p.run(&worktree)["outcome"]["lifecycle"], "working");
+}
+
+/// Liveness records the session's end, then lets go of the agent: wait for both.
+fn session_ended(p: &Project) {
+    wait_until("the session's end", || {
+        let run = p.run(&p.worktree());
+        run["attachment"]["sessions"][0]["end_reason"] == "process_gone"
+            && run["attachment"]["agent_process"].is_null()
+    });
 }
 
 /// With no remote-tracking refs Hermes counts no commit as unpushed, so it

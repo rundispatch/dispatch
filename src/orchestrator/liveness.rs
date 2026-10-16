@@ -9,6 +9,12 @@
 //! start time: it is followed the same way, the process told apart from a
 //! recycled pid by having started no later than the worktree was made.
 //!
+//! Removal does not stop this. Hermes removes its worktree as its process
+//! exits, and Dispatch notes the removal, by its hook or by seeing the
+//! worktree gone, usually before it sees the process gone. The lock went with
+//! the worktree, so the recorded process is followed by its exact identity
+//! alone: once it is gone, its sessions end as for any other gone process.
+//!
 //! Codex's and Cursor Agent's worktrees name no process (`discovery::
 //! UNOBSERVED`): their liveness is `Unknown` for good, so their Work never
 //! reads "agent running" and no end of their sessions is ever recorded. No
@@ -24,7 +30,7 @@ use crate::{
     EventRecord, LifecycleState, RunMode, RunRecord, WorkspaceOwner,
     db::Database,
     lock::OperationLock,
-    process::{self, ProcessIdentity},
+    process::{self, IdentityState, ProcessIdentity},
     runtime::{
         claude::{self, Liveness, Lock},
         hermes,
@@ -50,15 +56,28 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
         return Ok(());
     };
     // Only a workspace the runtime made: a person's attach, with or without
-    // `--pid`, is theirs. Removed workspaces are the removal's business.
-    // Finished Work is followed while it still records its agent: a session
-    // that outlives `finish`, even by a moment, still has its end recorded.
+    // `--pid`, is theirs. Finished Work is followed while it still records its
+    // agent: a session that outlives `finish`, even by a moment, still has its
+    // end recorded.
     if run.mode != RunMode::Attached
         || (run.outcome.lifecycle == LifecycleState::Finished && attachment.agent_process.is_none())
         || attachment.workspace_owner != WorkspaceOwner::Runtime
-        || attachment.workspace_removed.is_some()
     {
         return Ok(());
+    }
+    // A removed workspace has no lock left: only the recorded process is
+    // followed, until that exact process is gone.
+    if attachment.workspace_removed.is_some() {
+        let Some(old) = attachment.agent_process.as_ref() else {
+            return Ok(());
+        };
+        return match process::identity_state(old) {
+            IdentityState::Gone | IdentityState::Reused => {
+                end_sessions(state, run, None, "process_gone")?;
+                set_agent_process(state, &run.id, Some(old), None)
+            }
+            IdentityState::ExactLive | IdentityState::Unknown => Ok(()),
+        };
     }
     let workspace = attachment.workspace.as_path();
     let signals = claude::worktree_signals(workspace);
