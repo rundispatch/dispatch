@@ -498,7 +498,7 @@ fn next(
             vec![FINISH, CLOSE],
         ),
         "lost" if orchestrator::last_seen_patch(run).is_some() => (
-            "Its worktree is gone. A person must f finish its last seen changes explicitly; consent never finishes these. Or c close it.".into(),
+            "Its worktree is gone; only the changes last seen were kept. f finish them yourself, or c close it.".into(),
             vec![FINISH, CLOSE],
         ),
         "lost" => ("Its worktree is gone; nothing was kept. c close it.".into(), vec![CLOSE]),
@@ -1431,7 +1431,7 @@ fn render(frame: &mut Frame, screen: &Screen, palette: &Theme) {
         let second = if screen.header.unwatched {
             "Nothing is watching this project: dispatch start."
         } else {
-            "A Claude Code session in its own worktree of this project, or dispatch attach -- <agent>, appears here."
+            "A session in its own worktree of this project, from any agent Dispatch recognizes, or dispatch attach -- <agent>, appears here."
         };
         ["No Work in the last hour.", second]
             .iter()
@@ -2207,7 +2207,7 @@ mod tests {
         ).unwrap());
         let item = items(std::slice::from_ref(&run)).remove(0);
         assert!(
-            item.next.contains("person") && item.next.contains("explicitly"),
+            item.next.contains("only the changes last seen") && item.next.contains("yourself"),
             "{}",
             item.next
         );
@@ -2971,7 +2971,7 @@ mod tests {
     #[test]
     fn an_empty_view_says_what_would_appear_or_that_nothing_watches() {
         for (unwatched, line) in [
-            (false, "A Claude Code session in its own worktree"),
+            (false, "from any agent Dispatch recognizes"),
             (true, "Nothing is watching this project: dispatch start."),
         ] {
             let header = header(unwatched);

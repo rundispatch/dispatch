@@ -2988,7 +2988,7 @@ fn workspace_details(run: &RunRecord, attachment: &crate::AttachmentRecord) -> V
                 ),
                 (true, false) => "its exact changes were kept".into(),
                 (false, true) if last_seen_patch(run).is_some() => format!(
-                    "a person must finish its last seen changes explicitly (dispatch finish {id}); consent never finishes these; or close it: {close} workspace-removed"
+                    "only the changes last seen were kept; finish them yourself (dispatch finish {id}) or close it ({close} workspace-removed)"
                 ),
                 (false, true) => format!("nothing was kept; it cannot be finished; close it: {close} workspace-removed"),
                 (false, false) => "its worktree is gone".into(),

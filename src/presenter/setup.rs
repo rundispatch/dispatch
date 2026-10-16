@@ -160,7 +160,14 @@ pub(super) async fn accounts(
                 _ => Ok(()),
             }
         } else if choice == login_row + 1 {
-            integrations(ui, state).await
+            // Hooks are not a resource, so no provider advice follows.
+            if let Err(e) = integrations(ui, state).await {
+                ui.commit(&format!(
+                    "Nothing changed: {}",
+                    clip(&format!("{e:#}"), 500)
+                ))?;
+            }
+            Ok(())
         } else {
             return Ok(());
         };

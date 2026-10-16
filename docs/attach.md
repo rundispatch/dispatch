@@ -362,25 +362,49 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   - with stdout and stderr in `watchers/<key>.log`, which names each distinct error
     once and is truncated on each start.
 
-  It returns once the record names that child with an `ExactLive` identity (within
-  10 s), or prints the log's last lines. Of two concurrent starts, one wins the lock;
-  the other reports "Already watching". No agent profile is read.
+  It returns once the record names that child with an `ExactLive` identity and says
+  its first discovery scan is done (`discovery_ready`), within 120 s, or prints the
+  log's last lines. So a worktree made right after `start` returns is new to the
+  watch, not one listed as already there. Of two concurrent starts, one wins the
+  lock; the other reports "Already watching" once the winner's first scan is done. No
+  agent profile is read.
 - **`dispatch stop`** says "Not watching" when the lock is free, deleting any
   leftover record. Otherwise it sends SIGTERM only when the record names the exact
   live process (same pid, start time and boot), then waits for the lock. A record
   from before a crash or a reboot never names a live process, so it is never
   signalled; a lock held by an unidentified process is refused, naming the lock.
+- **Two loops.** The owner runs a fast loop on a thread of its own beside the tick,
+  so it keeps going while the tick waits, for example on a project's checks for Work
+  finished by consent. It stops before the owner releases the project.
+- **The fast loop** (about once a second: one pass, then a one-second wait; there is
+  no setting):
+  1. Load the root's runs and run discovery (see "Work that appears without hooks"):
+     list, recognize and register, nothing else. The first successful scan sets
+     `discovery_ready` on the watcher record, which `start` waits for.
+  2. Follow active attached Work whose agent can remove its own worktree
+     (`discovery::VANISHING_WORKTREES`: `hermes`), unless Dispatch made its workspace,
+     its workspace was already recorded removed, or a live wrapper owns it. Each pass
+     checks the worktree against a temporary index kept per run, and only when the tree
+     changed writes a new patch and replaces `delta-live.patch` with it. A capture that
+     overlaps the worktree's removal is dropped, so the last complete patch stays.
+  3. When such a worktree is gone, record it with the freshest complete patch as the
+     last-seen Δ (`note_workspace_gone`; see "Workspace removal").
+
+  Measured on one machine, medians of ten passes: an unchanged pass took about 15 ms and
+  a changed one 47 ms on Dispatch's own repository (340 tracked files); P0 measured the
+  worktree listing at 11 ms, and 21 ms with 60 linked worktrees.
 - **Every tick** (`coherence.poll_secs`, minimum 1 second):
   1. Read `world::signal(root)` and compare it with the previous tick's. Load the
      root's runs once (other projects' runs are not read). Adopt any orphaned Work
      (next bullet). Then observe the source at the start, once, for runtime-registered
      Work that is still `not_observed` and was published after this owner started (see
      "The source at the start"); each such Work costs one events query per owner
-     lifetime. Then list the root's worktrees for discovery, and read the session
-     locks of the runtime-made Work it follows for liveness (see "Work that appears
-     without hooks").
+     lifetime. Then read the session locks of the runtime-made Work it follows for
+     liveness (see "Liveness from the session lock").
   2. Follow every active attached run whose live owner state is not `Live` (a live
-     wrapper is that wrapper's own business). Its signal is a hash of its patch so
+     wrapper is that wrapper's own business). For Work the fast loop follows, the
+     tick still evaluates from its own scratch patch, but leaves `delta-live.patch` and
+     a vanished worktree to that loop. Its signal is a hash of its patch so
      far, taken with the trusted baseline repository into the owner's scratch
      directory, with an index kept per run so only changed files are re-hashed. No
      lock is held for this. When the world or that work moved:
@@ -519,7 +543,8 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   - `idle` (discovered work with no open session);
   - `removed` (its workspace is gone and its exact changes are kept, waiting for
     you, or for its checks when the project's check consent holds);
-  - `lost` (its workspace vanished unannounced; it cannot be finished);
+  - `lost` (its workspace vanished unannounced: you can finish the changes last seen,
+    or close it; with nothing kept, only close it);
   - `ready`, `blocked`, `applied` (`applied by auto-apply` when policy applied it),
     `closed` (a person closed it; its review is shown as none) or `finished`.
 
@@ -574,7 +599,8 @@ the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
 A runtime's session in its own worktree becomes Work in a watched project in two
 ways: through Claude Code's hooks, described here, or without any hook, when the
 owner finds the worktree ("Work that appears without hooks", below). Either way
-there is one Work per worktree.
+there is one Work per worktree. Hermes's hook registers nothing; it keeps the
+exact Δ of Work discovery found ("Hermes Agent", below).
 
 With Claude Code's hooks installed (`dispatch setup` → Runtime integrations), the
 runtime tells Dispatch about its sessions (`dispatch hook claude`, which reads the
@@ -655,17 +681,39 @@ runtime's event on stdin):
     hook's budget is unchanged.
   - Only an empty Δ closes the Work.
   - If a followed workspace vanishes without the hook, the owner keeps the last Δ it
-    followed (`delta-last-seen.patch`). That Work cannot be finished;
-    `dispatch close <id> --reason workspace-removed` closes it and keeps that Δ.
-    While an owner watches the project but has not yet recorded the vanished
-    workspace, `close` refuses and asks you to try again in a few seconds. If that
-    persists, the owner may be stuck: `dispatch stop` ends it, and close then goes
-    ahead without those changes. If that last Δ was empty, the Work closes by itself
-    with no changes.
+    followed (`delta-last-seen.patch`), and records when that patch was written as
+    `workspace_removed.last_seen_at`. For Work whose agent can remove its own worktree
+    the fast loop keeps that patch fresh; for other Work it is the tick's (see "The
+    project owner").
+    - `status`, `watch`, `finish`, `diff`, `check` and the review screen label it with
+      that time:
+
+      ```text
+      removed 2026-10-15 23:27 UTC: only the changes last seen were kept; finish them yourself (dispatch finish <id>) or close it (dispatch close <id> --reason workspace-removed)
+      Changes last seen 2026-10-15T23:27:17.198627622Z. Changes made after that time are not included; Dispatch cannot say whether there were any.
+      ```
+
+      A record from before 0.4.15 has no such time and says it is unknown. `diff
+      --name-only` writes the label on stderr, so stdout stays file names.
+    - A person can finish it: `dispatch finish <id>`, or `f` in `watch`. Finish copies
+      the last-seen Δ to `delta.patch`, rebuilds a workspace from S0 and it, and runs
+      the checks there, as for an exact capture. The result waits for review; accept
+      runs its merged checks when the source moved, and `accept --expect` binds it to
+      the reviewed Δ. The project's check consent never finishes it.
+    - With no last-seen Δ kept, `finish` refuses: *"the workspace of <id> was removed
+      and nothing was kept; it cannot be finished. Close this work: dispatch close
+      <id> --reason workspace-removed"*.
+    - `dispatch close <id> --reason workspace-removed` closes it and keeps that Δ.
+      While an owner watches the project but has not yet recorded the vanished
+      workspace, `close` refuses and asks you to try again in a few seconds. If that
+      persists, the owner may be stuck: `dispatch stop` ends it, and close then goes
+      ahead without those changes. If that last Δ was empty, the Work closes by itself
+      with no changes.
 
 ### Work that appears without hooks
 
-`orchestrator::discovery`, on every owner tick, with no hook installed:
+`orchestrator::discovery`, on every pass of the owner's fast loop (about once a
+second), with no hook installed:
 - **What is looked at.** `git worktree list --porcelain` for the root. No directory is
   walked: per worktree, Dispatch reads its `.git` file and the two files Claude Code
   keeps in `.git/worktrees/<name>/`. A plain-directory root has no worktrees.
@@ -673,8 +721,8 @@ runtime's event on stdin):
   whose Git directory holds `CLAUDE_BASE`. Recognizing it belongs to the Claude
   adapter (`runtime::claude::made_by_claude`). Worktrees a person made (`git worktree
   add`) are never registered, listed or logged. Missing and prunable entries are
-  skipped. Codex's and Cursor Agent's worktrees are recognized too, by their own signs
-  (below). Other agents' layouts are not recognized; `dispatch attach -- <agent>` gives
+  skipped. Codex's, Cursor Agent's and Hermes Agent's worktrees are recognized too, by
+  their own signs (below). Other agents' layouts are not recognized; `dispatch attach -- <agent>` gives
   any agent a workspace of its own.
 - **The first scan of a watch** puts every Claude worktree without Work into the
   inventory, `watchers/<key>.inventory.json` (path, first seen, `CLAUDE_BASE`, the lock
@@ -685,10 +733,10 @@ runtime's event on stdin):
 - **Later scans.** A worktree that appears after the first scan:
   - locked `claude session <name> (pid <pid> start <time>)` by a process that runs with
     that start: registered;
-  - locked that way by a process that is gone, as a `claude -p` run between two ticks
+  - locked that way by a process that is gone, as a `claude -p` run between two passes
     leaves it: registered, with its session recorded as ended (`end_reason:
     "process_gone"`), so it reads `idle` at once;
-  - locked that way, but the process's start cannot be read: looked at again next tick;
+  - locked that way, but the process's start cannot be read: looked at again next pass;
   - any other lock, or none (a subagent's or background session's worktree, whose lock
     has not been observed): listed in the inventory after a 3 s grace, since Claude Code
     writes `CLAUDE_BASE` a moment before it locks a new worktree. Each is noted once in
@@ -704,7 +752,7 @@ runtime's event on stdin):
   - authority to run checks comes from the project's check consent, as for a hook.
 
   `status` and `explain` show it as found by Dispatch. A failed registration is noted
-  once per owner process and retried every tick.
+  once per owner process and retried every pass.
 - **One Work per worktree.** A worktree with Work is neither listed nor registered. A
   hook's `SessionStart` before or after joins the same Work. A listed worktree that is
   removed leaves the list, and one made again at that path is new. Work whose worktree
@@ -750,11 +798,95 @@ the end of a Codex session is not observable — when it is done, finish to free
 `watch` shows its origin as `codex session in its own worktree, found by Dispatch; its
 end is not observable`. Hooks for these runtimes are not installed or read.
 
+**Hermes Agent** (`runtime::hermes`), observed with Hermes Agent 0.18.2 and read from
+its source:
+- **The sign.** `hermes chat --worktree` makes `<root>/.worktrees/hermes-<8 hex>` on a
+  new branch `refs/heads/hermes/hermes-<same 8 hex>` (lowercase hex), and locks it at
+  once with `hermes pid=<pid>`, its own process, with no start time. Both the path Git
+  lists and the branch must match. `hermes -z` ignores `--worktree`. Hermes also adds
+  `.worktrees/` to the checkout's `.gitignore`.
+- **Registration** follows Claude's rules, with that lock in place of `claude session`:
+  a worktree there on the first scan is listed, not tracked; a later one locked by a
+  running process is registered with that process, one whose process is gone is
+  registered with its session ended (`process_gone`), and one without the lock is
+  listed after the 3 s grace. S0 is its merge base, the agent `hermes`, and its one
+  session is the worktree's name, `hermes-<8 hex>`, with `source: "discovered"` and
+  `started_at` from the mtime of the worktree's `.git` file. Hermes's own session ID
+  never reaches discovery and is not recorded. The owner's log says `discovery: found a
+  Hermes session in <path>`.
+- **Liveness** ("Liveness from the session lock", below): the pid alone could be
+  recycled, so the process counts as running only if it started no later than the
+  worktree's `.git` file was written (plus 1 s for `ps`'s resolution). One that started
+  later is gone; an unreadable time is `Unknown`. Hermes removes its worktree as its
+  process exits, and Dispatch usually notes the removal first, by the hook or the fast
+  loop; the process it recorded is then followed by its exact identity until it is gone,
+  and the session ends `process_gone`, with or without the hook.
+- **It vanishes.** When the session ends, Hermes runs its `on_session_finalize` hooks,
+  then unlocks the worktree, runs `git worktree remove --force` and `git branch -D`,
+  uncommitted changes and all. It keeps the worktree only when it holds commits on no
+  remote-tracking ref; a repository with no remote-tracking refs counts as having none,
+  so even committed work goes. Hermes is the one entry of `VANISHING_WORKTREES`, so the
+  fast loop keeps its Work's `delta-live.patch` fresh, and a removal Dispatch did not
+  hear about leaves the last-seen Δ ("Workspace removal", above).
+- **The hook.** `dispatch setup` → Runtime integrations → `Install the Hermes hook`
+  appends one block to `~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml` when that is
+  set):
+
+  ```yaml
+  # Added by dispatch setup, which removes it unless it is edited.
+  hooks:
+    on_session_finalize:
+      - command: "'<dispatch>' --state-dir '<state>' hook hermes"
+        timeout: 300
+  ```
+
+  - The consent screen shows that block and the path, with focus on Cancel. The file is
+    only read (to find a top-level `hooks:` key and to check the block reads back as
+    written), never rewritten: the block is appended after a backup beside the file
+    (`config.yaml.dispatch-backup-<time>`), and every other byte is kept. A config that
+    already has `hooks:` is left alone, and setup shows the lines to add under it.
+  - `Remove the Hermes hook` takes out exactly that block, found by its marker line and
+    regenerated for comparison, and gives the file its bytes back. It refuses when the
+    block was edited, added by hand, or rewritten: *"Dispatch's hook in <path> is not as
+    Dispatch added it; it was edited or added by hand, so remove it there yourself"*.
+    `hermes config set` rewrites the file with PyYAML, which drops the marker, so after it
+    the hook must be removed by hand ("Upgrading to 0.4.15" in
+    [release-install.md](release-install.md)).
+  - Setup's status line is `Hermes hook: installed`, `not installed`, or `unknown, its
+    config.yaml is unreadable`; a hook added by hand counts as installed.
+  - Hermes asks the person to allow the hook the first time it runs it, and a run without
+    a terminal needs `hermes --accept-hooks`. Dispatch never writes Hermes's allowlist or
+    sets `hooks_auto_accept`. The allowlist is keyed by the command, so if the Dispatch
+    binary moves, Hermes asks again.
+  - The timeout is Hermes's most, 300 s, which covers the minute keeping a removed
+    worktree's Δ may wait for its registration and the minute it may wait for the Work's
+    lock. Hermes waits for the hook before it removes the worktree.
+- **What the hook does** (`dispatch hook hermes`, reading Hermes's payload on stdin and
+  the worktree from `TERMINAL_CWD`, since the payload's `cwd` is the main checkout):
+  - It acts only on `on_session_finalize` with `reason: "shutdown"`, which is the CLI's
+    process exit, right before the removal. `/new` fires it with `session_boundary`, and
+    the TUI with no reason, while the worktree lives on; `on_session_end` ends every turn.
+    All of those are ignored, so that Work falls back to the last-seen Δ.
+  - `TERMINAL_CWD` must be the top of a Hermes-shaped worktree, by path and branch, of the
+    same repository as the payload's `cwd`, and the worktree's lock must name the hook's
+    parent, the process about to remove it. Anything else is silent.
+  - If Hermes will remove the worktree (by its own rule above), the hook keeps the exact Δ
+    through the same path as Claude Code's `WorktreeRemove`: `workspace.removed` with
+    `exact: true`, and the Work waits for `finish` or `close`, or is finished by the
+    project's check consent. If Hermes will keep it, the hook records only the session's
+    end (`runtime.session_ended`, reason `shutdown`).
+  - It registers nothing. A worktree discovery never saw, in a project that is not watched
+    or removed before a scan, is not kept.
+  - It prints nothing. On an error it exits 1 with the reason on stderr; Hermes only logs
+    it and removes the worktree anyway, and the last-seen Δ is what remains.
+
 ### Liveness from the session lock
 
 `orchestrator::liveness`, on every owner tick, for attached Work whose workspace the
-runtime made (`workspace_owner: runtime`) and is still a Claude worktree, while it is
-unfinished or, once finished, while it still records its agent process:
+runtime made (`workspace_owner: runtime`) and is still a Claude or Hermes worktree, while
+it is unfinished or, once finished, while it still records its agent process. A Hermes
+lock has no start, so its process is judged by when the worktree was made (above), and
+when another pid takes a Hermes lock no session is ended for it:
 - **Running.** When the lock names a process that runs with the lock's start, the owner
   records its exact identity on the attachment once (`agent_process`,
   `runtime.agent_running`). `status`, `explain` and `watch` show `agent running (pid N)`.
@@ -777,6 +909,11 @@ unfinished or, once finished, while it still records its agent process:
   earlier session (`lock_released`) and records no process. In 0.4.13, Work finished a
   few seconds after its agent exited kept its session open for good (found by the
   0.4.14 conformance trials). The finish, its verdict and its Δ are not touched.
+- **After removal.** A removed workspace has no lock left. While the Work still records
+  its agent process, that process is followed by its exact identity alone: once it is
+  gone, or its pid was reused, the open sessions end (`process_gone`) and the process is
+  let go, as above. Until then nothing happens. This is not Hermes's alone: a Claude
+  session whose worktree was removed while it ran ends the same way.
 - **Nothing else.** A lock never seen running, or a process whose start cannot be read,
   proves nothing, and nothing is recorded. A session a hook already ended stays as it
   was, so there is one end. Nothing is finished, applied, closed or signalled. A
@@ -882,14 +1019,14 @@ In addition to the existing coherence, application and review events (see
 | `attach.created` | `attach` creates the Work (both forms) | `{"attachment": <AttachmentRecord>}` |
 | `attach.source_observed` | the one observation of the source at the start (see "The source at the start") | `StartObservation`: `{"at", "source_head", "differing", "paths": [{"path", "applied_work"?}]}` |
 | `attach.started` | the wrapped form's agent process has been spawned | `{"agent_process": <ProcessIdentity>}` |
-| `attach.finished` | `finish` (either explicit or on agent exit) freezes Δ | `{"reason": <FinishReason>}` |
+| `attach.finished` | `finish` (either explicit or on agent exit) freezes Δ | `{"reason": <FinishReason>, "workspace_removed": <WorkspaceRemoval> \| null}`; `workspace_removed` since 0.4.15, `{at, exact, last_seen_at}` |
 | `attach.adopted` | `serve` takes over observation of an orphaned run | `{"owner_state": "adopted"}` |
 | `attach.authorized` | Work gains local authority: from the project's check consent, or from a person's `finish --allow-unsafe-local` | `{"unsafe_local": true, "by": "project consent" \| "human"}` |
 | `runtime.session_started` | a hook records a new session on existing Work | `{"session": <RuntimeSession>}` |
-| `runtime.session_ended` | a hook's `SessionEnd`, or the owner from the session lock ("Liveness from the session lock") | `{"provider", "session_id", "reason"}`; the owner's reasons are `process_gone` and `lock_released` |
+| `runtime.session_ended` | a hook's `SessionEnd`, Hermes's hook when Hermes keeps its worktree, or the owner from the session lock ("Liveness from the session lock") | `{"provider", "session_id", "reason"}`; Hermes's hook gives `shutdown`, the owner's reasons are `process_gone` and `lock_released` |
 | `runtime.agent_running` | the owner records the process a session lock names, once it runs | `{"agent_process": <ProcessIdentity>, "previous"}` |
 | `runtime.agent_gone` | the owner clears it, once that process is gone or its lock released | `{"agent_process": null, "previous": <ProcessIdentity>}` |
-| `workspace.removed` | the workspace is gone: kept exactly by the hook, or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes"}` |
+| `workspace.removed` | the workspace is gone: kept exactly by a hook (Claude Code's or Hermes's), or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes", "last_seen_at"}`; `last_seen_at` since 0.4.15 |
 | `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
 | `work.closed` | a person closed Work (`dispatch close`, or `c` in `watch`). Before 0.4.12, a person rejected unfinished Work whose workspace was gone | `{"reason": "unfinished" \| "workspace_removed" \| "already_present" \| "superseded", "by": "human", "world_digest"?, "replacement"?}` |
 | `interaction.landed` | after `result.applied`: what the owner's view said about this Work and the others in progress | `measure::Landing` (see [coherence.md](coherence.md#measuring-interactions-measurers)) |
@@ -987,27 +1124,34 @@ directory, exactly as it already refuses any newer schema.
 
 - No socket and no push: `dispatch start` runs one local background process per
   project (`serve --background`), and it coordinates with every other command through
-  SQLite (WAL, revision-fenced projections) plus `flock` files. `serve` discovers new
-  or changed Work on its next tick (at most `poll_secs`, default 10 s). This is adequate for work measured in minutes to hours,
-  not for sub-second push updates.
+  SQLite (WAL, revision-fenced projections) plus `flock` files. `serve` finds new
+  worktrees within about a second, and re-evaluates changed Work on its next tick (at
+  most `poll_secs`, default 10 s). This is adequate for work measured in minutes to
+  hours, not for sub-second push updates. Polling is a cadence, not a guarantee: a
+  worktree that lives and vanishes between two passes is missed.
 - Interactions between Work are advisory, exist only while an owner watches the
   project, and never change a verdict or block anything.
 - `serve` never launches, kills or refreshes anything. It finishes Work only when
   the project's check consent holds and a runtime removed the Work's workspace
-  with its exact Δ kept. Otherwise wrapped attach and a human (`dispatch finish`)
-  are the only things that finish a Work. A session that ended, by a hook or by its
+  with its exact Δ kept; Work kept only as last seen waits for a person. Otherwise
+  wrapped attach and a human (`dispatch finish`) are the only things that finish a
+  Work. A session that ended, by a hook or by its
   lock, never finishes it.
 - No foreign process is ever signaled. `--pid` and the wrapper's own child PID are
   liveness-only.
-- Discovery recognizes only Claude Code's, Codex's and Cursor Agent's worktrees, and
-  liveness reads only a `claude session …` lock. Claude's was observed with Claude Code
-  2.1.296 on macOS; the lock of a subagent or background-session worktree, and the
-  format on Linux, were not. Codex's marker and Cursor's location were observed with
-  Codex 0.155.1 and Cursor Agent 2026.10.14 on macOS. The end of a Codex or Cursor
-  session is not observable. Hermes's worktrees are not recognized: Hermes 0.18.2's
-  `chat --worktree` works in `<repo>/.worktrees/hermes-<id>` and removes it, with its
-  changes, when the session ends. There is no process scanning
-  or association by working directory.
+- Discovery recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's
+  worktrees, and liveness reads only a `claude session …` or `hermes pid=` lock.
+  Claude's was observed with Claude Code 2.1.296 on macOS; the lock of a subagent or
+  background-session worktree, and the format on Linux, were not. Codex's marker and
+  Cursor's location were observed with Codex 0.155.1 and Cursor Agent 2026.10.14 on
+  macOS, and Hermes's place, branch, lock and hook with Hermes Agent 0.18.2 on macOS,
+  in one confirming session. The end of a Codex or Cursor session is not observable.
+  There is no process scanning or association by working directory.
+- Hermes's exact capture covers only the CLI's shutdown. Its TUI (`--tui`) and `/new`
+  fall back to the last-seen Δ, which misses changes made after the last pass. Without
+  the hook, a tick that falls between Hermes's `git worktree unlock` and its removal
+  ends the session as `lock_released` while Hermes still runs; it is still an end,
+  and the process is let go.
 - `mid_run: stop` does not apply to attached work in this version; a `Stop` verdict on
   attached work is recorded, not enforced.
 - One workspace holds exactly one active attached Work; there is no per-process

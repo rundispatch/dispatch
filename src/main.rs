@@ -197,8 +197,11 @@ enum Command {
     /// Show a run and its persisted signals.
     #[command(hide = true)]
     Show { run_id: String },
-    /// An agent runtime's lifecycle hook (installed by `dispatch setup`):
-    /// reads the runtime's event on stdin and never fails the runtime.
+    /// An agent runtime's lifecycle hook, `claude` or `hermes`, installed by
+    /// `dispatch setup`: reads the runtime's event on stdin. Claude Code's fails
+    /// only when it cannot keep a worktree's changes, which stops that removal;
+    /// Hermes's reports any failure, which Hermes logs before removing the
+    /// worktree anyway.
     #[command(hide = true)]
     Hook { provider: String },
     /// Print a candidate's patch.

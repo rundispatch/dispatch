@@ -1058,8 +1058,8 @@ def states_live(binary, base):
         "gone-exact": ("removed", "Its worktree was removed and its exact changes were kept. f finish to check them, "
                        "or c close it.",
                        "f finish · c close · ↑↓ select · q leave", "claude session in its own worktree"),
-        "gone-lost": ("lost", "Its worktree is gone. A person must f finish its last seen changes explicitly; "
-                      "consent never finishes these. Or c close it.",
+        "gone-lost": ("lost", "Its worktree is gone; only the changes last seen were kept. f finish them "
+                      "yourself, or c close it.",
                       "f finish · c close · ↑↓ select · q leave", "attached workspace"),
         "slugify": ("working", finish_next, "f finish · ↑↓ select · q leave", "attached workspace"),
         "auth-ctx": ("working", finish_next, "f finish · ↑↓ select · q leave", "claude session in its own worktree"),
@@ -1411,7 +1411,7 @@ def empty(binary, base):
     project.start()
     with project.watch(120) as watch:
         watch.shows("No Work in the last hour.")
-        watch.shows("A Claude Code session in its own worktree of this project, or dispatch attach -- <agent>, appears here.")
+        watch.shows("A session in its own worktree of this project, from any agent Dispatch recognizes, or dispatch attach -- <agent>, appears here.")
         watch.leave()
     print("PASS empty")
 

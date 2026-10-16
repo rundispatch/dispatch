@@ -51,6 +51,66 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.15
+
+No migration; the schema stays at 24. Existing records are not rewritten.
+- **Rollback.** Back up the whole state directory before upgrading, and roll back only by
+  restoring it.
+- **Additive JSON and events.**
+  - `workspace_removed` on `status --json` results, when the Work's workspace was removed:
+    `{at, exact, last_seen_at}`. `last_seen_at` is when the kept last-seen changes were
+    written, and `null` for an exact capture. `check --json` carries the same object only when
+    there is a removal; otherwise its keys are unchanged.
+  - `workspace.removed` events for a workspace seen missing add `last_seen_at`:
+    `{"exact": false, "no_changes", "last_seen_at"}`. `attach.finished` adds
+    `workspace_removed`, `null` unless the workspace was removed.
+  - Older records have no `last_seen_at`, and show the time of their last-seen changes as
+    unknown.
+  - Discovered Work can have agent `hermes`. Its one session has the worktree's name,
+    `hermes-<8 hex>`, as `session_id`, `source: "discovered"`, and `started_at` from when Git
+    made the worktree.
+- **Sessions end after removal.** `runtime.session_ended` (`process_gone`) and
+  `runtime.agent_gone` can now come after `workspace.removed`: the owner follows a removed
+  workspace's recorded agent process by its exact identity until it is gone.
+- **Work whose worktree vanished** can now be finished from its last-seen changes with
+  `dispatch finish <id>`, or `f` in `watch`. Its `status` line now reads `removed <time>: only
+  the changes last seen were kept; finish them yourself (dispatch finish <id>) or close it
+  (dispatch close <id> --reason workspace-removed)`. Close still works as before.
+- **`dispatch start` waits for the first scan.** It returns once the owner has listed the
+  worktrees already there, still within 120 s, and the watcher record
+  (`watchers/<key>.json`) gains `discovery_ready`. An "Already watching" start waits for that
+  too.
+- **The Hermes hook.** `dispatch setup` → Runtime integrations → `Install the Hermes hook`
+  appends one block to `~/.hermes/config.yaml` (or `$HERMES_HOME/config.yaml`), after a
+  backup beside it (`config.yaml.dispatch-backup-<time>`):
+
+  ```yaml
+  # Added by dispatch setup, which removes it unless it is edited.
+  hooks:
+    on_session_finalize:
+      - command: "'<dispatch>' --state-dir '<state>' hook hermes"
+        timeout: 300
+  ```
+
+  `Remove the Hermes hook`, in the same menu, takes out exactly that block and gives the file
+  its bytes back. If the Dispatch binary moves, the command changes, and Hermes asks for consent
+  again on the hook's next run.
+- **`hermes config set` drops the marker.** Hermes 0.18.2 writes `config.yaml` with PyYAML's
+  `yaml.dump` (`set_config_value` → `atomic_yaml_write`), which drops every comment, Dispatch's
+  marker line included, and reformats the block. The hook still runs, and setup still reports
+  `Hermes hook: installed`, but `Remove the Hermes hook` then changes nothing and says:
+
+  ```text
+  Nothing changed: Dispatch's hook in <path>/config.yaml is not as Dispatch added it; it was edited or added by hand, so remove it there yourself
+  ```
+
+  Remove it by hand: delete the `on_session_finalize` entry whose command ends in
+  `hook hermes`, and the `hooks:` key if nothing else is under it.
+- **Restart the owner.** Run `dispatch stop && dispatch start` so the project owner is 0.4.15.
+  An older owner discovers once per `poll_secs` tick, does not recognize Hermes worktrees, does
+  not keep a fresh Δ for them, and records no session's end once a worktree was removed. Hermes worktrees present when the 0.4.15 owner first scans
+  are listed, not tracked.
+
 ### Upgrading to 0.4.14
 
 No migration; the schema stays at 24. Existing records are not rewritten.

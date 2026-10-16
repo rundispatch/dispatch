@@ -412,6 +412,12 @@ implements `mid_run: stop`, and it never applies to attached work. See
 [attach.md](attach.md#shared-verdict-persistence) for the wrapped owner loop and
 [the project owner](attach.md#the-project-owner-start-stop-serve-and-watch).
 
+The project owner also runs a fast loop beside its tick, about once a second whatever
+`poll_secs` says: it lists the project's worktrees for discovery and, for Work whose
+agent can remove its own worktree (Hermes), rewrites `delta-live.patch` when the tree
+changed, so a worktree that vanishes leaves a recent last-seen Δ. It evaluates nothing and
+records no verdict; verdicts, liveness and interactions stay on the `poll_secs` tick.
+
 - Every `coherence.poll_secs` it takes `world::signal`: for Git, `HEAD`, the hash of
   `git status --porcelain=v2 -z --untracked-files=all`, and size and modification time of
   the reported files (at most 5,000); for plain directories a metadata walk. Dispatch's
@@ -610,7 +616,7 @@ every value is default. Unknown keys are ignored. The block is frozen with each 
 | `accept` | `validate` | `validate` checks the moved source; `strict` restores the whole-tree refusal. |
 | `mid_run` | `observe` | `observe` records verdicts; `stop` cancels the agent. |
 | `stop_on_refresh` | `false` | With `mid_run: stop`, also cancel on `Refresh` (otherwise only on `Stop`). |
-| `poll_secs` | `10` | Watcher interval; must be positive (validation error otherwise). |
+| `poll_secs` | `10` | Watcher interval, and the project owner's tick; must be positive (validation error otherwise). Worktree discovery does not use it. |
 | `integration_checks` | `true` | Run `checks.verify` on the merged tree when the world moved. |
 
 ## Persisted or recomputed

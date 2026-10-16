@@ -180,6 +180,15 @@ for line in sys.stdin:
         ui.send('5\r');ui.wait('2) Install the Hermes hook');ui.send('2\r');ui.wait('2) Cancel');ui.send('1\r')
         ui.wait('Hermes hook installed');ui.wait('6) Back')
         assert hermes_config.read_bytes().startswith(theirs) and b'hook hermes' in hermes_config.read_bytes()
+        # A rewrite that drops Dispatch's marker comment, as `hermes config set`
+        # does, is refused with nothing changed and no provider advice.
+        installed=hermes_config.read_bytes();rewritten=re.sub(rb'# Added by dispatch setup[^\n]*\n',b'',installed)
+        hermes_config.write_bytes(rewritten)
+        ui.send('5\r');ui.wait('2) Remove the Hermes hook');ui.send('2\r');ui.wait('2) Cancel');ui.send('1\r')
+        ui.wait('Nothing changed: ');ui.wait('remove it there yourself');ui.wait('6) Back')
+        assert 'Provider login for missing' not in ui.clean, 'a hook refusal gave provider advice'
+        assert hermes_config.read_bytes()==rewritten, 'a refused removal changed the config'
+        hermes_config.write_bytes(installed)
         ui.send('5\r');ui.wait('Hermes hook: installed');ui.wait('2) Remove the Hermes hook');ui.send('2\r');ui.wait('2) Cancel');ui.send('1\r')
         ui.wait('Hermes hook removed');ui.wait('6) Back');ui.send('6\r');ui.finish()
     assert hermes_config.read_bytes()==theirs

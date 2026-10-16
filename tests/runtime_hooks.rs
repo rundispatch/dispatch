@@ -452,7 +452,7 @@ fn a_worktree_that_vanishes_unannounced_can_be_finished_from_last_seen_changes()
     assert!(last.contains("+    2"), "{last}");
     let waiting = text(&p.dispatch(&["status", &id]));
     assert!(
-        waiting.contains("last seen") && waiting.contains("a person must finish"),
+        waiting.contains("only the changes last seen were kept; finish them yourself"),
         "{waiting}"
     );
     let finish = p.dispatch(&["finish", &id, "--allow-unsafe-local"]);
