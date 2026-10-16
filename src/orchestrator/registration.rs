@@ -126,17 +126,31 @@ pub(crate) fn budget() -> Duration {
     BUDGET
 }
 
+/// Debug builds only: under `<boundary>:deadline`, the hook's channel, on
+/// which `fault` sends `Lost` at `boundary`: the hook takes it as its deadline.
+#[cfg(debug_assertions)]
+static DEADLINE: std::sync::Mutex<Option<mpsc::Sender<Result<Started>>>> =
+    std::sync::Mutex::new(None);
+
 /// Debug builds only: `DISPATCH_REGISTRATION_FAULT=<boundary>` ends this
 /// process at `boundary` at once, with no reply and no cleanup;
 /// `<boundary>:sleep` stalls there instead, and `<boundary>:delay=<ms>` is a
 /// slow machine: it pauses there that long, then goes on.
+/// `<boundary>:deadline` stalls there too, and the hook's deadline is reached
+/// then, not by its clock, however long the worker took to get there.
 pub(crate) fn fault(boundary: &str) {
     #[cfg(debug_assertions)]
     if let Ok(fault) = std::env::var("DISPATCH_REGISTRATION_FAULT") {
         if fault == boundary {
             std::process::exit(86);
         }
-        if fault.strip_suffix(":sleep") == Some(boundary) {
+        if [":sleep", ":deadline"]
+            .iter()
+            .any(|mode| fault.strip_suffix(mode) == Some(boundary))
+        {
+            if let Some(hook) = DEADLINE.lock().unwrap().take() {
+                let _ = hook.send(Ok(Started::Lost));
+            }
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
@@ -284,12 +298,23 @@ pub(crate) fn register(
     let run_id = registration.run_id.clone();
     let building = begin(state, &run_id)?;
     let (sender, receiver) = mpsc::channel();
+    #[cfg(debug_assertions)]
+    let at_boundary = std::env::var("DISPATCH_REGISTRATION_FAULT")
+        .is_ok_and(|fault| fault.ends_with(":deadline"));
+    #[cfg(debug_assertions)]
+    if at_boundary {
+        *DEADLINE.lock().unwrap() = Some(sender.clone());
+    }
     let worker_state = state.clone();
     std::thread::spawn(move || {
         let _ = sender.send(work(&worker_state, registration));
     });
     let budget = budget();
-    let failure = match receiver.recv_timeout(budget.saturating_sub(began.elapsed())) {
+    let wait = budget.saturating_sub(began.elapsed());
+    // Under `<boundary>:deadline`, only the worker's boundary is the deadline.
+    #[cfg(debug_assertions)]
+    let wait = if at_boundary { Duration::MAX } else { wait };
+    let failure = match receiver.recv_timeout(wait) {
         Ok(Ok(Started::Existing)) => {
             building.remove();
             return Ok(None);

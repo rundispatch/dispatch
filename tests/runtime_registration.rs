@@ -27,15 +27,25 @@ const OWNER_BUDGET_MS: &str = "1500";
 /// it, so the session registers however slow the machine is.
 const NO_DEADLINE_MS: &str = "600000";
 
-/// A hook's budget where the worker must reach a boundary before the deadline:
-/// the product's own. On a loaded machine registration took longer than 3 s.
-fn racing_budget_ms() -> String {
-    registration::BUDGET.as_millis().to_string()
-}
-
 /// `SessionStart`'s hook timeout as `dispatch setup` installs it: the reply
 /// must come before Claude Code gives up on the hook.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A hook's deadline comes a budget after it starts, so past the deadline it
+/// has this long to reply; waiting a quarter of the budget for a publish under
+/// way must fit.
+const AFTER_DEADLINE: Duration = HOOK_TIMEOUT.saturating_sub(registration::BUDGET);
+const _: () = assert!(registration::BUDGET.as_millis() / 4 < AFTER_DEADLINE.as_millis());
+
+/// How long ago `path` was last written.
+fn since_written(path: &Path) -> Duration {
+    fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .elapsed()
+        .unwrap()
+}
 
 struct Project {
     _temp: tempfile::TempDir,
@@ -201,22 +211,21 @@ impl Project {
     }
 
     /// A session that started and was told its registration is pending: its
-    /// worker stalled after `registration.json` until the deadline.
+    /// worker stalled after `registration.json`, and the deadline came then,
+    /// however slow the machine was to get there.
     fn pending(&self) -> String {
-        let began = Instant::now();
         let notice = Self::notice(&self.start(
             "s1",
             "startup",
-            &[
-                (
-                    "DISPATCH_REGISTRATION_FAULT",
-                    "after_registration_json:sleep",
-                ),
-                ("DISPATCH_REGISTRATION_BUDGET_MS", &racing_budget_ms()),
-            ],
+            &[(
+                "DISPATCH_REGISTRATION_FAULT",
+                "after_registration_json:deadline",
+            )],
         ));
-        assert!(began.elapsed() < HOOK_TIMEOUT);
         let [(id, files)] = self.registrations().try_into().unwrap();
+        assert!(
+            since_written(&self.registration_dir(&id).join("registration.json")) < AFTER_DEADLINE
+        );
         assert_eq!(notice, registration::notice_pending(&id));
         assert!(files.contains(&"registration.json".to_owned()), "{files:?}");
         assert_eq!(self.decision(&id).as_deref(), Some("pending"));
@@ -623,19 +632,21 @@ fn an_owner_restart_while_pending_publishes_it_once() {
 #[test]
 fn a_deadline_that_finds_the_publish_under_way_waits_for_it_then_says_pending() {
     let mut p = Project::new();
-    let began = Instant::now();
+    let budget = registration::BUDGET.as_millis().to_string();
     let notice = Project::notice(&p.start(
         "s1",
         "startup",
         &[
-            ("DISPATCH_REGISTRATION_FAULT", "after_decision:sleep"),
-            ("DISPATCH_REGISTRATION_BUDGET_MS", &racing_budget_ms()),
+            ("DISPATCH_REGISTRATION_FAULT", "after_decision:deadline"),
+            ("DISPATCH_REGISTRATION_BUDGET_MS", &budget),
         ],
     ));
-    // The budget, then a quarter of it waiting for the publish.
-    assert!(began.elapsed() >= registration::BUDGET * 5 / 4);
-    assert!(began.elapsed() < HOOK_TIMEOUT);
     let [(id, _)] = p.registrations().try_into().unwrap();
+    // The deadline came as the publish began; a quarter of the budget waiting
+    // for it, then the reply.
+    let waited = since_written(&p.registration_dir(&id).join("decision"));
+    assert!(waited >= registration::BUDGET / 4, "{waited:?}");
+    assert!(waited < AFTER_DEADLINE, "{waited:?}");
     assert_eq!(notice, registration::notice_pending(&id));
     assert_eq!(p.decision(&id).as_deref(), Some("publishing"));
     assert!(p.runs().is_empty());
