@@ -1,6 +1,6 @@
 # Plan: Dispatch 0.4.15, worktrees caught while they exist
 
-**Draft, 2026-10-15.** Base: `1ab57e1` (Dispatch 0.4.14). Built as
+**Built 2026-10-15/16** (§8). Base: `1ab57e1` (Dispatch 0.4.14). Built as
 0.4.14 was: workers wrapped by a pinned released Dispatch, packets landed with
 `check --merged` and `accept --expect`, and CI validating each landing.
 
@@ -207,6 +207,89 @@ The user chose every recommendation on 2026-10-15:
 - D1: a kept, last-seen Δ can be finished and accepted;
 - D2: about one second, with no new setting;
 - D3: Claude Code, Codex and Hermes workers.
+
+## 8. Execution log
+
+Built as planned: workers wrapped by the pinned Dispatch 0.4.14 (`2e77b308afd3`,
+state `~/dispatch-dev/state-0415`), every packet checked with `check --merged`
+before review and landed with `accept --expect`, and CI validating each
+landing on draft PR #24. No coherence override was needed.
+
+### P0 (2026-10-15)
+
+- Hermes's worktree lifecycle was read from its source
+  (`~/dispatch-dev/p0-0415/hermes-source.md`), and the discovery cost measured
+  (§2).
+- One confirming Hermes session, approved by the user, with a temporary probe
+  hook (§2, `~/dispatch-dev/p0-0415/hook-confirm/`). The user's
+  `~/.hermes/config.yaml` was restored byte for byte, and the allowlist the run
+  created was removed.
+
+### Packets
+
+| Packet | Worker | Work | Merged checks before review | Landed |
+|---|---|---|---|---|
+| P1 fast loop | Codex 0.155.1, gpt-6-sol | `01M50J8KTTE2C4HVPARN2MQ0GD` | CONTINUE, 738 passed | `cde671b`, `--expect a8a1a8af82c6`, merged checks rerun on top of P2 |
+| P2 finish from last seen | Hermes Agent 0.18.2, gpt-6.1-sol | `01M50J8KTXE423FG0330603F67` | CONTINUE, 738 passed | `a3a859a`, `--expect 8b7ec9c932d7` |
+| P3 Hermes end to end | Claude Code | `01M50J8KTTPMFR5GZH40ZMS50V` | CONTINUE, 748 passed | `0154c5b`, `--expect 6fe043e45494`, merged checks rerun on top of P1 and P2 (754 passed) |
+| P4 session end after removal; runner | Claude Code | `01M50Y9JNMK63YVTCPY7S6MFVF` | CONTINUE, 755 passed | `354c9c1`, `--expect 6676fe0ebaa5` |
+| R docs, version | Claude Code | `01M50Y1ZQSW8X0Q66CRNW4823Z` | CONTINUE, 754 passed | `2ed389f`, `--expect 7b63741115e0`, merged checks rerun on top of P4 |
+| P5 freshest Δ on removal | Claude Code | `01M51BZXA1Z3FP8TET210695F3` | CONTINUE, 756 passed | `d732e1b`, `--expect 5d204d2863c0`, merged checks rerun |
+
+- **Overlap.** P1 and P3 both changed `discovery.rs`. P3's check before
+  accept read CONTINUE at the symbol level with 11 files changed underneath,
+  and its merged checks passed on top of P1 and P2.
+- **Review sent work back twice:**
+  - a capture lock and second patch file in P1, for wrapping a process inside a
+    Hermes-made worktree, which no observed case does; P1 went from +334 to
+    +291 production lines;
+  - two cost figures in R taken from the wrong column of P1's table (the full
+    follow instead of status-first: about 15 ms and 47 ms on this repository).
+- **Found before the conformance trial, by reading** (packet P4):
+  - the runner read the agent's tree after the agent exited, when Hermes had
+    already removed it;
+  - a Hermes session's end was never recorded once its worktree was removed.
+- **Found by CI** (packet P5): on macOS, `watch_acceptance` saw last-seen Work
+  cancelled as having no changes. The owner takes a Work's Δ twice a pass, and
+  an edit landing between the two was published in `delta-live.patch` but not
+  kept. P5 keeps the newer of the two. On a filesystem with one-second
+  timestamps a tie goes to `delta-live.patch`. Not built: a guard for a capture
+  that overlaps the removal itself (P5's handoff has the idea).
+- **One unexplained CI failure.** On `354c9c1`, `tests under load` failed once in
+  `hermes_worktrees::the_finalize_hook_keeps_the_exact_changes_before_hermes_removes_the_worktree`:
+  the hook exited 0, but nothing was recorded.
+  - Passed: the rerun of that job, stress CI on every other commit, and 52 local
+    stress repeats in the same image.
+  - Ruled out by reading: a second registration, `publish_durable`, the repo
+    key, and Dispatch touching worktree locks.
+  - Left: the hook's silent paths that depend on a Git command succeeding.
+    `inspect_source` reads a failing `rev-parse --is-inside-work-tree` as a
+    plain directory.
+  - Carried to the next release, with diagnostics if it recurs.
+
+### Workers, as their harnesses reported
+
+- **Codex (P1):**
+  - 440,541 tokens in total: 348,897 input (plus 25,399,424 cached) and 91,644
+    output (52,279 reasoning);
+  - asked once to run a `ps` timing probe outside its sandbox, approved.
+- **Hermes (P2):**
+  - 55m53s, 220 messages (213 tool calls);
+  - stopped once at its 60-tool-call turn budget, and finished after a second
+    message;
+  - tokens not shown.
+- **Claude Code (P3, P4, R, P5):** usage not reported at exit.
+
+### Conformance (user-approved, 2026-10-16)
+
+- **Scope:** only the Hermes worktree cell, with the candidate built from
+  `2ed389f` and the runner from the same commit. Real Hermes 0.18.2 ran three
+  short sessions without the Dispatch hook, so the last-seen path.
+- **Result: pass.** For B, A and C, S0 + Δ equalled the agent's tree as the
+  runner last saw it. Sessions' starts and ends were recorded, finish
+  succeeded, and the verdicts held.
+- **Evidence:** `~/dispatch-dev/conformance-0415/trials/hermes-worktree/`.
+  Every other cell keeps its 0.4.14 result.
 
 ## Not in this release, carried from 0.4.14
 

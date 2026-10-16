@@ -65,6 +65,12 @@ worktrees, with a hook that keeps their exact changes before Hermes removes them
   - Hermes asks you to allow the hook the first time it runs it; a run without a terminal needs
     `hermes --accept-hooks`. Dispatch never writes Hermes's allowlist.
 
+- **Fixed: the newest changes are kept when a worktree vanishes.** The owner takes a Work's
+  changes twice a pass: once for its own signal and once for `delta-live.patch`. An edit that
+  landed between the two was shown but not kept, so when the worktree then vanished Dispatch
+  kept the older copy, and Work holding changes could be closed as having none. It now keeps
+  the newer of the two. Seen once in CI on macOS (0.4.15, P5).
+
 Not in 0.4.15:
 - Hermes's TUI and `/new` get no exact capture; their Work has the last-seen Δ.
 - The Hermes hook registers no Work it has not seen. In a project that is not watched, or for a
@@ -99,11 +105,11 @@ nothing it tests changed. The table and evidence are in
 
 Built with Dispatch: each packet's worker ran in a workspace Dispatch 0.4.14 made, on three
 harnesses. Codex built the fast loop (P1), Hermes Agent built finishing from the last-seen Δ (P2),
-and Claude Code built Hermes's recognizer and hook (P3), the session-end and runner fix (P4) and
-the docs (R). Every packet passed `dispatch check --merged` before review and landed with
-`dispatch accept --expect`, with no override. P3 and P1 both changed the discovery module; P3's
-accept ran the merged checks on top of P1 and P2, and they passed. Review sent back two things: a
-capture lock in P1 that no observed case needed, and two cost figures in R taken from the wrong
-column of P1's measurements.
+and Claude Code built Hermes's recognizer and hook (P3), the session-end and runner fix (P4), the
+freshest-Δ fix (P5) and the docs (R). Every packet passed `dispatch check --merged` before review
+and landed with `dispatch accept --expect`, with no override. P3 and P1 both changed the discovery
+module; P3's accept ran the merged checks on top of P1 and P2, and they passed. Review sent back
+two things: a capture lock in P1 that no observed case needed, and two cost figures in R taken from
+the wrong column of P1's measurements.
 
 Site impact: discovery runs about once a second instead of every `poll_secs` tick, and `dispatch start` returns only after its first scan; Hermes Agent worktrees (`hermes chat --worktree`) become Work in a watched project (`discovered hermes` origin, `agent running` from the `hermes pid=` lock, owner-log line `discovery: found a Hermes session in <path>`), so "only Claude Code's, Codex's and Cursor Agent's worktrees are recognized" and "Hermes's own worktrees are not recognized" no longer hold; Work whose worktree vanished can now be finished: new `status` line `removed …: only the changes last seen were kept; finish them yourself (dispatch finish <id>) or close it (…)`, a `Changes last seen <time>. …` line on `status`, `watch`, `finish`, `diff` and `check`, and `watch` offers `f finish` and `c close` for it instead of close only; `dispatch setup` → Runtime integrations gains a `Hermes hook:` line and `Install/Remove the Hermes hook`, and a hook that cannot be installed or removed now reads `Nothing changed: <reason>` with no provider-login advice; hidden `dispatch hook hermes`; the empty `watch` view now reads "A session in its own worktree of this project, from any agent Dispatch recognizes, or dispatch attach -- <agent>, appears here."; `status --json` and `check --json` gain `workspace_removed`.
