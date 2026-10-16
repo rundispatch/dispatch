@@ -842,9 +842,14 @@ impl Owner {
             if !attachment.workspace.exists() {
                 // The fast loop owns last-seen capture for vanishing trees.
                 if !needs_fast_follow(attachment) {
-                    if let Err(error) =
-                        super::attach::note_workspace_gone(state, &candidate.id, Some(&scratch))
-                    {
+                    // `delta-live.patch` is newer when the edit landed between
+                    // this pass's two captures.
+                    let live = state.run_dir(&candidate.id).join("delta-live.patch");
+                    if let Err(error) = super::attach::note_workspace_gone(
+                        state,
+                        &candidate.id,
+                        freshest_patch(&scratch, &live),
+                    ) {
                         tick.report(&error);
                     }
                     tick.persisted = true;
@@ -1733,5 +1738,62 @@ mod tests {
         let runs = [waiting, reviewed];
         let rows: Vec<&str> = view_rows(&runs).iter().map(|run| run.id.as_str()).collect();
         assert_eq!(rows, ["waiting"]);
+    }
+
+    /// An edit that lands between a pass's scratch capture and its
+    /// `delta-live.patch` is in the newer live patch only. When the worktree
+    /// is then gone, that newer patch is the one kept as last seen.
+    #[test]
+    fn a_vanished_worktree_keeps_the_fresher_of_scratch_and_live_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = State::discover(Some(temp.path().join("state"))).unwrap();
+        state.initialize().unwrap();
+        let mut run: RunRecord = serde_json::from_value(serde_json::json!({
+            "id": "W", "task": "t", "exact_prompt": "t", "source_path": "/source",
+            "source_kind": "git_worktree", "source_git_head": null, "source_fingerprint": "f",
+            "baseline_path": "/b", "baseline_commit": "abc", "status": "running",
+            "created_at": "2026-10-15T00:00:00Z", "completed_at": null,
+            "environment": {"dispatch_version":"test","os":"test","architecture":"test","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "evaluation": null, "applied_candidate": null,
+            "attachment": {
+                "version": 1, "workspace": temp.path().join("gone"), "integration_root": "/source",
+                "repo_key": null, "provenance": {"git_merge_base": {"commit": "abc"}},
+                "confidence": "full", "agent": null, "command": null, "owner": null,
+                "agent_process": null, "owner_state": "unknown",
+                "capabilities": {"observe": true, "signal": false, "control": false, "integrate": false},
+                "attached_at": "2026-10-15T00:00:00Z", "finished_at": null, "finish_reason": null
+            }
+        }))
+        .unwrap();
+        run.mode = RunMode::Attached;
+        run.outcome.lifecycle = LifecycleState::Working;
+        fs::create_dir_all(state.run_dir("W")).unwrap();
+        state.save_run(&run).unwrap();
+        let mut owner = Owner::new(temp.path().join("source"), SourceKind::GitWorktree).unwrap();
+        let scratch = owner.scratch.path().join("W.patch");
+        fs::write(&scratch, b"").unwrap();
+        let older = std::time::SystemTime::now() - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&scratch)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        let edit = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
+        fs::write(state.run_dir("W").join("delta-live.patch"), edit).unwrap();
+
+        let mut tick = Tick::default();
+        owner.reevaluate(&state, &[run], &mut tick, false);
+
+        assert_eq!(tick.error, None);
+        let kept = fs::read(state.run_dir("W").join("delta-last-seen.patch")).unwrap();
+        assert_eq!(kept, edit);
+        let run = state.load_run("W").unwrap();
+        assert_eq!(
+            run.outcome.lifecycle,
+            LifecycleState::Working,
+            "not cancelled"
+        );
+        assert!(run.attachment.unwrap().workspace_removed.is_some());
     }
 }
