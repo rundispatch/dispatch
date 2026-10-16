@@ -136,20 +136,20 @@ python3 scripts/harness-trial/trial.py table --write docs/harness-conformance.md
 ## Results
 
 <!-- conformance-table:begin -->
-Evidence under `~/dispatch-dev/conformance-0414/trials/`, on the machine that ran the trials.
+Evidence on the machine that ran the trials.
 
 | Harness | Path | Result | Dispatch | Harness | Date | Evidence |
 |---|---|---|---|---|---|---|
-| claude | attach | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `claude-attach/` |
-| claude | native | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `claude-native/` |
-| claude | worktree | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `claude-worktree/` |
-| codex | attach | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `codex-attach/` |
-| codex | native | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `codex-native/` |
-| codex | worktree | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `codex-worktree/` |
-| cursor | attach | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-attach/` |
-| cursor | native | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-native/` |
-| cursor | worktree | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `cursor-worktree/` |
-| hermes | attach | pass | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-attach/` |
-| hermes | native | pass | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-native/` |
-| hermes | worktree | fail: B: Work: expected Work created; observed no Work within the wait; the harness's worktrees: none | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `hermes-worktree/` |
+| claude | attach | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/claude-attach` |
+| claude | native | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/claude-native` |
+| claude | worktree | pass | dispatch 0.4.14 | 2.1.296 (Claude Code) | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/claude-worktree` |
+| codex | attach | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/codex-attach` |
+| codex | native | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/codex-native` |
+| codex | worktree | pass | dispatch 0.4.14 | codex-cli 0.155.1, model gpt-6-sol | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/codex-worktree` |
+| cursor | attach | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/cursor-attach` |
+| cursor | native | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/cursor-native` |
+| cursor | worktree | pass | dispatch 0.4.14 | 2026.10.14-0f9edde | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/cursor-worktree` |
+| hermes | attach | pass | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/hermes-attach` |
+| hermes | native | pass | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/hermes-native` |
+| hermes | worktree | pass (agent's tree: B last seen by the runner, 2026-10-16T01:20:50Z; A last seen by the runner, 2026-10-16T01:22:05Z; C last seen by the runner, 2026-10-16T01:22:31Z) | dispatch 0.4.15 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-16 | `~/dispatch-dev/conformance-0415/trials/hermes-worktree` |
 <!-- conformance-table:end -->

@@ -86,12 +86,24 @@ Discovered Work with agent `hermes`. "Upgrading to 0.4.15" in `docs/release-inst
 details, including what `hermes config set` does to the hook block; restart the owner after
 upgrading.
 
-Conformance: not rerun for this release. The table in
-[`docs/harness-conformance.md`](docs/harness-conformance.md) still holds 0.4.14's results, where
-Hermes's own worktree mode failed. The runner now reads a Hermes agent's tree even after Hermes
-removed it: on the `hermes worktree` path it keeps its own copy of each worktree's tree while
-the agent runs, and `record.json` names where each task's tree came from
-(`agent.tree_source`: `workspace`, or `last seen by the runner, <time>`). The table notes the
-second case.
+Conformance: only Hermes's own worktree mode was rerun, on 2026-10-16 with this release's
+candidate and Hermes Agent 0.18.2, and it passed. It was one trial of three short sessions, without
+the Hermes hook, so the last-seen path. For each task, S0 + Δ equalled the agent's tree as the
+runner last saw it, the session's start and end were recorded, `dispatch finish` succeeded, and
+the verdicts held (B applied, A REFRESH on `validate`'s signature, C CONTINUE). The runner now
+keeps its own copy of a Hermes worktree's tree while the agent runs, because Hermes removes the
+worktree before the runner can read it; `record.json` names where each task's tree came from
+(`agent.tree_source`), and the table notes it. Every other cell keeps its 0.4.14 result, since
+nothing it tests changed. The table and evidence are in
+[`docs/harness-conformance.md`](docs/harness-conformance.md).
+
+Built with Dispatch: each packet's worker ran in a workspace Dispatch 0.4.14 made, on three
+harnesses. Codex built the fast loop (P1), Hermes Agent built finishing from the last-seen Δ (P2),
+and Claude Code built Hermes's recognizer and hook (P3), the session-end and runner fix (P4) and
+the docs (R). Every packet passed `dispatch check --merged` before review and landed with
+`dispatch accept --expect`, with no override. P3 and P1 both changed the discovery module; P3's
+accept ran the merged checks on top of P1 and P2, and they passed. Review sent back two things: a
+capture lock in P1 that no observed case needed, and two cost figures in R taken from the wrong
+column of P1's measurements.
 
 Site impact: discovery runs about once a second instead of every `poll_secs` tick, and `dispatch start` returns only after its first scan; Hermes Agent worktrees (`hermes chat --worktree`) become Work in a watched project (`discovered hermes` origin, `agent running` from the `hermes pid=` lock, owner-log line `discovery: found a Hermes session in <path>`), so "only Claude Code's, Codex's and Cursor Agent's worktrees are recognized" and "Hermes's own worktrees are not recognized" no longer hold; Work whose worktree vanished can now be finished: new `status` line `removed …: only the changes last seen were kept; finish them yourself (dispatch finish <id>) or close it (…)`, a `Changes last seen <time>. …` line on `status`, `watch`, `finish`, `diff` and `check`, and `watch` offers `f finish` and `c close` for it instead of close only; `dispatch setup` → Runtime integrations gains a `Hermes hook:` line and `Install/Remove the Hermes hook`, and a hook that cannot be installed or removed now reads `Nothing changed: <reason>` with no provider-login advice; hidden `dispatch hook hermes`; the empty `watch` view now reads "A session in its own worktree of this project, from any agent Dispatch recognizes, or dispatch attach -- <agent>, appears here."; `status --json` and `check --json` gain `workspace_removed`.
