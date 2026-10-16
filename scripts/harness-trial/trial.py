@@ -203,17 +203,21 @@ def task_record(out, path, t, repo, fixture_tree):
                         + clip(result.get("error") or read(os.path.join(out, "steps", f"{t}.run.err"), ""))})
         return rec, None, defects
 
-    # The agent's own change, read from its workspace.
+    # The agent's own change, read from its workspace, or the runner's last
+    # look at it when the agent removed its worktree: approximate either way.
     agent_tree = read(os.path.join(td, "agent-tree.txt"))
+    tree_source = read(os.path.join(td, "agent-tree-source.txt"))
     files = (read(os.path.join(td, "agent-files.txt"), "") or "").split()
     check = read(os.path.join(out, "steps", f"{t}.agent-check.exit"))
-    rec["agent"].update({"tree": agent_tree, "changed_files": files,
+    rec["agent"].update({"tree": agent_tree, "tree_source": tree_source, "changed_files": files,
                          "check": None if check is None else ("passed" if check == "0" else "failed")})
     if path == "worktree":
         rec["harness_worktrees"] = new_worktrees(td)
     allowed, needs, avoids = FITS[t]
     misfit = []
-    if not files:
+    if agent_tree is None:
+        misfit.append("the runner never saw the agent's tree")
+    elif not files:
         misfit.append("changed nothing")
     if set(files) - allowed:
         misfit.append("also changed " + ", ".join(sorted(set(files) - allowed)))
@@ -245,7 +249,8 @@ def task_record(out, path, t, repo, fixture_tree):
     rec["delta"] = {"s0_plus_delta_tree": delta, "agent_tree": agent_tree,
                     "equal": None if delta is None or agent_tree is None else delta == agent_tree}
     if rec["delta"]["equal"] is False:
-        defects.append({"step": f"{t.upper()}: Δ", "expected": f"S0 + Δ = the agent's tree {agent_tree}",
+        seen = f" ({tree_source})" if tree_source != "workspace" else ""
+        defects.append({"step": f"{t.upper()}: Δ", "expected": f"S0 + Δ = the agent's tree {agent_tree}{seen}",
                         "observed": delta})
     rec["session"] = session_of(m, attempt)
     started, ended = rec["session"]["started_at"], rec["session"]["ended_at"]
@@ -274,7 +279,11 @@ def task_record(out, path, t, repo, fixture_tree):
 def new_worktrees(td):
     before = set((read(os.path.join(td, "worktrees-before.txt"), "") or "").splitlines())
     after = (read(os.path.join(td, "worktrees-after.txt"), "") or "").splitlines()
-    return [w for w in after if w not in before]
+    # And those the agent removed before it exited, as the runner last saw them.
+    seen = os.path.join(td, "last-seen")
+    for name in sorted(os.listdir(seen)) if os.path.isdir(seen) else []:
+        after.append((read(os.path.join(seen, name), "") or "").split("\n")[0])
+    return list(dict.fromkeys(w for w in after if w and w not in before))
 
 
 def first_line(path):
@@ -414,6 +423,10 @@ def cmd_table(args):
                 lines.append(f"| {h} | {p} | not run | | | | |")
                 continue
             result = r["status"] + (f": {clip(r['reason'], 160)}" if r.get("reason") else "")
+            seen = [f"{t.upper()} {w['agent']['tree_source']}" for t, w in (r.get("work") or {}).items()
+                    if (w.get("agent") or {}).get("tree_source") not in (None, "workspace")]
+            if seen:
+                result += " (agent's tree: " + "; ".join(seen) + ")"
             harness = (r.get("harness_version") or "unknown") + (
                 f", model {r['model_override']}" if r.get("model_override") else "")
             evidence = os.path.basename(r["evidence"]) + "/" if len(roots) == 1 else shown(r["evidence"])

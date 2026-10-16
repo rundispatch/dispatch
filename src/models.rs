@@ -672,6 +672,9 @@ pub struct StartPath {
 pub struct WorkspaceRemoval {
     pub at: DateTime<Utc>,
     pub exact: bool,
+    /// When the owner captured the kept Δ, not when it noticed removal.
+    #[serde(default)]
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 /// One agent-runtime session in a Work's workspace, as its runtime reported
@@ -928,6 +931,8 @@ pub struct RunResult {
     /// Present only when `--auto-apply` attempted an automatic application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_apply: Option<AutoApplySummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_removed: Option<WorkspaceRemoval>,
 }
 
 /// Local execution policy and delivery lineage, never part of v1 sync envelopes.

@@ -197,8 +197,11 @@ enum Command {
     /// Show a run and its persisted signals.
     #[command(hide = true)]
     Show { run_id: String },
-    /// An agent runtime's lifecycle hook (installed by `dispatch setup`):
-    /// reads the runtime's event on stdin and never fails the runtime.
+    /// An agent runtime's lifecycle hook, `claude` or `hermes`, installed by
+    /// `dispatch setup`: reads the runtime's event on stdin. Claude Code's fails
+    /// only when it cannot keep a worktree's changes, which stops that removal;
+    /// Hermes's reports any failure, which Hermes logs before removing the
+    /// worktree anyway.
     #[command(hide = true)]
     Hook { provider: String },
     /// Print a candidate's patch.
@@ -724,12 +727,21 @@ async fn run() -> Result<()> {
         }
         Command::Hook { provider } => {
             use std::io::Read;
-            anyhow::ensure!(provider == "claude", "unknown agent runtime: {provider}");
+            anyhow::ensure!(
+                matches!(provider.as_str(), "claude" | "hermes"),
+                "unknown agent runtime: {provider}"
+            );
             let mut input = Vec::new();
             std::io::stdin()
                 .take(dispatch::runtime::MAX_INPUT_BYTES as u64 + 1)
                 .read_to_end(&mut input)?;
-            let output = dispatch::runtime::claude::handle(&state, &input);
+            let output = if provider == "hermes" {
+                // Hermes gives the worktree only in the hook's environment.
+                let worktree = std::env::var_os("TERMINAL_CWD");
+                dispatch::runtime::hermes::handle(&state, &input, worktree.as_deref())
+            } else {
+                dispatch::runtime::claude::handle(&state, &input)
+            };
             if !output.stdout.is_empty() {
                 println!("{}", output.stdout);
             }

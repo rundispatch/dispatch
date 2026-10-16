@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.14 — experimental developer preview**
+**Dispatch 0.4.15 — experimental developer preview**
 
 <p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch; once one lands, the other no longer fits, and dispatch accept refuses it as REFRESH, leaving the source unchanged."></a></p>
 <p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
@@ -88,9 +88,10 @@ terminal. Letting Work run them by itself is never granted without a terminal.
 **Work that appears without hooks.** In a watched project, a Claude Code
 worktree that appears after watching began (`claude --worktree` or `claude -p
 --worktree`) becomes Work by itself, with no hooks installed.
-- Dispatch lists the project's Git worktrees on every tick and never walks your
-  directories. A worktree counts when Claude Code made it under
-  `.claude/worktrees/` and a `claude session` holds its lock.
+- Dispatch lists the project's Git worktrees about once a second and never walks
+  your directories; `dispatch start` returns once it has taken that list. A
+  worktree counts when Claude Code made it under `.claude/worktrees/` and a
+  `claude session` holds its lock.
 - S0 is its merge base with the project, with full confidence: everything in a
   worktree that appeared while you watched is its session's.
 - While the session's process runs, the Work shows `agent running`. When it is
@@ -108,6 +109,25 @@ worktree that appears after watching began (`claude --worktree` or `claude -p
   their sessions end. Their Work never reads `agent running` and never turns
   idle by itself; when the agent is done, `dispatch finish <id>`, or `dispatch
   close <id> --reason unfinished`.
+- Hermes Agent worktrees (`hermes chat --worktree`) are recognized by place and
+  branch: `.worktrees/hermes-<8 hex>` in the project, on branch
+  `hermes/hermes-<same 8 hex>`. While the Hermes process that locked the worktree
+  runs, the Work shows `agent running`. Once that process is gone, its session
+  is recorded as ended, also after Hermes removed the worktree: Dispatch follows
+  the process it recorded by its exact identity, not only by the lock.
+- Hermes removes its worktree when the session ends, with the agent's
+  uncommitted changes, unless the worktree holds commits on no remote-tracking
+  ref. So Dispatch rewrites the Work's patch so far whenever its tree changes,
+  about once a second. When the worktree is gone, `status` and `watch` say when
+  the kept changes were last seen; anything after that is not included. You can
+  still finish them (`dispatch finish <id>`), review them and accept them, or
+  close the Work; only you can finish them, never your check consent.
+- With Hermes's hook installed (`dispatch setup` → Runtime integrations →
+  Install the Hermes hook), Dispatch keeps the exact changes before Hermes
+  removes the worktree, at the end of a CLI `hermes chat` session. `/new` and
+  the TUI fall back to the changes last seen. Setup appends one block to
+  `~/.hermes/config.yaml`, keeps every other byte, and removes exactly that
+  block again; Hermes asks you to allow the hook the first time it runs it.
 - Other agents' worktrees are not recognized: `dispatch attach -- <agent>`
   gives any agent its own workspace.
 
@@ -278,7 +298,7 @@ coherence:
   accept: validate        # validate: check the moved tree; strict: refuse on any drift (0.1.x behavior)
   mid_run: observe        # observe: record verdicts while the agent works; stop: cancel it on STOP
   stop_on_refresh: false  # with mid_run: stop, also cancel on REFRESH
-  poll_secs: 10           # how often the mid-run watcher looks for source changes (must be > 0)
+  poll_secs: 10           # how often the watchers look for source changes (must be > 0); worktree discovery runs about once a second regardless
   integration_checks: true  # when the source moved, run checks.verify on the merged tree before applying
 ```
 
@@ -630,9 +650,9 @@ No network service is required to create, execute, inspect, accept, or reject a 
 ## Current boundaries
 
 - Experimental developer preview, not a stable 1.0 service.
-- Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent and Hermes Agent remain available as an explicit `--agent cursor` or `--agent hermes` choice without a funding contract. Hermes passed attach and native runs in the 0.4.14 conformance trials; its own worktree mode is not recognized. Agent installation, authentication, quotas, and provider availability remain external prerequisites.
+- Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent and Hermes Agent remain available as an explicit `--agent cursor` or `--agent hermes` choice without a funding contract. Hermes passed attach and native runs in the 0.4.14 conformance trials; its own worktree mode, which 0.4.14 did not recognize, passed with 0.4.15 on 2026-10-16, in one trial without the hook (the last-seen path). Agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current and applies only attached work you allowed to integrate; it never launches, refreshes, finishes on a session's end or signals agents. It recognizes only Claude Code's, Codex's and Cursor Agent's worktrees by itself, sees only Claude Code's sessions end, and scans no processes.
+- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current and applies only attached work you allowed to integrate; it never launches, refreshes, finishes on a session's end or signals agents. It recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's worktrees by itself, sees only Claude Code's and Hermes's sessions end, and scans no processes.
 
 ## Development
 

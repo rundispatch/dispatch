@@ -1032,7 +1032,9 @@ def states_live(binary, base):
     # Still working, and already stale: the mid-run verdict is advisory.
     project.attach("me-live")
     project.edit("me-live", "api.py", CALLER)
-    time.sleep(2.5)  # its footprint is seen before the source moves
+    project.wait_run("me-live", "edit followed before the source moves",
+                     lambda r: "+def login(t):" in
+                     (project.state / "runs" / r["id"] / "delta-live.patch").read_text())
     project.commit({"auth.py": AUTH_MOVED})
     project.wait_run("me-live", "advisory REFRESH", lambda r: r["coherence"]["validity"]["decision"] == "refresh")
     project.claude("auth-ctx")
@@ -1043,7 +1045,9 @@ def states_live(binary, base):
     project.remove_worktree("gone-exact")
     project.attach("gone-lost")
     project.edit("gone-lost", "lost.py", "LOST = 1\n")
-    time.sleep(2.5)  # seen by the watcher before it vanishes
+    project.wait_run("gone-lost", "edit followed before its worktree vanishes",
+                     lambda r: "+LOST = 1" in
+                     (project.state / "runs" / r["id"] / "delta-live.patch").read_text())
     shutil.rmtree(project.workspaces["gone-lost"])
     project.wait_run("gone-lost", "lost",
                      lambda r: (r["attachment"].get("workspace_removed") or {}).get("exact") is False)
@@ -1054,9 +1058,9 @@ def states_live(binary, base):
         "gone-exact": ("removed", "Its worktree was removed and its exact changes were kept. f finish to check them, "
                        "or c close it.",
                        "f finish · c close · ↑↓ select · q leave", "claude session in its own worktree"),
-        "gone-lost": ("lost", "Its worktree is gone; only its last-seen changes were kept, and they cannot be "
-                      "finished. c close it.",
-                      "c close · ↑↓ select · q leave", "attached workspace"),
+        "gone-lost": ("lost", "Its worktree is gone; only the changes last seen were kept. f finish them "
+                      "yourself, or c close it.",
+                      "f finish · c close · ↑↓ select · q leave", "attached workspace"),
         "slugify": ("working", finish_next, "f finish · ↑↓ select · q leave", "attached workspace"),
         "auth-ctx": ("working", finish_next, "f finish · ↑↓ select · q leave", "claude session in its own worktree"),
         "idle-one": ("idle", "Its session ended. f finish to freeze its changes, or resume the session in its "
@@ -1077,6 +1081,10 @@ def states_live(binary, base):
             assert origin in details, (name, origin, details)
             assert "Next " + next_text in details, (name, next_text, watch.screen())
             assert watch.hint() == hint, (name, watch.hint())
+            if name == "gone-lost":
+                at = project.run(name)["attachment"]["workspace_removed"]["last_seen_at"]
+                assert "Changes last seen " + at in details, details
+                assert "Dispatch cannot say whether there were any." in details, details
             if name == "auth-ctx":
                 assert ".claude/worktrees/auth-ctx" in details, details
                 began = re.search(r"Began a Dispatch snapshot \(([0-9a-f]{8})\) of its worktree when its first "
@@ -1403,7 +1411,7 @@ def empty(binary, base):
     project.start()
     with project.watch(120) as watch:
         watch.shows("No Work in the last hour.")
-        watch.shows("A Claude Code session in its own worktree of this project, or dispatch attach -- <agent>, appears here.")
+        watch.shows("A session in its own worktree of this project, from any agent Dispatch recognizes, or dispatch attach -- <agent>, appears here.")
         watch.leave()
     print("PASS empty")
 

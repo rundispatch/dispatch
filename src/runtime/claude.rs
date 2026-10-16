@@ -408,7 +408,7 @@ pub fn liveness(lock: &Lock) -> Liveness {
 }
 
 /// `pid`'s start time as Claude Code writes it in a lock: `ps -o lstart=` in UTC.
-fn process_start_utc(pid: u32) -> Option<String> {
+pub(super) fn process_start_utc(pid: u32) -> Option<String> {
     let output = std::process::Command::new("ps")
         .env("TZ", "UTC0")
         .args(["-o", "lstart=", "-p", &pid.to_string()])

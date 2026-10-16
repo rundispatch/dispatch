@@ -5,6 +5,16 @@
 //! ran, through the same path a hook's `SessionEnd` takes. The Work then reads
 //! `idle`. Nothing here finishes, applies, closes or signals anything.
 //!
+//! A Hermes worktree's lock, `hermes pid=<pid>`, names its process without a
+//! start time: it is followed the same way, the process told apart from a
+//! recycled pid by having started no later than the worktree was made.
+//!
+//! Removal does not stop this. Hermes removes its worktree as its process
+//! exits, and Dispatch notes the removal, by its hook or by seeing the
+//! worktree gone, usually before it sees the process gone. The lock went with
+//! the worktree, so the recorded process is followed by its exact identity
+//! alone: once it is gone, its sessions end as for any other gone process.
+//!
 //! Codex's and Cursor Agent's worktrees name no process (`discovery::
 //! UNOBSERVED`): their liveness is `Unknown` for good, so their Work never
 //! reads "agent running" and no end of their sessions is ever recorded. No
@@ -20,8 +30,11 @@ use crate::{
     EventRecord, LifecycleState, RunMode, RunRecord, WorkspaceOwner,
     db::Database,
     lock::OperationLock,
-    process::{self, ProcessIdentity},
-    runtime::claude::{self, Liveness, Lock},
+    process::{self, IdentityState, ProcessIdentity},
+    runtime::{
+        claude::{self, Liveness, Lock},
+        hermes,
+    },
     state::State,
 };
 
@@ -43,36 +56,54 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
         return Ok(());
     };
     // Only a workspace the runtime made: a person's attach, with or without
-    // `--pid`, is theirs. Removed workspaces are the removal's business.
-    // Finished Work is followed while it still records its agent: a session
-    // that outlives `finish`, even by a moment, still has its end recorded.
+    // `--pid`, is theirs. Finished Work is followed while it still records its
+    // agent: a session that outlives `finish`, even by a moment, still has its
+    // end recorded.
     if run.mode != RunMode::Attached
         || (run.outcome.lifecycle == LifecycleState::Finished && attachment.agent_process.is_none())
         || attachment.workspace_owner != WorkspaceOwner::Runtime
-        || attachment.workspace_removed.is_some()
     {
         return Ok(());
     }
-    let signals = claude::worktree_signals(&attachment.workspace);
-    if !claude::made_by_claude(root, &attachment.workspace, &signals) {
-        return Ok(());
+    // A removed workspace has no lock left: only the recorded process is
+    // followed, until that exact process is gone.
+    if attachment.workspace_removed.is_some() {
+        let Some(old) = attachment.agent_process.as_ref() else {
+            return Ok(());
+        };
+        return match process::identity_state(old) {
+            IdentityState::Gone | IdentityState::Reused => {
+                end_sessions(state, run, None, "process_gone")?;
+                set_agent_process(state, &run.id, Some(old), None)
+            }
+            IdentityState::ExactLive | IdentityState::Unknown => Ok(()),
+        };
     }
-    let session = match signals.lock {
-        Some(Lock::Session { pid, start, .. }) => Some((pid, start)),
-        _ => None,
+    let workspace = attachment.workspace.as_path();
+    let signals = claude::worktree_signals(workspace);
+    // The lock's process, with its start when the lock records one.
+    let session = if claude::made_by_claude(root, workspace, &signals) {
+        match signals.lock {
+            Some(Lock::Session { pid, start, .. }) => Some((pid, Some(start))),
+            _ => None,
+        }
+    } else if hermes::made(root, workspace) {
+        hermes::locked_pid(workspace).map(|pid| (pid, None))
+    } else {
+        return Ok(());
     };
     let recorded = attachment.agent_process.as_ref();
     match (recorded, session) {
         (None, None) => Ok(()),
         // Running: record it. Gone or Unknown, never seen running: nothing.
-        (None, Some((pid, start))) => match running(pid, &start) {
+        (None, Some((pid, start))) => match running(workspace, pid, start.as_deref()) {
             Some(identity) => set_agent_process(state, &run.id, None, Some(identity)),
             None => Ok(()),
         },
         // The lock still names the recorded process: it ended if that exact
         // process is gone, as `claude -p` leaves it. Unknown proves nothing.
         (Some(old), Some((pid, start))) if pid == old.pid => {
-            match claude::liveness(&session_lock(pid, &start)) {
+            match lock_liveness(workspace, pid, start.as_deref()) {
                 Liveness::Gone => {
                     end_sessions(state, run, None, "process_gone")?;
                     set_agent_process(state, &run.id, Some(old), None)
@@ -83,10 +114,11 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
         // Another session locked the worktree: the recorded process's lock was
         // released. Sessions that began before the new process stay its own.
         (Some(old), Some((pid, start))) => {
-            if let Some(since) = lock_start(&start) {
+            if let Some(since) = start.as_deref().and_then(lock_start) {
                 end_sessions(state, run, Some(since), "lock_released")?;
             }
-            set_agent_process(state, &run.id, Some(old), running(pid, &start))
+            let new = running(workspace, pid, start.as_deref());
+            set_agent_process(state, &run.id, Some(old), new)
         }
         (Some(old), None) => {
             end_sessions(state, run, None, "lock_released")?;
@@ -96,12 +128,21 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
 }
 
 /// The exact identity of the process a session lock names, if it runs.
-fn running(pid: u32, start: &str) -> Option<ProcessIdentity> {
-    if claude::liveness(&session_lock(pid, start)) != Liveness::Running {
+fn running(workspace: &Path, pid: u32, start: Option<&str>) -> Option<ProcessIdentity> {
+    if lock_liveness(workspace, pid, start) != Liveness::Running {
         return None;
     }
     let identity = process::process_identity(pid);
     (identity.start.is_some() && identity.boot.is_some()).then_some(identity)
+}
+
+/// Whether the process a lock in `workspace` names runs: Claude's by the
+/// start its lock records, Hermes's by when it made the worktree.
+fn lock_liveness(workspace: &Path, pid: u32, start: Option<&str>) -> Liveness {
+    match start {
+        Some(start) => claude::liveness(&session_lock(pid, start)),
+        None => hermes::liveness(pid, workspace),
+    }
 }
 
 /// What `liveness` compares: the lock's pid and start.
@@ -476,7 +517,7 @@ mod tests {
     fn a_pid_another_process_now_has_counts_as_gone() {
         let p = project();
         let child = sleeper();
-        let Some(identity) = running(child.id(), &utc_start(child.id())) else {
+        let Some(identity) = running(&p.locked, child.id(), Some(&utc_start(child.id()))) else {
             stop(child);
             return; // no exact identity on this platform
         };

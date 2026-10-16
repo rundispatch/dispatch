@@ -409,8 +409,8 @@ fn when_the_changes_cannot_be_kept_the_removal_is_stopped() {
 }
 
 #[test]
-fn a_worktree_that_vanishes_unannounced_is_noted_and_cannot_be_finished() {
-    let p = Project::new("");
+fn a_worktree_that_vanishes_unannounced_can_be_finished_from_last_seen_changes() {
+    let p = Project::new("checks:\n  verify: ['test -f src/lib.rs && printf checked']\n");
     p.watch();
     p.start("s1", "startup", &p.worktree);
     let id = p.only_run()["id"].as_str().unwrap().to_owned();
@@ -450,34 +450,69 @@ fn a_worktree_that_vanishes_unannounced_is_noted_and_cannot_be_finished() {
     );
     let last = fs::read_to_string(p.run_dir(&id).join("delta-last-seen.patch")).unwrap();
     assert!(last.contains("+    2"), "{last}");
-    let close = format!("dispatch close {id} --reason workspace-removed");
-    let finish = p.dispatch(&["finish", &id]);
-    assert!(!finish.status.success());
+    let waiting = text(&p.dispatch(&["status", &id]));
     assert!(
-        text(&finish).contains("cannot be finished") && text(&finish).contains(&close),
-        "{}",
-        text(&finish)
+        waiting.contains("only the changes last seen were kept; finish them yourself"),
+        "{waiting}"
     );
-    // It has no result to reject; closing it records no judgment.
-    let reject = p.dispatch(&["reject", &id]);
-    assert!(!reject.status.success());
-    assert!(text(&reject).contains(&close), "{}", text(&reject));
-    assert_eq!(p.only_run()["outcome"]["lifecycle"], "working");
-    let closed = p.dispatch(&["close", &id, "--reason", "workspace-removed"]);
-    assert!(closed.status.success(), "{}", text(&closed));
-    assert!(
-        text(&closed).contains("delta-last-seen.patch"),
-        "{}",
-        text(&closed)
-    );
+    let finish = p.dispatch(&["finish", &id, "--allow-unsafe-local"]);
+    assert!(finish.status.success(), "{}", text(&finish));
     let run = p.only_run();
+    let at = run["attachment"]["workspace_removed"]["last_seen_at"]
+        .as_str()
+        .expect("the patch capture time");
+    let labelled = |output: Output| {
+        assert!(output.status.success(), "{}", text(&output));
+        let shown = text(&output);
+        assert!(shown.contains("last seen") && shown.contains(at), "{shown}");
+    };
+    labelled(finish);
+    labelled(p.dispatch(&["status", &id]));
+    let status = p.dispatch(&["status", &id, "--json"]);
+    assert!(status.status.success(), "{}", text(&status));
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["workspace_removed"],
+        run["attachment"]["workspace_removed"]
+    );
+    labelled(p.dispatch(&["diff", &id]));
+    fs::write(p.root.join("unrelated.txt"), "source moved\n").unwrap();
+    labelled(p.dispatch(&["check", &id]));
+    let checked = p.dispatch(&["check", &id, "--json"]);
+    assert!(checked.status.success(), "{}", text(&checked));
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(
+        checked["workspace_removed"],
+        run["attachment"]["workspace_removed"]
+    );
+    let digest = checked["delta_digest"].as_str().unwrap();
+    labelled(p.dispatch(&["accept", &id, "--expect", digest]));
     assert_eq!(run["outcome"]["lifecycle"], "finished");
-    assert_eq!(run["outcome"]["work_result"], "cancelled");
-    assert_eq!(run["outcome"]["review"], "not_requested");
-    assert_eq!(run["outcome"]["closed"]["reason"], "workspace_removed");
-    // The changes last seen stay as evidence.
-    let last = fs::read_to_string(p.run_dir(&id).join("delta-last-seen.patch")).unwrap();
-    assert!(last.contains("+    2"), "{last}");
+    assert_eq!(run["outcome"]["review"], "pending");
+    assert_eq!(p.only_run()["outcome"]["application"], "applied");
+    assert!(
+        fs::read_to_string(p.root.join("src/lib.rs"))
+            .unwrap()
+            .contains("    2")
+    );
+    let events = fs::read_to_string(p.run_dir(&id).join("events.jsonl")).unwrap();
+    let events: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "attach.finished"
+                && event["payload"]["workspace_removed"]["last_seen_at"] == at)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "coherence.merged_checks"
+                && event["payload"]["by"] == "accept"),
+        "{events:?}"
+    );
 }
 
 /// Claude Code's `ExitWorktree` tool with `action: remove` deletes the worktree

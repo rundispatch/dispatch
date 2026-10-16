@@ -215,6 +215,9 @@ fn item(
         run.outcome.review == ReviewState::Pending && run.outcome.work_result == WorkResult::Ready;
 
     let mut details = Vec::new();
+    if let Some(label) = orchestrator::last_seen_changes(run) {
+        details.push(Detail::new("Changes", label, 0));
+    }
     match state {
         "applied" => details.push(Detail::new("Landed", landed(run, &line), 0)),
         "rejected" => details.push(Detail::new("Outcome", "Rejected · nothing was applied", 0)),
@@ -494,11 +497,11 @@ fn next(
                 .into(),
             vec![FINISH, CLOSE],
         ),
-        "lost" => (
-            "Its worktree is gone; only its last-seen changes were kept, and they cannot be finished. c close it."
-                .into(),
-            vec![CLOSE],
+        "lost" if orchestrator::last_seen_patch(run).is_some() => (
+            "Its worktree is gone; only the changes last seen were kept. f finish them yourself, or c close it.".into(),
+            vec![FINISH, CLOSE],
         ),
+        "lost" => ("Its worktree is gone; nothing was kept. c close it.".into(), vec![CLOSE]),
         "applied" => (format!("Nothing to do: it is in {root}."), vec![]),
         "rejected" | "closed" | "finished" => ("Nothing to do.".into(), vec![]),
         // Ready, or blocked: what accepting it would do.
@@ -1428,7 +1431,7 @@ fn render(frame: &mut Frame, screen: &Screen, palette: &Theme) {
         let second = if screen.header.unwatched {
             "Nothing is watching this project: dispatch start."
         } else {
-            "A Claude Code session in its own worktree of this project, or dispatch attach -- <agent>, appears here."
+            "A session in its own worktree of this project, from any agent Dispatch recognizes, or dispatch attach -- <agent>, appears here."
         };
         ["No Work in the last hour.", second]
             .iter()
@@ -2185,6 +2188,53 @@ mod tests {
         );
     }
 
+    /// Last-seen provenance survives the transition into review.
+    #[test]
+    fn last_seen_work_is_dated_in_watch_before_and_after_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut run = working(worktree("01M4DRXH00000000000000000B", "wt", 1));
+        run.candidates.push(serde_json::from_value(serde_json::json!({
+            "id": "candidate", "label": "A", "harness_id": "external", "status": "running",
+            "workspace_path": "/gone", "prompt_path": "/prompt", "stdout_path": "/stdout",
+            "stderr_path": "/stderr", "diff_path": temp.path().join("delta.patch"),
+            "duration_ms": 0, "exit_code": null, "timed_out": false, "tokens": null,
+            "cost_usd": null, "error": null,
+            "diff_stats": {"files_changed": 1, "lines_added": 1, "lines_removed": 1, "changed_files": ["f"]}, "checks": []
+        })).unwrap());
+        std::fs::write(temp.path().join("delta-last-seen.patch"), "kept changes").unwrap();
+        run.attachment.as_mut().unwrap().workspace_removed = Some(serde_json::from_value(
+            serde_json::json!({"at": "2026-10-15T12:00:00Z", "exact": false, "last_seen_at": "2026-10-15T11:59:58Z"})
+        ).unwrap());
+        let item = items(std::slice::from_ref(&run)).remove(0);
+        assert!(
+            item.next.contains("only the changes last seen") && item.next.contains("yourself"),
+            "{}",
+            item.next
+        );
+        assert_eq!(item.keys, [FINISH, CLOSE]);
+        for run in [run.clone(), ready(run, None)] {
+            // The plain watch and watch --json share this dated reason;
+            // the interactive view also keeps it in its Changes detail.
+            let line = orchestrator::work_line(&run, None);
+            assert!(
+                line.reason
+                    .unwrap()
+                    .contains("last seen 2026-10-15T11:59:58Z")
+            );
+            let item = items(&[run]).remove(0);
+            let buffer = draw(
+                std::slice::from_ref(&item),
+                Some(&item.id),
+                (160, 45),
+                false,
+                &no_color(),
+            );
+            let text = rows(&buffer).join("\n");
+            assert!(text.contains("last seen 2026-10-15T11:59:58Z"), "{text}");
+            assert!(text.contains("cannot say whether"), "{text}");
+        }
+    }
+
     /// One item per state, with its Next text and keys (§3.8).
     #[test]
     fn every_state_says_what_comes_next_and_offers_its_keys() {
@@ -2215,6 +2265,7 @@ mod tests {
             run.attachment.as_mut().unwrap().workspace_removed = Some(WorkspaceRemoval {
                 at: chrono::Utc::now(),
                 exact,
+                last_seen_at: None,
             });
             run
         };
@@ -2315,7 +2366,7 @@ mod tests {
                 removed(false),
                 "lost",
                 "not checked",
-                "Its worktree is gone; only its last-seen changes were kept, and they cannot be finished. c close it.",
+                "Its worktree is gone; nothing was kept. c close it.",
                 &[CLOSE],
             ),
             (closed, "closed", "–", "Nothing to do.", &[]),
@@ -2920,7 +2971,7 @@ mod tests {
     #[test]
     fn an_empty_view_says_what_would_appear_or_that_nothing_watches() {
         for (unwatched, line) in [
-            (false, "A Claude Code session in its own worktree"),
+            (false, "from any agent Dispatch recognizes"),
             (true, "Nothing is watching this project: dispatch start."),
         ] {
             let header = header(unwatched);

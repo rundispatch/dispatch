@@ -27,6 +27,21 @@ struct Project {
     home: Option<PathBuf>,
 }
 
+/// Releases a deliberately blocked project check even if an assertion fails.
+struct CheckGate(PathBuf);
+
+impl CheckGate {
+    fn release(&self) {
+        fs::write(&self.0, b"released\n").unwrap();
+    }
+}
+
+impl Drop for CheckGate {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"released\n");
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
@@ -143,7 +158,10 @@ impl Project {
     fn watch(&self) {
         let output = self.start();
         assert!(output.status.success(), "{}", text(&output));
-        wait_until("the first scan", || self.inventory().is_some());
+        assert!(
+            self.inventory().is_some(),
+            "start returned before discovery was ready"
+        );
     }
 
     /// Owner ticks ended so far, by the owner's log.
@@ -796,6 +814,78 @@ impl Project {
     fn status(&self, id: &str) -> String {
         text(&self.dispatch(&["status", id]))
     }
+
+    fn attach_workspace(&self, worktree: &Path, agent: &str) -> String {
+        let output = self.dispatch(&[
+            "attach",
+            "--workspace",
+            worktree.to_str().unwrap(),
+            "--root",
+            self.root.to_str().unwrap(),
+            "--agent",
+            agent,
+            "--allow-unsafe-local",
+        ]);
+        assert!(output.status.success(), "{}", text(&output));
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("ATTACHED "))
+            .expect("attach prints ATTACHED <id>")
+            .to_owned()
+    }
+
+    /// Make the owner's first coherence tick run checks until the test opens
+    /// a gate. The pre-removal hook keeps an exact patch before watching, so
+    /// the owner can enter `finish_by_consent` on its first tick.
+    fn watch_with_blocked_check(&self) -> (String, CheckGate) {
+        let started = self._temp.path().join("check-started");
+        let release = self._temp.path().join("check-release");
+        fs::write(
+            self.root.join("verify.sh"),
+            format!(
+                "#!/bin/sh\n: > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.1; done\n",
+                started.display(),
+                release.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            self.root.join("dispatch.yml"),
+            "checks:\n  verify: ['sh verify.sh']\ncoherence:\n  poll_secs: 60\n",
+        )
+        .unwrap();
+        git(&self.root, &["add", "-A"]);
+        git(&self.root, &["commit", "--quiet", "-m", "gated checks"]);
+        let state = dispatch::state::State::discover(Some(self.state.clone())).unwrap();
+        dispatch::consent::grant(&state, &self.root).unwrap();
+
+        let worktree = self.add_worktree("consented");
+        let id = self.attach_workspace(&worktree, "claude");
+        fs::write(
+            worktree.join("src/lib.rs"),
+            "pub fn f() -> i32 {\n    2\n}\n",
+        )
+        .unwrap();
+        self.hook(serde_json::json!({
+            "hook_event_name": "WorktreeRemove", "session_id": "consented",
+            "cwd": self.root, "worktree_path": worktree, "name": "consented",
+        }));
+        git(
+            &self.root,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                ".claude/worktrees/consented",
+            ],
+        );
+
+        let gate = CheckGate(release);
+        self.watch();
+        wait_until("the consented check to start", || started.exists());
+        (id, gate)
+    }
 }
 
 /// Work whose agent's runtime names no process: never "agent running", no
@@ -948,4 +1038,87 @@ fn worktrees_without_a_reliable_sign_never_become_work() {
         assert!(p.runs_in(worktree).is_empty(), "{}", worktree.display());
     }
     assert!(p.listed().is_empty());
+}
+
+/// Discovery keeps running with a long coherence interval even while the
+/// owner is occupied by a consented Work item's project check.
+#[test]
+fn a_codex_worktree_becomes_work_while_the_owner_runs_checks() {
+    let p = Project::new();
+    let (checking, gate) = p.watch_with_blocked_check();
+    let worktree = p.codex_worktree("a15f");
+
+    wait_until("Codex Work during the blocked check", || {
+        p.runs_in(&worktree).len() == 1
+    });
+    let [run] = p.runs_in(&worktree).try_into().unwrap();
+    assert_eq!(run["attachment"]["agent"], "codex");
+    assert_eq!(run["attachment"]["sessions"][0]["session_id"], CODEX_THREAD);
+    assert!(!gate.0.exists(), "the check gate stayed closed");
+    let checking_run = p
+        .runs()
+        .into_iter()
+        .find(|run| run["id"] == checking)
+        .unwrap();
+    assert_eq!(checking_run["outcome"]["lifecycle"], "working");
+
+    gate.release();
+    wait_until("the consented check to finish", || {
+        p.runs()
+            .iter()
+            .any(|run| run["id"] == checking && run["outcome"]["lifecycle"] == "finished")
+    });
+}
+
+/// A runtime that removes its own worktree needs its latest followed Δ even
+/// while the coherence tick is occupied by a different Work item's checks.
+#[test]
+fn a_vanishing_hermes_worktree_keeps_the_second_followed_edit() {
+    let p = Project::new();
+    let (checking, gate) = p.watch_with_blocked_check();
+    let worktree = p.add_worktree_at(
+        &p._temp.path().join("hermes-worktree"),
+        Some("manual-hermes"),
+    );
+    let id = p.attach_workspace(&worktree, "hermes");
+    let followed = p.state.join("runs").join(&id).join("delta-live.patch");
+
+    fs::write(
+        worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    wait_until("the first Hermes edit to be followed", || {
+        fs::read_to_string(&followed).is_ok_and(|patch| patch.contains("+    2"))
+    });
+    fs::write(
+        worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    wait_until("the second Hermes edit to be followed", || {
+        fs::read_to_string(&followed).is_ok_and(|patch| patch.contains("+    3"))
+    });
+    git(
+        &p.root,
+        &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+    );
+
+    wait_until("the vanished worktree to be noted", || {
+        p.runs_in(&worktree)
+            .first()
+            .is_some_and(|run| run["attachment"]["workspace_removed"]["exact"] == false)
+    });
+    let last =
+        fs::read_to_string(p.state.join("runs").join(&id).join("delta-last-seen.patch")).unwrap();
+    assert!(last.contains("+    3"), "{last}");
+    assert!(!last.contains("+    2"), "{last}");
+    assert!(!gate.0.exists(), "the check gate stayed closed");
+
+    gate.release();
+    wait_until("the consented check to finish", || {
+        p.runs()
+            .iter()
+            .any(|run| run["id"] == checking && run["outcome"]["lifecycle"] == "finished")
+    });
 }

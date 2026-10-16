@@ -1608,6 +1608,10 @@ pub fn run_result(run: &RunRecord) -> RunResult {
                 analysis: validity.analysis,
             }),
         auto_apply: None,
+        workspace_removed: run
+            .attachment
+            .as_ref()
+            .and_then(|a| a.workspace_removed.clone()),
     }
 }
 
@@ -1883,6 +1887,9 @@ pub fn diff(
         None => sole_candidate(&run)?,
     };
     if name_only {
+        if let Some(label) = last_seen_changes(&run) {
+            eprintln!("{label}");
+        }
         for path in &candidate.diff_stats.changed_files {
             println!("{path}");
         }
@@ -1890,11 +1897,17 @@ pub fn diff(
     }
     println!("Run {}", run.id);
     if stat {
+        if let Some(label) = last_seen_changes(&run) {
+            println!("{label}");
+        }
         print_diff_stats(candidate);
         println!("{}", digest_line(&delta_digest(&candidate.diff_path)?));
         return Ok(());
     }
     println!("Candidate {}\n", candidate.label);
+    if let Some(label) = last_seen_changes(&run) {
+        println!("{label}");
+    }
     print_diff_stats(candidate);
     println!();
     let patch = fs::read_to_string(&candidate.diff_path)
@@ -1998,6 +2011,9 @@ pub fn review_diff(state: &State, command: &ReviewCommand) -> Result<String> {
     let mut patch = String::from_utf8_lossy(&bytes).into_owned();
     if patch.len() >= 256 * 1024 {
         patch.push_str("\n[Preview limit reached; complete patch is in Details.]\n");
+    }
+    if let Some(label) = last_seen_changes(&run) {
+        patch.insert_str(0, &format!("{label}\n\n"));
     }
     Ok(patch)
 }
@@ -2121,6 +2137,9 @@ pub(crate) fn decide(
     // again (the latest revision stands), so this does not require a
     // pending review the way the interactive delivery does.
     let (run, _lock) = locked_delivery(state, &command, false)?;
+    if !quiet && let Some(label) = last_seen_changes(&run) {
+        println!("{label}");
+    }
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     let merged = review_locked(state, run, decision, reasons, explanation, quiet)?;
@@ -2266,6 +2285,13 @@ pub async fn check(
             "validity": validity,
             "delta_digest": digest,
         });
+        if let Some(removal) = run
+            .attachment
+            .as_ref()
+            .and_then(|a| a.workspace_removed.as_ref())
+        {
+            shown["workspace_removed"] = serde_json::json!(removal);
+        }
         if let Some(id) = &landed_by {
             shown["landed_by"] = serde_json::json!(id);
         }
@@ -2437,6 +2463,9 @@ fn print_check(
         crate::coherence::verdict(validity.decision)
     );
     println!("Analysis: {}", snake_case(&validity.analysis));
+    if let Some(label) = last_seen_changes(run) {
+        println!("{label}");
+    }
     println!("World changed files: {}", validity.changed_files);
     for reason in &validity.reasons {
         println!("  {}", reason_line(reason));
@@ -2722,6 +2751,10 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
         }
         Some(_) => "attached",
     };
+    let reason = match (reason, last_seen_changes(run)) {
+        (Some(reason), Some(label)) => Some(format!("{reason}; {label}")),
+        (reason, label) => reason.or(label),
+    };
     WorkLine {
         origin,
         agent,
@@ -2954,12 +2987,16 @@ fn workspace_details(run: &RunRecord, attachment: &crate::AttachmentRecord) -> V
                     "its exact changes are kept; finish it (dispatch finish {id}) or close it ({close} workspace-removed)"
                 ),
                 (true, false) => "its exact changes were kept".into(),
-                (false, true) => format!(
-                    "only the changes last seen were kept; it cannot be finished; close it: {close} workspace-removed"
+                (false, true) if last_seen_patch(run).is_some() => format!(
+                    "only the changes last seen were kept; finish them yourself (dispatch finish {id}) or close it ({close} workspace-removed)"
                 ),
-                (false, false) => "only the changes last seen were kept".into(),
+                (false, true) => format!("nothing was kept; it cannot be finished; close it: {close} workspace-removed"),
+                (false, false) => "its worktree is gone".into(),
             }
         ));
+        if let Some(label) = last_seen_changes(run) {
+            lines.push(format!("  {label}"));
+        }
     } else if unfinished
         && attachment
             .sessions
@@ -2981,6 +3018,41 @@ fn workspace_details(run: &RunRecord, attachment: &crate::AttachmentRecord) -> V
         lines.extend(start.map(|line| format!("    {line}")));
     }
     lines
+}
+
+/// The retained last-seen Δ, if it contains changes. Never substitute a live
+/// patch or a removal timestamp for evidence the owner did not keep.
+pub(crate) fn last_seen_patch(run: &RunRecord) -> Option<PathBuf> {
+    let removal = run.attachment.as_ref()?.workspace_removed.as_ref()?;
+    if removal.exact {
+        return None;
+    }
+    let patch = run
+        .candidates
+        .first()?
+        .diff_path
+        .parent()?
+        .join("delta-last-seen.patch");
+    fs::metadata(&patch)
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        .then_some(patch)
+}
+
+pub(crate) fn last_seen_changes(run: &RunRecord) -> Option<String> {
+    let removal = run.attachment.as_ref()?.workspace_removed.as_ref()?;
+    if removal.exact {
+        return None;
+    }
+    if last_seen_patch(run).is_none() {
+        return Some("The worktree is gone; nothing was kept.".into());
+    }
+    let when = removal.last_seen_at.map_or_else(
+        || "at an unknown time (older record)".into(),
+        |at| at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+    );
+    Some(format!(
+        "Changes last seen {when}. Changes made after that time are not included; Dispatch cannot say whether there were any."
+    ))
 }
 
 /// How the integration source compared with the Work's S0 when it began, as

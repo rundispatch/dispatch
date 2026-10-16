@@ -160,7 +160,14 @@ pub(super) async fn accounts(
                 _ => Ok(()),
             }
         } else if choice == login_row + 1 {
-            integrations(ui, state).await
+            // Hooks are not a resource, so no provider advice follows.
+            if let Err(e) = integrations(ui, state).await {
+                ui.commit(&format!(
+                    "Nothing changed: {}",
+                    clip(&format!("{e:#}"), 500)
+                ))?;
+            }
+            Ok(())
         } else {
             return Ok(());
         };
@@ -170,32 +177,53 @@ pub(super) async fn accounts(
     }
 }
 
-/// Claude Code's session hooks, which let Work appear by itself in watched
-/// projects. They are observation hooks, not a resource: no account, model
-/// or funding is involved. Installing shows exactly what is added and where,
-/// and needs a deliberate choice; focus starts on Cancel.
+/// Claude Code's session hooks and Hermes's session-end hook, which let Work
+/// appear by itself in watched projects and keep a worktree's changes before
+/// its runtime removes it. They are observation hooks, not a resource: no
+/// account, model or funding is involved. Installing shows exactly what is
+/// added and where, and needs a deliberate choice; focus starts on Cancel.
 async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
-    use crate::runtime::claude;
+    use crate::runtime::{claude, hermes};
     let path = claude::settings_path()?;
     let installed = claude::hooks_installed(&path)?;
+    let hermes_path = hermes::config_path()?;
+    let hermes_installed = hermes::installed(&hermes_path);
     let action = if installed {
         "Remove Claude Code hooks"
     } else {
         "Install Claude Code hooks"
     };
+    let hermes_action = if matches!(hermes_installed, Ok(true)) {
+        "Remove the Hermes hook"
+    } else {
+        "Install the Hermes hook"
+    };
     let body = format!(
-        "Runtime integrations\nClaude Code hooks: {} ({})\nWith them, a Claude Code session in its own worktree of a project you watch \
-         (dispatch start) appears as Work by itself; a session in the checkout itself is told Dispatch cannot follow it.",
+        "Runtime integrations\nClaude Code hooks: {} ({})\nHermes hook: {} ({})\nWith them, a Claude Code session in its own worktree of a project you watch \
+         (dispatch start) appears as Work by itself; a session in the checkout itself is told Dispatch cannot follow it. \
+         Hermes's hook keeps a hermes --worktree session's exact changes before Hermes removes its worktree.",
         if installed {
             "installed"
         } else {
             "not installed"
         },
-        path.display()
+        path.display(),
+        match hermes_installed {
+            Ok(true) => "installed",
+            Ok(false) => "not installed",
+            Err(_) => "unknown, its config.yaml is unreadable",
+        },
+        hermes_path.display()
     );
-    let rows = [Choice::new(action), Choice::new("Back")];
-    if ui.select(&body, &rows, 0).await? != Some(0) {
-        return Ok(());
+    let rows = [
+        Choice::new(action),
+        Choice::new(hermes_action),
+        Choice::new("Back"),
+    ];
+    match ui.select(&body, &rows, 0).await? {
+        Some(0) => {}
+        Some(1) => return hermes_hook(ui, state, &hermes_path).await,
+        _ => return Ok(()),
     }
     let command = claude::hook_command(state)?;
     let consent = if installed {
@@ -226,6 +254,62 @@ async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
     ui.commit(&format!(
         "Claude Code hooks {}.{kept}",
         if installed { "removed" } else { "installed" }
+    ))
+}
+
+/// Hermes's consent stays Hermes's: Dispatch never writes its allowlist.
+const HERMES_CONSENT: &str = "Hermes asks you to allow the hook the first time it runs it; \
+     a run without a terminal needs hermes --accept-hooks.";
+
+/// Install or remove the `on_session_finalize` hook in Hermes's
+/// `config.yaml`, which is kept byte for byte: Dispatch appends one block, or
+/// removes exactly that block, and never rewrites the rest.
+async fn hermes_hook(ui: &mut Ui, state: &State, path: &std::path::Path) -> Result<()> {
+    use crate::runtime::hermes;
+    let installed = hermes::installed(path)?;
+    let command = hermes::hook_command(state)?;
+    let consent = if installed {
+        format!(
+            "Remove Dispatch's hook from {}?\nOnly the block Dispatch added is removed, and only as Dispatch added it; a backup is kept beside the file.",
+            path.display()
+        )
+    } else {
+        match hermes::addition(path, &command)? {
+            hermes::Addition::Append(block) => format!(
+                "Add this to the end of {}?\n{}\nEvery other byte of the file is kept; a backup is kept beside the file. {HERMES_CONSENT}",
+                path.display(),
+                block.trim_start_matches('\n')
+            ),
+            hermes::Addition::ByHand(lines) => {
+                return ui.commit(&format!(
+                    "{} has a hooks: key of its own, so Dispatch leaves the file alone. Add these lines under it by hand:\n{}{HERMES_CONSENT}",
+                    path.display(),
+                    lines
+                ));
+            }
+        }
+    };
+    let confirm = if installed { "Remove" } else { "Install" };
+    let rows = [Choice::new(confirm), Choice::new("Cancel")];
+    if ui.select(&consent, &rows, 1).await? != Some(0) {
+        return Ok(());
+    }
+    let backup = if installed {
+        hermes::uninstall(path)?
+    } else {
+        hermes::install(path, &command)?
+    };
+    let kept = backup.map_or_else(String::new, |backup| {
+        format!(" Previous config: {}.", backup.display())
+    });
+    ui.commit(&format!(
+        "Hermes hook {}.{kept}{}",
+        if installed { "removed" } else { "installed" },
+        if installed {
+            String::new()
+        } else {
+            format!(" {HERMES_CONSENT}")
+        }
     ))
 }
 

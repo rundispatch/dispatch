@@ -33,6 +33,8 @@ pub(crate) struct WatcherRecord {
     pub started_at: DateTime<Utc>,
     pub dispatch_version: String,
     pub background: bool,
+    #[serde(default)]
+    pub discovery_ready: bool,
 }
 
 pub(crate) enum Watcher {
@@ -102,8 +104,21 @@ pub(crate) fn write_record(state: &State, root: &Path, background: bool) -> Resu
         started_at: Utc::now(),
         dispatch_version: VERSION.to_owned(),
         background,
+        discovery_ready: false,
     };
     write_atomically(&path, &serde_json::to_vec_pretty(&record)?)
+}
+
+/// `start` must not return until the first successful discovery scan has
+/// inventoried worktrees that were already present.
+pub(crate) fn mark_discovery_ready(state: &State, root: &Path) -> Result<()> {
+    let path = record_path(state, root);
+    let mut record = read_record(state, root).context("watcher record disappeared")?;
+    if !record.discovery_ready {
+        record.discovery_ready = true;
+        write_atomically(&path, &serde_json::to_vec_pretty(&record)?)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn remove_record(state: &State, root: &Path) {
@@ -223,6 +238,27 @@ fn is_exact(record: &WatcherRecord) -> bool {
     identity_state(&record.identity) == IdentityState::ExactLive
 }
 
+#[cfg(unix)]
+fn wait_for_existing_discovery(state: &State, root: &Path) -> Result<bool> {
+    let deadline = std::time::Instant::now() + OWNER_WAIT;
+    loop {
+        match watcher(state, root)? {
+            Watcher::Watched(Some(record)) if is_exact(&record) && record.discovery_ready => {
+                return Ok(true);
+            }
+            Watcher::Watched(_) => {}
+            Watcher::NotWatched => return Ok(false),
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the owner for {} did not complete discovery in {} s",
+            root.display(),
+            OWNER_WAIT.as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// How long `start` waits for a live owner to become ready, and `stop` for
 /// it to exit. Either is a step of fixed work: opening the state and
 /// inspecting the project, or the tick under way when the signal came. A
@@ -253,7 +289,9 @@ pub async fn start(
     let root = source::resolve_source(root.as_deref())?;
     // A broken configuration fails here, before anything is spawned.
     let (config, _) = Config::discover(&root, None)?;
-    if let Watcher::Watched(_) = watcher(state, &root)? {
+    if let Watcher::Watched(_) = watcher(state, &root)?
+        && wait_for_existing_discovery(state, &root)?
+    {
         println!(
             "Already watching {}: {}",
             root.display(),
@@ -314,6 +352,7 @@ pub async fn start(
         if let Some(record) = read_record(state, &root)
             && record.identity.pid == child.id()
             && is_exact(&record)
+            && record.discovery_ready
         {
             println!("✓ Watching {}", root.display());
             println!(
@@ -326,7 +365,9 @@ pub async fn start(
         }
         if child.try_wait()?.is_some() {
             // Another `start` may have won the race for this root.
-            if let Watcher::Watched(Some(_)) = watcher(state, &root)? {
+            if let Watcher::Watched(_) = watcher(state, &root)?
+                && wait_for_existing_discovery(state, &root)?
+            {
                 println!(
                     "Already watching {}: {}",
                     root.display(),
