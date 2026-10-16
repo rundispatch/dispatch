@@ -205,13 +205,19 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// Every file under `dir`, `.git` included, with its bytes.
+/// Every file under `dir` with its bytes, Git's own directory left out: Git
+/// changes it by itself (its background maintenance takes and drops
+/// `objects/maintenance.lock` after a commit), so `source_state` reads the
+/// repository through Git instead.
 fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut files = BTreeMap::new();
     let mut pending = vec![dir.to_owned()];
     while let Some(current) = pending.pop() {
         for entry in fs::read_dir(&current).unwrap() {
             let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
             if path.is_dir() {
                 pending.push(path);
             } else {
@@ -220,6 +226,15 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     files
+}
+
+/// The source as a person sees it: its files, its commit and what is staged.
+fn source_state(root: &Path) -> (BTreeMap<PathBuf, Vec<u8>>, String, String) {
+    (
+        tree(root),
+        git(root, &["rev-parse", "HEAD"]),
+        git(root, &["ls-files", "--stage"]),
+    )
 }
 
 /// The per-command line for `command`, which must say `PASS` or `FAIL`
@@ -248,7 +263,7 @@ fn check_merged_on_finished_work_after_the_source_moved_changes_nothing() {
     f.finish(&id);
     f.move_source();
     let head = git(&f.root, &["rev-parse", "HEAD"]);
-    let source_before = tree(&f.root);
+    let source_before = source_state(&f.root);
     let run_before = tree(&f.run_dir(&id));
     let committed_before = f.committed(&id);
 
@@ -279,7 +294,7 @@ fn check_merged_on_finished_work_after_the_source_moved_changes_nothing() {
 
     // Nothing applied, nothing about the run changed but its evidence: the
     // logs and the event.
-    assert_eq!(tree(&f.root), source_before);
+    assert_eq!(source_state(&f.root), source_before);
     assert_eq!(f.committed(&id), committed_before);
     let mut run_after = tree(&f.run_dir(&id));
     run_after.retain(|path, _| {
@@ -415,7 +430,7 @@ fn accept_expect_lands_only_the_reviewed_delta_and_reports_each_check() {
     f.finish(&id);
     f.move_source();
     let digest = f.digest(&id);
-    let source_before = tree(&f.root);
+    let source_before = source_state(&f.root);
 
     let refused = f.dispatch(&["accept", &id, "--expect", "0123456789abcdef"]);
 
@@ -424,7 +439,7 @@ fn accept_expect_lands_only_the_reviewed_delta_and_reports_each_check() {
     assert!(error.contains(&digest[..16]), "{error}");
     assert!(error.contains("0123456789abcdef"), "{error}");
     assert!(error.contains("nothing was applied"), "{error}");
-    assert_eq!(tree(&f.root), source_before);
+    assert_eq!(source_state(&f.root), source_before);
     assert_eq!(f.metadata(&id)["outcome"]["review"], "pending");
     assert!(f.events(&id, "review.accepted").is_empty());
     assert!(f.events(&id, "coherence.merged_checks").is_empty());
