@@ -235,6 +235,7 @@ landing on draft PR #24. No coherence override was needed.
 | P4 session end after removal; runner | Claude Code | `01M50Y9JNMK63YVTCPY7S6MFVF` | CONTINUE, 755 passed | `354c9c1`, `--expect 6676fe0ebaa5` |
 | R docs, version | Claude Code | `01M50Y1ZQSW8X0Q66CRNW4823Z` | CONTINUE, 754 passed | `2ed389f`, `--expect 7b63741115e0`, merged checks rerun on top of P4 |
 | P5 freshest Δ on removal | Claude Code | `01M51BZXA1Z3FP8TET210695F3` | CONTINUE, 756 passed | `d732e1b`, `--expect 5d204d2863c0`, merged checks rerun |
+| P6 registration tests that do not race the machine | Claude Code | `01M52FTJD0VGT76R7G7A1XG7BW` | finish verification on the unmoved source, 756 passed | `266ee67`, `--expect cfd90f329685` |
 
 - **Overlap.** P1 and P3 both changed `discovery.rs`. P3's check before
   accept read CONTINUE at the symbol level with 11 files changed underneath,
@@ -255,6 +256,11 @@ landing on draft PR #24. No coherence override was needed.
   kept. P5 keeps the newer of the two. On a filesystem with one-second
   timestamps a tie goes to `delta-live.patch`. Not built: a guard for a capture
   that overlaps the removal itself (P5's handoff has the idea).
+- **Found by CI on PR #23** (packet P6): a 0.4.14 `runtime_registration` test
+  needed registration to reach `registration.json` within the product's real
+  40 s budget, and a slow macOS runner took longer. A debug-only
+  `<boundary>:deadline` fault makes the hook's deadline arrive at the boundary;
+  with a 45 s slowdown inserted, the old tests fail as CI did and the new pass.
 - **One unexplained CI failure.** On `354c9c1`, `tests under load` failed once in
   `hermes_worktrees::the_finalize_hook_keeps_the_exact_changes_before_hermes_removes_the_worktree`:
   the hook exited 0, but nothing was recorded.
