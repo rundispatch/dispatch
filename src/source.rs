@@ -1017,7 +1017,8 @@ fn apply_checked(
     })
 }
 
-/// Apply a candidate patch inside a disposable workspace (never the source).
+/// Test helper for applying a patch inside a disposable workspace.
+#[cfg(test)]
 pub(crate) fn apply_patch_in_workspace(workspace: &Path, patch: &Path) -> Result<()> {
     let mut apply = git_command(workspace);
     apply
@@ -1027,16 +1028,12 @@ pub(crate) fn apply_patch_in_workspace(workspace: &Path, patch: &Path) -> Result
     Ok(())
 }
 
-/// Copy the files that make up the current source into `dest` for a throwaway
-/// checking tree. Unlike `create_snapshot`, ignored build output (`target/`,
-/// `node_modules/`, ...) is not copied: a Git source contributes exactly what
-/// `git ls-files -co --exclude-standard` lists, a directory source its whole
-/// tree. Build caches are therefore absent, so a check such as `cargo test`
-/// builds from scratch in the scratch tree; a check may point `CARGO_TARGET_DIR`
-/// (or the equivalent) elsewhere to reuse a cache. Nested repositories that Git
-/// lists as one directory entry are copied whole. The result is a plain
-/// directory, not a Git repository. A tracked file deleted from the worktree is
-/// simply absent; a file that vanishes while it is copied is an error.
+/// Copy the files that make up the current source into `dest` for staging.
+/// A Git source contributes exactly what `git ls-files -co --exclude-standard`
+/// lists, a directory source its whole tree. Nested repositories that Git
+/// lists as one directory entry are copied without their Git metadata.
+/// A tracked file deleted from the worktree is simply absent; a file that
+/// vanishes while it is copied is an error.
 pub(crate) fn create_scratch_tree(source: &Path, kind: &SourceKind, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| format!("failed to create {}", dest.display()))?;
     if matches!(kind, SourceKind::Directory) {
@@ -1094,6 +1091,153 @@ pub(crate) fn create_scratch_tree(source: &Path, kind: &SourceKind, dest: &Path)
         }
     }
     Ok(())
+}
+
+/// The persistent, private check repository for this source path. Its Git
+/// history is independent of the source, including when the source is a
+/// linked worktree.
+pub(crate) fn check_workspace_path(state_root: &Path, source: &Path) -> PathBuf {
+    let key = hex::encode(Sha256::digest(source.to_string_lossy().as_bytes()));
+    state_root.join("check-workspaces").join(key)
+}
+
+fn check_git_command(workspace: &Path, work_tree: &Path) -> Command {
+    let mut command = plain_git_command();
+    command
+        .arg("--git-dir")
+        .arg(workspace.join(".git"))
+        .arg("--work-tree")
+        .arg(work_tree)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ]);
+    command
+}
+
+/// Stage the source's current, non-ignored world in a separate kept index,
+/// apply the patch there, and update the private checkout from its last tree.
+/// The default index remains the checkout's previous tree until read-tree, so
+/// unchanged files retain their times and ignored build output stays in place.
+pub(crate) fn prepare_check_workspace(
+    source: &Path,
+    kind: &SourceKind,
+    workspace: &Path,
+    patch: &Path,
+) -> Result<String> {
+    let parent = workspace
+        .parent()
+        .context("check workspace has no parent")?;
+    fs::create_dir_all(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(workspace) {
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "check workspace is not a directory: {}",
+            workspace.display()
+        );
+    }
+    if !workspace.join(".git").exists() {
+        let mut init = plain_git_command();
+        init.args(["init", "--quiet", "--"]).arg(workspace);
+        checked_output(init, "failed to initialize the check workspace")?;
+    }
+    ensure!(
+        fs::symlink_metadata(workspace.join(".git"))?.is_dir(),
+        "check workspace is not an internal Git repository: {}",
+        workspace.display()
+    );
+    for relative in [".git/info", ".git/objects"] {
+        ensure!(
+            fs::symlink_metadata(workspace.join(relative))?.is_dir(),
+            "check workspace Git metadata is not a directory: {}",
+            workspace.join(relative).display()
+        );
+    }
+    if let Ok(metadata) = fs::symlink_metadata(workspace.join(".git/info/attributes")) {
+        ensure!(
+            metadata.is_file(),
+            "check workspace attributes path is not a file"
+        );
+    }
+    if let Ok(metadata) = fs::symlink_metadata(workspace.join(".git/check.index")) {
+        ensure!(
+            metadata.is_file(),
+            "check workspace index path is not a file"
+        );
+    }
+    // The checked tree must have the source's bytes, even if its
+    // .gitattributes requests line-ending or other conversions. Also repair
+    // an interrupted first setup before staging again.
+    fs::write(
+        workspace.join(".git/info/attributes"),
+        b"* -text -filter -ident -working-tree-encoding -eol\n",
+    )?;
+
+    // Staging happens outside the checkout: neither source files nor build
+    // output in the warm workspace are overwritten while constructing Δ.
+    let stage = Builder::new()
+        .prefix("stage-")
+        .tempdir_in(workspace.join(".git"))?;
+    create_scratch_tree(source, kind, stage.path())?;
+    let index = workspace.join(".git/check.index");
+    let mut empty = check_git_command(workspace, workspace);
+    empty
+        .env("GIT_INDEX_FILE", &index)
+        .args(["read-tree", "--empty"]);
+    checked_output(empty, "failed to reset the check staging index")?;
+    let mut add = check_git_command(workspace, stage.path());
+    add.env("GIT_INDEX_FILE", &index)
+        .args(["add", "-A", "-f", "--", "."]);
+    checked_output(add, "failed to stage the current source for checks")?;
+    let mut apply = check_git_command(workspace, workspace);
+    apply
+        .env("GIT_INDEX_FILE", &index)
+        .args(["apply", "--cached", "--binary", "--whitespace=nowarn", "--"])
+        .arg(patch);
+    checked_output(apply, "candidate patch does not apply to the merged tree")?;
+    let mut staged_tree = check_git_command(workspace, workspace);
+    staged_tree.env("GIT_INDEX_FILE", &index).arg("write-tree");
+    let staged_tree = checked_output(staged_tree, "failed to write the staged check tree")?;
+    let tree_id = std::str::from_utf8(&staged_tree.stdout)?.trim().to_owned();
+
+    // Checks may change file times without changing bytes. Refresh the
+    // checkout index's stat data so read-tree leaves those files in place.
+    // A check may also edit tracked files; read-tree below resets those.
+    let mut refresh = check_git_command(workspace, workspace);
+    refresh.args(["update-index", "--refresh"]);
+    let _ = run_git(refresh, None, "failed to refresh the check workspace index")?;
+    let mut checkout = check_git_command(workspace, workspace);
+    checkout.args(["read-tree", "--reset", "-u", &tree_id]);
+    checked_output(checkout, "failed to update the check workspace")?;
+    let mut clean = check_git_command(workspace, workspace);
+    clean.args(["clean", "-fd"]);
+    checked_output(clean, "failed to remove check workspace leftovers")?;
+    let mut checked_tree = check_git_command(workspace, workspace);
+    checked_tree.arg("write-tree");
+    let checked_tree = checked_output(checked_tree, "failed to verify the checked-out tree")?;
+    ensure!(
+        checked_tree.stdout == staged_tree.stdout,
+        "check workspace tree differs from the staged source and patch"
+    );
+    let mut modified = check_git_command(workspace, workspace);
+    modified.args(["diff-files", "--name-only"]);
+    ensure!(
+        checked_output(modified, "failed to inspect the check workspace")?
+            .stdout
+            .is_empty(),
+        "check workspace differs from the intended tree"
+    );
+    let mut leftovers = check_git_command(workspace, workspace);
+    leftovers.args(["ls-files", "--others", "--exclude-standard"]);
+    ensure!(
+        checked_output(leftovers, "failed to inspect check workspace leftovers")?
+            .stdout
+            .is_empty(),
+        "check workspace contains files outside the intended tree"
+    );
+    Ok(tree_id)
 }
 
 /// The first parent of `relative` under `root` that is a symlink, if any.

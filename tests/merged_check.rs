@@ -11,7 +11,9 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use serde_json::Value;
@@ -74,10 +76,14 @@ impl Fixture {
     }
 
     fn attach(&self) -> String {
+        self.attach_workspace(&self.workspace)
+    }
+
+    fn attach_workspace(&self, workspace: &Path) -> String {
         let output = self.dispatch(&[
             "attach",
             "--workspace",
-            self.workspace.to_str().unwrap(),
+            workspace.to_str().unwrap(),
             "--root",
             self.root.to_str().unwrap(),
             "--allow-unsafe-local",
@@ -111,6 +117,11 @@ impl Fixture {
 
     fn run_dir(&self, id: &str) -> PathBuf {
         self.state.join("runs").join(id)
+    }
+
+    fn check_workspace(&self) -> PathBuf {
+        let source_key = hex::encode(Sha256::digest(self.root.to_string_lossy().as_bytes()));
+        self.state.join("check-workspaces").join(source_key)
     }
 
     fn metadata(&self, id: &str) -> Value {
@@ -226,6 +237,39 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     files
+}
+
+fn relative_tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    tree(dir)
+        .into_iter()
+        .map(|(path, bytes)| (path.strip_prefix(dir).unwrap().to_owned(), bytes))
+        .collect()
+}
+
+fn wait_for(mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn spawn_check(f: &Fixture, id: &str, transcript: &Path) -> Child {
+    let output = fs::File::create(transcript).unwrap();
+    Command::new(assert_cmd::cargo_bin!("dispatch"))
+        .arg("--state-dir")
+        .arg(&f.state)
+        .args(["check", id, "--merged"])
+        .current_dir(&f.root)
+        .stdout(Stdio::from(output.try_clone().unwrap()))
+        .stderr(Stdio::from(output))
+        .spawn()
+        .unwrap()
 }
 
 /// The source as a person sees it: its files, its commit and what is staged.
@@ -532,5 +576,204 @@ fn finish_check_and_diff_stat_show_the_digest_and_json_keeps_its_fields() {
     assert_eq!(
         merged["merged_checks"]["results"].as_array().unwrap().len(),
         2
+    );
+}
+
+#[test]
+fn check_workspace_keeps_ignored_build_output_and_removes_leftovers() {
+    let f = Fixture::new(&[
+        "if test -f second-round.txt; then test -f target/cache && test ! -e leftover.txt; else mkdir -p target && printf cache > target/cache && printf leftover > leftover.txt; fi",
+    ]);
+    fs::write(f.root.join(".gitignore"), "target/\n").unwrap();
+    let id = f.attach();
+    f.edit_workspace();
+    f.move_source();
+
+    let first = f.dispatch(&["check", &id, "--merged"]);
+    assert!(
+        first.status.success(),
+        "{}{}",
+        stdout(&first),
+        stderr(&first)
+    );
+    let workspace = f.check_workspace();
+    assert_eq!(fs::read(workspace.join("target/cache")).unwrap(), b"cache");
+    assert_eq!(
+        fs::read(workspace.join("leftover.txt")).unwrap(),
+        b"leftover"
+    );
+    assert!(!f.root.join("target/cache").exists());
+    assert!(!f.root.join("leftover.txt").exists());
+    let unchanged = workspace.join("src/lib.rs");
+    let fixed_mtime = UNIX_EPOCH + Duration::from_secs(946_684_800);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&unchanged)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(fixed_mtime))
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&unchanged).unwrap().modified().unwrap(),
+        fixed_mtime
+    );
+
+    fs::write(f.root.join("second-round.txt"), "second run\n").unwrap();
+    let second = f.dispatch(&["check", &id, "--merged"]);
+    assert!(
+        second.status.success(),
+        "{}{}",
+        stdout(&second),
+        stderr(&second)
+    );
+    assert_eq!(fs::read(workspace.join("target/cache")).unwrap(), b"cache");
+    assert!(!workspace.join("leftover.txt").exists());
+    assert_eq!(
+        fs::metadata(&unchanged).unwrap().modified().unwrap(),
+        fixed_mtime
+    );
+    assert_eq!(f.events(&id, "coherence.merged_checks").len(), 2);
+}
+
+#[test]
+fn check_workspace_checkout_matches_source_plus_deletion_and_rename() {
+    let f = Fixture::new(&["test ! -e drop.txt && test ! -e old.txt && test -f renamed.txt"]);
+    fs::write(f.root.join("drop.txt"), "remove me\n").unwrap();
+    fs::write(f.root.join("old.txt"), "keep under a new name\n").unwrap();
+    git(&f.root, &["add", "-A"]);
+    git(&f.root, &["commit", "--quiet", "-m", "initial files"]);
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+    git(&f.workspace, &["reset", "--hard", &head]);
+
+    let id = f.attach();
+    fs::remove_file(f.workspace.join("drop.txt")).unwrap();
+    fs::rename(f.workspace.join("old.txt"), f.workspace.join("renamed.txt")).unwrap();
+    f.move_source();
+
+    let checked = f.dispatch(&["check", &id, "--merged"]);
+    assert!(
+        checked.status.success(),
+        "{}{}",
+        stdout(&checked),
+        stderr(&checked)
+    );
+    let workspace = f.check_workspace();
+    let events = f.events(&id, "coherence.merged_checks");
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    let patch = PathBuf::from(event["patch"].as_str().unwrap());
+    let patch_text = fs::read_to_string(&patch).unwrap();
+    assert!(patch_text.contains("diff --git a/drop.txt b/drop.txt"));
+    assert!(patch_text.contains("diff --git a/old.txt b/old.txt"));
+    assert!(patch_text.contains("diff --git a/renamed.txt b/renamed.txt"));
+
+    let expected = f._temp.path().join("expected");
+    fs::create_dir_all(expected.join("src")).unwrap();
+    for relative in [
+        "dispatch.yml",
+        "src/lib.rs",
+        "drop.txt",
+        "old.txt",
+        "notes.txt",
+    ] {
+        fs::copy(f.root.join(relative), expected.join(relative)).unwrap();
+    }
+    git(&expected, &["init", "--quiet"]);
+    git(
+        &expected,
+        &["apply", "--binary", "--", patch.to_str().unwrap()],
+    );
+    git(&expected, &["add", "-A"]);
+    let intended_tree_id = git(&expected, &["write-tree"]);
+    assert_eq!(git(&workspace, &["write-tree"]), intended_tree_id);
+    assert_eq!(event["tree_id"], intended_tree_id);
+    assert_eq!(event["warm"], true);
+    let load = event["load_average"].as_array().unwrap();
+    assert_eq!(load.len(), 3);
+    assert!(load.iter().all(Value::is_number));
+    assert_eq!(relative_tree(&workspace), relative_tree(&expected));
+    assert_eq!(git(&workspace, &["diff", "--name-only"]), "");
+    assert_eq!(
+        git(&workspace, &["ls-files", "--others", "--exclude-standard"]),
+        ""
+    );
+    assert!(fs::read_dir(f.run_dir(&id)).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("coherence-scratch-")
+    }));
+}
+
+#[test]
+fn merged_checks_for_two_works_on_one_project_wait_their_turn() {
+    let sync = tempfile::tempdir().unwrap();
+    let owner = sync.path().join("owner");
+    let first_started = sync.path().join("first-started");
+    let release = sync.path().join("release");
+    let overlap = sync.path().join("overlap");
+    let command = format!(
+        "if mkdir '{}' 2>/dev/null; then touch '{}'; while test ! -e '{}'; do sleep 0.05; done; rmdir '{}'; else touch '{}'; fi",
+        owner.display(),
+        first_started.display(),
+        release.display(),
+        owner.display(),
+        overlap.display()
+    );
+    let f = Fixture::new(&[&command]);
+    let second_workspace = f._temp.path().join("wt2");
+    git(
+        &f.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "agent2",
+            second_workspace.to_str().unwrap(),
+        ],
+    );
+    let first_id = f.attach();
+    let second_id = f.attach_workspace(&second_workspace);
+    f.edit_workspace();
+    fs::write(second_workspace.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+    f.move_source();
+
+    let first_log = f._temp.path().join("first-check.log");
+    let second_log = f._temp.path().join("second-check.log");
+    let mut first = spawn_check(&f, &first_id, &first_log);
+    let started = wait_for(|| first_started.exists() || first.try_wait().unwrap().is_some());
+    if !started || !first_started.exists() {
+        let _ = first.kill();
+        let _ = first.wait();
+        panic!(
+            "first check did not start: {}",
+            fs::read_to_string(&first_log).unwrap()
+        );
+    }
+
+    let mut second = spawn_check(&f, &second_id, &second_log);
+    let observed = wait_for(|| {
+        let waiting = fs::read(&second_log)
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .to_lowercase()
+                    .contains("waiting")
+            })
+            .unwrap_or(false);
+        waiting || overlap.exists() || second.try_wait().unwrap().is_some()
+    });
+    fs::write(&release, "go\n").unwrap();
+    let first_status = first.wait().unwrap();
+    let second_status = second.wait().unwrap();
+    let first_output = fs::read_to_string(&first_log).unwrap();
+    let second_output = fs::read_to_string(&second_log).unwrap();
+    assert!(observed, "second check made no progress: {second_output}");
+    assert!(first_status.success(), "{first_output}");
+    assert!(second_status.success(), "{second_output}");
+    assert!(!overlap.exists(), "checks overlapped: {second_output}");
+    assert!(
+        second_output.to_lowercase().contains("waiting"),
+        "{second_output}"
     );
 }

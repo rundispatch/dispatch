@@ -1535,12 +1535,12 @@ fn a_workspace_pass_then_a_merged_failure_refuses_accept() {
 fn the_source_moving_while_merged_checks_run_blocks_the_apply() {
     let f = Fixture::new(true);
     let moved = f.root.join("moved.txt");
-    // Only the run on the merged tree, in a coherence scratch tree, writes
+    // Only the run on the merged tree, in the private check workspace, writes
     // into the source.
     fs::write(
         f.root.join("dispatch.yml"),
         format!(
-            "checks:\n  verify:\n    - if pwd | grep -q coherence-scratch-; then echo moved >> {}; fi\n",
+            "checks:\n  verify:\n    - if pwd | grep -q '/check-workspaces/'; then echo moved >> {}; fi\n",
             moved.display()
         ),
     )

@@ -1,16 +1,16 @@
 //! L2 integration oracle: when the source moved but the static layers see no
 //! conflict, run the project's own `checks.verify` commands against the merged
-//! result (current source plus the candidate's patch) in a scratch tree before
+//! result (current source plus the candidate's patch) in a private check tree before
 //! anything is applied. Static facts cannot see transitive or behavioral
 //! breakage; the user's checks can, and they cost no tokens.
 //!
-//! The source is only read. The scratch tree omits ignored build output (see
-//! `create_scratch_tree`) and is removed on every exit path; the
-//! check logs are kept under the run directory as evidence.
+//! The source is only read. The check tree keeps ignored build output between
+//! runs; check logs are kept under the run directory as evidence.
 
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -23,10 +23,13 @@ use crate::{
     RunRecord, SourceKind, Validity,
     config::{AcceptMode, Config},
     executor::run_checks_with_config,
+    lock::OperationLock,
+    orchestrator::source_lock_path,
     source::{
-        apply_patch_in_workspace, checked_output, create_scratch_tree, fingerprint_tree,
-        git_command, inspect_source,
+        check_workspace_path, checked_output, fingerprint_tree, git_command, inspect_source,
+        prepare_check_workspace,
     },
+    state::State,
 };
 
 /// Why accept does not run `checks.verify` on the merged tree.
@@ -160,6 +163,8 @@ pub struct MergedRun {
     pub source: SourceState,
     pub logs: PathBuf,
     pub results: Vec<CheckResult>,
+    pub tree_id: String,
+    pub load_average: Option<[f64; 3]>,
 }
 
 impl MergedRun {
@@ -181,6 +186,9 @@ impl MergedRun {
             "duration_ms": self.results.iter().map(|result| result.duration_ms).sum::<u64>(),
             "results": self.results,
             "logs": self.logs,
+            "tree_id": self.tree_id,
+            "warm": true,
+            "load_average": self.load_average,
         })
     }
 }
@@ -243,15 +251,6 @@ const MAX_EXCERPT_CHARS: usize = 240;
 /// How much of each output log is searched for the excerpt.
 const EXCERPT_SCAN_BYTES: u64 = 256 * 1024;
 
-/// Removes the scratch tree when dropped, whatever path leaves the function.
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Verify `candidate_label` against the merged tree. Returns `validity`
 /// unchanged, with the reason, when `checks_skipped` says the checks do not
 /// run. A failing check downgrades the verdict to Refresh; so does an
@@ -312,8 +311,8 @@ pub fn new_logs(run_dir: &Path) -> PathBuf {
         .join(Ulid::new().to_string())
 }
 
-/// Build the merged tree (the current source with `patch`) in a scratch area
-/// and run `config`'s verify commands there, keeping their logs in `logs`.
+/// Build the merged tree (the current source with `patch`) in its private,
+/// persistent check workspace and run `config`'s verify commands there.
 /// The one merged-check runner: accept's gate and `dispatch check --merged`.
 pub async fn run_merged(
     run: &RunRecord,
@@ -322,20 +321,43 @@ pub async fn run_merged(
     run_dir: &Path,
     logs: &Path,
 ) -> Result<MergedRun> {
-    let id = logs
-        .file_name()
-        .context("merged-check logs need a directory name")?
-        .to_string_lossy();
-    let scratch = Scratch(run_dir.join(format!("coherence-scratch-{id}")));
+    let state_root = run_dir
+        .parent()
+        .and_then(Path::parent)
+        .context("merged checks need a run directory under the state directory")?;
+    let state = State {
+        root: state_root.to_owned(),
+    };
+    let lock_path = source_lock_path(&state, run);
+    if OperationLock::is_held(&lock_path)? {
+        eprintln!(
+            "Merged checks: waiting for the source lock on {}",
+            run.source_path.display()
+        );
+    }
+    let _source_lock = tokio::task::spawn_blocking(move || {
+        loop {
+            match OperationLock::acquire_wait(
+                &lock_path,
+                "another operation is using this source",
+                Duration::from_secs(30),
+            ) {
+                Ok(lock) => return Ok(lock),
+                Err(error) if error.to_string().contains("still busy after waiting") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .context("source lock waiter stopped")??;
     let source = SourceState::observe(&run.source_path, &run.source_kind)?;
-    // The current source minus ignored build output, as a plain directory;
-    // `git apply` does not need a repository.
-    create_scratch_tree(&run.source_path, &run.source_kind, &scratch.0)
-        .context("failed to copy the current source")?;
-    apply_patch_in_workspace(&scratch.0, patch)?;
+    let workspace = check_workspace_path(state_root, &run.source_path);
+    let tree_id = prepare_check_workspace(&run.source_path, &run.source_kind, &workspace, patch)
+        .context("failed to build the merged check workspace")?;
     fs::create_dir_all(logs).with_context(|| format!("failed to create {}", logs.display()))?;
+    let load_average = load_average();
     let results = run_checks_with_config(
-        &scratch.0,
+        &workspace,
         &config.checks.verify,
         CheckPhase::Verify,
         logs,
@@ -349,7 +371,33 @@ pub async fn run_merged(
         source,
         logs: logs.to_owned(),
         results,
+        tree_id,
+        load_average,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn load_average() -> Option<[f64; 3]> {
+    let text = fs::read_to_string("/proc/loadavg").ok()?;
+    let values = text
+        .split_whitespace()
+        .filter_map(|word| word.parse::<f64>().ok())
+        .take(3)
+        .collect::<Vec<_>>();
+    values.try_into().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn load_average() -> Option<[f64; 3]> {
+    let mut values = [0.0_f64; 3];
+    // SAFETY: `values` holds three writable doubles for getloadavg.
+    (unsafe { libc::getloadavg(values.as_mut_ptr(), values.len() as i32) } == values.len() as i32)
+        .then_some(values)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn load_average() -> Option<[f64; 3]> {
+    None
 }
 
 /// One bounded reason per check that did not pass.

@@ -183,9 +183,9 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Remove the workspaces Dispatch made for Work that is over (rejected,
-    /// closed, or applied and not yet released), after you confirm. Worktrees
-    /// you or an agent's runtime made are listed, never removed.
+    /// Remove internal check workspaces and workspaces Dispatch made for Work
+    /// that is over, after you confirm. Worktrees you or an agent's runtime
+    /// made are listed, never removed.
     Clean {
         /// Only list what would be removed.
         #[arg(long)]

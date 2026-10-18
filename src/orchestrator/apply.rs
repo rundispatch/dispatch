@@ -161,10 +161,10 @@ pub(super) fn persist_verdict(
     Ok(kind)
 }
 
-/// The per-source apply lock path, keyed by the run's source path. Shared by
-/// every caller that serializes against concurrent application of that
-/// source (`apply_locked`, `auto_apply`) so the key expression exists once.
-fn source_lock_path(state: &State, run: &RunRecord) -> PathBuf {
+/// The per-source lock path, keyed by the run's source path. Shared by checks
+/// and application so they never use the private check workspace concurrently
+/// or apply a source change while its checks run.
+pub(crate) fn source_lock_path(state: &State, run: &RunRecord) -> PathBuf {
     let source_key = hex::encode(Sha256::digest(run.source_path.to_string_lossy().as_bytes()));
     state
         .root
@@ -396,10 +396,6 @@ pub(super) fn apply_locked(
         run.id
     );
     let normalized_label = sole_candidate(&run)?.label.clone();
-    let _source_lock = OperationLock::acquire(
-        &source_lock_path(state, &run),
-        "another apply operation is already modifying this source",
-    )?;
     let applied = crate::coherence::gate(
         &run,
         &normalized_label,
@@ -437,6 +433,15 @@ pub(super) fn apply_locked(
             println!("Merged checks: {checks}");
             print_check_lines(&checks);
         }
+        let source_lock_path = source_lock_path(state, &run);
+        if OperationLock::is_held(&source_lock_path)? {
+            eprintln!("Apply: waiting for the source lock on {}", run.source_path.display());
+        }
+        let _source_lock = OperationLock::acquire_wait(
+            &source_lock_path,
+            "another operation is using this source",
+            Duration::from_secs(run.environment.timeout_secs),
+        )?;
         let landing = observe_landing(state, &run, authority, validity.as_ref());
         let report = match &validity {
             None => source::safe_apply(&run, &normalized_label)?,
@@ -769,15 +774,6 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
     if empty_delta {
         return persist_skip(state, run, "empty_delta");
     }
-    let source_lock = OperationLock::acquire_wait(
-        &source_lock_path(state, &run),
-        "another apply operation is already modifying this source",
-        Duration::from_secs(run.environment.timeout_secs),
-    );
-    let Ok(_source_lock) = source_lock else {
-        return persist_skip(state, run, "source_busy");
-    };
-
     let mut retried = false;
     loop {
         let authorization = match decide(&run, &candidate_label, &run_dir)? {
@@ -787,6 +783,14 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
         let validity = match &authorization {
             Authorization::Fingerprint => None,
             Authorization::Digest(validity) => Some(validity.clone()),
+        };
+        let source_lock = OperationLock::acquire_wait(
+            &source_lock_path(state, &run),
+            "another apply operation is already modifying this source",
+            Duration::from_secs(run.environment.timeout_secs),
+        );
+        let Ok(_source_lock) = source_lock else {
+            return persist_skip(state, run, "source_busy");
         };
         let landing = observe_landing(state, &run, ApplyAuthority::AutoApply, validity.as_ref());
         let applied = match &authorization {

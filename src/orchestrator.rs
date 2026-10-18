@@ -6,6 +6,7 @@ pub(crate) mod liveness;
 pub(crate) mod native;
 pub mod registration;
 pub mod serve;
+pub(crate) use apply::source_lock_path;
 pub use apply::{ApplyAuthority, ApplyOutcome, auto_apply};
 pub use native::{QuestionCommand, answer_question, cancel_question};
 use std::{
@@ -2195,7 +2196,7 @@ pub struct MergedCheck {
 /// `dispatch check`: evaluate the run's sole candidate against the source as it
 /// is now. Reads only; the verdict is printed, never stored. With `merged`,
 /// also run `checks.verify` on the current source with the Work's Δ as of
-/// now, in a scratch copy: nothing is applied and no verdict or review
+/// now, in its private check workspace: nothing is applied and no verdict or review
 /// changes; one event records the run.
 pub async fn check(
     state: &State,
