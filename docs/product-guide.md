@@ -88,8 +88,9 @@ same menu.
 themselves: Work that a runtime reports, or that Dispatch finds, then has them run
 when its worktree is removed, and accept runs them on the merged tree.
 - Checks run project code, including code an agent wrote, on your machine with
-  your permissions, not in a sandbox. They run in the Work's workspace and, at
-  accept, in the merged scratch tree.
+  your permissions, not in a sandbox. They run in the Work's workspace and, on the
+  source as it is then with the Work's change, in the project's check workspace at
+  accept and at a finish that finds the source moved.
 - The screen shows the exact commands, and focus starts on Cancel.
 - The permission lives in Dispatch's state, never in the repository, and names
   those exact commands. If `checks.verify` changes, it no longer holds until you
@@ -143,16 +144,21 @@ Coherence section when the source moved or the run is a refresh.
   It ends with `Δ <12 hex>`, the start of the SHA-256 of the patch, which
   `finish` and `diff --stat` print too.
 - `dispatch check <id> --merged` also runs your checks on the source as it is
-  now with the Work's change applied, in a scratch copy, as accept would, and
-  prints one line per command: `PASS` or `FAIL`, exit code, duration and logs.
+  now with the Work's change applied, in the project's check workspace, as accept
+  would, and prints one line per command: `PASS` or `FAIL`, exit code, duration and
+  logs. A tree that already passed the same checks is not checked again: it prints
+  `passed, reused from <run> at <time>; logs: …`, and for finished Work whose source
+  has not moved it runs nothing, as accept does.
   For unfinished attached Work it takes the change from the workspace now, new
   files included, as `finish` would. It applies nothing, changes no verdict, and
   exits 1 if a check fails. It needs the authority `finish` has, or
-  `--allow-unsafe-local` for that check alone. Accept still runs its own
-  merged checks, because the source can move after.
+  `--allow-unsafe-local` for that check alone. Accept checks again only a tree
+  with no recorded pass, because the source can move after.
 - `dispatch accept [run]` prints `Merged checks:` before it applies: passed, with
-  the logs and one line per command, or not run and why (the source has not
-  moved, no checks are configured, and so on). `--expect <digest>` accepts only
+  the logs and one line per command; `passed, reused from <run> at <time>` when
+  that exact tree already passed, for example at finish or `check --merged`, and
+  nothing ran; or not run and why (the source has not moved, no checks are
+  configured, and so on). `--expect <digest>` accepts only
   the Δ you reviewed: if the frozen Δ's digest does not start with it, nothing
   happens and both digests are named. Without an ID it acts only when exactly
   one result waits for review for the source, and so does `dispatch reject`;
@@ -357,7 +363,11 @@ dispatch finish <run-id>          # once you know the agent is done
 
 `finish` is the only thing that decides a foreign attachment is done — there is no
 timeout or idle heuristic. Until you run it, or until the agent's own driving script
-does, the work stays observed but not judged. Its summary shows the patch, the
+does, the work stays observed but not judged. Its checks run on what would land:
+in the workspace when the source has not moved since the Work began, otherwise on
+the source as it is now with the Work's change, as accept checks it, so accept can
+reuse that pass; only if that fails do they also run in the workspace, to show
+whose change broke it. Its summary shows the patch, the
 verdict against the source now, what accept would verify, and the commands for
 this Work by its full ID. A stale result offers no accept: run the agent again on
 the current source, then `dispatch close <old-id> --reason superseded --replacement

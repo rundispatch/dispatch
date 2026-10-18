@@ -190,8 +190,11 @@ reports outside the clone, so they never enter a patch.
 - Dispatch's workspaces live under the state directory, outside the clone, so
   nothing that walks the clone walks them.
 - `/target/` is ignored by the tracked `.gitignore`, so it never enters S0 or Δ.
-- `finish` runs the checks in the same workspace and reuses the worker's own
-  build. Merged-tree checks at accept build from nothing in their scratch tree.
+- `finish` on an unmoved source runs the checks in the same workspace and reuses
+  the worker's own build. Merged-tree checks, at accept and at a `finish` on a moved
+  source, run in the project's check workspace under the state directory, which
+  keeps its own `target/` between runs: the first builds from nothing, later ones
+  incrementally. `dispatch clean` removes it.
 
 A workspace is removed once its Work is applied. Otherwise it stays until
 `dispatch clean`, which never removes one that unfinished Work, or Work waiting
@@ -298,14 +301,18 @@ Run these from the integration clone. `D` below stands for
 2. **Review it in its workspace:** for example, `git -C <workspace> status`
    and `git -C <workspace> diff`. Read the worker's report. Then `D check <id>
    --merged` runs `checks.verify` on HEAD plus the Work's change as it is now,
-   untracked files included, in a scratch copy, and prints one line per
-   command. Note the `Δ` it prints. From 0.4.14; before, run fmt, clippy and the
+   untracked files included, in the project's check workspace, and prints one
+   line per command. From 0.4.16 a tree that already passed is not checked again
+   (`passed, reused from <run>`), but only for the same `PATH`: a check run from
+   inside an agent's shell, which may change `PATH`, is not reused by yours. Note the `Δ` it prints. From 0.4.14; before, run fmt, clippy and the
    full suite yourself on HEAD plus the patch.
 3. **Get the human's approval.** Recommend accept, revise or reject. A person
    decides; an agent's opinion is not the approval.
 4. **Finish it:** wrapped Work (`attach --`) finishes by itself when the agent
    exits. Other Work: `D finish <id> --allow-unsafe-local` freezes Δ and runs
-   the checks in the Work's workspace. The summary shows the verdict against
+   the checks on what would land: in the Work's workspace when the clone has not
+   moved since the Work began, otherwise on the clone now plus Δ, which accept then
+   reuses. The summary shows the verdict against
    the clone now and what accept would verify, and its `Δ`. Before `finish`,
    `diff` shows no changes.
 5. **Accept it:** `D accept <id> --expect <Δ from step 2>` refuses, applying
@@ -343,9 +350,12 @@ rejection.
 > artifacts can never stand in for another's checks.
 
 Dispatch runs `checks.verify` in two kinds of place:
-- `finish` runs it in the Work's own workspace.
-- `accept` runs it on the merged tree, in a new scratch directory under
-  `<state>/runs/<id>/`, which is deleted afterwards.
+- `finish` runs it in the Work's own workspace when the source has not moved,
+  and when its merged-tree check fails, to show whose change broke it.
+- merged-tree checks (`accept`, `check --merged`, and `finish` on a moved
+  source) run it in the project's check workspace,
+  `<state>/check-workspaces/<sha256 of the source path>`, which is kept between
+  runs, with its ignored build output, until `dispatch clean`.
 
 Each command runs under `/bin/sh -lc`, with the environment cleared except
 `PATH`, `HOME`, `TMPDIR` and `LANG`. A `CARGO_TARGET_DIR` exported in your
@@ -356,8 +366,8 @@ reach every check workspace at once. To check, run
 **For Rust**, use one of these:
 - **The default target directory per workspace.** Set no `CARGO_TARGET_DIR`,
   as in the `dispatch.yml` above. Each workspace builds into its own `target/`.
-  Merged-tree checks build from nothing each time, which is slower but
-  correct.
+  The check workspace keeps its own `target/`, so merged-tree checks build
+  incrementally after the first.
 - **A `CARGO_TARGET_DIR` namespaced per workspace.** Derive the directory from
   the workspace's path, and keep it outside the repository:
   ```yaml
@@ -368,10 +378,11 @@ reach every check workspace at once. To check, run
       - CARGO_TARGET_DIR="$HOME/dispatch-dev/check-targets/$(pwd -P | shasum -a 256 | cut -c1-16)" cargo test --lib
   ```
   This keeps check builds out of worktrees inside the integration root, which
-  a 0.4.9 supervisor needs (section 9). Every merged-tree check gets a new
-  directory, because its scratch path is new. Nothing removes these
-  directories, so delete `~/dispatch-dev/check-targets` yourself when no checks
-  are running.
+  a 0.4.9 supervisor needs (section 9). From 0.4.16 the check workspace's path
+  is stable, so merged-tree checks for one project share one such directory;
+  before, every merged-tree check got a new one, because its scratch path was
+  new. Nothing removes these directories, so delete
+  `~/dispatch-dev/check-targets` yourself when no checks are running.
 
 **Never one shared `CARGO_TARGET_DIR` across Dispatch's check workspaces.**
 Cargo does not rebuild for a new checkout path, and it bakes

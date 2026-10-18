@@ -5,8 +5,9 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -68,10 +69,25 @@ pub fn inspect_source(source: &Path) -> Result<(SourceKind, Option<String>)> {
 
     let mut inside = git_command(&source);
     inside.args(["rev-parse", "--is-inside-work-tree"]);
-    let output = inside
-        .output()
-        .with_context(|| "failed to run Git while inspecting the source")?;
-    if !output.status.success() || trim_ascii(&output.stdout) != b"true" {
+    let output = run_git(
+        inside,
+        None,
+        "failed to run Git while inspecting the source",
+    )?;
+    // Only Git's own "not a git repository" makes a plain directory: any
+    // other failure (a broken configuration, an unsafe owner) is not one.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.starts_with("fatal: not a git repository") {
+            return Ok((SourceKind::Directory, None));
+        }
+        bail!(
+            "failed to inspect the source {}: {}",
+            source.display(),
+            stderr.trim()
+        );
+    }
+    if trim_ascii(&output.stdout) != b"true" {
         return Ok((SourceKind::Directory, None));
     }
 
@@ -249,6 +265,14 @@ pub fn merge_base(root: &Path, workspace: &Path) -> Result<Option<String>> {
 /// `HEAD`, so dirty and untracked source files are part of every candidate's
 /// common baseline. Git and Dispatch state directories are never copied.
 pub fn create_snapshot(source: &Path, run_dir: &Path) -> Result<SourceSnapshot> {
+    create_snapshot_with_mode(source, run_dir, false)
+}
+
+pub(crate) fn create_snapshot_with_mode(
+    source: &Path,
+    run_dir: &Path,
+    strict: bool,
+) -> Result<SourceSnapshot> {
     let source = resolve_source(Some(source))?;
     let projected_run_dir = canonicalize_allow_missing(run_dir)?;
     ensure!(
@@ -258,7 +282,12 @@ pub fn create_snapshot(source: &Path, run_dir: &Path) -> Result<SourceSnapshot> 
     );
 
     let (kind, git_head) = inspect_source(&source)?;
-    let fingerprint_before = fingerprint_tree(&source)?;
+    let fingerprint = if strict {
+        fingerprint_tree_strict
+    } else {
+        fingerprint_tree
+    };
+    let fingerprint_before = fingerprint(&source)?;
 
     fs::create_dir_all(run_dir)
         .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
@@ -277,8 +306,13 @@ pub fn create_snapshot(source: &Path, run_dir: &Path) -> Result<SourceSnapshot> 
 
     // A source changed while it was being copied is not a trustworthy baseline.
     // Check both ends so a mixed snapshot cannot be accepted silently.
-    let fingerprint_after = fingerprint_tree(&source)?;
-    let copied_fingerprint = fingerprint_tree(staging.path())?;
+    let fingerprint_after = fingerprint(&source)?;
+    let copied_fingerprint = if !strict && matches!(kind, SourceKind::Git | SourceKind::GitWorktree)
+    {
+        fingerprint_git_tree(staging.path(), &source)?
+    } else {
+        fingerprint(staging.path())?
+    };
     ensure!(
         fingerprint_before == fingerprint_after && fingerprint_before == copied_fingerprint,
         "source changed while Dispatch was creating its baseline; retry the run"
@@ -410,8 +444,21 @@ fn capture_world(checkout: &Path) -> Result<String> {
         .trim(),
     );
     if real_index.is_file() {
+        // The copy keeps the index's mtime, read before copying: Git trusts
+        // an entry's stat data only when the file is older than the index
+        // file, and re-reads "racily clean" entries written in the same
+        // second. A fresh mtime would hide a same-size edit made in the
+        // second the index was written.
+        let written = fs::metadata(&real_index)
+            .and_then(|metadata| metadata.modified())
+            .with_context(|| format!("failed to read {}", real_index.display()))?;
         fs::copy(&real_index, &index)
             .with_context(|| format!("failed to copy {}", real_index.display()))?;
+        fs::File::options()
+            .write(true)
+            .open(&index)
+            .and_then(|copy| copy.set_modified(written))
+            .context("failed to keep the Git index's time on its copy")?;
     }
     let head = git_head_at(checkout)?;
     if !real_index.is_file() && head.is_some() {
@@ -766,15 +813,83 @@ pub(crate) fn snapshot_delta_if_changed_indexed(
     }
 }
 
-/// Hash the complete logical source tree, excluding Git and Dispatch state.
+/// Hash the logical source tree, excluding Git and Dispatch state, and for Git
+/// sources ignoring untracked files excluded by the repository's ignore rules.
 /// Content, paths, symlink targets, file kinds, and permission bits are covered;
 /// timestamps are intentionally ignored. An entry that disappears during the
 /// walk (a build deleting its output) is a difference, never an error: it is
 /// hashed as `VANISHED`, so the value equals no tree that held the entry.
 pub fn fingerprint_tree(root: &Path) -> Result<String> {
     let root = resolve_source(Some(root))?;
+    if !matches!(inspect_source(&root)?.0, SourceKind::Directory) {
+        return fingerprint_git_tree(&root, &root);
+    }
     let entries = list_tree(&root)?;
     hash_tree(&root, entries)
+}
+
+/// Strict mode fences the complete tree, including ignored build output.
+pub(crate) fn fingerprint_tree_strict(root: &Path) -> Result<String> {
+    let root = resolve_source(Some(root))?;
+    hash_tree(&root, list_tree(&root)?)
+}
+
+/// An unreadable frozen configuration keeps the strict, fail-closed fence.
+pub(crate) fn fingerprint_for_run(run: &RunRecord) -> Result<String> {
+    let strict = run
+        .baseline_path
+        .parent()
+        .and_then(crate::coherence::run_config)
+        .is_none_or(|config| config.coherence.accept == crate::config::AcceptMode::Strict);
+    if strict {
+        fingerprint_tree_strict(&run.source_path)
+    } else {
+        fingerprint_tree(&run.source_path)
+    }
+}
+
+// Use the source's index and ignore rules even for the not-yet-initialized copy.
+fn fingerprint_git_tree(root: &Path, repository: &Path) -> Result<String> {
+    let mut list = git_command(repository);
+    list.args(["ls-files", "-co", "--exclude-standard", "-z", "--", "."])
+        .args(dispatch_exclusion_pathspecs());
+    let listing = checked_output(list, "failed to list fingerprint inputs")?;
+    let mut paths = HashSet::new();
+    let mut directories = HashSet::new();
+    for raw in listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|p| !p.is_empty())
+    {
+        let relative = bytes_to_path(raw.strip_suffix(b"/").unwrap_or(raw));
+        if !parents_are_directories(root, &relative, &mut directories) {
+            if let Some(link) = symlinked_parent(root, &relative)? {
+                paths.insert(link);
+            }
+            continue;
+        }
+        let path = root.join(&relative);
+        if unless_vanished(fs::symlink_metadata(&path), || {
+            format!("failed to inspect {}", path.display())
+        })?
+        .is_none()
+        {
+            continue;
+        }
+        paths.insert(path);
+        for parent in relative
+            .ancestors()
+            .skip(1)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            paths.insert(root.join(parent));
+        }
+    }
+    let mut entries: Vec<_> = paths.into_iter().map(|path| (path, true)).collect();
+    entries.sort_by(|(a, _), (b, _)| {
+        path_bytes(a.strip_prefix(root).unwrap()).cmp(&path_bytes(b.strip_prefix(root).unwrap()))
+    });
+    hash_tree(root, entries)
 }
 
 /// Hashed in place of an entry's kind (`l`, `d` or `f`) when it vanished.
@@ -922,7 +1037,7 @@ enum ExpectedWorld<'a> {
 impl ExpectedWorld<'_> {
     fn holds(self, run: &RunRecord, source: &Path) -> Result<bool> {
         Ok(match self {
-            Self::Fingerprint => fingerprint_tree(source)? == run.source_fingerprint,
+            Self::Fingerprint => fingerprint_for_run(run)? == run.source_fingerprint,
             Self::Digest(expected) => {
                 crate::coherence::world::observe(
                     source,
@@ -1017,7 +1132,8 @@ fn apply_checked(
     })
 }
 
-/// Apply a candidate patch inside a disposable workspace (never the source).
+/// Test helper for applying a patch inside a disposable workspace.
+#[cfg(test)]
 pub(crate) fn apply_patch_in_workspace(workspace: &Path, patch: &Path) -> Result<()> {
     let mut apply = git_command(workspace);
     apply
@@ -1027,16 +1143,12 @@ pub(crate) fn apply_patch_in_workspace(workspace: &Path, patch: &Path) -> Result
     Ok(())
 }
 
-/// Copy the files that make up the current source into `dest` for a throwaway
-/// checking tree. Unlike `create_snapshot`, ignored build output (`target/`,
-/// `node_modules/`, ...) is not copied: a Git source contributes exactly what
-/// `git ls-files -co --exclude-standard` lists, a directory source its whole
-/// tree. Build caches are therefore absent, so a check such as `cargo test`
-/// builds from scratch in the scratch tree; a check may point `CARGO_TARGET_DIR`
-/// (or the equivalent) elsewhere to reuse a cache. Nested repositories that Git
-/// lists as one directory entry are copied whole. The result is a plain
-/// directory, not a Git repository. A tracked file deleted from the worktree is
-/// simply absent; a file that vanishes while it is copied is an error.
+/// Copy the files that make up the current source into `dest` for staging.
+/// A Git source contributes exactly what `git ls-files -co --exclude-standard`
+/// lists, a directory source its whole tree. Nested repositories that Git
+/// lists as one directory entry are copied without their Git metadata.
+/// A tracked file deleted from the worktree is simply absent; a file that
+/// vanishes while it is copied is an error.
 pub(crate) fn create_scratch_tree(source: &Path, kind: &SourceKind, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| format!("failed to create {}", dest.display()))?;
     if matches!(kind, SourceKind::Directory) {
@@ -1094,6 +1206,153 @@ pub(crate) fn create_scratch_tree(source: &Path, kind: &SourceKind, dest: &Path)
         }
     }
     Ok(())
+}
+
+/// The persistent, private check repository for this source path. Its Git
+/// history is independent of the source, including when the source is a
+/// linked worktree.
+pub(crate) fn check_workspace_path(state_root: &Path, source: &Path) -> PathBuf {
+    let key = hex::encode(Sha256::digest(source.to_string_lossy().as_bytes()));
+    state_root.join("check-workspaces").join(key)
+}
+
+fn check_git_command(workspace: &Path, work_tree: &Path) -> Command {
+    let mut command = plain_git_command();
+    command
+        .arg("--git-dir")
+        .arg(workspace.join(".git"))
+        .arg("--work-tree")
+        .arg(work_tree)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ]);
+    command
+}
+
+/// Stage the source's current, non-ignored world in a separate kept index,
+/// apply the patch there, and update the private checkout from its last tree.
+/// The default index remains the checkout's previous tree until read-tree, so
+/// unchanged files retain their times and ignored build output stays in place.
+pub(crate) fn prepare_check_workspace(
+    source: &Path,
+    kind: &SourceKind,
+    workspace: &Path,
+    patch: &Path,
+) -> Result<String> {
+    let parent = workspace
+        .parent()
+        .context("check workspace has no parent")?;
+    fs::create_dir_all(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(workspace) {
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "check workspace is not a directory: {}",
+            workspace.display()
+        );
+    }
+    if !workspace.join(".git").exists() {
+        let mut init = plain_git_command();
+        init.args(["init", "--quiet", "--"]).arg(workspace);
+        checked_output(init, "failed to initialize the check workspace")?;
+    }
+    ensure!(
+        fs::symlink_metadata(workspace.join(".git"))?.is_dir(),
+        "check workspace is not an internal Git repository: {}",
+        workspace.display()
+    );
+    for relative in [".git/info", ".git/objects"] {
+        ensure!(
+            fs::symlink_metadata(workspace.join(relative))?.is_dir(),
+            "check workspace Git metadata is not a directory: {}",
+            workspace.join(relative).display()
+        );
+    }
+    if let Ok(metadata) = fs::symlink_metadata(workspace.join(".git/info/attributes")) {
+        ensure!(
+            metadata.is_file(),
+            "check workspace attributes path is not a file"
+        );
+    }
+    if let Ok(metadata) = fs::symlink_metadata(workspace.join(".git/check.index")) {
+        ensure!(
+            metadata.is_file(),
+            "check workspace index path is not a file"
+        );
+    }
+    // The checked tree must have the source's bytes, even if its
+    // .gitattributes requests line-ending or other conversions. Also repair
+    // an interrupted first setup before staging again.
+    fs::write(
+        workspace.join(".git/info/attributes"),
+        b"* -text -filter -ident -working-tree-encoding -eol\n",
+    )?;
+
+    // Staging happens outside the checkout: neither source files nor build
+    // output in the warm workspace are overwritten while constructing Δ.
+    let stage = Builder::new()
+        .prefix("stage-")
+        .tempdir_in(workspace.join(".git"))?;
+    create_scratch_tree(source, kind, stage.path())?;
+    let index = workspace.join(".git/check.index");
+    let mut empty = check_git_command(workspace, workspace);
+    empty
+        .env("GIT_INDEX_FILE", &index)
+        .args(["read-tree", "--empty"]);
+    checked_output(empty, "failed to reset the check staging index")?;
+    let mut add = check_git_command(workspace, stage.path());
+    add.env("GIT_INDEX_FILE", &index)
+        .args(["add", "-A", "-f", "--", "."]);
+    checked_output(add, "failed to stage the current source for checks")?;
+    let mut apply = check_git_command(workspace, workspace);
+    apply
+        .env("GIT_INDEX_FILE", &index)
+        .args(["apply", "--cached", "--binary", "--whitespace=nowarn", "--"])
+        .arg(patch);
+    checked_output(apply, "candidate patch does not apply to the merged tree")?;
+    let mut staged_tree = check_git_command(workspace, workspace);
+    staged_tree.env("GIT_INDEX_FILE", &index).arg("write-tree");
+    let staged_tree = checked_output(staged_tree, "failed to write the staged check tree")?;
+    let tree_id = std::str::from_utf8(&staged_tree.stdout)?.trim().to_owned();
+
+    // Checks may change file times without changing bytes. Refresh the
+    // checkout index's stat data so read-tree leaves those files in place.
+    // A check may also edit tracked files; read-tree below resets those.
+    let mut refresh = check_git_command(workspace, workspace);
+    refresh.args(["update-index", "--refresh"]);
+    let _ = run_git(refresh, None, "failed to refresh the check workspace index")?;
+    let mut checkout = check_git_command(workspace, workspace);
+    checkout.args(["read-tree", "--reset", "-u", &tree_id]);
+    checked_output(checkout, "failed to update the check workspace")?;
+    let mut clean = check_git_command(workspace, workspace);
+    clean.args(["clean", "-fd"]);
+    checked_output(clean, "failed to remove check workspace leftovers")?;
+    let mut checked_tree = check_git_command(workspace, workspace);
+    checked_tree.arg("write-tree");
+    let checked_tree = checked_output(checked_tree, "failed to verify the checked-out tree")?;
+    ensure!(
+        checked_tree.stdout == staged_tree.stdout,
+        "check workspace tree differs from the staged source and patch"
+    );
+    let mut modified = check_git_command(workspace, workspace);
+    modified.args(["diff-files", "--name-only"]);
+    ensure!(
+        checked_output(modified, "failed to inspect the check workspace")?
+            .stdout
+            .is_empty(),
+        "check workspace differs from the intended tree"
+    );
+    let mut leftovers = check_git_command(workspace, workspace);
+    leftovers.args(["ls-files", "--others", "--exclude-standard"]);
+    ensure!(
+        checked_output(leftovers, "failed to inspect check workspace leftovers")?
+            .stdout
+            .is_empty(),
+        "check workspace contains files outside the intended tree"
+    );
+    Ok(tree_id)
 }
 
 /// The first parent of `relative` under `root` that is a symlink, if any.
@@ -1773,7 +2032,18 @@ pub(crate) fn checked_output(command: Command, context: &str) -> Result<Output> 
 
 /// Run Git under the same timeout and output limits as `checked_output`, but
 /// leave the exit status to the caller and optionally feed standard input.
-pub(crate) fn run_git(mut command: Command, input: Option<&[u8]>, context: &str) -> Result<Output> {
+pub(crate) fn run_git(command: Command, input: Option<&[u8]>, context: &str) -> Result<Output> {
+    run_git_within(command, input, context, GIT_COMMAND_TIMEOUT)
+}
+
+/// `run_git` with its safety timeout given. A thread waits for the child, so
+/// the caller learns of its exit at once rather than at the next poll.
+fn run_git_within(
+    mut command: Command,
+    input: Option<&[u8]>,
+    context: &str,
+    timeout: Duration,
+) -> Result<Output> {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -1802,24 +2072,29 @@ pub(crate) fn run_git(mut command: Command, input: Option<&[u8]>, context: &str)
     let stderr = child.stderr.take().context("Git stderr was not captured")?;
     let stdout_reader = thread::spawn(move || read_limited(stdout));
     let stderr_reader = thread::spawn(move || read_limited(stderr));
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().with_context(|| context.to_owned())? {
-            break status;
-        }
-        if started.elapsed() >= GIT_COMMAND_TIMEOUT {
+    let (exited, exit) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _ = exited.send(child.wait());
+    });
+    let status = match exit.recv_timeout(timeout) {
+        Ok(status) => status.with_context(|| context.to_owned())?,
+        Err(_) => {
+            // The child leads its own group, so this kills it too and the
+            // waiter returns. Elsewhere it is left to exit by itself.
             kill_command_group(child_id);
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            #[cfg(unix)]
+            {
+                let _ = waiter.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+            }
             bail!(
                 "{context}: Git exceeded the {} second safety timeout",
-                GIT_COMMAND_TIMEOUT.as_secs()
+                timeout.as_secs()
             );
         }
-        thread::sleep(Duration::from_millis(20));
     };
+    let _ = waiter.join();
     kill_command_group(child_id);
     if let Some(writer) = stdin_writer {
         let _ = writer.join();
@@ -1951,7 +2226,7 @@ fn create_symlink(target: &Path, destination: &Path, source_link: &Path) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, time::Instant};
 
     use chrono::Utc;
     use tempfile::TempDir;
@@ -2124,6 +2399,48 @@ mod tests {
     }
 
     #[test]
+    fn a_git_failure_other_than_no_repository_is_an_error_not_a_plain_directory() {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        write(&repository.join("file.txt"), "git\n");
+        initialize_user_repository(&repository);
+        write(&repository.join(".git/config"), "this is [not a config\n");
+        let error = inspect_source(&repository).unwrap_err();
+        assert!(format!("{error:#}").contains("bad config"), "{error:#}");
+        assert!(repo_identity(&repository).is_err());
+
+        // Git's own "not a git repository" still means a plain directory.
+        let plain = temp.path().join("plain");
+        write(&plain.join(".git/private"), "not a repository");
+        assert_eq!(
+            inspect_source(&plain).unwrap(),
+            (SourceKind::Directory, None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_git_reports_exit_and_output_and_its_timeout_still_fires() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "cat; echo said >&2; exit 3"]);
+        let output = super::run_git(command, Some(b"fed"), "the stand-in").unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"fed");
+        assert_eq!(output.stderr, b"said\n");
+
+        // A child that leaves a grandchild holding its output is killed with
+        // its group, so the timeout returns rather than waiting on the pipe.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 60 & sleep 60"]);
+        let started = Instant::now();
+        let error =
+            run_git_within(command, None, "the stand-in", Duration::from_millis(300)).unwrap_err();
+        assert!(format!("{error:#}").contains("safety timeout"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
     fn snapshot_is_exact_private_and_excludes_state() {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -2150,7 +2467,13 @@ mod tests {
         assert_eq!(snapshot.fingerprint, original_fingerprint);
         assert_eq!(fingerprint_tree(&source).unwrap(), original_fingerprint);
         assert_eq!(
-            fingerprint_tree(&snapshot.baseline_path).unwrap(),
+            // This source was a plain directory, including empty directories;
+            // its private snapshot is now Git, whose fingerprint covers files.
+            hash_tree(
+                &snapshot.baseline_path,
+                list_tree(&snapshot.baseline_path).unwrap()
+            )
+            .unwrap(),
             original_fingerprint
         );
         assert!(!snapshot.baseline_path.join(".git/private").exists());
@@ -2454,6 +2777,34 @@ mod tests {
     }
 
     #[test]
+    fn git_fingerprints_ignore_build_output_but_cover_source_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".gitignore"), "target/\ntracked\n").unwrap();
+        fs::write(root.join("tracked"), "one").unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/cache"), "one").unwrap();
+        let mut init = git_command(root);
+        init.args(["init", "-q"]);
+        checked_output(init, "init").unwrap();
+        let mut add = git_command(root);
+        add.args(["add", "-f", "tracked", ".gitignore"]);
+        checked_output(add, "add").unwrap();
+        let before = fingerprint_tree(root).unwrap();
+        fs::write(root.join("target/cache"), "two").unwrap();
+        fs::create_dir(root.join("target/new-directory")).unwrap();
+        assert_eq!(before, fingerprint_tree(root).unwrap());
+        fs::write(root.join("tracked"), "two").unwrap();
+        let tracked = fingerprint_tree(root).unwrap();
+        assert_ne!(before, tracked);
+        fs::write(root.join("untracked"), "one").unwrap();
+        let untracked = fingerprint_tree(root).unwrap();
+        assert_ne!(tracked, untracked);
+        fs::write(root.join("untracked"), "two").unwrap();
+        assert_ne!(untracked, fingerprint_tree(root).unwrap());
+    }
+
+    #[test]
     fn fingerprints_ignore_state_but_detect_content_symlinks_and_execute_bits() {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -2732,6 +3083,41 @@ mod tests {
             run_git(&fresh, &["ls-tree", "-r", "--name-only", &commit]),
             "first.txt"
         );
+    }
+
+    /// Git trusts an entry's stat data only for a file older than the index
+    /// file, so a same-size edit made in the second the index was written is
+    /// caught only by reading it again; the capture's copy of the index must
+    /// keep that. Whole-second stat checks and fixed times make the race
+    /// exact here.
+    #[test]
+    fn world_commit_sees_a_same_size_edit_made_as_the_index_was_written() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("a.txt"), "1\n");
+        initialize_user_repository(&source);
+        run_git(&source, &["config", "core.checkStat", "minimal"]);
+        run_git(&source, &["config", "core.trustCtime", "false"]);
+        let second = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let set_time = |path: &Path| {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(second)
+                .unwrap()
+        };
+        set_time(&source.join("a.txt"));
+        run_git(&source, &["update-index", "--refresh"]);
+
+        write(&source.join("a.txt"), "2\n");
+        set_time(&source.join("a.txt"));
+        set_time(&source.join(".git/index"));
+        assert_eq!(run_git(&source, &["diff-files", "--name-only"]), "a.txt");
+
+        let commit = world_commit(&source).unwrap();
+        assert_eq!(run_git(&source, &["show", &format!("{commit}:a.txt")]), "2");
     }
 
     #[cfg(unix)]

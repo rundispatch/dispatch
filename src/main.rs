@@ -128,8 +128,9 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// Also run checks.verify on the current source with the Work's
-        /// change as of now, in a scratch copy. Applies nothing and changes
-        /// no verdict; accept still runs its own.
+        /// change as of now, in the project's check workspace, unless that
+        /// tree already passed them. Applies nothing and changes no verdict;
+        /// accept checks the source as it is then.
         #[arg(long)]
         merged: bool,
         /// Allow this check to run checks.verify on the host, when neither
@@ -183,9 +184,9 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Remove the workspaces Dispatch made for Work that is over (rejected,
-    /// closed, or applied and not yet released), after you confirm. Worktrees
-    /// you or an agent's runtime made are listed, never removed.
+    /// Remove internal check workspaces and workspaces Dispatch made for Work
+    /// that is over, after you confirm. Worktrees you or an agent's runtime
+    /// made are listed, never removed.
     Clean {
         /// Only list what would be removed.
         #[arg(long)]

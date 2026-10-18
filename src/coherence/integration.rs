@@ -1,32 +1,37 @@
 //! L2 integration oracle: when the source moved but the static layers see no
 //! conflict, run the project's own `checks.verify` commands against the merged
-//! result (current source plus the candidate's patch) in a scratch tree before
+//! result (current source plus the candidate's patch) in a private check tree before
 //! anything is applied. Static facts cannot see transitive or behavioral
 //! breakage; the user's checks can, and they cost no tokens.
 //!
-//! The source is only read. The scratch tree omits ignored build output (see
-//! `create_scratch_tree`) and is removed on every exit path; the
-//! check logs are kept under the run directory as evidence.
+//! The source is only read. The check tree keeps ignored build output between
+//! runs; check logs are kept under the run directory as evidence. A pass is
+//! recorded in the verification memo (`memo`), and a tree with a recorded
+//! pass is not checked again.
 
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use ulid::Ulid;
 
-use super::{MAX_DETAIL_CHARS, MAX_REASONS, find_candidate, patch_is_empty, run_config};
+use super::{MAX_DETAIL_CHARS, MAX_REASONS, find_candidate, memo, patch_is_empty, run_config};
 use crate::{
     AnalysisLevel, CheckPhase, CheckResult, CheckStatus, Decision, Reason, ReasonCode, RunMode,
     RunRecord, SourceKind, Validity,
     config::{AcceptMode, Config},
     executor::run_checks_with_config,
+    lock::OperationLock,
+    orchestrator::source_lock_path,
     source::{
-        apply_patch_in_workspace, checked_output, create_scratch_tree, fingerprint_tree,
-        git_command, inspect_source,
+        check_workspace_path, checked_output, fingerprint_tree, git_command, inspect_source,
+        prepare_check_workspace,
     },
+    state::State,
 };
 
 /// Why accept does not run `checks.verify` on the merged tree.
@@ -143,6 +148,10 @@ impl fmt::Display for MergedChecks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Skipped(why) => write!(f, "not run — {why}"),
+            Self::Passed(MergedRun {
+                reused: Some(entry),
+                ..
+            }) => write!(f, "{}; logs: {}", entry.describe(), entry.logs.display()),
             Self::Passed(ran) => write!(
                 f,
                 "passed on the current source with this patch; logs: {}",
@@ -154,12 +163,17 @@ impl fmt::Display for MergedChecks {
 }
 
 /// One run of `checks.verify` on a merged tree: the source state it was
-/// built from, each command's result, and the directory with their logs.
+/// built from, each command's result, and the directory with their logs. A
+/// pass the memo already held (`reused`) ran nothing: it has no results, and
+/// its logs are the reused run's.
 #[derive(Debug, Clone)]
 pub struct MergedRun {
     pub source: SourceState,
     pub logs: PathBuf,
     pub results: Vec<CheckResult>,
+    pub tree_id: String,
+    pub load_average: Option<[f64; 3]>,
+    pub reused: Option<memo::Entry>,
 }
 
 impl MergedRun {
@@ -169,10 +183,26 @@ impl MergedRun {
             .all(|result| result.status == CheckStatus::Passed)
     }
 
-    /// What the merged-check event records, for accept and `check --merged`
-    /// (`by`): the source state, the Δ digest, and each command's result
-    /// with its duration. Test-runner counts are not parsed.
-    pub fn event_payload(&self, by: &str, delta_digest: &str) -> serde_json::Value {
+    /// The event that records this for `by` (accept, `check --merged` or
+    /// finish): `checks.reused` naming the reused run, its logs and key, or
+    /// `coherence.merged_checks` with the source state, the Δ digest, and
+    /// each command's result with its duration. Test-runner counts are not
+    /// parsed.
+    pub fn event(&self, by: &str, delta_digest: &str) -> (&'static str, serde_json::Value) {
+        let Some(entry) = &self.reused else {
+            return (
+                "coherence.merged_checks",
+                self.event_payload(by, delta_digest),
+            );
+        };
+        let mut payload = entry.event_payload(by);
+        payload["source"] = serde_json::json!(self.source);
+        payload["delta_digest"] = serde_json::json!(delta_digest);
+        payload["passed"] = serde_json::json!(true);
+        ("checks.reused", payload)
+    }
+
+    fn event_payload(&self, by: &str, delta_digest: &str) -> serde_json::Value {
         serde_json::json!({
             "by": by,
             "source": self.source,
@@ -181,6 +211,9 @@ impl MergedRun {
             "duration_ms": self.results.iter().map(|result| result.duration_ms).sum::<u64>(),
             "results": self.results,
             "logs": self.logs,
+            "tree_id": self.tree_id,
+            "warm": true,
+            "load_average": self.load_average,
         })
     }
 }
@@ -243,25 +276,17 @@ const MAX_EXCERPT_CHARS: usize = 240;
 /// How much of each output log is searched for the excerpt.
 const EXCERPT_SCAN_BYTES: u64 = 256 * 1024;
 
-/// Removes the scratch tree when dropped, whatever path leaves the function.
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Verify `candidate_label` against the merged tree. Returns `validity`
 /// unchanged, with the reason, when `checks_skipped` says the checks do not
 /// run. A failing check downgrades the verdict to Refresh; so does an
 /// infrastructure error, because a false Refresh costs a rerun while a false
-/// Continue would corrupt the source.
-pub async fn verify_integration(
+/// Continue would corrupt the source. The caller holds the source lock.
+pub(crate) async fn verify_integration(
     run: &RunRecord,
     candidate_label: &str,
     validity: Validity,
     run_dir: &Path,
+    source_lock: &OperationLock,
 ) -> Result<(Validity, MergedChecks)> {
     if let Some(skipped) =
         checks_skipped(run, candidate_label, run_dir, Some(validity.world_changed))?
@@ -271,8 +296,15 @@ pub async fn verify_integration(
     let config = run_config(run_dir).context("the run's frozen configuration cannot be read")?;
     let patch = find_candidate(run, candidate_label)?.diff_path.clone();
 
-    let (new_reasons, ran) = match run_merged(run, &patch, &config, run_dir, &new_logs(run_dir))
-        .await
+    let (new_reasons, ran) = match run_or_reuse(
+        run,
+        &patch,
+        &config,
+        run_dir,
+        &new_logs(run_dir),
+        Some(source_lock),
+    )
+    .await
     {
         Ok(ran) if ran.passed() => {
             let validity = Validity {
@@ -305,6 +337,63 @@ pub async fn verify_integration(
     Ok((validity, MergedChecks::Failed(ran)))
 }
 
+/// `run_merged`, unless the memo holds a pass for the same merged tree,
+/// commands and environment, in which case nothing runs. A pass is recorded.
+/// `source_lock` as for `run_merged`.
+pub(crate) async fn run_or_reuse(
+    run: &RunRecord,
+    patch: &Path,
+    config: &Config,
+    run_dir: &Path,
+    logs: &Path,
+    source_lock: Option<&OperationLock>,
+) -> Result<MergedRun> {
+    let key = memo::merged_key(run, patch, config);
+    if let Some(reused) = reused_for(run, key.as_ref(), run_dir)? {
+        return Ok(reused);
+    }
+    let ran = run_merged(run, patch, config, run_dir, logs, source_lock).await?;
+    // Recorded only under the tree the checks saw: a source that moved after
+    // the key was computed, or a tree the workspace staged differently, is
+    // not filed under the key's tree.
+    if ran.passed()
+        && let Some(key) = key
+        && key.tree == ran.tree_id
+    {
+        let _ = memo::store(run_dir, &key, &run.id, logs);
+    }
+    Ok(ran)
+}
+
+/// The memo's pass for `config`'s verify commands on the current source of
+/// `run` with `patch`, if it holds one; nothing runs.
+pub fn reused(
+    run: &RunRecord,
+    patch: &Path,
+    config: &Config,
+    run_dir: &Path,
+) -> Result<Option<MergedRun>> {
+    reused_for(run, memo::merged_key(run, patch, config).as_ref(), run_dir)
+}
+
+fn reused_for(
+    run: &RunRecord,
+    key: Option<&memo::Key>,
+    run_dir: &Path,
+) -> Result<Option<MergedRun>> {
+    let Some(entry) = key.and_then(|key| memo::lookup(run_dir, key)) else {
+        return Ok(None);
+    };
+    Ok(Some(MergedRun {
+        source: SourceState::observe(&run.source_path, &run.source_kind)?,
+        logs: entry.logs.clone(),
+        results: Vec::new(),
+        tree_id: entry.tree.clone(),
+        load_average: None,
+        reused: Some(entry),
+    }))
+}
+
 /// A new directory under `run_dir` for one merged-check run's logs.
 pub fn new_logs(run_dir: &Path) -> PathBuf {
     run_dir
@@ -312,30 +401,40 @@ pub fn new_logs(run_dir: &Path) -> PathBuf {
         .join(Ulid::new().to_string())
 }
 
-/// Build the merged tree (the current source with `patch`) in a scratch area
-/// and run `config`'s verify commands there, keeping their logs in `logs`.
-/// The one merged-check runner: accept's gate and `dispatch check --merged`.
-pub async fn run_merged(
+/// Build the merged tree (the current source with `patch`) in its private,
+/// persistent check workspace and run `config`'s verify commands there.
+/// The one merged-check runner: accept's gate, `dispatch check --merged` and
+/// attached finish, through `run_or_reuse`. The workspace is used only under
+/// the source lock: `source_lock` is the caller's own hold on it (accept and
+/// auto-apply hold it from evaluation to apply), or `None` to take it here,
+/// waiting for it.
+pub(crate) async fn run_merged(
     run: &RunRecord,
     patch: &Path,
     config: &Config,
     run_dir: &Path,
     logs: &Path,
+    source_lock: Option<&OperationLock>,
 ) -> Result<MergedRun> {
-    let id = logs
-        .file_name()
-        .context("merged-check logs need a directory name")?
-        .to_string_lossy();
-    let scratch = Scratch(run_dir.join(format!("coherence-scratch-{id}")));
+    let state_root = run_dir
+        .parent()
+        .and_then(Path::parent)
+        .context("merged checks need a run directory under the state directory")?;
+    let state = State {
+        root: state_root.to_owned(),
+    };
+    let _own_lock = match source_lock {
+        Some(_) => None,
+        None => Some(wait_for_source_lock(source_lock_path(&state, run), &run.source_path).await?),
+    };
     let source = SourceState::observe(&run.source_path, &run.source_kind)?;
-    // The current source minus ignored build output, as a plain directory;
-    // `git apply` does not need a repository.
-    create_scratch_tree(&run.source_path, &run.source_kind, &scratch.0)
-        .context("failed to copy the current source")?;
-    apply_patch_in_workspace(&scratch.0, patch)?;
+    let workspace = check_workspace_path(state_root, &run.source_path);
+    let tree_id = prepare_check_workspace(&run.source_path, &run.source_kind, &workspace, patch)
+        .context("failed to build the merged check workspace")?;
     fs::create_dir_all(logs).with_context(|| format!("failed to create {}", logs.display()))?;
+    let load_average = load_average();
     let results = run_checks_with_config(
-        &scratch.0,
+        &workspace,
         &config.checks.verify,
         CheckPhase::Verify,
         logs,
@@ -349,7 +448,60 @@ pub async fn run_merged(
         source,
         logs: logs.to_owned(),
         results,
+        tree_id,
+        load_average,
+        reused: None,
     })
+}
+
+/// Take the source lock at `lock_path`, saying so when someone else holds it,
+/// and waiting as long as they do.
+async fn wait_for_source_lock(lock_path: PathBuf, source: &Path) -> Result<OperationLock> {
+    if OperationLock::is_held(&lock_path)? {
+        eprintln!(
+            "Merged checks: waiting for the source lock on {}",
+            source.display()
+        );
+    }
+    tokio::task::spawn_blocking(move || {
+        loop {
+            match OperationLock::acquire_wait(
+                &lock_path,
+                "another operation is using this source",
+                Duration::from_secs(30),
+            ) {
+                Ok(lock) => return Ok(lock),
+                Err(error) if error.to_string().contains("still busy after waiting") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .context("source lock waiter stopped")?
+}
+
+#[cfg(target_os = "linux")]
+fn load_average() -> Option<[f64; 3]> {
+    let text = fs::read_to_string("/proc/loadavg").ok()?;
+    let values = text
+        .split_whitespace()
+        .filter_map(|word| word.parse::<f64>().ok())
+        .take(3)
+        .collect::<Vec<_>>();
+    values.try_into().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn load_average() -> Option<[f64; 3]> {
+    let mut values = [0.0_f64; 3];
+    // SAFETY: `values` holds three writable doubles for getloadavg.
+    (unsafe { libc::getloadavg(values.as_mut_ptr(), values.len() as i32) } == values.len() as i32)
+        .then_some(values)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn load_average() -> Option<[f64; 3]> {
+    None
 }
 
 /// One bounded reason per check that did not pass.

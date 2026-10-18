@@ -161,10 +161,10 @@ pub(super) fn persist_verdict(
     Ok(kind)
 }
 
-/// The per-source apply lock path, keyed by the run's source path. Shared by
-/// every caller that serializes against concurrent application of that
-/// source (`apply_locked`, `auto_apply`) so the key expression exists once.
-fn source_lock_path(state: &State, run: &RunRecord) -> PathBuf {
+/// The per-source lock path, keyed by the run's source path. Shared by checks
+/// and application so they never use the private check workspace concurrently
+/// or apply a source change while its checks run.
+pub(crate) fn source_lock_path(state: &State, run: &RunRecord) -> PathBuf {
     let source_key = hex::encode(Sha256::digest(run.source_path.to_string_lossy().as_bytes()));
     state
         .root
@@ -396,15 +396,26 @@ pub(super) fn apply_locked(
         run.id
     );
     let normalized_label = sole_candidate(&run)?.label.clone();
-    let _source_lock = OperationLock::acquire(
-        &source_lock_path(state, &run),
-        "another apply operation is already modifying this source",
+    // Held from evaluation to apply, so no other accept writes the source
+    // while this one evaluates it; the merged checks run under it.
+    let source_lock_path = source_lock_path(state, &run);
+    if OperationLock::is_held(&source_lock_path)? {
+        eprintln!(
+            "Apply: waiting for the source lock on {}",
+            run.source_path.display()
+        );
+    }
+    let source_lock = OperationLock::acquire_wait(
+        &source_lock_path,
+        "another operation is using this source",
+        Duration::from_secs(run.environment.timeout_secs),
     )?;
     let applied = crate::coherence::gate(
         &run,
         &normalized_label,
         &state.run_dir(&run.id),
         despite_refresh,
+        &source_lock,
     )
     .and_then(|gate| {
         let (validity, overridden, checks) = match gate {
@@ -454,8 +465,8 @@ pub(super) fn apply_locked(
         };
         Ok((report, validity, overridden, landing, checks))
     });
-    // Each merged-check run is recorded with its per-command durations,
-    // whatever became of the accept.
+    // Each merged-check run is recorded with its per-command durations, or
+    // as the reuse of an earlier pass, whatever became of the accept.
     let ran = match &applied {
         Ok((.., checks)) => checks.ran(),
         Err(error) => error
@@ -466,13 +477,8 @@ pub(super) fn apply_locked(
     if let Some(ran) = ran.cloned() {
         let digest = super::delta_digest(&sole_candidate(&run)?.diff_path)?;
         let database = Database::open(state.db_path())?;
-        transition(
-            state,
-            &database,
-            &mut run,
-            "coherence.merged_checks",
-            ran.event_payload("accept", &digest),
-        )?;
+        let (kind, payload) = ran.event("accept", &digest);
+        transition(state, &database, &mut run, kind, payload)?;
     }
     let (report, validity, overridden, landing, checks) = match applied {
         Ok(applied) => applied,
@@ -640,15 +646,16 @@ fn decide(
     run: &RunRecord,
     candidate_label: &str,
     run_dir: &Path,
+    source_lock: &OperationLock,
 ) -> Result<Result<Authorization, (String, Option<Validity>)>> {
     Ok(
         // A policy never overrides a verdict.
-        match crate::coherence::gate(run, candidate_label, run_dir, false)? {
+        match crate::coherence::gate(run, candidate_label, run_dir, false, source_lock)? {
             // `config_unreadable` was already ruled out in stage 1: a config
             // that was readable there and is unreadable here would be an
             // extraordinary race, not a case this predicate distinguishes.
             AcceptGate::Legacy(_) => {
-                if source::fingerprint_tree(&run.source_path)? == run.source_fingerprint {
+                if source::fingerprint_for_run(run)? == run.source_fingerprint {
                     Ok(Authorization::Fingerprint)
                 } else {
                     Err(("strict_mode_drift".into(), None))
@@ -769,18 +776,26 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
     if empty_delta {
         return persist_skip(state, run, "empty_delta");
     }
+    // Held from evaluation to apply, so no other application writes the
+    // source while this one evaluates it; the merged checks run under it.
+    let source_lock_path = source_lock_path(state, &run);
+    if OperationLock::is_held(&source_lock_path)? {
+        eprintln!(
+            "Auto-apply: waiting for the source lock on {}",
+            run.source_path.display()
+        );
+    }
     let source_lock = OperationLock::acquire_wait(
-        &source_lock_path(state, &run),
+        &source_lock_path,
         "another apply operation is already modifying this source",
         Duration::from_secs(run.environment.timeout_secs),
     );
-    let Ok(_source_lock) = source_lock else {
+    let Ok(source_lock) = source_lock else {
         return persist_skip(state, run, "source_busy");
     };
-
     let mut retried = false;
     loop {
-        let authorization = match decide(&run, &candidate_label, &run_dir)? {
+        let authorization = match decide(&run, &candidate_label, &run_dir, &source_lock)? {
             Ok(authorization) => authorization,
             Err((reason, validity)) => return persist_blocked(state, run, reason, validity),
         };

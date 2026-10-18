@@ -32,7 +32,7 @@ use crate::{
     OwnerState, ReviewState, RunMode, RunRecord, SourceAtStart, SourceKind, Validity, WorkResult,
     WorkspaceOwner,
     coherence::{
-        self, WorkView,
+        self, WorkView, facts,
         interactions::{self, Analysis, Edge, Footprint, Participant, Projection},
         measure::{self, Counterpart, Evaluation, Landing, Outcome},
         world,
@@ -237,6 +237,44 @@ fn freshest_patch<'a>(scratch: &'a Path, live: &'a Path) -> Option<&'a Path> {
         .map(|(_, path)| path)
 }
 
+/// Capture `workspace`'s Δ into `scratch` when the worktree changed since the
+/// index kept beside it, as the fast loop does: whether it was captured.
+fn follow(baseline: &Path, workspace: &Path, scratch: &Path) -> Result<bool> {
+    source::snapshot_delta_if_changed_indexed(
+        baseline,
+        workspace,
+        scratch,
+        &scratch.with_extension("index"),
+        scratch,
+    )
+}
+
+/// `each` of `items`, side by side, as many at once as there are cores, the
+/// results in the items' order. A panic is an error for its item alone.
+fn side_by_side<T: Sync, R: Send>(
+    items: &[T],
+    each: impl Fn(&T) -> Result<R> + Sync,
+) -> Vec<Result<R>> {
+    let width = thread::available_parallelism().map_or(1, |n| n.get());
+    let mut results = Vec::with_capacity(items.len());
+    for chunk in items.chunks(width) {
+        thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|item| scope.spawn(|| each(item)))
+                .collect();
+            for handle in handles {
+                results.push(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("a worker thread panicked"))),
+                );
+            }
+        });
+    }
+    results
+}
+
 /// List and register through discovery's one path, then follow only Work
 /// whose runtime may delete its worktree. No verdict or interaction runs here.
 fn fast_pass(state: &State, root: &Path, scratch: &Path, ready: &mut bool) -> Vec<anyhow::Error> {
@@ -422,6 +460,10 @@ pub(crate) struct Owner {
     starts: HashSet<String>,
     /// The live counts as this owner last wrote them; `None` until then.
     live: Option<BTreeMap<String, usize>>,
+    /// The root as last observed, shared by every Work until the signal
+    /// moves, and the facts each Work's (S0, Δ) was found to assume.
+    worlds: world::Worlds,
+    memo: facts::Memo,
     scratch: tempfile::TempDir,
 }
 
@@ -478,6 +520,7 @@ pub(crate) struct Tick {
 /// its patch), evaluating it, re-checking Ready results, and auto-apply.
 #[derive(Default)]
 pub(crate) struct Cost {
+    pub total: Duration,
     pub signal: Duration,
     pub load: Duration,
     pub follow: Duration,
@@ -504,7 +547,7 @@ impl std::fmt::Display for Cost {
         let ms = |d: Duration| d.as_millis();
         write!(
             f,
-            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted in {} ms · pairs in {} ms",
+            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted in {} ms · pairs in {} ms · total {} ms",
             ms(self.signal),
             self.runs,
             ms(self.load),
@@ -517,7 +560,8 @@ impl std::fmt::Display for Cost {
             ms(self.apply),
             self.footprinted,
             ms(self.footprint),
-            ms(self.pairs)
+            ms(self.pairs),
+            ms(self.total)
         )
     }
 }
@@ -543,6 +587,8 @@ impl Owner {
             started: Utc::now(),
             starts: HashSet::new(),
             live: None,
+            worlds: world::Worlds::default(),
+            memo: facts::Memo::default(),
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -552,6 +598,7 @@ impl Owner {
 
     pub(crate) fn tick(&mut self, state: &State) -> Tick {
         let mut tick = Tick::default();
+        let began = Instant::now();
         let started = Instant::now();
         let signal_now = match world::signal(&self.root, &self.kind) {
             Ok(signal) => Some(signal),
@@ -567,6 +614,11 @@ impl Owner {
         };
         if let Some(signal_now) = &signal_now {
             self.last_signal = Some(signal_now.clone());
+        }
+        // The world is looked at again once per signal; a signal that
+        // could not be read says nothing, so it is looked at again too.
+        if tick.moved || signal_now.is_none() {
+            self.worlds.moved();
         }
         tick.cost.signal = started.elapsed();
 
@@ -596,6 +648,7 @@ impl Owner {
                     tick.applied = true;
                     // The apply is the doorbell: re-observe immediately
                     // rather than waiting for the next tick's signal.
+                    self.worlds.moved();
                     self.reevaluate(state, &runs, &mut tick, true);
                 }
                 Ok(_) => {}
@@ -616,12 +669,23 @@ impl Owner {
             self.interact(state, &runs, &mut tick);
         }
         self.measure(state, &runs, &mut tick);
+        // Facts are kept only for each Work's (S0, Δ) as its footprint
+        // stands now.
+        let keep: HashSet<(String, String)> = runs
+            .iter()
+            .filter_map(|run| {
+                let ((digest, _), _, _) = self.footprints.get(&run.id)?;
+                Some((run.baseline_commit.clone(), digest.clone()))
+            })
+            .collect();
+        self.memo.retain(&keep);
         self.publish_live(state, &mut tick);
         // Registrations whose S0 is durable become Work; failed ones go.
         if let Err(error) = super::registration::reconcile(state, &self.root) {
             tick.report(&error);
         }
         tick.runs = runs;
+        tick.cost.total = began.elapsed();
         tick
     }
 
@@ -708,18 +772,9 @@ fn run_lock_path(state: &State, run_id: &str) -> PathBuf {
 }
 
 /// Every run (any mode) whose `source_path` is `root`, loaded fresh from
-/// disk/DB. A run's source never changes, so the projected metadata decides
-/// which runs to load; other projects' runs are never loaded.
+/// disk/DB (`State::load_source_runs`); other projects' runs are never loaded.
 pub(crate) fn load_source_runs(state: &State, root: &Path) -> Result<Vec<RunRecord>> {
-    let mut runs = Vec::new();
-    for path in state.list_metadata_paths()? {
-        let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("invalid metadata at {}", path.display()))?;
-        if projected.source_path == root {
-            runs.push(state.load_run(&projected.id)?);
-        }
-    }
-    Ok(runs)
+    state.load_source_runs(root)
 }
 
 /// `ExactLive` maps to `Live`, `Gone`/`Reused` to `Gone`; no owner, or a
@@ -818,8 +873,9 @@ impl Owner {
         tick: &mut Tick,
         world_moved: bool,
     ) {
-        let (root, kind) = (self.root.as_path(), &self.kind);
+        let (root, kind) = (self.root.clone(), self.kind.clone());
         let mut followed = HashSet::new();
+        let mut pending = Vec::new();
         for candidate in runs {
             if candidate.mode != RunMode::Attached
                 || candidate.outcome.lifecycle == LifecycleState::Finished
@@ -856,17 +912,19 @@ impl Owner {
                 }
                 continue;
             }
-            let started = Instant::now();
-            let index = scratch.with_extension("index");
-            let work = source::snapshot_delta_indexed(
-                &candidate.baseline_path,
-                &attachment.workspace,
-                &scratch,
-                &index,
-            )
-            .and_then(|()| Ok(hex::encode(Sha256::digest(fs::read(&scratch)?))));
-            tick.cost.follow += started.elapsed();
-            tick.cost.followed += 1;
+            pending.push((candidate, attachment.workspace.as_path(), scratch));
+        }
+        // Each Work is its own Git status against its own index, so they
+        // are followed side by side.
+        let started = Instant::now();
+        let captured = side_by_side(&pending, |(candidate, workspace, scratch)| {
+            follow(&candidate.baseline_path, workspace, scratch)
+                .and_then(|_| Ok(hex::encode(Sha256::digest(fs::read(scratch)?))))
+        });
+        tick.cost.follow += started.elapsed();
+        tick.cost.followed += pending.len();
+        let mut moved = Vec::new();
+        for ((candidate, _, scratch), work) in pending.into_iter().zip(captured) {
             let work = match work {
                 Ok(work) => {
                     tick.followed.insert(candidate.id.clone());
@@ -881,6 +939,49 @@ impl Owner {
             if !world_moved && self.work.get(&candidate.id) == Some(&work) {
                 continue;
             }
+            let started = Instant::now();
+            let world = self.worlds.observe(
+                &root,
+                &candidate.baseline_path,
+                &candidate.baseline_commit,
+                &kind,
+            );
+            tick.cost.evaluate += started.elapsed();
+            match world {
+                Ok(world) => {
+                    tick.digest.get_or_insert_with(|| world.digest.clone());
+                    moved.push((candidate, scratch, work, world));
+                }
+                Err(error) => tick.report(&error),
+            }
+        }
+        // Evaluated side by side, without the runs' locks: `finish` takes a
+        // run's lock without waiting, so it is held only to record.
+        let started = Instant::now();
+        let memo = &self.memo;
+        let verdicts = side_by_side(&moved, |(candidate, scratch, _, world)| {
+            coherence::evaluate_with(
+                world,
+                &WorkView {
+                    source: &root,
+                    delta_patch: scratch,
+                    baseline: &candidate.baseline_path,
+                    baseline_commit: &candidate.baseline_commit,
+                },
+                memo,
+            )
+        });
+        tick.cost.evaluate += started.elapsed();
+        tick.cost.evaluated += moved.len();
+        let mut database: Option<Database> = None;
+        for ((candidate, scratch, work, _), validity) in moved.into_iter().zip(verdicts) {
+            let validity = match validity {
+                Ok(validity) => validity,
+                Err(error) => {
+                    tick.report(&error);
+                    continue;
+                }
+            };
             let Ok(_lock) = OperationLock::acquire(
                 &run_lock_path(state, &candidate.id),
                 "run has a foreground owner",
@@ -905,44 +1006,21 @@ impl Owner {
             {
                 continue;
             }
-            let started = Instant::now();
-            let delta_path = if needs_fast_follow(&attachment) {
-                scratch.clone()
-            } else {
-                let delta_path = state.run_dir(&run.id).join("delta-live.patch");
-                if let Err(error) =
-                    source::snapshot_delta(&run.baseline_path, &attachment.workspace, &delta_path)
-                {
-                    tick.report(&error);
-                    continue;
-                }
-                delta_path
-            };
-            let world = match world::observe(root, &run.baseline_path, &run.baseline_commit, kind) {
-                Ok(world) => world,
-                Err(error) => {
-                    tick.report(&error);
-                    continue;
-                }
-            };
-            tick.digest.get_or_insert_with(|| world.digest.clone());
-            let validity = match coherence::evaluate(
-                &world,
-                &WorkView {
-                    source: root,
-                    delta_patch: &delta_path,
-                    baseline: &run.baseline_path,
-                    baseline_commit: &run.baseline_commit,
-                },
-            ) {
-                Ok(validity) => validity,
-                Err(error) => {
-                    tick.report(&error);
-                    continue;
-                }
-            };
-            tick.cost.evaluate += started.elapsed();
-            tick.cost.evaluated += 1;
+            // The Δ followed and evaluated is kept as the run's evidence: it
+            // is captured once per tick. Runtime-made worktrees have theirs
+            // published by the fast loop.
+            if !needs_fast_follow(&attachment)
+                && let Err(error) =
+                    fs::read(&scratch)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|bytes| {
+                            let live = state.run_dir(&run.id).join("delta-live.patch");
+                            crate::state::write_atomically(&live, &bytes)
+                        })
+            {
+                tick.report(&error);
+                continue;
+            }
             // Compared with the verdict stored on the run, not with anything
             // this process remembers: a restarted owner still records a change.
             let validity = coherence::watch::settle(validity);
@@ -951,14 +1029,20 @@ impl Owner {
                 self.work.insert(run.id.clone(), work);
                 continue;
             }
-            let database = match Database::open(state.db_path()) {
-                Ok(database) => database,
-                Err(error) => {
-                    tick.report(&error);
-                    continue;
+            // One connection for every verdict this pass records.
+            if database.is_none() {
+                match Database::open(state.db_path()) {
+                    Ok(opened) => database = Some(opened),
+                    Err(error) => {
+                        tick.report(&error);
+                        continue;
+                    }
                 }
+            }
+            let Some(database) = database.as_ref() else {
+                continue;
             };
-            if let Err(error) = apply::persist_verdict(state, &database, &mut run, &validity) {
+            if let Err(error) = apply::persist_verdict(state, database, &mut run, &validity) {
                 tick.report(&error);
                 continue;
             }
@@ -997,12 +1081,15 @@ impl Owner {
                 Some(known) => known,
                 None => {
                     let started = Instant::now();
-                    let fresh = match interactions::footprint(&WorkView {
-                        source: &self.root,
-                        delta_patch: &patch,
-                        baseline: &run.baseline_path,
-                        baseline_commit: &run.baseline_commit,
-                    }) {
+                    let fresh = match interactions::footprint(
+                        &WorkView {
+                            source: &self.root,
+                            delta_patch: &patch,
+                            baseline: &run.baseline_path,
+                            baseline_commit: &run.baseline_commit,
+                        },
+                        &self.memo,
+                    ) {
                         Ok(fresh) => fresh,
                         Err(error) => {
                             tick.report(&error);
@@ -1141,19 +1228,26 @@ impl Owner {
         if missing.is_empty() {
             return Ok(true);
         }
-        let outcomes: Vec<Outcome> = missing
-            .into_iter()
-            .map(|counterpart| {
-                let current = runs.iter().find(|r| r.id == counterpart.identity.run_id);
-                let evaluation = match current
-                    .and_then(|run| self.delta_of(run, tick).map(|(patch, _)| (run, patch)))
-                {
-                    None => Evaluation::Gone,
-                    Some((run, patch)) => self.evaluate_counterpart(run, &patch),
-                };
-                measure::outcome::outcome(&landing, counterpart, evaluation, Utc::now())
-            })
-            .collect();
+        // An outcome is recorded once, so it is measured against the source
+        // as it is now, not as the tick's signal last saw it: the landing
+        // may have come since.
+        self.worlds.moved();
+        let mut outcomes: Vec<Outcome> = Vec::new();
+        for counterpart in missing {
+            let current = runs.iter().find(|r| r.id == counterpart.identity.run_id);
+            let evaluation = match current
+                .and_then(|run| self.delta_of(run, tick).map(|(patch, _)| (run, patch)))
+            {
+                None => Evaluation::Gone,
+                Some((run, patch)) => self.evaluate_counterpart(run, &patch),
+            };
+            outcomes.push(measure::outcome::outcome(
+                &landing,
+                counterpart,
+                evaluation,
+                Utc::now(),
+            ));
+        }
         let Ok(_lock) = OperationLock::acquire(
             &run_lock_path(state, &landed.id),
             "run has a foreground owner",
@@ -1186,11 +1280,11 @@ impl Owner {
     }
 
     /// The coherence verdict on a counterpart's Δ against the source now.
-    fn evaluate_counterpart(&self, run: &RunRecord, patch: &Path) -> Evaluation {
+    fn evaluate_counterpart(&mut self, run: &RunRecord, patch: &Path) -> Evaluation {
         let delta_sha256 = fs::read(patch)
             .ok()
             .map(|bytes| hex::encode(Sha256::digest(&bytes)));
-        let world = world::observe(
+        let world = self.worlds.observe(
             &self.root,
             &run.baseline_path,
             &run.baseline_commit,
@@ -1200,7 +1294,7 @@ impl Owner {
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{e:#}"))
             .and_then(|world| {
-                coherence::evaluate(
+                coherence::evaluate_with(
                     world,
                     &WorkView {
                         source: &self.root,
@@ -1208,6 +1302,7 @@ impl Owner {
                         baseline: &run.baseline_path,
                         baseline_commit: &run.baseline_commit,
                     },
+                    &self.memo,
                 )
             });
         match (evaluated, delta_sha256) {
@@ -1258,12 +1353,7 @@ impl Owner {
                 return None;
             }
             let started = Instant::now();
-            if let Err(error) = source::snapshot_delta_indexed(
-                &run.baseline_path,
-                &workspace,
-                &scratch,
-                &scratch.with_extension("index"),
-            ) {
+            if let Err(error) = follow(&run.baseline_path, &workspace, &scratch) {
                 tick.report(&error);
                 return None;
             }
@@ -1297,7 +1387,9 @@ impl Owner {
             // An evaluation that fails is logged by `live_validity` and
             // tried again when the world next moves.
             tick.cost.rechecked += 1;
-            let Some(validity) = coherence::live_validity(candidate) else {
+            let Some(validity) =
+                coherence::live_validity_in(candidate, &mut self.worlds, &self.memo)
+            else {
                 self.checked.insert(candidate.id.clone(), signal.clone());
                 continue;
             };

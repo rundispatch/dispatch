@@ -90,12 +90,13 @@ pub enum Analysis {
     Pending,
 }
 
-/// The footprint of `work`'s patch against its own S0.
-pub fn footprint(work: &WorkView) -> Result<Footprint> {
+/// The footprint of `work`'s patch against its own S0, its facts derived
+/// through `memo`.
+pub fn footprint(work: &WorkView, memo: &facts::Memo) -> Result<Footprint> {
     let patch = fs::read(work.delta_patch)
         .with_context(|| format!("failed to read delta {}", work.delta_patch.display()))?;
     let delta = facts::parse_patch(&patch);
-    let derived = facts::derive_facts(work, &delta)?;
+    let derived = memo.derive(work, &patch)?;
     let changed: BTreeMap<String, DeltaStatus> = facts::changed_paths(&patch).into_iter().collect();
     let mut found = Footprint {
         unresolved: derived.unbound,
@@ -661,12 +662,15 @@ mod tests {
 
     impl Work<'_> {
         pub(super) fn footprint(&self) -> Footprint {
-            footprint(&WorkView {
-                source: &self.base.source,
-                delta_patch: &self.patch,
-                baseline: &self.base.snapshot.baseline_path,
-                baseline_commit: &self.base.snapshot.baseline_commit,
-            })
+            footprint(
+                &WorkView {
+                    source: &self.base.source,
+                    delta_patch: &self.patch,
+                    baseline: &self.base.snapshot.baseline_path,
+                    baseline_commit: &self.base.snapshot.baseline_commit,
+                },
+                &facts::Memo::default(),
+            )
             .unwrap()
         }
     }

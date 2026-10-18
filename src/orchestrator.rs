@@ -6,6 +6,7 @@ pub(crate) mod liveness;
 pub(crate) mod native;
 pub mod registration;
 pub mod serve;
+pub(crate) use apply::source_lock_path;
 pub use apply::{ApplyAuthority, ApplyOutcome, auto_apply};
 pub use native::{QuestionCommand, answer_question, cancel_question};
 use std::{
@@ -32,7 +33,7 @@ use crate::{
     EnvironmentRecord, EventRecord, LifecycleState, ReviewOutcome, ReviewState, RunMode,
     RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, VERSION, VerificationState, WaitingOn,
     WorkResult,
-    coherence::integration::MergedChecks,
+    coherence::integration::{self, ChecksSkipped, MergedChecks, MergedRun},
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -563,7 +564,11 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         println!("RUN {run_id}\n");
         println!("Creating baseline...");
     }
-    let snapshot = match source::create_snapshot(&source_path, &run_dir) {
+    let snapshot = match source::create_snapshot_with_mode(
+        &source_path,
+        &run_dir,
+        config.coherence.accept == crate::config::AcceptMode::Strict,
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             let _ = fs::remove_dir_all(&run_dir);
@@ -687,62 +692,38 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         &mut run,
     )?;
 
-    let mut baseline_passed = true;
-    let baseline_commands = if config.checks.baseline.is_empty() {
-        &config.checks.verify
-    } else {
-        &config.checks.baseline
-    };
-    if !baseline_commands.is_empty() {
+    native::resolve_check_programs(state, &mut run, &config, cancellation.clone()).await;
+    let programs_resolved = run.baseline_checks.is_empty();
+    // Commands the person listed in `checks.baseline` run on S0 before the
+    // agent. Without them, S0 is checked only for what the candidate fails.
+    let eager = programs_resolved && !config.checks.baseline.is_empty();
+    if eager {
         if request.output == RunOutputMode::Human {
             println!("Running baseline checks...");
         }
-        let baseline_check_dir = run_dir.join("baseline-check");
-        let baseline_check_workspace = match source::create_candidate_workspace(
-            &run.baseline_path,
-            &baseline_check_dir.join("workspace"),
-        ) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                let message = format!("failed to prepare baseline checks: {error:#}");
-                finish_failed(state, &mut db, &mut run, &message)?;
-                bail!(message);
-            }
-        };
-        let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel();
-        let check_output_dir = run_dir.join("checks/baseline");
-        let baseline_future = run_checks_with_observer(
-            &baseline_check_workspace,
-            baseline_commands,
-            CheckPhase::Baseline,
-            &check_output_dir,
-            config.execution.clone(),
+        let id = run.id.clone();
+        let ran = native::check_on_s0(
+            state,
+            &db,
+            &mut run,
+            &config.checks.baseline,
+            &config,
             cancellation.clone(),
-            Some(check_tx),
-            None,
-        );
-        tokio::pin!(baseline_future);
-        run.baseline_checks = loop {
-            tokio::select! {
-                results = &mut baseline_future => break results,
-                Some(event) = check_rx.recv() => persist_check_lifecycle(state, &db, &mut run, event)?,
-            }
-        };
-        while let Ok(event) = check_rx.try_recv() {
-            persist_check_lifecycle(state, &db, &mut run, event)?;
-        }
-        baseline_passed = run
-            .baseline_checks
-            .iter()
-            .all(|check| check.status == CheckStatus::Passed);
+        )
+        .await;
+        native::finish_error(state, &db, &id, ran)?;
         if request.output == RunOutputMode::Human {
+            let passed = run
+                .baseline_checks
+                .iter()
+                .all(|check| check.status == CheckStatus::Passed);
             println!(
                 "Running baseline checks... {}",
-                if baseline_passed { "pass" } else { "FAIL" }
+                if passed { "pass" } else { "FAIL" }
             );
         }
-        db.sync_run(&run)?;
     }
+    db.sync_run(&run)?;
     if cancellation.is_cancelled() {
         if run.execution.is_some() {
             let failure = native::interrupted(&run);
@@ -772,7 +753,12 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             timestamp: Utc::now(),
             payload: serde_json::json!({
                 "commit": run.baseline_commit,
-                "checks_passed": baseline_passed,
+                "programs_resolved": programs_resolved,
+                "checks_deferred": !eager,
+                "checks_passed": eager.then(|| run
+                    .baseline_checks
+                    .iter()
+                    .all(|check| check.status == CheckStatus::Passed)),
             }),
             ..EventRecord::default()
         },
@@ -1641,37 +1627,6 @@ fn finish_interrupted(state: &State, db: &mut Database, run: &mut RunRecord) -> 
     )
 }
 
-fn finish_failed(
-    state: &State,
-    db: &mut Database,
-    run: &mut RunRecord,
-    message: &str,
-) -> Result<()> {
-    run.status = RunStatus::Failed;
-    run.outcome.lifecycle = LifecycleState::Finished;
-    run.outcome.work_result = WorkResult::Failed;
-    run.outcome.verification = VerificationState::NotRun;
-    run.outcome.review = ReviewState::NotRequested;
-    run.outcome.phase = RunPhase::Finished;
-    run.completed_at = Some(Utc::now());
-    run.candidates
-        .sort_by(|left, right| left.label.cmp(&right.label));
-    db.sync_run(run)?;
-    persist_event(
-        state,
-        db,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: None,
-            event_type: "run.failed".into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({"error": message}),
-            ..EventRecord::default()
-        },
-        run,
-    )
-}
-
 pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
     let run = match id {
         Some(id) => state.load_run(id)?,
@@ -1689,6 +1644,9 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
         print_run_header(&run);
         println!("\nTask\n  {}\n", one_line(&run.task, 120));
         print_candidates(&run, files_now(state, &run));
+        for line in attach::checks_notes(state, &run) {
+            println!("{line}");
+        }
         if let Some(line) = coherence_line(&run) {
             println!("{line}");
         }
@@ -1768,6 +1726,15 @@ pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Resul
     };
     let run = crate::coherence::with_live_validity(&run);
     let mut result = serde_json::to_value(run_result(&run))?;
+    let reused = Database::open(state.db_path())?
+        .events_for_run(&run.id)?
+        .into_iter()
+        .filter(|event| event.event_type == "checks.reused")
+        .map(|event| event.payload)
+        .collect::<Vec<_>>();
+    if !reused.is_empty() {
+        result["checks_reused"] = serde_json::Value::Array(reused);
+    }
     // Only while an owner watches the project is anything known about how
     // this Work interacts with other Work.
     if let Some(projection) = background::interactions(state, &run.source_path)
@@ -2195,8 +2162,10 @@ pub struct MergedCheck {
 /// `dispatch check`: evaluate the run's sole candidate against the source as it
 /// is now. Reads only; the verdict is printed, never stored. With `merged`,
 /// also run `checks.verify` on the current source with the Work's Δ as of
-/// now, in a scratch copy: nothing is applied and no verdict or review
-/// changes; one event records the run.
+/// now, in its private check workspace: nothing is applied and no verdict or review
+/// changes; one event records the run. Nothing runs when the memo holds a
+/// pass for that tree (one event records the reuse), or, as at accept, when
+/// finished Work's source has not moved.
 pub async fn check(
     state: &State,
     run_id: Option<&str>,
@@ -2254,27 +2223,53 @@ pub async fn check(
             unfinished.then_some(patch),
         );
     }
+    // A pass the memo holds runs nothing. Without one, accept's rule:
+    // finished Work on a source that has not moved was checked on this very
+    // tree when it finished, so nothing runs either.
     let ran = match &merged {
         Some((config, logs, patch)) => {
-            let ran = crate::coherence::integration::run_merged(
-                &run,
-                patch,
-                config,
-                &state.run_dir(&run.id),
-                logs,
-            )
-            .await;
-            let mut payload = match &ran {
-                Ok(ran) => ran.event_payload("check", &digest),
-                Err(error) => serde_json::json!({
-                    "by": "check",
-                    "delta_digest": digest,
-                    "error": format!("{error:#}"),
-                    "logs": logs,
-                }),
+            let run_dir = state.run_dir(&run.id);
+            let unmoved = !unfinished
+                && integration::checks_skipped(
+                    &run,
+                    &candidate.label,
+                    &run_dir,
+                    Some(validity.world_changed),
+                )? == Some(ChecksSkipped::Unmoved);
+            let ran = if unmoved {
+                integration::reused(&run, patch, config, &run_dir)
+            } else {
+                integration::run_or_reuse(&run, patch, config, &run_dir, logs, None)
+                    .await
+                    .map(Some)
+            };
+            let (kind, mut payload) = match &ran {
+                Ok(Some(ran)) => {
+                    let (kind, payload) = ran.event("check", &digest);
+                    (Some(kind), payload)
+                }
+                Ok(None) => (
+                    None,
+                    serde_json::json!({
+                        "by": "check",
+                        "delta_digest": digest,
+                        "skipped": ChecksSkipped::Unmoved.to_string(),
+                    }),
+                ),
+                Err(error) => (
+                    Some("coherence.merged_checks"),
+                    serde_json::json!({
+                        "by": "check",
+                        "delta_digest": digest,
+                        "error": format!("{error:#}"),
+                        "logs": logs,
+                    }),
+                ),
             };
             payload["patch"] = serde_json::json!(patch);
-            record_observation(state, &run, "coherence.merged_checks", payload.clone())?;
+            if let Some(kind) = kind {
+                record_observation(state, &run, kind, payload.clone())?;
+            }
             Some((ran, payload))
         }
         None => None,
@@ -2301,7 +2296,17 @@ pub async fn check(
         println!("{shown}");
     } else if let Some((ran, _)) = &ran {
         match ran {
-            Ok(ran) => {
+            Ok(None) => println!("Merged checks: not run — {}", ChecksSkipped::Unmoved),
+            Ok(Some(MergedRun {
+                source,
+                reused: Some(entry),
+                ..
+            })) => println!(
+                "Merged checks on the current source ({source}) with this Δ: {}; logs: {}",
+                entry.describe(),
+                entry.logs.display()
+            ),
+            Ok(Some(ran)) => {
                 println!(
                     "Merged checks on the current source ({}) with this Δ: {}",
                     ran.source,
@@ -2318,14 +2323,14 @@ pub async fn check(
             Err(error) => println!("Merged checks: could not run — {error:#}"),
         }
         println!(
-            "Nothing was applied and no verdict changed. accept runs its own merged checks, because the source can move after this."
+            "Nothing was applied and no verdict changed. accept checks again only if the source moves; a tree with a recorded pass is not checked again."
         );
     }
     if !json {
         println!("{}", digest_line(&digest));
     }
     anyhow::ensure!(
-        ran.is_none_or(|(ran, _)| ran.is_ok_and(|ran| ran.passed())),
+        ran.is_none_or(|(ran, _)| ran.is_ok_and(|ran| ran.is_none_or(|ran| ran.passed()))),
         "the merged checks did not pass for {}",
         run.id
     );

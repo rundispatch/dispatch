@@ -21,6 +21,7 @@ use crate::{
         world::WorldObservation,
     },
     config::Config,
+    lock::OperationLock,
     source::{git_command, run_git},
 };
 
@@ -28,6 +29,7 @@ pub mod facts;
 pub mod integration;
 pub mod interactions;
 pub mod measure;
+pub mod memo;
 pub mod symbols;
 pub mod watch;
 pub mod world;
@@ -68,15 +70,33 @@ pub fn evaluate_run(
     candidate_label: &str,
     keep: Option<&Path>,
 ) -> Result<Validity> {
+    evaluate_run_in(
+        run,
+        candidate_label,
+        keep,
+        &mut world::Worlds::default(),
+        &facts::Memo::default(),
+    )
+}
+
+/// `evaluate_run`, observing through `worlds` and deriving through `memo`.
+fn evaluate_run_in(
+    run: &RunRecord,
+    candidate_label: &str,
+    keep: Option<&Path>,
+    worlds: &mut world::Worlds,
+    memo: &facts::Memo,
+) -> Result<Validity> {
     let candidate = find_candidate(run, candidate_label)?;
-    let world = world::observe(
+    let world = worlds.observe(
         &run.source_path,
         &run.baseline_path,
         &run.baseline_commit,
         &run.source_kind,
     )?;
     let kept = keep.map(|run_dir| run_dir.join(CONFLICT_OUTPUT));
-    let (validity, conflict) = assess(&world, &WorkView::of(run, candidate), kept.as_deref())?;
+    let (validity, conflict) =
+        assess(&world, &WorkView::of(run, candidate), kept.as_deref(), memo)?;
     if let (Some(path), Some(output)) = (&kept, conflict) {
         fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))?;
     }
@@ -95,7 +115,23 @@ pub fn shown_validity(
     candidate_label: &str,
     keep: Option<&Path>,
 ) -> Result<Validity> {
-    let live = evaluate_run(run, candidate_label, keep)?;
+    shown_validity_in(
+        run,
+        candidate_label,
+        keep,
+        &mut world::Worlds::default(),
+        &facts::Memo::default(),
+    )
+}
+
+fn shown_validity_in(
+    run: &RunRecord,
+    candidate_label: &str,
+    keep: Option<&Path>,
+    worlds: &mut world::Worlds,
+    memo: &facts::Memo,
+) -> Result<Validity> {
+    let live = evaluate_run_in(run, candidate_label, keep, worlds, memo)?;
     Ok(
         match run.coherence.as_ref().and_then(|c| c.validity.as_ref()) {
             Some(stored)
@@ -132,18 +168,38 @@ pub fn is_ready_unapplied(run: &RunRecord) -> bool {
 /// been applied and has exactly one candidate; `None` for any other run, or
 /// when evaluation fails. Reads only; nothing is written.
 pub fn live_validity(run: &RunRecord) -> Option<Validity> {
-    live(run, None)
+    live(
+        run,
+        None,
+        &mut world::Worlds::default(),
+        &facts::Memo::default(),
+    )
+}
+
+/// `live_validity`, observing through `worlds` and deriving through `memo`:
+/// the project owner's, shared by every Work it evaluates.
+pub fn live_validity_in(
+    run: &RunRecord,
+    worlds: &mut world::Worlds,
+    memo: &facts::Memo,
+) -> Option<Validity> {
+    live(run, None, worlds, memo)
 }
 
 /// `live_validity`, with `keep` as for `evaluate_run`.
-fn live(run: &RunRecord, keep: Option<&Path>) -> Option<Validity> {
+fn live(
+    run: &RunRecord,
+    keep: Option<&Path>,
+    worlds: &mut world::Worlds,
+    memo: &facts::Memo,
+) -> Option<Validity> {
     if !is_ready_unapplied(run) {
         return None;
     }
     let [candidate] = run.candidates.as_slice() else {
         return None;
     };
-    match shown_validity(run, &candidate.label, keep) {
+    match shown_validity_in(run, &candidate.label, keep, worlds, memo) {
         Ok(validity) => Some(validity),
         Err(error) => {
             tracing::debug!("coherence evaluation of run {} failed: {error:#}", run.id);
@@ -161,7 +217,13 @@ pub fn with_live_validity(run: &RunRecord) -> RunRecord {
 /// `with_live_validity` for finish and the end of a native run: a patch that
 /// no longer applies leaves Git's whole complaint beside the run (`run_dir`).
 pub fn with_kept_validity(run: &RunRecord, run_dir: &Path) -> RunRecord {
-    shown_with(run, live(run, Some(run_dir)))
+    let validity = live(
+        run,
+        Some(run_dir),
+        &mut world::Worlds::default(),
+        &facts::Memo::default(),
+    );
+    shown_with(run, validity)
 }
 
 fn shown_with(run: &RunRecord, live: Option<Validity>) -> RunRecord {
@@ -343,16 +405,19 @@ pub fn run_config(run_dir: &Path) -> Option<Config> {
 /// moved but L0 says the work is still valid, the run's own verification checks
 /// are run against the merged result before anything is applied.
 ///
-/// The caller holds the per-run and per-source operation locks and has no
-/// database transaction open; the checks (each bounded by the run's execution
-/// timeout) hold only those locks.
+/// The caller holds the per-run operation lock and `source_lock`, the
+/// per-source one, and has no database transaction open; the checks (each
+/// bounded by the run's execution timeout) hold only those locks. Holding the
+/// source lock from here to the apply means no other accept writes the source
+/// while this one evaluates it.
 /// `despite_refresh` is a human's explicit override (`dispatch accept
 /// --despite-refresh`); policy applications always pass `false`.
-pub fn gate(
+pub(crate) fn gate(
     run: &RunRecord,
     candidate_label: &str,
     run_dir: &Path,
     despite_refresh: bool,
+    source_lock: &OperationLock,
 ) -> Result<AcceptGate> {
     // Strict accept, or a launched run's unmoved tree: the fingerprint rules
     // apply, and nothing is evaluated.
@@ -370,6 +435,7 @@ pub fn gate(
             candidate_label,
             validity,
             run_dir,
+            source_lock,
         ))??;
         return Ok(match validity.decision {
             Decision::Continue => AcceptGate::Compatible { validity, checks },
@@ -391,6 +457,7 @@ pub fn gate(
                 ..validity.clone()
             },
             run_dir,
+            source_lock,
         ))??;
         return Ok(match (verified.decision, checks) {
             (Decision::Continue, checks @ MergedChecks::Passed(_)) => AcceptGate::Overridden {
@@ -455,7 +522,17 @@ fn block_on<T: Send>(future: impl Future<Output = T> + Send) -> Result<T> {
 /// continues and the world moved does L1 check the symbols and files the patch
 /// assumes; any reason it finds means refresh.
 pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
-    Ok(assess(world, work, None)?.0)
+    evaluate_with(world, work, &facts::Memo::default())
+}
+
+/// `evaluate`, with facts already derived for the same (S0, Δ) taken from
+/// `memo`.
+pub fn evaluate_with(
+    world: &WorldObservation,
+    work: &WorkView,
+    memo: &facts::Memo,
+) -> Result<Validity> {
+    Ok(assess(world, work, None, memo)?.0)
 }
 
 /// `evaluate`, also returning Git's whole complaint when the patch no longer
@@ -465,6 +542,7 @@ fn assess(
     world: &WorldObservation,
     work: &WorkView,
     kept: Option<&Path>,
+    memo: &facts::Memo,
 ) -> Result<(Validity, Option<String>)> {
     let world_changed = !world.changes.is_empty();
     let mut analysis = AnalysisLevel::FilesOnly;
@@ -491,7 +569,7 @@ fn assess(
         conflict = Some(stderr);
         (Decision::Refresh, vec![reason])
     } else {
-        let (found, level) = facts::check(work, world)?;
+        let (found, level) = facts::check(work, world, memo)?;
         analysis = level;
         (
             if found.is_empty() {
@@ -1124,8 +1202,9 @@ mod tests {
         fixture.write("b.txt", "b edited\n");
         let run_dir = fixture.root.path().join("run");
         assert!(run_config(&run_dir).is_none());
+        let lock = OperationLock::acquire(&run_dir.join("source.lock"), "busy").unwrap();
         assert!(matches!(
-            gate(&run, "A", &run_dir, false).unwrap(),
+            gate(&run, "A", &run_dir, false, &lock).unwrap(),
             AcceptGate::Legacy(ChecksSkipped::ConfigUnreadable)
         ));
         fs::write(run_dir.join("config.snapshot.yml"), "coherence: [not a map").unwrap();

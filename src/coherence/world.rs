@@ -3,10 +3,12 @@
 //! ignore rules exclude, so build outputs are not drift.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, Metadata},
     io::ErrorKind,
     path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -49,15 +51,161 @@ pub struct WorldObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signal(pub String);
 
-/// Present regular files and symlinks by raw path: `(is_symlink, is_executable)`.
-type Present = BTreeMap<Vec<u8>, (bool, bool)>;
+/// Present regular files and symlinks by raw path.
+type Present = BTreeMap<Vec<u8>, Stat>;
+
+/// What `lstat` says of a present file: its kind, and the fields a hash kept
+/// from an earlier look is trusted by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stat {
+    symlink: bool,
+    executable: bool,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    inode: u64,
+    mode: u32,
+}
 
 /// One tree entry, keyed elsewhere by its raw path bytes.
+#[derive(Clone)]
 struct Entry {
     symlink: bool,
     executable: bool,
     /// Git blob hash of the file bytes, or of the symlink target text.
     hash: String,
+}
+
+/// A tree by raw path.
+type Tree = BTreeMap<Vec<u8>, Entry>;
+
+/// A file modified this close to the look that hashed it may have changed
+/// again within its timestamp's granularity, so its hash is not kept.
+const RACY: Duration = Duration::from_secs(2);
+
+/// A file's hash as last seen, and when it was looked at.
+struct Seen {
+    stat: Stat,
+    hash: String,
+    looked: SystemTime,
+}
+
+/// The source as it is now, whatever baseline it is compared with.
+struct Current {
+    entries: Tree,
+    /// Paths Git lists that are gone from disk.
+    missing: BTreeSet<Vec<u8>>,
+    nested: Vec<Vec<u8>>,
+    digest: String,
+}
+
+/// Observations of one source that share their work, in memory only: each
+/// file's hash is kept by what `lstat` says of it (size, modification and
+/// change times, inode and mode), each baseline commit's tree by its id, and
+/// the source as it is now until `moved` says it may have changed. The
+/// project owner keeps one; `observe` starts from nothing.
+#[derive(Default)]
+pub struct Worlds {
+    hashes: HashMap<Vec<u8>, Seen>,
+    trees: HashMap<String, Arc<Tree>>,
+    /// The source now, by its kind and the length of the object ids it was
+    /// hashed for.
+    now: Option<(SourceKind, usize, Arc<Current>)>,
+}
+
+impl Worlds {
+    /// `observe`, sharing what this value already knows.
+    pub fn observe(
+        &mut self,
+        source: &Path,
+        baseline: &Path,
+        baseline_commit: &str,
+        kind: &SourceKind,
+    ) -> Result<WorldObservation> {
+        let tree = match self.trees.get(baseline_commit) {
+            Some(tree) => Arc::clone(tree),
+            None => {
+                // A commit id names its tree, in whichever baseline it is.
+                let tree = Arc::new(read_baseline_tree(baseline, baseline_commit)?);
+                self.trees
+                    .insert(baseline_commit.to_owned(), Arc::clone(&tree));
+                tree
+            }
+        };
+        let ids = baseline_commit.len();
+        let current = match &self.now {
+            Some((was, hashed, current)) if was == kind && *hashed == ids => Arc::clone(current),
+            _ => {
+                let current = Arc::new(self.current(source, baseline, kind, ids)?);
+                self.now = Some((kind.clone(), ids, Arc::clone(&current)));
+                current
+            }
+        };
+        compare(source, kind, &tree, &current)
+    }
+
+    /// The source may have changed: the next observation looks at it again.
+    pub fn moved(&mut self) {
+        self.now = None;
+    }
+
+    /// List the source and hash what changed since it was last looked at.
+    /// `ids` is the length of the baseline's object ids, which a kept hash
+    /// must have.
+    fn current(
+        &mut self,
+        source: &Path,
+        baseline: &Path,
+        kind: &SourceKind,
+        ids: usize,
+    ) -> Result<Current> {
+        let looked = SystemTime::now();
+        let (present, missing, nested) = match kind {
+            SourceKind::Directory => (walk_directory(source)?, BTreeSet::new(), Vec::new()),
+            SourceKind::Git | SourceKind::GitWorktree => list_git_world(source)?,
+        };
+        let entries = self.hash_world(source, baseline, &present, looked, ids)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"dispatch-world-v1\0");
+        for (path, entry) in &entries {
+            hash_sized_bytes(&mut hasher, path);
+            hasher.update(match (entry.symlink, entry.executable) {
+                (true, _) => b"l",
+                (false, true) => b"x",
+                (false, false) => b"f",
+            });
+            hash_sized_bytes(&mut hasher, entry.hash.as_bytes());
+        }
+        Ok(Current {
+            entries,
+            missing,
+            nested,
+            digest: hex::encode(hasher.finalize()),
+        })
+    }
+
+    /// The kept hash of `path`, if `stat` still matches the look that made it,
+    /// that look came well after the file was last modified or changed, and
+    /// the hash has `ids` characters.
+    fn kept(&self, path: &[u8], stat: &Stat, ids: usize) -> Option<&str> {
+        let seen = self
+            .hashes
+            .get(path)
+            .filter(|seen| seen.hash.len() == ids)?;
+        let time = |(seconds, nanos): (i64, i64)| {
+            SystemTime::UNIX_EPOCH.checked_add(Duration::new(
+                u64::try_from(seconds).ok()?,
+                u32::try_from(nanos).ok()?,
+            ))
+        };
+        let last = time(stat.modified)?.max(time(stat.changed)?);
+        (seen.stat == *stat
+            && seen
+                .looked
+                .duration_since(last)
+                .is_ok_and(|age| age >= RACY))
+        .then_some(seen.hash.as_str())
+    }
 }
 
 /// Compare the current source tree with the baseline commit.
@@ -76,15 +224,19 @@ pub fn observe(
     baseline_commit: &str,
     kind: &SourceKind,
 ) -> Result<WorldObservation> {
-    let baseline_tree = read_baseline_tree(baseline, baseline_commit)?;
-    let (present, listed_missing, nested) = match kind {
-        SourceKind::Directory => (walk_directory(source)?, BTreeSet::new(), Vec::new()),
-        SourceKind::Git | SourceKind::GitWorktree => list_git_world(source)?,
-    };
-    let current = hash_world(source, baseline, present)?;
+    Worlds::default().observe(source, baseline, baseline_commit, kind)
+}
 
+/// The source now against one baseline tree.
+fn compare(
+    source: &Path,
+    kind: &SourceKind,
+    baseline_tree: &Tree,
+    now: &Current,
+) -> Result<WorldObservation> {
+    let current = &now.entries;
     let mut changes = Vec::new();
-    for (path, now) in &current {
+    for (path, now) in current {
         let kind = match baseline_tree.get(path) {
             None if now.symlink => Some(ChangeKind::Symlink),
             None => Some(ChangeKind::Added),
@@ -108,14 +260,14 @@ pub fn observe(
     // exclude it. A path Git listed but that is gone from disk is never ignored.
     let absent: Vec<&Vec<u8>> = baseline_tree
         .keys()
-        .filter(|path| !current.contains_key(*path) && !inside_nested(&nested, path))
+        .filter(|path| !current.contains_key(*path) && !inside_nested(&now.nested, path))
         .collect();
     let to_check: Vec<&Vec<u8>> = match kind {
         SourceKind::Directory => Vec::new(),
         _ => absent
             .iter()
             .copied()
-            .filter(|path| !listed_missing.contains(*path))
+            .filter(|path| !now.missing.contains(*path))
             .collect(),
     };
     let ignored = ignored_paths(source, &to_check)?;
@@ -128,20 +280,8 @@ pub fn observe(
         }
     }
     changes.sort_by(|left, right| left.path.cmp(&right.path));
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"dispatch-world-v1\0");
-    for (path, entry) in &current {
-        hash_sized_bytes(&mut hasher, path);
-        hasher.update(match (entry.symlink, entry.executable) {
-            (true, _) => b"l",
-            (false, true) => b"x",
-            (false, false) => b"f",
-        });
-        hash_sized_bytes(&mut hasher, entry.hash.as_bytes());
-    }
     Ok(WorldObservation {
-        digest: hex::encode(hasher.finalize()),
+        digest: now.digest.clone(),
         changes,
     })
 }
@@ -398,70 +538,113 @@ fn walk_directory(source: &Path) -> Result<Present> {
 }
 
 #[cfg(unix)]
-fn entry_kind(metadata: &Metadata) -> (bool, bool) {
-    use std::os::unix::fs::PermissionsExt;
+fn entry_kind(metadata: &Metadata) -> Stat {
+    use std::os::unix::fs::MetadataExt;
     let symlink = metadata.file_type().is_symlink();
-    // A symlink's own permission bits are not versioned by Git.
-    (
+    Stat {
         symlink,
-        !symlink && metadata.permissions().mode() & 0o100 != 0,
-    )
+        // A symlink's own permission bits are not versioned by Git.
+        executable: !symlink && metadata.mode() & 0o100 != 0,
+        size: metadata.size(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+    }
 }
 
 #[cfg(not(unix))]
-fn entry_kind(metadata: &Metadata) -> (bool, bool) {
-    (metadata.file_type().is_symlink(), false)
+fn entry_kind(metadata: &Metadata) -> Stat {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or((0, 0), |elapsed| {
+            (elapsed.as_secs() as i64, i64::from(elapsed.subsec_nanos()))
+        });
+    Stat {
+        symlink: metadata.file_type().is_symlink(),
+        executable: false,
+        size: metadata.len(),
+        modified,
+        changed: modified,
+        inode: 0,
+        mode: 0,
+    }
 }
 
-/// Blob-hash the present files with the trusted baseline repository.
-/// `--no-filters` matches how the baseline was frozen: literal bytes.
-fn hash_world(
-    source: &Path,
-    baseline: &Path,
-    present: Present,
-) -> Result<BTreeMap<Vec<u8>, Entry>> {
-    let mut regular = Vec::new();
-    let mut input = Vec::new();
-    for (path, (symlink, _)) in &present {
-        if !symlink {
-            input.extend(c_quote(&path_bytes(&source.join(bytes_to_path(path)))));
-            input.push(b'\n');
-            regular.push(path);
+impl Worlds {
+    /// Blob-hash the present files with the trusted baseline repository,
+    /// reusing every kept hash `kept` trusts; what was not present is
+    /// forgotten. `--no-filters` matches how the baseline was frozen: literal
+    /// bytes.
+    fn hash_world(
+        &mut self,
+        source: &Path,
+        baseline: &Path,
+        present: &Present,
+        looked: SystemTime,
+        ids: usize,
+    ) -> Result<Tree> {
+        let mut regular = Vec::new();
+        let mut input = Vec::new();
+        for (path, stat) in present {
+            if !stat.symlink && self.kept(path, stat, ids).is_none() {
+                input.extend(c_quote(&path_bytes(&source.join(bytes_to_path(path)))));
+                input.push(b'\n');
+                regular.push(path);
+            }
         }
-    }
-    let mut hashes = if regular.is_empty() {
-        Vec::new()
-    } else {
-        blob_hashes(baseline, "--stdin-paths", &input)?
-    };
-    ensure!(
-        hashes.len() == regular.len(),
-        "Git hashed {} files but {} were requested",
-        hashes.len(),
-        regular.len()
-    );
-    hashes.reverse();
-
-    let mut world = BTreeMap::new();
-    for (path, (symlink, executable)) in &present {
-        let hash = if *symlink {
-            let full = source.join(bytes_to_path(path));
-            let target = fs::read_link(&full)
-                .with_context(|| format!("failed to read symlink {}", full.display()))?;
-            blob_hashes(baseline, "--stdin", &path_bytes(&target))?.remove(0)
+        let mut hashes = if regular.is_empty() {
+            Vec::new()
         } else {
-            hashes.pop().expect("one hash per regular file")
+            blob_hashes(baseline, "--stdin-paths", &input)?
         };
-        world.insert(
-            path.clone(),
-            Entry {
-                symlink: *symlink,
-                executable: *executable,
-                hash,
-            },
+        ensure!(
+            hashes.len() == regular.len(),
+            "Git hashed {} files but {} were requested",
+            hashes.len(),
+            regular.len()
         );
+        hashes.reverse();
+
+        let mut world = BTreeMap::new();
+        for (path, stat) in present {
+            let hash = match self.kept(path, stat, ids) {
+                Some(hash) => hash.to_owned(),
+                None if stat.symlink => {
+                    let full = source.join(bytes_to_path(path));
+                    let target = fs::read_link(&full)
+                        .with_context(|| format!("failed to read symlink {}", full.display()))?;
+                    blob_hashes(baseline, "--stdin", &path_bytes(&target))?.remove(0)
+                }
+                None => hashes.pop().expect("one hash per regular file"),
+            };
+            world.insert(
+                path.clone(),
+                Entry {
+                    symlink: stat.symlink,
+                    executable: stat.executable,
+                    hash,
+                },
+            );
+        }
+        self.hashes.retain(|path, _| present.contains_key(path));
+        for (path, entry) in &world {
+            let stat = present[path];
+            if self.kept(path, &stat, ids).is_none() {
+                self.hashes.insert(
+                    path.clone(),
+                    Seen {
+                        stat,
+                        hash: entry.hash.clone(),
+                        looked,
+                    },
+                );
+            }
+        }
+        Ok(world)
     }
-    Ok(world)
 }
 
 fn blob_hashes(baseline: &Path, mode: &str, input: &[u8]) -> Result<Vec<String>> {
@@ -790,6 +973,196 @@ mod tests {
             observe_as_git(&fixture).changes,
             [change("b.txt", ChangeKind::Added)]
         );
+    }
+
+    /// A file whose last modification is `age` before now.
+    fn age(path: &Path, age: Duration) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_kept_hash_is_trusted_only_while_every_stat_field_matches_and_outside_the_racy_window() {
+        let stat = Stat {
+            symlink: false,
+            executable: false,
+            size: 4,
+            modified: (1_000_000, 5),
+            changed: (1_000_000, 7),
+            inode: 42,
+            mode: 0o100644,
+        };
+        let modified = SystemTime::UNIX_EPOCH + Duration::new(1_000_000, 7);
+        let hash = "a".repeat(40);
+        let mut worlds = Worlds::default();
+        let mut keep = |looked: SystemTime| {
+            worlds.hashes.insert(
+                b"a.txt".to_vec(),
+                Seen {
+                    stat,
+                    hash: hash.clone(),
+                    looked,
+                },
+            );
+        };
+        keep(modified + Duration::from_secs(60));
+        assert_eq!(worlds.kept(b"a.txt", &stat, 40), Some(hash.as_str()));
+        assert_eq!(
+            worlds.kept(b"a.txt", &stat, 64),
+            None,
+            "another hash length"
+        );
+        assert_eq!(worlds.kept(b"b.txt", &stat, 40), None);
+        let changed = [
+            Stat { size: 5, ..stat },
+            Stat {
+                modified: (1_000_000, 6),
+                ..stat
+            },
+            Stat {
+                changed: (1_000_001, 7),
+                ..stat
+            },
+            Stat { inode: 43, ..stat },
+            Stat {
+                mode: 0o100755,
+                ..stat
+            },
+        ];
+        for other in changed {
+            assert_eq!(worlds.kept(b"a.txt", &other, 40), None, "{other:?}");
+        }
+        let mut worlds = Worlds::default();
+        let mut keep = |looked: SystemTime| {
+            worlds.hashes.insert(
+                b"a.txt".to_vec(),
+                Seen {
+                    stat,
+                    hash: hash.clone(),
+                    looked,
+                },
+            );
+            worlds.kept(b"a.txt", &stat, 40).is_some()
+        };
+        // Looked at within 2 s of the modification: it may have changed
+        // again within its timestamp's granularity.
+        assert!(!keep(modified + Duration::from_millis(1999)));
+        assert!(!keep(modified));
+        assert!(
+            !keep(modified - Duration::from_secs(1)),
+            "modified after the look"
+        );
+        assert!(keep(modified + RACY));
+        // The later of the two times counts: a file whose modification time
+        // was set back changed when it was set.
+        let set_back = Stat {
+            changed: (1_000_100, 0),
+            ..stat
+        };
+        let mut worlds = Worlds::default();
+        worlds.hashes.insert(
+            b"a.txt".to_vec(),
+            Seen {
+                stat: set_back,
+                hash: hash.clone(),
+                looked: modified + Duration::from_secs(60),
+            },
+        );
+        assert_eq!(worlds.kept(b"a.txt", &set_back, 40), None);
+    }
+
+    #[test]
+    fn kept_hashes_are_reused_and_an_edit_that_keeps_size_and_time_is_still_seen() {
+        let fixture = Fixture::new(true, &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+        let file = fixture.source.join("a.txt");
+        age(&file, Duration::from_secs(3600));
+        age(&fixture.source.join("b.txt"), Duration::from_secs(3600));
+        // Setting a time is a change, which must be older than the racy
+        // window before a look can keep the hash.
+        std::thread::sleep(RACY + Duration::from_millis(100));
+        let mut worlds = Worlds::default();
+        let observe = |worlds: &mut Worlds| {
+            worlds
+                .observe(
+                    &fixture.source,
+                    &fixture.snapshot.baseline_path,
+                    &fixture.snapshot.baseline_commit,
+                    &fixture.snapshot.kind,
+                )
+                .unwrap()
+        };
+        let first = observe(&mut worlds);
+        assert!(first.changes.is_empty());
+        let looked = worlds.hashes[b"a.txt".as_slice()].looked;
+        worlds.moved();
+        assert_eq!(observe(&mut worlds), first);
+        assert_eq!(
+            worlds.hashes[b"a.txt".as_slice()].looked,
+            looked,
+            "an unchanged old file is not hashed again"
+        );
+
+        // Same size and the same modification time: the change time moves.
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        fs::write(&file, "eno\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        worlds.moved();
+        let edited = observe(&mut worlds);
+        assert_eq!(edited.changes, [change("a.txt", ChangeKind::Modified)]);
+        assert_eq!(edited, fixture.observe());
+        assert_ne!(edited.digest, first.digest);
+
+        // Until `moved`, the source now is the one already looked at.
+        fixture.write("c.txt", "three\n");
+        assert_eq!(observe(&mut worlds), edited);
+        worlds.moved();
+        assert_eq!(observe(&mut worlds), fixture.observe());
+        assert!(!worlds.hashes.contains_key(b"zzz".as_slice()));
+        fs::remove_file(fixture.source.join("c.txt")).unwrap();
+        worlds.moved();
+        observe(&mut worlds);
+        assert!(
+            !worlds.hashes.contains_key(b"c.txt".as_slice()),
+            "a file gone is forgotten"
+        );
+    }
+
+    #[test]
+    fn one_look_at_the_source_serves_every_baseline_as_a_fresh_observation_would() {
+        let fixture = Fixture::new(true, &[("a.txt", "one\n"), ("gone.txt", "g\n")]);
+        fixture.write("a.txt", "edited\n");
+        fs::remove_file(fixture.source.join("gone.txt")).unwrap();
+        let later = create_snapshot(&fixture.source, &fixture._root.path().join("run2")).unwrap();
+        fixture.write("new.txt", "new\n");
+        let mut worlds = Worlds::default();
+        for snapshot in [&fixture.snapshot, &later, &fixture.snapshot] {
+            let shared = worlds
+                .observe(
+                    &fixture.source,
+                    &snapshot.baseline_path,
+                    &snapshot.baseline_commit,
+                    &snapshot.kind,
+                )
+                .unwrap();
+            let fresh = observe(
+                &fixture.source,
+                &snapshot.baseline_path,
+                &snapshot.baseline_commit,
+                &snapshot.kind,
+            )
+            .unwrap();
+            assert_eq!(shared, fresh);
+        }
+        assert_eq!(worlds.trees.len(), 2);
     }
 
     #[test]

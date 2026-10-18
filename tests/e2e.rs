@@ -49,7 +49,7 @@ fn non_git_native_run_applies_safely_end_to_end() {
     let metadata: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
     assert_eq!(metadata["source_kind"], "directory");
     assert_eq!(metadata["outcome"]["work_result"], "ready");
-    assert_eq!(metadata["baseline_checks"][0]["status"], "failed");
+    assert!(metadata["baseline_checks"].as_array().unwrap().is_empty());
     let candidate = &metadata["candidates"][0];
     assert_eq!(candidate["status"], "completed");
     assert_eq!(candidate["checks"][0]["status"], "passed");

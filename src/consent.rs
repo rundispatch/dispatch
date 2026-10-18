@@ -27,8 +27,9 @@ struct Record {
 /// What consent lets checks do, shown in full before the person allows it.
 pub const SCOPE: &str = "Checks run project code, including code an agent wrote, on this host \
     with your permissions, not in a sandbox: in the Work's workspace when a runtime registers \
-    Work here and when its worktree is removed, and in the merged scratch tree at accept. \
-    Nothing is applied by this. If the checks change, Dispatch asks again.";
+    Work here and when its worktree is removed, and, on the source as it is then with the \
+    Work's change, in this project's check workspace at accept and at a finish that finds the \
+    source moved. Nothing is applied by this. If the checks change, Dispatch asks again.";
 
 /// Where a project's consent stands now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +202,7 @@ mod tests {
             "on this host",
             "your permissions",
             "workspace",
-            "merged scratch tree at accept",
+            "check workspace at accept",
         ] {
             assert!(SCOPE.contains(words), "{words:?} missing from {SCOPE:?}");
         }
