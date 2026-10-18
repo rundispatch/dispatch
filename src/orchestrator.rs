@@ -33,7 +33,7 @@ use crate::{
     EnvironmentRecord, EventRecord, LifecycleState, ReviewOutcome, ReviewState, RunMode,
     RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, VERSION, VerificationState, WaitingOn,
     WorkResult,
-    coherence::integration::MergedChecks,
+    coherence::integration::{self, ChecksSkipped, MergedChecks, MergedRun},
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -1611,6 +1611,9 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
         print_run_header(&run);
         println!("\nTask\n  {}\n", one_line(&run.task, 120));
         print_candidates(&run, files_now(state, &run));
+        for line in attach::checks_notes(state, &run) {
+            println!("{line}");
+        }
         if let Some(line) = coherence_line(&run) {
             println!("{line}");
         }
@@ -1690,6 +1693,15 @@ pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Resul
     };
     let run = crate::coherence::with_live_validity(&run);
     let mut result = serde_json::to_value(run_result(&run))?;
+    let reused = Database::open(state.db_path())?
+        .events_for_run(&run.id)?
+        .into_iter()
+        .filter(|event| event.event_type == "checks.reused")
+        .map(|event| event.payload)
+        .collect::<Vec<_>>();
+    if !reused.is_empty() {
+        result["checks_reused"] = serde_json::Value::Array(reused);
+    }
     // Only while an owner watches the project is anything known about how
     // this Work interacts with other Work.
     if let Some(projection) = background::interactions(state, &run.source_path)
@@ -2118,7 +2130,9 @@ pub struct MergedCheck {
 /// is now. Reads only; the verdict is printed, never stored. With `merged`,
 /// also run `checks.verify` on the current source with the Work's Δ as of
 /// now, in its private check workspace: nothing is applied and no verdict or review
-/// changes; one event records the run.
+/// changes; one event records the run. Nothing runs when the memo holds a
+/// pass for that tree (one event records the reuse), or, as at accept, when
+/// finished Work's source has not moved.
 pub async fn check(
     state: &State,
     run_id: Option<&str>,
@@ -2176,27 +2190,53 @@ pub async fn check(
             unfinished.then_some(patch),
         );
     }
+    // A pass the memo holds runs nothing. Without one, accept's rule:
+    // finished Work on a source that has not moved was checked on this very
+    // tree when it finished, so nothing runs either.
     let ran = match &merged {
         Some((config, logs, patch)) => {
-            let ran = crate::coherence::integration::run_merged(
-                &run,
-                patch,
-                config,
-                &state.run_dir(&run.id),
-                logs,
-            )
-            .await;
-            let mut payload = match &ran {
-                Ok(ran) => ran.event_payload("check", &digest),
-                Err(error) => serde_json::json!({
-                    "by": "check",
-                    "delta_digest": digest,
-                    "error": format!("{error:#}"),
-                    "logs": logs,
-                }),
+            let run_dir = state.run_dir(&run.id);
+            let unmoved = !unfinished
+                && integration::checks_skipped(
+                    &run,
+                    &candidate.label,
+                    &run_dir,
+                    Some(validity.world_changed),
+                )? == Some(ChecksSkipped::Unmoved);
+            let ran = if unmoved {
+                integration::reused(&run, patch, config, &run_dir)
+            } else {
+                integration::run_or_reuse(&run, patch, config, &run_dir, logs)
+                    .await
+                    .map(Some)
+            };
+            let (kind, mut payload) = match &ran {
+                Ok(Some(ran)) => {
+                    let (kind, payload) = ran.event("check", &digest);
+                    (Some(kind), payload)
+                }
+                Ok(None) => (
+                    None,
+                    serde_json::json!({
+                        "by": "check",
+                        "delta_digest": digest,
+                        "skipped": ChecksSkipped::Unmoved.to_string(),
+                    }),
+                ),
+                Err(error) => (
+                    Some("coherence.merged_checks"),
+                    serde_json::json!({
+                        "by": "check",
+                        "delta_digest": digest,
+                        "error": format!("{error:#}"),
+                        "logs": logs,
+                    }),
+                ),
             };
             payload["patch"] = serde_json::json!(patch);
-            record_observation(state, &run, "coherence.merged_checks", payload.clone())?;
+            if let Some(kind) = kind {
+                record_observation(state, &run, kind, payload.clone())?;
+            }
             Some((ran, payload))
         }
         None => None,
@@ -2223,7 +2263,17 @@ pub async fn check(
         println!("{shown}");
     } else if let Some((ran, _)) = &ran {
         match ran {
-            Ok(ran) => {
+            Ok(None) => println!("Merged checks: not run — {}", ChecksSkipped::Unmoved),
+            Ok(Some(MergedRun {
+                source,
+                reused: Some(entry),
+                ..
+            })) => println!(
+                "Merged checks on the current source ({source}) with this Δ: {}; logs: {}",
+                entry.describe(),
+                entry.logs.display()
+            ),
+            Ok(Some(ran)) => {
                 println!(
                     "Merged checks on the current source ({}) with this Δ: {}",
                     ran.source,
@@ -2247,7 +2297,7 @@ pub async fn check(
         println!("{}", digest_line(&digest));
     }
     anyhow::ensure!(
-        ran.is_none_or(|(ran, _)| ran.is_ok_and(|ran| ran.passed())),
+        ran.is_none_or(|(ran, _)| ran.is_ok_and(|ran| ran.is_none_or(|ran| ran.passed()))),
         "the merged checks did not pass for {}",
         run.id
     );

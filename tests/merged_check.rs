@@ -461,7 +461,12 @@ fn check_merged_needs_authority_and_never_widens_it() {
     let allowed = f.dispatch(&["check", &id, "--merged", "--allow-unsafe-local"]);
 
     assert!(allowed.status.success(), "{}", stderr(&allowed));
-    command_line(&stdout(&allowed), "true", "PASS", 0);
+    // finish passed on this very tree, so nothing runs again.
+    assert!(
+        stdout(&allowed).contains(&format!("passed, reused from {id} at ")),
+        "{}",
+        stdout(&allowed)
+    );
     assert_eq!(f.metadata(&id)["environment"]["unsafe_local"], false);
     assert!(f.events(&id, "attach.authorized").is_empty());
 }
@@ -573,10 +578,9 @@ fn finish_check_and_diff_stat_show_the_digest_and_json_keeps_its_fields() {
     );
     assert_eq!(merged["validity"]["decision"], "continue");
     assert_eq!(merged["merged_checks"]["passed"], true);
-    assert_eq!(
-        merged["merged_checks"]["results"].as_array().unwrap().len(),
-        2
-    );
+    // finish passed on this very tree: the pass is reused, and says whose.
+    assert_eq!(merged["merged_checks"]["reused_run"], id);
+    assert!(merged["merged_checks"]["logs"].is_string());
 }
 
 #[test]

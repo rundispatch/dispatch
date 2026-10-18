@@ -5,7 +5,9 @@
 //! breakage; the user's checks can, and they cost no tokens.
 //!
 //! The source is only read. The check tree keeps ignored build output between
-//! runs; check logs are kept under the run directory as evidence.
+//! runs; check logs are kept under the run directory as evidence. A pass is
+//! recorded in the verification memo (`memo`), and a tree with a recorded
+//! pass is not checked again.
 
 use std::{
     fmt, fs,
@@ -17,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use ulid::Ulid;
 
-use super::{MAX_DETAIL_CHARS, MAX_REASONS, find_candidate, patch_is_empty, run_config};
+use super::{MAX_DETAIL_CHARS, MAX_REASONS, find_candidate, memo, patch_is_empty, run_config};
 use crate::{
     AnalysisLevel, CheckPhase, CheckResult, CheckStatus, Decision, Reason, ReasonCode, RunMode,
     RunRecord, SourceKind, Validity,
@@ -146,6 +148,10 @@ impl fmt::Display for MergedChecks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Skipped(why) => write!(f, "not run — {why}"),
+            Self::Passed(MergedRun {
+                reused: Some(entry),
+                ..
+            }) => write!(f, "{}; logs: {}", entry.describe(), entry.logs.display()),
             Self::Passed(ran) => write!(
                 f,
                 "passed on the current source with this patch; logs: {}",
@@ -157,7 +163,9 @@ impl fmt::Display for MergedChecks {
 }
 
 /// One run of `checks.verify` on a merged tree: the source state it was
-/// built from, each command's result, and the directory with their logs.
+/// built from, each command's result, and the directory with their logs. A
+/// pass the memo already held (`reused`) ran nothing: it has no results, and
+/// its logs are the reused run's.
 #[derive(Debug, Clone)]
 pub struct MergedRun {
     pub source: SourceState,
@@ -165,6 +173,7 @@ pub struct MergedRun {
     pub results: Vec<CheckResult>,
     pub tree_id: String,
     pub load_average: Option<[f64; 3]>,
+    pub reused: Option<memo::Entry>,
 }
 
 impl MergedRun {
@@ -174,10 +183,26 @@ impl MergedRun {
             .all(|result| result.status == CheckStatus::Passed)
     }
 
-    /// What the merged-check event records, for accept and `check --merged`
-    /// (`by`): the source state, the Δ digest, and each command's result
-    /// with its duration. Test-runner counts are not parsed.
-    pub fn event_payload(&self, by: &str, delta_digest: &str) -> serde_json::Value {
+    /// The event that records this for `by` (accept, `check --merged` or
+    /// finish): `checks.reused` naming the reused run, its logs and key, or
+    /// `coherence.merged_checks` with the source state, the Δ digest, and
+    /// each command's result with its duration. Test-runner counts are not
+    /// parsed.
+    pub fn event(&self, by: &str, delta_digest: &str) -> (&'static str, serde_json::Value) {
+        let Some(entry) = &self.reused else {
+            return (
+                "coherence.merged_checks",
+                self.event_payload(by, delta_digest),
+            );
+        };
+        let mut payload = entry.event_payload(by);
+        payload["source"] = serde_json::json!(self.source);
+        payload["delta_digest"] = serde_json::json!(delta_digest);
+        payload["passed"] = serde_json::json!(true);
+        ("checks.reused", payload)
+    }
+
+    fn event_payload(&self, by: &str, delta_digest: &str) -> serde_json::Value {
         serde_json::json!({
             "by": by,
             "source": self.source,
@@ -270,7 +295,7 @@ pub async fn verify_integration(
     let config = run_config(run_dir).context("the run's frozen configuration cannot be read")?;
     let patch = find_candidate(run, candidate_label)?.diff_path.clone();
 
-    let (new_reasons, ran) = match run_merged(run, &patch, &config, run_dir, &new_logs(run_dir))
+    let (new_reasons, ran) = match run_or_reuse(run, &patch, &config, run_dir, &new_logs(run_dir))
         .await
     {
         Ok(ran) if ran.passed() => {
@@ -304,6 +329,61 @@ pub async fn verify_integration(
     Ok((validity, MergedChecks::Failed(ran)))
 }
 
+/// `run_merged`, unless the memo holds a pass for the same merged tree,
+/// commands and environment, in which case nothing runs. A pass is recorded.
+pub async fn run_or_reuse(
+    run: &RunRecord,
+    patch: &Path,
+    config: &Config,
+    run_dir: &Path,
+    logs: &Path,
+) -> Result<MergedRun> {
+    let key = memo::merged_key(run, patch, config);
+    if let Some(reused) = reused_for(run, key.as_ref(), run_dir)? {
+        return Ok(reused);
+    }
+    let ran = run_merged(run, patch, config, run_dir, logs).await?;
+    // Recorded only under the tree the checks saw: a source that moved after
+    // the key was computed, or a tree the workspace staged differently, is
+    // not filed under the key's tree.
+    if ran.passed()
+        && let Some(key) = key
+        && key.tree == ran.tree_id
+    {
+        let _ = memo::store(run_dir, &key, &run.id, logs);
+    }
+    Ok(ran)
+}
+
+/// The memo's pass for `config`'s verify commands on the current source of
+/// `run` with `patch`, if it holds one; nothing runs.
+pub fn reused(
+    run: &RunRecord,
+    patch: &Path,
+    config: &Config,
+    run_dir: &Path,
+) -> Result<Option<MergedRun>> {
+    reused_for(run, memo::merged_key(run, patch, config).as_ref(), run_dir)
+}
+
+fn reused_for(
+    run: &RunRecord,
+    key: Option<&memo::Key>,
+    run_dir: &Path,
+) -> Result<Option<MergedRun>> {
+    let Some(entry) = key.and_then(|key| memo::lookup(run_dir, key)) else {
+        return Ok(None);
+    };
+    Ok(Some(MergedRun {
+        source: SourceState::observe(&run.source_path, &run.source_kind)?,
+        logs: entry.logs.clone(),
+        results: Vec::new(),
+        tree_id: entry.tree.clone(),
+        load_average: None,
+        reused: Some(entry),
+    }))
+}
+
 /// A new directory under `run_dir` for one merged-check run's logs.
 pub fn new_logs(run_dir: &Path) -> PathBuf {
     run_dir
@@ -313,7 +393,8 @@ pub fn new_logs(run_dir: &Path) -> PathBuf {
 
 /// Build the merged tree (the current source with `patch`) in its private,
 /// persistent check workspace and run `config`'s verify commands there.
-/// The one merged-check runner: accept's gate and `dispatch check --merged`.
+/// The one merged-check runner: accept's gate, `dispatch check --merged` and
+/// attached finish, through `run_or_reuse`.
 pub async fn run_merged(
     run: &RunRecord,
     patch: &Path,
@@ -373,6 +454,7 @@ pub async fn run_merged(
         results,
         tree_id,
         load_average,
+        reused: None,
     })
 }
 

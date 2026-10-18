@@ -228,6 +228,9 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
     with Session([binary,'--state-dir',str(state),'clean'],repo,captures,'clean-remove',width=160,height=30) as ui:
         ui.wait('Cancel');ui.send('\x1b[A');ui.pump(.3);ui.send('\r');ui.wait('Removed 1');ui.finish()
     assert not kept.exists()
+    # The source holds untracked worktrees, so the merged tree cannot be
+    # known; it has not moved, so each finish checked once, in place.
+    assert not (state/'check-workspaces').exists(),'a finish on an unmoved source used the check workspace'
     # Work that touches other Work names it in its row, and the selected
     # Work's details say how, naming both, apart from its verdict.
     proj=root/'interacting'; proj.mkdir(); (proj/'src').mkdir()

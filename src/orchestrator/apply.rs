@@ -459,8 +459,8 @@ pub(super) fn apply_locked(
         };
         Ok((report, validity, overridden, landing, checks))
     });
-    // Each merged-check run is recorded with its per-command durations,
-    // whatever became of the accept.
+    // Each merged-check run is recorded with its per-command durations, or
+    // as the reuse of an earlier pass, whatever became of the accept.
     let ran = match &applied {
         Ok((.., checks)) => checks.ran(),
         Err(error) => error
@@ -471,13 +471,8 @@ pub(super) fn apply_locked(
     if let Some(ran) = ran.cloned() {
         let digest = super::delta_digest(&sole_candidate(&run)?.diff_path)?;
         let database = Database::open(state.db_path())?;
-        transition(
-            state,
-            &database,
-            &mut run,
-            "coherence.merged_checks",
-            ran.event_payload("accept", &digest),
-        )?;
+        let (kind, payload) = ran.event("accept", &digest);
+        transition(state, &database, &mut run, kind, payload)?;
     }
     let (report, validity, overridden, landing, checks) = match applied {
         Ok(applied) => applied,

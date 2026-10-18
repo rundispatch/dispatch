@@ -10,6 +10,9 @@ use std::{fs, path::PathBuf};
 pub async fn clean(state: &State, dry_run: bool, yes: bool, options: Options) -> Result<()> {
     let (listed, kept) = attach::cleanable(state)?;
     let check_workspaces = check_workspaces(state)?;
+    if !dry_run {
+        crate::coherence::memo::clear(state)?;
+    }
     remove(state, &listed, &check_workspaces, dry_run, yes, options).await?;
     if kept.is_empty() {
         return Ok(());

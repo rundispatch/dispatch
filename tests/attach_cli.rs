@@ -1449,7 +1449,14 @@ fn accept_says_whether_merged_checks_ran_and_why_not() {
         "{summary}"
     );
     let out = Fixture::stdout(&b.dispatch(&["accept", &id]).success());
-    let logs = merged_logs(&out);
+    // finish checked what would land, so accept reuses that pass.
+    let logs = PathBuf::from(
+        out.lines()
+            .find_map(|line| line.strip_prefix("Merged checks: passed, reused from "))
+            .and_then(|rest| rest.split_once("; logs: "))
+            .unwrap_or_else(|| panic!("no reused merged checks in {out}"))
+            .1,
+    );
     assert!(logs.is_dir(), "{out}");
     assert!(
         logs.parent().unwrap().ends_with("coherence-checks"),
@@ -1548,10 +1555,20 @@ fn the_source_moving_while_merged_checks_run_blocks_the_apply() {
     let id = f.attach(&[]);
     fs::write(f.workspace.join("src/lib.rs"), TWO).unwrap();
     f.dispatch(&["finish", &id]).success();
-    assert!(
-        !moved.exists(),
-        "the workspace's checks leave the source alone"
-    );
+    // The source differs from S0 (dispatch.yml), so finish checked what
+    // would land, which moved the source while it ran. The pass is recorded
+    // only under the tree the checks saw, which the moved source no longer
+    // makes, so accept runs the checks again.
+    assert!(moved.is_file());
+    let finish = f.events("coherence.merged_checks");
+    assert_eq!(finish.len(), 1, "{finish:?}");
+    let entries = fs::read_dir(f.state.join("memo"))
+        .unwrap()
+        .map(|entry| serde_json::from_slice::<Value>(&fs::read(entry.unwrap().path()).unwrap()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["tree"], finish[0].1["tree_id"]);
 
     let refused = f.dispatch(&["accept", &id]).failure();
     let (stdout, stderr) = (Fixture::stdout(&refused), Fixture::stderr(&refused));

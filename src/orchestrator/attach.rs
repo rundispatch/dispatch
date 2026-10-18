@@ -1319,8 +1319,8 @@ fn find_active(
     Ok(None)
 }
 
-/// `dispatch finish <id>`: freeze Δ, run verification in the workspace
-/// itself, and become an ordinary Ready result. See part 14.9.
+/// `dispatch finish <id>`: freeze Δ, run verification on what would land
+/// (`finish_checks`), and become an ordinary Ready result. See part 14.9.
 pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Result<RunRecord> {
     let run = finish_quietly(state, run_id, allow_unsafe_local).await?;
     print_finish_summary(
@@ -1391,8 +1391,8 @@ pub(crate) async fn finish_quietly(
 
 /// The mechanics of "finished" (part 14.9), shared by `dispatch finish`
 /// (`reason: Explicit`) and the wrapped owner loop (`reason: ProcessExit`,
-/// once the agent has exited): freeze Δ, run `checks.verify` in the
-/// workspace itself, set the candidate's outcome and `exit_code` from
+/// once the agent has exited): freeze Δ, run `checks.verify` on what would
+/// land (`finish_checks`), set the candidate's outcome and `exit_code` from
 /// `reason`, and commit `attach.finished` + `run.finished`. The caller holds
 /// the run's operation lock and has already checked that the run is an
 /// active, single-candidate attachment; this prints nothing, so each caller
@@ -1466,24 +1466,12 @@ pub(super) async fn finish_locked(
     run.candidates[0].diff_stats = diff_stats;
 
     let config = crate::coherence::run_config(&run_dir);
-    let verify = config
-        .as_ref()
-        .map_or_else(Vec::new, |cfg| cfg.checks.verify.clone());
-    if !verify.is_empty() {
+    if let Some(config) = config.filter(|config| !config.checks.verify.is_empty()) {
         anyhow::ensure!(
             run.environment.unsafe_local || allow_unsafe_local,
             "finish runs your checks.verify on the host; pass --allow-unsafe-local"
         );
-        let execution = config.map(|cfg| cfg.execution).unwrap_or_default();
-        let results = crate::executor::run_checks_with_config(
-            &workspace,
-            &verify,
-            CheckPhase::Verify,
-            &run_dir.join("checks/verify"),
-            execution,
-        )
-        .await;
-        run.candidates[0].checks = results;
+        run.candidates[0].checks = finish_checks(state, &run, &workspace, &config).await?;
     }
 
     run.candidates[0].status = CandidateStatus::Completed;
@@ -1530,6 +1518,169 @@ pub(super) async fn finish_locked(
     persist_event(state, db, run_finished_event(&run), &mut run)?;
 
     Ok(run)
+}
+
+/// Finish's checks. First what would land: the current source with Δ, as
+/// accept checks it. Only when that does not pass, or cannot be built, Δ on
+/// its own start (S0) in `workspace`, as before, to show whose change broke
+/// it. When the source has not moved the two are one tree, checked once, in
+/// `workspace`; when the merged tree cannot be known, accept's rule says
+/// whether the source moved. Either run is skipped when the memo holds a pass for its
+/// tree; a run on the merged tree, or a reuse, is recorded as an event. The
+/// returned results are the Work's verification: the merged run's when it
+/// passed, else S0 + Δ's.
+async fn finish_checks(
+    state: &State,
+    run: &RunRecord,
+    workspace: &Path,
+    config: &Config,
+) -> Result<Vec<crate::CheckResult>> {
+    use crate::coherence::{integration, memo};
+    let run_dir = state.run_dir(&run.id);
+    let (verify, execution) = (&config.checks.verify, &config.execution);
+    let patch = &run.candidates[0].diff_path;
+    let digest = super::delta_digest(patch)?;
+    let in_place = memo::workspace_key(workspace, verify, execution);
+    let merged = memo::merged_key(run, patch, config);
+    let one_tree = match (&in_place, &merged) {
+        (Some(a), Some(b)) => a.tree == b.tree,
+        // The merged tree cannot be known: accept's rule says whether the
+        // source moved since the Work began.
+        (_, None) => {
+            let world = crate::coherence::world::observe(
+                &run.source_path,
+                &run.baseline_path,
+                &run.baseline_commit,
+                &run.source_kind,
+            )?;
+            integration::checks_skipped(
+                run,
+                &run.candidates[0].label,
+                &run_dir,
+                Some(!world.changes.is_empty()),
+            )? == Some(integration::ChecksSkipped::Unmoved)
+        }
+        (None, Some(_)) => false,
+    };
+    if !one_tree {
+        let logs = integration::new_logs(&run_dir);
+        let (kind, payload) =
+            match integration::run_or_reuse(run, patch, config, &run_dir, &logs).await {
+                Ok(ran) if ran.passed() => {
+                    let (kind, payload) = ran.event("finish", &digest);
+                    super::record_observation(state, run, kind, payload)?;
+                    return Ok(match &ran.reused {
+                        Some(entry) => reused_results(verify, &entry.logs),
+                        None => ran.results,
+                    });
+                }
+                Ok(ran) => ran.event("finish", &digest),
+                Err(error) => (
+                    "coherence.merged_checks",
+                    serde_json::json!({
+                        "by": "finish",
+                        "delta_digest": digest,
+                        "error": format!("{error:#}"),
+                        "logs": logs,
+                    }),
+                ),
+            };
+        super::record_observation(state, run, kind, payload)?;
+    }
+    if let Some(entry) = in_place
+        .as_ref()
+        .and_then(|key| memo::lookup(&run_dir, key))
+    {
+        let mut payload = entry.event_payload("finish");
+        payload["delta_digest"] = serde_json::json!(digest);
+        payload["passed"] = serde_json::json!(true);
+        super::record_observation(state, run, "checks.reused", payload)?;
+        return Ok(reused_results(verify, &entry.logs));
+    }
+    let logs = run_dir.join("checks/verify");
+    let results = crate::executor::run_checks_with_config(
+        workspace,
+        verify,
+        CheckPhase::Verify,
+        &logs,
+        execution.clone(),
+    )
+    .await;
+    let passed = results
+        .iter()
+        .all(|result| result.status == crate::CheckStatus::Passed);
+    if passed
+        && let Some(key) = in_place
+        && memo::workspace_key(workspace, verify, execution).as_ref() == Some(&key)
+    {
+        let _ = memo::store(&run_dir, &key, &run.id, &logs);
+    }
+    Ok(results)
+}
+
+/// What the Work's check lines do not say, from the events: each pass that
+/// was reused, and, for finish, how the current source with Δ fared. Empty
+/// when finish checked only the workspace, as it did before.
+pub(super) fn checks_notes(state: &State, run: &RunRecord) -> Vec<String> {
+    let Ok(events) = Database::open(state.db_path()).and_then(|db| db.events_for_run(&run.id))
+    else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for event in &events {
+        let payload = &event.payload;
+        let by = payload["by"].as_str().unwrap_or("unknown");
+        match event.event_type.as_str() {
+            "checks.reused" => {
+                if let Some(reused) = crate::coherence::memo::describe_reuse(payload) {
+                    lines.push(format!("  {by}: checks: {reused}"));
+                }
+            }
+            "coherence.merged_checks" if by == "finish" => {
+                if payload["passed"] == true {
+                    lines.push(
+                        "  finish: checked on the current source with this Δ, as accept checks it"
+                            .into(),
+                    );
+                } else if let Some(error) = payload["error"].as_str() {
+                    lines.push(format!(
+                        "  finish: the current source with this Δ could not be checked ({error}); the checks ran on this Δ's own start (S0)"
+                    ));
+                } else {
+                    lines.push(
+                        "  finish: the current source with this Δ did not pass; the checks ran again on this Δ's own start (S0). On the current source:"
+                            .into(),
+                    );
+                    let results = serde_json::from_value::<Vec<crate::CheckResult>>(
+                        payload["results"].clone(),
+                    )
+                    .unwrap_or_default();
+                    lines.extend(results.iter().map(super::check_line));
+                }
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+/// The Work's verification when finish reused a pass: each command passed,
+/// with the reused run's logs. Nothing ran, so it took no time.
+fn reused_results(commands: &[String], logs: &Path) -> Vec<crate::CheckResult> {
+    commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| crate::CheckResult {
+            name: format!("verify {}", index + 1),
+            phase: CheckPhase::Verify,
+            command: command.clone(),
+            status: crate::CheckStatus::Passed,
+            exit_code: Some(0),
+            duration_ms: 0,
+            stdout_path: logs.join(format!("verify-{:02}.stdout.log", index + 1)),
+            stderr_path: logs.join(format!("verify-{:02}.stderr.log", index + 1)),
+        })
+        .collect()
 }
 
 /// A runtime is about to delete the workspace of active Work, which destroys
@@ -1604,7 +1755,8 @@ pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u6
 
 /// Finish Work whose workspace was removed with its exact changes kept, when
 /// the person consented to the project's checks running by themselves: the
-/// checks run in a workspace rebuilt from S0 and those changes, and the Work
+/// checks run as `finish_checks` runs them, S0 + Δ in a workspace rebuilt
+/// from S0 and those changes, and the Work
 /// becomes an ordinary result awaiting review. Only when the consent still
 /// holds for exactly the commands this Work would run. Returns whether it
 /// finished; a run another process holds is left for the next try.
@@ -1984,6 +2136,9 @@ fn print_finish_summary(state: &State, run: &RunRecord) {
     println!("Verification\n  {}", result_verification(candidate));
     for check in &candidate.checks {
         println!("{}", super::check_line(check));
+    }
+    for line in checks_notes(state, run) {
+        println!("{line}");
     }
     println!();
     let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
