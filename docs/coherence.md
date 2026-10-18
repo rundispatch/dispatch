@@ -179,9 +179,10 @@ needs a non-empty `checks.verify`, a non-empty Δ and authority: the Work's own
 prints `Merged checks: not run — …`, unless the memo holds a pass for that tree. It
 changes no verdict and applies nothing.
 
-1. Take the project's source lock (`apply::source_lock_path`). When another merged
-   check or apply holds it, print `Merged checks: waiting for the source lock on <path>`
-   once and wait.
+1. Take the project's source lock (`apply::source_lock_path`), unless the caller
+   already holds it: accept and auto-apply take it before their gate and pass it down.
+   When another merged check or apply holds it, print `Merged checks: waiting for the
+   source lock on <path>` once and wait.
 2. Prepare the project's check workspace (`source::prepare_check_workspace`):
    `<state>/check-workspaces/<sha256 of the source path>`, one internal Git repository
    per project. It is never a worktree of the source's repository, and its Git
@@ -213,8 +214,8 @@ changes no verdict and applies nothing.
 
 There is no cooperative cancellation of these checks. They run under the project's
 source lock, so merged checks and applies for one project run one at a time. At accept
-the run's lock is held too, and the apply takes the source lock again only after the
-gate. `check --merged` takes no run lock.
+the run's lock is held too, and the source lock is held from the gate through the
+apply. `check --merged` takes no run lock.
 
 Each run is recorded as one `coherence.merged_checks` event (see "Events"). Its
 `source` is observed just before the check workspace is prepared, under
@@ -275,8 +276,10 @@ digest is recorded on the `review.accepted` or `review.rejected` event as
 `delta_digest`.
 
 `apply_locked` (used by `dispatch accept`, the review view and `dispatch apply`) runs
-under the run's lock, calls `coherence::gate`, whose merged checks take the source lock
-themselves, and then takes the per-source lock for the apply:
+under the run's lock, takes the per-source lock (waiting up to the run's
+`execution.timeout_secs`, and saying `Apply: waiting for the source lock on <path>` when
+another holds it), and calls `coherence::gate` under both, so no other application writes
+the source between the evaluation and the apply:
 
 - The configuration frozen with the run (`config.snapshot.yml` in the run directory)
   is read. If it cannot be read or parsed, the gate is `Legacy` (strict).
@@ -366,7 +369,7 @@ to 5 s). Every failure below returns `Skipped`, and every one except `run_busy` 
 | `outcome.verification == Passed` | `verification_failed`, `verification_inconclusive`, `verification_not_run`, or `verification_not_configured` |
 | On the local backend, `environment.unsafe_local` is true | `integration_checks_unavailable` |
 | The sole candidate's `diff_path` is non-empty | `empty_delta` |
-| The source lock is free within the run's `execution.timeout_secs`, after the gate (stage 2) | `source_busy` |
+| The source lock is free within the run's `execution.timeout_secs` (a wait prints `Auto-apply: waiting for the source lock on <path>`) | `source_busy` |
 
 `verification_not_configured` is never eligible: without `checks.verify` there is no
 L2, and the only evidence would be that the agent exited zero. No configuration key
@@ -380,13 +383,11 @@ applied with zero files changed.
 process holding no operation lock, or by a human review holding it; writing an event
 here would bump the run's `state_revision` out from under that owner.
 
-### Stage 2: the gate, then the source lock
+### Stage 2: the gate under both locks
 
-Under the run's lock, `decide()` (`src/orchestrator/apply.rs`) calls
-`coherence::gate` and applies a stricter authorization predicate than human accept.
-The gate's merged checks take the source lock themselves; the apply then takes it
-(`source_busy` if it stays held), and the digest fence refuses a source that moved in
-between:
+With both locks held, `decide()` (`src/orchestrator/apply.rs`) calls
+`coherence::gate` and applies a stricter authorization predicate than human accept. The
+gate's merged checks run under the source lock auto-apply already holds:
 
 | Gate result | Authorized | Else |
 |---|---|---|

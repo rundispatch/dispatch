@@ -99,10 +99,13 @@ No migration; the schema stays at 24. Existing records are not rewritten.
     ignored build output after a run no longer blocks its accept. Strict mode and plain
     directories keep the whole-tree fingerprint. A native run that 0.4.15 made, in a Git source
     with ignored build output, still checks as unmoved and accepts with 0.4.16.
-  - **Accept and auto-apply take the source lock after their gate,** no longer around it. The
-    gate's merged checks take it themselves. A second merged check or apply on the same
-    project waits, saying `Merged checks: waiting for the source lock on <path>` or `Apply:
-    waiting for the source lock on <path>`.
+  - **Merged checks take the project's source lock.** `check --merged` and finish wait for
+    it, saying `Merged checks: waiting for the source lock on <path>`. Accept and auto-apply
+    hold it from their evaluation through the apply, as in 0.4.15, with their merged checks
+    under it. An accept that finds it held now waits, up to the run's
+    `execution.timeout_secs`, saying `Apply: waiting for the source lock on <path>`, where
+    0.4.15 refused at once; a waiting auto-apply says `Auto-apply: waiting for the source
+    lock on <path>`.
   - **`dispatch check --merged`** on finished Work whose source has not moved runs nothing,
     as accept does, unless a recorded pass is reused first. Its closing line now reads
     `accept checks again only if the source moves; a tree with a recorded pass is not checked

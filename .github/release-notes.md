@@ -56,8 +56,11 @@ starts native agents without a suite, and makes the owner and the hooks cheap.
     cache: a project's first run in it builds from nothing.
   - Merged checks hold the project's source lock while they run. A second one waits, saying
     `Merged checks: waiting for the source lock on <path>`, instead of failing. Accept and
-    auto-apply now take the source lock after their gate, and their digest fence still
-    refuses a source that moved in between.
+    auto-apply hold that lock from their evaluation to the apply, as in 0.4.15, and run their
+    merged checks under it, so one never evaluates a source another is writing. An accept
+    that finds the lock held now waits for it, saying `Apply: waiting for the source lock on
+    <path>`, where 0.4.15 refused at once; a waiting auto-apply says `Auto-apply: waiting for
+    the source lock on <path>`.
   - `dispatch clean` lists each check workspace (`<path> · internal check workspace`) and the
     memo (`<state>/memo · recorded passes (N)`), and removes them only after you confirm,
     never on `--dry-run` or when it refuses. It refuses a check workspace whose source lock is
@@ -113,6 +116,13 @@ starts native agents without a suite, and makes the owner and the hooks cheap.
   repository" now means a plain directory. Any other failure, such as a broken config or a
   repository owned by another user, stops with Git's message, where 0.4.15 snapshotted the
   source as a plain directory, and hooks said nothing.
+- **Fixed: on Linux, a same-size edit could be captured with its old content** (since
+  0.4.10). Dispatch reads a checkout's current files through a copy of its Git index. On
+  Linux that copy got a new modification time, so Git trusted cached file data it should
+  have checked again: a file rewritten at the same size in the second Git last wrote the
+  index kept its old content in what Dispatch captured. An attached or registered Work's S0
+  could miss such an edit, which then counted as part of the Work's Δ. The copy now keeps
+  the index's time. On macOS the copy already kept it.
 
 Not in 0.4.16:
 - A pass is reused only from the same fingerprint. A check run from an agent's shell, which
@@ -136,17 +146,22 @@ Measurements, counted from recorded events and logs:
 - **0.4.15's own check runs, replayed** through a memo of passed runs, keyed by the tree each
   tested: 17 suite runs for 7 landed Works (2.43 per landed Work) would have been 12 (1.71).
   The duplicates were `check --merged` re-testing exactly the tree `finish` had tested.
-- **This build's own suite runs per landed Work:** _[INTEGRATOR: fill in from the execution
-  log, as counts with their denominators, and the reuses as reuses. Target ≤ 1.75; 0.4.15:
-  2.43.]_
+- **This build's own suite runs:** 11 for 6 landed Works (1.83 per landed Work), and no tree
+  was tested twice. Three of the 11 were the finishes of Works replaced after a conflict;
+  without them, 8 for 6 (1.33). The build ran on 0.4.15, which has no memo, so nothing was
+  reused. Replayed with 0.4.16's finish, which checks what would land, the same runs come to
+  9 (1.50).
 
 A reused result is counted as reused, never as time saved.
 
 Built with Dispatch: each packet's worker ran in a workspace Dispatch 0.4.15 made, on three
 harnesses. Claude Code built the memo (P1, re-applied on top of P2 as P1b), the owner and hook
-costs (P4) and the docs (R); Codex built the warm check workspace (P2); Hermes Agent built
-native start (P3). P1 to P4 each landed with `dispatch accept --expect`. P1 conflicted with P2 in
+costs (P4), the docs (R) and the fixes for two failures CI found on the release branch (P5);
+Codex built the warm check workspace (P2); Hermes Agent built native start (P3). Every packet
+landed with `dispatch accept --expect`, and no verdict was overridden. P1 conflicted with P2 in
 three files and was re-applied on top of it in a fresh workspace; P4's accept was refused once
-its patch no longer applied after P1b landed, and its frozen Δ was re-applied with a 3-way merge.
+its patch no longer applied after P1b landed, and its frozen Δ was re-applied with a 3-way merge;
+P5 came out REFRESH because R had edited the same function, and its frozen Δ was re-applied on
+top of R.
 
-Site impact: `check --merged`, accept and `status` can say `passed, reused from <run> at <time>; logs: …` instead of running checks; `check --merged` on finished Work with an unmoved source prints `Merged checks: not run — the source has not moved since the Work began, so the merged result is the Work's own tree`; attached `finish` on a moved source checks the current source with Δ and prints `finish: checked on the current source with this Δ, as accept checks it` (or that it did not pass and S0 was checked too); `status --json` gains `checks_reused`; native runs without `checks.baseline` no longer print `Running baseline checks...` and run no S0 suite before the agent (an explicit `checks.baseline` still runs first); a missing check program prints `` check program not found: <program> (from `<command>`); the agent was not started `` and `Work stopped: the project's checks could not run on its starting point (S0), so the agent was not started`; `check --merged` ends `accept checks again only if the source moves; a tree with a recorded pass is not checked again`; merged checks run in a per-project check workspace under the state directory instead of a scratch copy, can print `Merged checks: waiting for the source lock on <path>`, and `dispatch clean` lists `<path> · internal check workspace` and `<state>/memo · recorded passes (N)`, with its own confirmation text, and prints `Removed N recorded pass(es).`; the check consent text and `dispatch check --merged`'s help now name the check workspace; `serve -v` tick lines end with `· total N ms`; a source whose Git inspection fails for any reason but "not a git repository" is now an error.
+Site impact: `check --merged`, accept and `status` can say `passed, reused from <run> at <time>; logs: …` instead of running checks; `check --merged` on finished Work with an unmoved source prints `Merged checks: not run — the source has not moved since the Work began, so the merged result is the Work's own tree`; attached `finish` on a moved source checks the current source with Δ and prints `finish: checked on the current source with this Δ, as accept checks it` (or that it did not pass and S0 was checked too); `status --json` gains `checks_reused`; native runs without `checks.baseline` no longer print `Running baseline checks...` and run no S0 suite before the agent (an explicit `checks.baseline` still runs first); a missing check program prints `` check program not found: <program> (from `<command>`); the agent was not started `` and `Work stopped: the project's checks could not run on its starting point (S0), so the agent was not started`; `check --merged` ends `accept checks again only if the source moves; a tree with a recorded pass is not checked again`; merged checks run in a per-project check workspace under the state directory instead of a scratch copy, can print `Merged checks: waiting for the source lock on <path>`, and `dispatch clean` lists `<path> · internal check workspace` and `<state>/memo · recorded passes (N)`, with its own confirmation text, and prints `Removed N recorded pass(es).`; accept and auto-apply hold the source lock from their evaluation to the apply, and a waiting one prints `Apply: waiting for the source lock on <path>` (accept no longer refuses at once) or `Auto-apply: waiting for the source lock on <path>`; the check consent text and `dispatch check --merged`'s help now name the check workspace; `serve -v` tick lines end with `· total N ms`; a source whose Git inspection fails for any reason but "not a git repository" is now an error.

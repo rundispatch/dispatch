@@ -198,10 +198,109 @@ The other approved clauses come with the releases that ship them.
 
 ## 7. Execution log
 
-(empty)
+Built as planned: workers wrapped by the pinned Dispatch 0.4.15 (`dadc574be248`, state
+`~/dispatch-dev/state-0416`), every packet landed with `accept --expect`, and CI validating
+each landing on draft PR #26. No coherence override was needed. Three packets conflicted with
+packets that landed before them and were re-applied (P1b, P4b, P5b).
+
+### P0 (2026-10-18)
+
+The replay, tick, hook, copy and ignored-input probes in §2, with their scripts in
+`~/dispatch-dev/p0-0416/`.
+
+### Packets
+
+| Packet | Worker | Work | Finish | Landed |
+|---|---|---|---|---|
+| P2 warm check workspace | Codex 0.155.1, gpt-6-sol | `01M56DF92HVPHQVAZQ1EB13PJZ` | CONTINUE, 760 passed | `04eb03a`, `--expect b648d73d7a08`; source unmoved, no rerun |
+| P3 native start | Hermes Agent 0.18.2 | `01M56DF928SV91WZ45KKCM0B1P` | CONTINUE, 760 passed | `469b4a7`, `--expect 44bd58963d63`; merged checks on top of P2 (764 passed) |
+| P1 verification memo | Claude Code | `01M56DF92H3W7FG46D6YDGQPA7` | 769 passed | not landed: conflicted with P2 in three files; closed as superseded by P1b |
+| P1b the memo on top of P2 | Claude Code | `01M56HVJ1T6NGZT6W2TK0G3KRJ` | CONTINUE, 777 passed | `3eab908`, `--expect cec43cfee0df`; merged checks on top of P2 and P3 (781 passed) |
+| P4 owner and hook costs | Claude Code | `01M56DF92H3ND2XQ8SH04BM8TA` | CONTINUE, 768 passed | refused at accept: REFRESH, its patch no longer applied to `attach.rs` after P1b; closed as superseded by P4b |
+| P4b P4's Δ re-applied | the integrator, no agent | `01M57N0RZN3ZGRSGTETCM5NY2A` | CONTINUE, 793 passed | `4818ef3`, `--expect bd1209c35b10`; source unmoved, no rerun |
+| R docs, version | Claude Code | `01M57NMFC0X1XEABYKB9JYG9FS` | CONTINUE, 795 passed | `416d414`, `--expect df8ee4388e77`; source unmoved, no rerun |
+| P5 two CI failures | Claude Code | `01M57QK0NC45G4M9ZQ4T5KP00M` | REFRESH, `check` also edited by R; 795 passed | not landed: closed as superseded by P5b |
+| P5b P5's Δ re-applied | the integrator, no agent | `01M57VVKJWF7HCEV03M62E727G` | CONTINUE, 797 passed | `e5f2626`, `--expect 987c7e75e830`; source unmoved, no rerun |
+
+- **Conflicts.**
+  - P1 and P2 both changed `integration.rs`, `orchestrator.rs` and `clean.rs`: P2 replaced
+    the scratch tree that P1's memo was written against. P2 landed first, and P1's patch was
+    re-applied on top of it in a fresh workspace (P1b).
+  - P4 merged cleanly with P1b in a 3-way test, but accept applies without 3-way, so once P1b
+    landed P4's patch no longer applied to `attach.rs` (shifted context, no real conflict).
+    The integrator applied P4's frozen Δ 3-way on the new source (one trivial conflict: two
+    adjacent doc comments, both kept) and attached it as P4b.
+  - R and P5 both edited `check` in `orchestrator.rs`: R one string, P5 one argument, about
+    84 lines apart. P5's patch applied cleanly, but 0.4.15 refuses an accept when a landing
+    edited the same declaration (`same_symbol_edited`, REFRESH). P5's frozen Δ was applied on
+    the new source and attached as P5b, rather than overriding the verdict.
+  - All three are evidence for 0.5.0: workers that hear about each other, a stale agent that
+    catches up in place (P5's REFRESH rested only on a symbol fact in a file R changed), and
+    a landing that applies 3-way (S0's objects are kept).
+  - The three superseded finishes cost one suite run each.
+- **Review sent work back:**
+  - P3 removed strict mode's fence on ignored files; strict mode keeps the whole-tree
+    fingerprint.
+  - P1b: content-converting attributes or config (LF and CRLF under `text=auto`) made two
+    different sources one memo key, a possible false pass; such sources get no key.
+  - P4: the per-workspace pointer was dropped in favour of the query, and projection repair
+    on read was kept, only when stale.
+  - R found four defects in the landed packets, fixed with tests: `clean` cleared the memo
+    before you confirmed (P1); an explicit `checks.baseline` no longer ran before the agent
+    (P3); `check --merged`'s closing line was stale; a missing check program was reported as
+    a failed baseline.
+- **Found by CI** (packet P5):
+  - `merged_check` failed on Linux in 1 of 5 CI-image runs (2 of 20 in P5's loop):
+    `source::capture_world` copied the Git index with a new mtime, so Git trusted stat data
+    for a same-size edit made in the second the index was written, and the captured world
+    kept the old file. A bug since 0.4.10 that could also leave such an edit out of an
+    attached or registered Work's S0. The copy keeps the index's mtime now; 40 of 40 runs
+    pass.
+  - `auto_apply_concurrency` failed once: P2 had moved the source lock after the gate, so an
+    auto-apply could evaluate a source another application was writing. The lock is held
+    from evaluation to apply again, as in 0.4.15, and passed down to the merged checks. The
+    exact CI run was not reproduced (10 of 10 in Docker); a deterministic test shows the old
+    order.
+- **CI on PR #26:** green on P2's and P3's commits. P1b's commit failed the four
+  `merged_check` tests on Linux and P4b's the `auto_apply_concurrency` test, each passing on
+  macOS and under load; R's commit was green, since both failures are intermittent.
+
+### Workers, as their harnesses reported
+
+- **Codex (P2):** 30m53s; 193,362 tokens and 15.2M cached, as reported at exit.
+- **Hermes (P3):** 1h16m, 252 messages (235 tool calls); tokens not shown.
+- **Claude Code (P1, P1b, P4, R, P5):** usage not reported at exit.
+
+### Against §6
+
+- **Suite runs per landed Work:** 11 for 6 landed Works (1.83; 0.4.15: 2.43), with no tree tested
+  twice. Not met as run: three of the 11 were the finishes of superseded Works (8 for 6 without
+  them, 1.33), and the build ran on 0.4.15, which has no memo and whose finish checks S0 with
+  Δ. Replayed with 0.4.16's finish rule and memo, the same runs come to 9 (1.50). The memo's
+  first real use is 0.4.17's build.
+- **Warm clippy:** 4.2 s in the check workspace after a one-line edit (21.8 s cold; one pair,
+  load averages 53.3 and 48.7). Met.
+- **Owner and hooks** (6 Works on this repository, §2's method):
+  - a tick when nothing moved: 36 to 64 ms (target ≤ 100 ms). Met.
+  - a tick after the source moved: 86 to 334 ms; a move that records verdicts took 311 to
+    427 ms in 6 of 15 samples, mostly at load averages above 10 (target ≤ 300 ms). Met at
+    ordinary load, not under heavy load.
+  - a hook with nothing to do: 4.0 to 4.4 ms at the median at load averages 4.3 to 5.1
+    (target ≤ 10 ms), and 8 to 20 ms at load average 30. Met at ordinary load.
+- **No suite before a native agent launches:** met, unless `checks.baseline` asks for one.
 
 ## Carried, not in this release
 
 - A guard for a capture that overlaps a removal (0.4.15 P5's note).
 - Ties between same-second modification times in `freshest_patch` (filesystems with
   one-second times only).
+- Accept applies Δ without a 3-way merge, so shifted context refuses a patch with no real
+  conflict (P4). For 0.5.0's batch landing.
+- A REFRESH that rests only on a symbol fact a landing changed (P5) is the case 0.5.0's
+  catch-up is for.
+- A native run's snapshot still copies and walks ignored build output (P3: 121 s to start
+  with a 3.8 GB `target/` at load average 39). Candidate: clone the tree (`clonefile` on APFS,
+  reflinks on Linux).
+- The 0.4.15 stress failure in `hermes_worktrees`, still unexplained. It did not recur in
+  this build's CI; `inspect_source` now reports Git failures instead of treating them as a
+  plain directory (P4).
