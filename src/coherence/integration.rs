@@ -280,12 +280,13 @@ const EXCERPT_SCAN_BYTES: u64 = 256 * 1024;
 /// unchanged, with the reason, when `checks_skipped` says the checks do not
 /// run. A failing check downgrades the verdict to Refresh; so does an
 /// infrastructure error, because a false Refresh costs a rerun while a false
-/// Continue would corrupt the source.
-pub async fn verify_integration(
+/// Continue would corrupt the source. The caller holds the source lock.
+pub(crate) async fn verify_integration(
     run: &RunRecord,
     candidate_label: &str,
     validity: Validity,
     run_dir: &Path,
+    source_lock: &OperationLock,
 ) -> Result<(Validity, MergedChecks)> {
     if let Some(skipped) =
         checks_skipped(run, candidate_label, run_dir, Some(validity.world_changed))?
@@ -295,8 +296,15 @@ pub async fn verify_integration(
     let config = run_config(run_dir).context("the run's frozen configuration cannot be read")?;
     let patch = find_candidate(run, candidate_label)?.diff_path.clone();
 
-    let (new_reasons, ran) = match run_or_reuse(run, &patch, &config, run_dir, &new_logs(run_dir))
-        .await
+    let (new_reasons, ran) = match run_or_reuse(
+        run,
+        &patch,
+        &config,
+        run_dir,
+        &new_logs(run_dir),
+        Some(source_lock),
+    )
+    .await
     {
         Ok(ran) if ran.passed() => {
             let validity = Validity {
@@ -331,18 +339,20 @@ pub async fn verify_integration(
 
 /// `run_merged`, unless the memo holds a pass for the same merged tree,
 /// commands and environment, in which case nothing runs. A pass is recorded.
-pub async fn run_or_reuse(
+/// `source_lock` as for `run_merged`.
+pub(crate) async fn run_or_reuse(
     run: &RunRecord,
     patch: &Path,
     config: &Config,
     run_dir: &Path,
     logs: &Path,
+    source_lock: Option<&OperationLock>,
 ) -> Result<MergedRun> {
     let key = memo::merged_key(run, patch, config);
     if let Some(reused) = reused_for(run, key.as_ref(), run_dir)? {
         return Ok(reused);
     }
-    let ran = run_merged(run, patch, config, run_dir, logs).await?;
+    let ran = run_merged(run, patch, config, run_dir, logs, source_lock).await?;
     // Recorded only under the tree the checks saw: a source that moved after
     // the key was computed, or a tree the workspace staged differently, is
     // not filed under the key's tree.
@@ -394,13 +404,17 @@ pub fn new_logs(run_dir: &Path) -> PathBuf {
 /// Build the merged tree (the current source with `patch`) in its private,
 /// persistent check workspace and run `config`'s verify commands there.
 /// The one merged-check runner: accept's gate, `dispatch check --merged` and
-/// attached finish, through `run_or_reuse`.
-pub async fn run_merged(
+/// attached finish, through `run_or_reuse`. The workspace is used only under
+/// the source lock: `source_lock` is the caller's own hold on it (accept and
+/// auto-apply hold it from evaluation to apply), or `None` to take it here,
+/// waiting for it.
+pub(crate) async fn run_merged(
     run: &RunRecord,
     patch: &Path,
     config: &Config,
     run_dir: &Path,
     logs: &Path,
+    source_lock: Option<&OperationLock>,
 ) -> Result<MergedRun> {
     let state_root = run_dir
         .parent()
@@ -409,28 +423,10 @@ pub async fn run_merged(
     let state = State {
         root: state_root.to_owned(),
     };
-    let lock_path = source_lock_path(&state, run);
-    if OperationLock::is_held(&lock_path)? {
-        eprintln!(
-            "Merged checks: waiting for the source lock on {}",
-            run.source_path.display()
-        );
-    }
-    let _source_lock = tokio::task::spawn_blocking(move || {
-        loop {
-            match OperationLock::acquire_wait(
-                &lock_path,
-                "another operation is using this source",
-                Duration::from_secs(30),
-            ) {
-                Ok(lock) => return Ok(lock),
-                Err(error) if error.to_string().contains("still busy after waiting") => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    })
-    .await
-    .context("source lock waiter stopped")??;
+    let _own_lock = match source_lock {
+        Some(_) => None,
+        None => Some(wait_for_source_lock(source_lock_path(&state, run), &run.source_path).await?),
+    };
     let source = SourceState::observe(&run.source_path, &run.source_kind)?;
     let workspace = check_workspace_path(state_root, &run.source_path);
     let tree_id = prepare_check_workspace(&run.source_path, &run.source_kind, &workspace, patch)
@@ -456,6 +452,32 @@ pub async fn run_merged(
         load_average,
         reused: None,
     })
+}
+
+/// Take the source lock at `lock_path`, saying so when someone else holds it,
+/// and waiting as long as they do.
+async fn wait_for_source_lock(lock_path: PathBuf, source: &Path) -> Result<OperationLock> {
+    if OperationLock::is_held(&lock_path)? {
+        eprintln!(
+            "Merged checks: waiting for the source lock on {}",
+            source.display()
+        );
+    }
+    tokio::task::spawn_blocking(move || {
+        loop {
+            match OperationLock::acquire_wait(
+                &lock_path,
+                "another operation is using this source",
+                Duration::from_secs(30),
+            ) {
+                Ok(lock) => return Ok(lock),
+                Err(error) if error.to_string().contains("still busy after waiting") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .context("source lock waiter stopped")?
 }
 
 #[cfg(target_os = "linux")]

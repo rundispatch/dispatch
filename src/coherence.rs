@@ -21,6 +21,7 @@ use crate::{
         world::WorldObservation,
     },
     config::Config,
+    lock::OperationLock,
     source::{git_command, run_git},
 };
 
@@ -404,16 +405,19 @@ pub fn run_config(run_dir: &Path) -> Option<Config> {
 /// moved but L0 says the work is still valid, the run's own verification checks
 /// are run against the merged result before anything is applied.
 ///
-/// The caller holds the per-run and per-source operation locks and has no
-/// database transaction open; the checks (each bounded by the run's execution
-/// timeout) hold only those locks.
+/// The caller holds the per-run operation lock and `source_lock`, the
+/// per-source one, and has no database transaction open; the checks (each
+/// bounded by the run's execution timeout) hold only those locks. Holding the
+/// source lock from here to the apply means no other accept writes the source
+/// while this one evaluates it.
 /// `despite_refresh` is a human's explicit override (`dispatch accept
 /// --despite-refresh`); policy applications always pass `false`.
-pub fn gate(
+pub(crate) fn gate(
     run: &RunRecord,
     candidate_label: &str,
     run_dir: &Path,
     despite_refresh: bool,
+    source_lock: &OperationLock,
 ) -> Result<AcceptGate> {
     // Strict accept, or a launched run's unmoved tree: the fingerprint rules
     // apply, and nothing is evaluated.
@@ -431,6 +435,7 @@ pub fn gate(
             candidate_label,
             validity,
             run_dir,
+            source_lock,
         ))??;
         return Ok(match validity.decision {
             Decision::Continue => AcceptGate::Compatible { validity, checks },
@@ -452,6 +457,7 @@ pub fn gate(
                 ..validity.clone()
             },
             run_dir,
+            source_lock,
         ))??;
         return Ok(match (verified.decision, checks) {
             (Decision::Continue, checks @ MergedChecks::Passed(_)) => AcceptGate::Overridden {
@@ -1196,8 +1202,9 @@ mod tests {
         fixture.write("b.txt", "b edited\n");
         let run_dir = fixture.root.path().join("run");
         assert!(run_config(&run_dir).is_none());
+        let lock = OperationLock::acquire(&run_dir.join("source.lock"), "busy").unwrap();
         assert!(matches!(
-            gate(&run, "A", &run_dir, false).unwrap(),
+            gate(&run, "A", &run_dir, false, &lock).unwrap(),
             AcceptGate::Legacy(ChecksSkipped::ConfigUnreadable)
         ));
         fs::write(run_dir.join("config.snapshot.yml"), "coherence: [not a map").unwrap();

@@ -396,11 +396,26 @@ pub(super) fn apply_locked(
         run.id
     );
     let normalized_label = sole_candidate(&run)?.label.clone();
+    // Held from evaluation to apply, so no other accept writes the source
+    // while this one evaluates it; the merged checks run under it.
+    let source_lock_path = source_lock_path(state, &run);
+    if OperationLock::is_held(&source_lock_path)? {
+        eprintln!(
+            "Apply: waiting for the source lock on {}",
+            run.source_path.display()
+        );
+    }
+    let source_lock = OperationLock::acquire_wait(
+        &source_lock_path,
+        "another operation is using this source",
+        Duration::from_secs(run.environment.timeout_secs),
+    )?;
     let applied = crate::coherence::gate(
         &run,
         &normalized_label,
         &state.run_dir(&run.id),
         despite_refresh,
+        &source_lock,
     )
     .and_then(|gate| {
         let (validity, overridden, checks) = match gate {
@@ -433,15 +448,6 @@ pub(super) fn apply_locked(
             println!("Merged checks: {checks}");
             print_check_lines(&checks);
         }
-        let source_lock_path = source_lock_path(state, &run);
-        if OperationLock::is_held(&source_lock_path)? {
-            eprintln!("Apply: waiting for the source lock on {}", run.source_path.display());
-        }
-        let _source_lock = OperationLock::acquire_wait(
-            &source_lock_path,
-            "another operation is using this source",
-            Duration::from_secs(run.environment.timeout_secs),
-        )?;
         let landing = observe_landing(state, &run, authority, validity.as_ref());
         let report = match &validity {
             None => source::safe_apply(&run, &normalized_label)?,
@@ -640,10 +646,11 @@ fn decide(
     run: &RunRecord,
     candidate_label: &str,
     run_dir: &Path,
+    source_lock: &OperationLock,
 ) -> Result<Result<Authorization, (String, Option<Validity>)>> {
     Ok(
         // A policy never overrides a verdict.
-        match crate::coherence::gate(run, candidate_label, run_dir, false)? {
+        match crate::coherence::gate(run, candidate_label, run_dir, false, source_lock)? {
             // `config_unreadable` was already ruled out in stage 1: a config
             // that was readable there and is unreadable here would be an
             // extraordinary race, not a case this predicate distinguishes.
@@ -769,23 +776,32 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
     if empty_delta {
         return persist_skip(state, run, "empty_delta");
     }
+    // Held from evaluation to apply, so no other application writes the
+    // source while this one evaluates it; the merged checks run under it.
+    let source_lock_path = source_lock_path(state, &run);
+    if OperationLock::is_held(&source_lock_path)? {
+        eprintln!(
+            "Auto-apply: waiting for the source lock on {}",
+            run.source_path.display()
+        );
+    }
+    let source_lock = OperationLock::acquire_wait(
+        &source_lock_path,
+        "another apply operation is already modifying this source",
+        Duration::from_secs(run.environment.timeout_secs),
+    );
+    let Ok(source_lock) = source_lock else {
+        return persist_skip(state, run, "source_busy");
+    };
     let mut retried = false;
     loop {
-        let authorization = match decide(&run, &candidate_label, &run_dir)? {
+        let authorization = match decide(&run, &candidate_label, &run_dir, &source_lock)? {
             Ok(authorization) => authorization,
             Err((reason, validity)) => return persist_blocked(state, run, reason, validity),
         };
         let validity = match &authorization {
             Authorization::Fingerprint => None,
             Authorization::Digest(validity) => Some(validity.clone()),
-        };
-        let source_lock = OperationLock::acquire_wait(
-            &source_lock_path(state, &run),
-            "another apply operation is already modifying this source",
-            Duration::from_secs(run.environment.timeout_secs),
-        );
-        let Ok(_source_lock) = source_lock else {
-            return persist_skip(state, run, "source_busy");
         };
         let landing = observe_landing(state, &run, ApplyAuthority::AutoApply, validity.as_ref());
         let applied = match &authorization {

@@ -444,8 +444,21 @@ fn capture_world(checkout: &Path) -> Result<String> {
         .trim(),
     );
     if real_index.is_file() {
+        // The copy keeps the index's mtime, read before copying: Git trusts
+        // an entry's stat data only when the file is older than the index
+        // file, and re-reads "racily clean" entries written in the same
+        // second. A fresh mtime would hide a same-size edit made in the
+        // second the index was written.
+        let written = fs::metadata(&real_index)
+            .and_then(|metadata| metadata.modified())
+            .with_context(|| format!("failed to read {}", real_index.display()))?;
         fs::copy(&real_index, &index)
             .with_context(|| format!("failed to copy {}", real_index.display()))?;
+        fs::File::options()
+            .write(true)
+            .open(&index)
+            .and_then(|copy| copy.set_modified(written))
+            .context("failed to keep the Git index's time on its copy")?;
     }
     let head = git_head_at(checkout)?;
     if !real_index.is_file() && head.is_some() {
@@ -3070,6 +3083,41 @@ mod tests {
             run_git(&fresh, &["ls-tree", "-r", "--name-only", &commit]),
             "first.txt"
         );
+    }
+
+    /// Git trusts an entry's stat data only for a file older than the index
+    /// file, so a same-size edit made in the second the index was written is
+    /// caught only by reading it again; the capture's copy of the index must
+    /// keep that. Whole-second stat checks and fixed times make the race
+    /// exact here.
+    #[test]
+    fn world_commit_sees_a_same_size_edit_made_as_the_index_was_written() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("a.txt"), "1\n");
+        initialize_user_repository(&source);
+        run_git(&source, &["config", "core.checkStat", "minimal"]);
+        run_git(&source, &["config", "core.trustCtime", "false"]);
+        let second = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let set_time = |path: &Path| {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(second)
+                .unwrap()
+        };
+        set_time(&source.join("a.txt"));
+        run_git(&source, &["update-index", "--refresh"]);
+
+        write(&source.join("a.txt"), "2\n");
+        set_time(&source.join("a.txt"));
+        set_time(&source.join(".git/index"));
+        assert_eq!(run_git(&source, &["diff-files", "--name-only"]), "a.txt");
+
+        let commit = world_commit(&source).unwrap();
+        assert_eq!(run_git(&source, &["show", &format!("{commit}:a.txt")]), "2");
     }
 
     #[cfg(unix)]

@@ -1592,7 +1592,7 @@ async fn finish_checks(
     if !one_tree {
         let logs = integration::new_logs(&run_dir);
         let (kind, payload) =
-            match integration::run_or_reuse(run, patch, config, &run_dir, &logs).await {
+            match integration::run_or_reuse(run, patch, config, &run_dir, &logs, None).await {
                 Ok(ran) if ran.passed() => {
                     let (kind, payload) = ran.event("finish", &digest);
                     super::record_observation(state, run, kind, payload)?;

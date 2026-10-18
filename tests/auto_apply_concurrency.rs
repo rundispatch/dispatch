@@ -115,7 +115,9 @@ impl OwnedChild {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         self.0.stdout.take().unwrap().read_to_end(&mut stdout)?;
-        self.0.stderr.take().unwrap().read_to_end(&mut stderr)?;
+        if let Some(mut piped) = self.0.stderr.take() {
+            piped.read_to_end(&mut stderr)?;
+        }
         Ok(Output {
             status: self.0.wait()?,
             stdout,
@@ -229,6 +231,11 @@ impl Fixture {
     /// --auto-apply --json` with the given task text (which must carry
     /// exactly one `ROLE_*` marker the agent script recognizes).
     fn spawn(&self, task: &str) -> Result<OwnedChild> {
+        self.spawn_with_stderr(task, Stdio::piped())
+    }
+
+    /// `spawn`, with the run's stderr going to `stderr`.
+    fn spawn_with_stderr(&self, task: &str, stderr: Stdio) -> Result<OwnedChild> {
         Ok(OwnedChild(
             self.command()
                 .arg("run")
@@ -243,9 +250,30 @@ impl Fixture {
                     "codex",
                 ])
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(stderr)
                 .spawn()?,
         ))
+    }
+
+    /// Takes `run_id`'s source lock, as an application of another run does,
+    /// until the returned file is dropped.
+    fn hold_source_lock(&self, run_id: &str) -> Result<fs::File> {
+        use sha2::{Digest, Sha256};
+        use std::os::fd::AsRawFd;
+        let source = self.loaded(run_id)?.source_path;
+        let key = hex::encode(Sha256::digest(source.to_string_lossy().as_bytes()));
+        let path = self.state.join("locks").join(format!("source-{key}.lock"));
+        fs::create_dir_all(path.parent().unwrap())?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        // SAFETY: the descriptor is owned by `file`, which the caller keeps.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        anyhow::ensure!(locked == 0, "the source lock is already held");
+        Ok(file)
     }
 
     /// Waits for the agent slot `role` (`a`, `b` or `q`) to reach its gate,
@@ -619,6 +647,63 @@ fn simultaneous_finish_serializes_on_the_source_lock() -> Result<()> {
         "the follower ({follower_id}, {follower_ts}) must apply after the mover \
          ({mover_id}, {mover_ts})"
     );
+    Ok(())
+}
+
+/// A second application never evaluates the source while another holds the
+/// source lock, since that one may be writing the source: it waits for the
+/// lock first, then judges the source as the other left it. The test plays
+/// the other application by holding the lock itself.
+#[test]
+fn auto_apply_waits_for_the_source_lock_before_it_evaluates() -> Result<()> {
+    let f = Fixture::new(Verify::Trivial)?;
+    let errors = f.root.join("b.stderr");
+    let mut b = f.spawn_with_stderr(
+        "ROLE_CREATE_B: create b.txt",
+        fs::File::create(&errors)?.into(),
+    )?;
+    f.wait_started("b", &mut b)?;
+    // The world moved, so B's verdict needs an evaluation and merged checks.
+    fs::write(f.source.join("c.txt"), "landed before B finished\n")?;
+    let lock = f.hold_source_lock(&f.only_run_id()?)?;
+
+    f.release("b")?;
+    wait_until(|| {
+        Ok(
+            fs::read_to_string(&errors)?.contains("waiting for the source lock")
+                || b.0.try_wait()?.is_some(),
+        )
+    })?;
+    let waiting = fs::read_to_string(&errors)?;
+    assert!(
+        waiting.contains("Auto-apply: waiting for the source lock"),
+        "B must wait for the lock before evaluating: {waiting}"
+    );
+    assert!(
+        !waiting.contains("Merged checks"),
+        "B evaluated the source while the lock was held: {waiting}"
+    );
+    // What the other application writes while it holds the lock.
+    fs::write(f.source.join("a.txt"), "baseline a\nedited by A\n")?;
+    drop(lock);
+
+    let output = b.output()?;
+    assert!(output.status.success(), "{}", fs::read_to_string(&errors)?);
+    let result = Fixture::result(&output)?;
+    assert_eq!(result["auto_apply"]["outcome"], "applied", "{result}");
+    assert_eq!(
+        result["auto_apply"]["coherence"]["analysis"], "integration",
+        "{result}"
+    );
+    // Judged after the lock: both files the source moved by count.
+    assert_eq!(
+        result["auto_apply"]["coherence"]["changed_files"]
+            .as_u64()
+            .unwrap(),
+        2,
+        "{result}"
+    );
+    assert_eq!(fs::read_to_string(f.source.join("b.txt"))?, "b\n");
     Ok(())
 }
 

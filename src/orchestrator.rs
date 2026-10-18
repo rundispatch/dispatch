@@ -2239,7 +2239,7 @@ pub async fn check(
             let ran = if unmoved {
                 integration::reused(&run, patch, config, &run_dir)
             } else {
-                integration::run_or_reuse(&run, patch, config, &run_dir, logs)
+                integration::run_or_reuse(&run, patch, config, &run_dir, logs, None)
                     .await
                     .map(Some)
             };
