@@ -683,11 +683,107 @@ fn delivery_applies_from_original_baseline_and_pending_question_is_not_reviewabl
 #[test]
 fn unavailable_baseline_tool_stops_before_model_invocation() -> Result<()> {
     let f = Fixture::new("success")?;
-    executable(&f.root.join("verify"), "#!/bin/sh\nexit 127\n")?;
+    fs::remove_file(f.root.join("verify"))?;
+    let first = f.root.join("first-check");
+    let marker = f.root.join("check-ran");
+    executable(
+        &first,
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )?;
+    f.checks(&[
+        first.to_str().unwrap(),
+        f.root.join("verify").to_str().unwrap(),
+    ])?;
     let result = Fixture::result(&f.run(&[])?)?;
+    assert!(
+        !marker.exists(),
+        "program resolution must not execute checks"
+    );
     assert_eq!(f.count(), 0);
     assert_eq!(result["execution"]["failure"], "baseline_infrastructure");
     f.no_live_launches()
+}
+
+#[test]
+fn lazy_baseline_agent_starts_before_checks() -> Result<()> {
+    let f = Fixture::new("success")?;
+    executable(
+        &f.root.join("verify"),
+        &format!("#!/bin/sh\ntest -f '{}/invocations'\n", f.root.display()),
+    )?;
+    let result = Fixture::result(&f.run(&[])?)?;
+    let run = f.loaded(result["run_id"].as_str().unwrap())?;
+    assert!(run.baseline_checks.is_empty());
+    let events = fs::read_to_string(f.state.join("runs").join(&run.id).join("events.jsonl"))?;
+    let events: Vec<Value> = events
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let baseline = events
+        .iter()
+        .find(|e| e["event_type"] == "baseline.finished")
+        .unwrap();
+    assert_eq!(baseline["payload"]["checks_deferred"], true);
+    assert!(baseline["payload"]["checks_passed"].is_null());
+    let started = events
+        .iter()
+        .position(|e| e["event_type"] == "attempt.started")
+        .unwrap();
+    let check = events
+        .iter()
+        .position(|e| e["event_type"] == "check.started")
+        .unwrap();
+    assert!(
+        started < check,
+        "agent must start before checks: {events:?}"
+    );
+    assert_eq!(f.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn lazy_baseline_only_rechecks_failed_candidate_command() -> Result<()> {
+    for already_broken in [false, true] {
+        let f = Fixture::new("both-fail")?;
+        if already_broken {
+            fs::write(f.source.join("result.txt"), "bad\n")?;
+        }
+        let pass = f.root.join("pass");
+        executable(&pass, "#!/bin/sh\nexit 0\n")?;
+        let verify = f.root.join("verify");
+        f.checks(&[pass.to_str().unwrap(), verify.to_str().unwrap()])?;
+        let result = Fixture::result(&f.run(&[])?)?;
+        let run = f.loaded(result["run_id"].as_str().unwrap())?;
+        assert_eq!(run.baseline_checks.len(), 1);
+        assert_eq!(run.baseline_checks[0].command, verify.to_str().unwrap());
+        assert_eq!(
+            result["execution"]["failure"],
+            if already_broken {
+                "baseline_infrastructure"
+            } else {
+                "target_verification"
+            }
+        );
+        assert_eq!(f.count(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn lazy_baseline_preserves_shell_check_syntax() -> Result<()> {
+    let f = Fixture::new("success")?;
+    f.checks(&["! false", "true; true", "VALUE=ok test ok = ok"])?;
+    let result = Fixture::result(&f.run(&[])?)?;
+    assert_eq!(f.count(), 1);
+    let run = f.loaded(result["run_id"].as_str().unwrap())?;
+    assert!(run.baseline_checks.is_empty());
+    assert!(
+        run.candidates[0]
+            .checks
+            .iter()
+            .all(|c| c.status == dispatch::CheckStatus::Passed)
+    );
+    Ok(())
 }
 
 #[test]

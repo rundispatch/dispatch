@@ -249,6 +249,14 @@ pub fn merge_base(root: &Path, workspace: &Path) -> Result<Option<String>> {
 /// `HEAD`, so dirty and untracked source files are part of every candidate's
 /// common baseline. Git and Dispatch state directories are never copied.
 pub fn create_snapshot(source: &Path, run_dir: &Path) -> Result<SourceSnapshot> {
+    create_snapshot_with_mode(source, run_dir, false)
+}
+
+pub(crate) fn create_snapshot_with_mode(
+    source: &Path,
+    run_dir: &Path,
+    strict: bool,
+) -> Result<SourceSnapshot> {
     let source = resolve_source(Some(source))?;
     let projected_run_dir = canonicalize_allow_missing(run_dir)?;
     ensure!(
@@ -258,7 +266,12 @@ pub fn create_snapshot(source: &Path, run_dir: &Path) -> Result<SourceSnapshot> 
     );
 
     let (kind, git_head) = inspect_source(&source)?;
-    let fingerprint_before = fingerprint_tree(&source)?;
+    let fingerprint = if strict {
+        fingerprint_tree_strict
+    } else {
+        fingerprint_tree
+    };
+    let fingerprint_before = fingerprint(&source)?;
 
     fs::create_dir_all(run_dir)
         .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
@@ -277,8 +290,13 @@ pub fn create_snapshot(source: &Path, run_dir: &Path) -> Result<SourceSnapshot> 
 
     // A source changed while it was being copied is not a trustworthy baseline.
     // Check both ends so a mixed snapshot cannot be accepted silently.
-    let fingerprint_after = fingerprint_tree(&source)?;
-    let copied_fingerprint = fingerprint_tree(staging.path())?;
+    let fingerprint_after = fingerprint(&source)?;
+    let copied_fingerprint = if !strict && matches!(kind, SourceKind::Git | SourceKind::GitWorktree)
+    {
+        fingerprint_git_tree(staging.path(), &source)?
+    } else {
+        fingerprint(staging.path())?
+    };
     ensure!(
         fingerprint_before == fingerprint_after && fingerprint_before == copied_fingerprint,
         "source changed while Dispatch was creating its baseline; retry the run"
@@ -766,15 +784,83 @@ pub(crate) fn snapshot_delta_if_changed_indexed(
     }
 }
 
-/// Hash the complete logical source tree, excluding Git and Dispatch state.
+/// Hash the logical source tree, excluding Git and Dispatch state, and for Git
+/// sources ignoring untracked files excluded by the repository's ignore rules.
 /// Content, paths, symlink targets, file kinds, and permission bits are covered;
 /// timestamps are intentionally ignored. An entry that disappears during the
 /// walk (a build deleting its output) is a difference, never an error: it is
 /// hashed as `VANISHED`, so the value equals no tree that held the entry.
 pub fn fingerprint_tree(root: &Path) -> Result<String> {
     let root = resolve_source(Some(root))?;
+    if !matches!(inspect_source(&root)?.0, SourceKind::Directory) {
+        return fingerprint_git_tree(&root, &root);
+    }
     let entries = list_tree(&root)?;
     hash_tree(&root, entries)
+}
+
+/// Strict mode fences the complete tree, including ignored build output.
+pub(crate) fn fingerprint_tree_strict(root: &Path) -> Result<String> {
+    let root = resolve_source(Some(root))?;
+    hash_tree(&root, list_tree(&root)?)
+}
+
+/// An unreadable frozen configuration keeps the strict, fail-closed fence.
+pub(crate) fn fingerprint_for_run(run: &RunRecord) -> Result<String> {
+    let strict = run
+        .baseline_path
+        .parent()
+        .and_then(crate::coherence::run_config)
+        .is_none_or(|config| config.coherence.accept == crate::config::AcceptMode::Strict);
+    if strict {
+        fingerprint_tree_strict(&run.source_path)
+    } else {
+        fingerprint_tree(&run.source_path)
+    }
+}
+
+// Use the source's index and ignore rules even for the not-yet-initialized copy.
+fn fingerprint_git_tree(root: &Path, repository: &Path) -> Result<String> {
+    let mut list = git_command(repository);
+    list.args(["ls-files", "-co", "--exclude-standard", "-z", "--", "."])
+        .args(dispatch_exclusion_pathspecs());
+    let listing = checked_output(list, "failed to list fingerprint inputs")?;
+    let mut paths = HashSet::new();
+    let mut directories = HashSet::new();
+    for raw in listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|p| !p.is_empty())
+    {
+        let relative = bytes_to_path(raw.strip_suffix(b"/").unwrap_or(raw));
+        if !parents_are_directories(root, &relative, &mut directories) {
+            if let Some(link) = symlinked_parent(root, &relative)? {
+                paths.insert(link);
+            }
+            continue;
+        }
+        let path = root.join(&relative);
+        if unless_vanished(fs::symlink_metadata(&path), || {
+            format!("failed to inspect {}", path.display())
+        })?
+        .is_none()
+        {
+            continue;
+        }
+        paths.insert(path);
+        for parent in relative
+            .ancestors()
+            .skip(1)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            paths.insert(root.join(parent));
+        }
+    }
+    let mut entries: Vec<_> = paths.into_iter().map(|path| (path, true)).collect();
+    entries.sort_by(|(a, _), (b, _)| {
+        path_bytes(a.strip_prefix(root).unwrap()).cmp(&path_bytes(b.strip_prefix(root).unwrap()))
+    });
+    hash_tree(root, entries)
 }
 
 /// Hashed in place of an entry's kind (`l`, `d` or `f`) when it vanished.
@@ -922,7 +1008,7 @@ enum ExpectedWorld<'a> {
 impl ExpectedWorld<'_> {
     fn holds(self, run: &RunRecord, source: &Path) -> Result<bool> {
         Ok(match self {
-            Self::Fingerprint => fingerprint_tree(source)? == run.source_fingerprint,
+            Self::Fingerprint => fingerprint_for_run(run)? == run.source_fingerprint,
             Self::Digest(expected) => {
                 crate::coherence::world::observe(
                     source,
@@ -2294,7 +2380,13 @@ mod tests {
         assert_eq!(snapshot.fingerprint, original_fingerprint);
         assert_eq!(fingerprint_tree(&source).unwrap(), original_fingerprint);
         assert_eq!(
-            fingerprint_tree(&snapshot.baseline_path).unwrap(),
+            // This source was a plain directory, including empty directories;
+            // its private snapshot is now Git, whose fingerprint covers files.
+            hash_tree(
+                &snapshot.baseline_path,
+                list_tree(&snapshot.baseline_path).unwrap()
+            )
+            .unwrap(),
             original_fingerprint
         );
         assert!(!snapshot.baseline_path.join(".git/private").exists());
@@ -2595,6 +2687,34 @@ mod tests {
             fs::read_to_string(source.join("two.txt")).unwrap(),
             "incompatible contents\n"
         );
+    }
+
+    #[test]
+    fn git_fingerprints_ignore_build_output_but_cover_source_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".gitignore"), "target/\ntracked\n").unwrap();
+        fs::write(root.join("tracked"), "one").unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/cache"), "one").unwrap();
+        let mut init = git_command(root);
+        init.args(["init", "-q"]);
+        checked_output(init, "init").unwrap();
+        let mut add = git_command(root);
+        add.args(["add", "-f", "tracked", ".gitignore"]);
+        checked_output(add, "add").unwrap();
+        let before = fingerprint_tree(root).unwrap();
+        fs::write(root.join("target/cache"), "two").unwrap();
+        fs::create_dir(root.join("target/new-directory")).unwrap();
+        assert_eq!(before, fingerprint_tree(root).unwrap());
+        fs::write(root.join("tracked"), "two").unwrap();
+        let tracked = fingerprint_tree(root).unwrap();
+        assert_ne!(before, tracked);
+        fs::write(root.join("untracked"), "one").unwrap();
+        let untracked = fingerprint_tree(root).unwrap();
+        assert_ne!(tracked, untracked);
+        fs::write(root.join("untracked"), "two").unwrap();
+        assert_ne!(untracked, fingerprint_tree(root).unwrap());
     }
 
     #[test]

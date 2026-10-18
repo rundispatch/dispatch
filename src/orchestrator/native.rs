@@ -360,6 +360,121 @@ fn apply_watch(
     Ok(())
 }
 
+/// Resolve simple check programs in the same shell/backend as verification,
+/// without executing the checks. Compound shell scripts resolve their shell;
+/// their inner programs can only be diagnosed when verification runs.
+pub(super) async fn resolve_check_programs(
+    state: &State,
+    run: &mut RunRecord,
+    config: &Config,
+    cancellation: CancellationToken,
+) {
+    let commands: Vec<_> = config
+        .checks
+        .baseline
+        .iter()
+        .chain(&config.checks.verify)
+        .collect();
+    let probes: Vec<String> = commands
+        .iter()
+        .map(|command| {
+            let words = shell_words::split(command).unwrap_or_default();
+            let program = words.first().map(String::as_str).unwrap_or("/bin/sh");
+            let program = if program.contains('=')
+                || program.contains([';', '&', '|', '<', '>', '(', ')', '$', '`', '\n'])
+                || matches!(
+                    program,
+                    "!" | "if" | "for" | "while" | "until" | "case" | "{"
+                ) {
+                "/bin/sh"
+            } else {
+                program
+            };
+            format!(
+                "command -v {} >/dev/null || exit 127",
+                shell_words::quote(program)
+            )
+        })
+        .collect();
+    let results = run_checks_with_observer(
+        &run.baseline_path,
+        &probes,
+        CheckPhase::Baseline,
+        &state.run_dir(&run.id).join("checks/programs"),
+        config.execution.clone(),
+        cancellation,
+        None,
+        None,
+    )
+    .await;
+    run.baseline_checks = results
+        .into_iter()
+        .zip(commands)
+        .filter_map(|(mut check, command)| {
+            if check.status == CheckStatus::Passed {
+                return None;
+            }
+            check.command = command.clone();
+            Some(check)
+        })
+        .collect();
+}
+
+/// The sole S0 verification path: only normally failing candidate commands
+/// need a baseline result to distinguish a target defect from a broken S0.
+async fn check_failed_baseline(
+    state: &State,
+    db: &Database,
+    run: &mut RunRecord,
+    candidate: &CandidateRecord,
+    config: &Config,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let commands: Vec<_> = candidate
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Failed && matches!(c.exit_code, Some(1..=125)))
+        .map(|c| c.command.clone())
+        .collect();
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let dir = state.run_dir(&run.id);
+    let workspace = source::create_candidate_workspace(
+        &run.baseline_path,
+        &dir.join("baseline-check/workspace"),
+    )?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let output_dir = dir.join("checks/baseline");
+    let checks = run_checks_with_observer(
+        &workspace,
+        &commands,
+        CheckPhase::Baseline,
+        &output_dir,
+        config.execution.clone(),
+        cancellation.clone(),
+        Some(tx),
+        None,
+    );
+    tokio::pin!(checks);
+    run.baseline_checks = loop {
+        tokio::select! {
+            results = &mut checks => break results,
+            Some(event) = rx.recv() => {
+                if let Err(error) = persist_check_lifecycle(state, db, run, event) {
+                    cancellation.cancel();
+                    let _ = (&mut checks).await;
+                    return Err(error);
+                }
+            }
+        }
+    };
+    while let Ok(event) = rx.try_recv() {
+        persist_check_lifecycle(state, db, run, event)?;
+    }
+    Ok(())
+}
+
 pub(super) fn verification_failure(
     run: &RunRecord,
     candidate: &CandidateRecord,
@@ -775,6 +890,17 @@ async fn drive_inner(
             )?;
         }
         let candidate = execution.candidate.clone();
+        if candidate.status == CandidateStatus::Completed && !cancellation.is_cancelled() {
+            check_failed_baseline(
+                state,
+                db,
+                &mut run,
+                &candidate,
+                &config,
+                cancellation.clone(),
+            )
+            .await?;
+        }
         run.candidates = vec![candidate.clone()];
         refresh_outcome(&mut run);
         run.outcome.lifecycle = LifecycleState::Working;

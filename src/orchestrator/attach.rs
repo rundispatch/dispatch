@@ -346,7 +346,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
     // runtime worktrees inside the root, and races its deletion. In any other
     // mode the value can never match, so every reader fails closed.
     let source_fingerprint = if config.coherence.accept == crate::config::AcceptMode::Strict {
-        source::fingerprint_tree(root)?
+        source::fingerprint_tree_strict(root)?
     } else {
         NOT_FINGERPRINTED.to_owned()
     };

@@ -653,7 +653,7 @@ fn decide(
             // that was readable there and is unreadable here would be an
             // extraordinary race, not a case this predicate distinguishes.
             AcceptGate::Legacy(_) => {
-                if source::fingerprint_tree(&run.source_path)? == run.source_fingerprint {
+                if source::fingerprint_for_run(run)? == run.source_fingerprint {
                     Ok(Authorization::Fingerprint)
                 } else {
                     Err(("strict_mode_drift".into(), None))

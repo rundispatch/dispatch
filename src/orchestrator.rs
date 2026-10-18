@@ -564,7 +564,11 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         println!("RUN {run_id}\n");
         println!("Creating baseline...");
     }
-    let snapshot = match source::create_snapshot(&source_path, &run_dir) {
+    let snapshot = match source::create_snapshot_with_mode(
+        &source_path,
+        &run_dir,
+        config.coherence.accept == crate::config::AcceptMode::Strict,
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             let _ = fs::remove_dir_all(&run_dir);
@@ -688,62 +692,9 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         &mut run,
     )?;
 
-    let mut baseline_passed = true;
-    let baseline_commands = if config.checks.baseline.is_empty() {
-        &config.checks.verify
-    } else {
-        &config.checks.baseline
-    };
-    if !baseline_commands.is_empty() {
-        if request.output == RunOutputMode::Human {
-            println!("Running baseline checks...");
-        }
-        let baseline_check_dir = run_dir.join("baseline-check");
-        let baseline_check_workspace = match source::create_candidate_workspace(
-            &run.baseline_path,
-            &baseline_check_dir.join("workspace"),
-        ) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                let message = format!("failed to prepare baseline checks: {error:#}");
-                finish_failed(state, &mut db, &mut run, &message)?;
-                bail!(message);
-            }
-        };
-        let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel();
-        let check_output_dir = run_dir.join("checks/baseline");
-        let baseline_future = run_checks_with_observer(
-            &baseline_check_workspace,
-            baseline_commands,
-            CheckPhase::Baseline,
-            &check_output_dir,
-            config.execution.clone(),
-            cancellation.clone(),
-            Some(check_tx),
-            None,
-        );
-        tokio::pin!(baseline_future);
-        run.baseline_checks = loop {
-            tokio::select! {
-                results = &mut baseline_future => break results,
-                Some(event) = check_rx.recv() => persist_check_lifecycle(state, &db, &mut run, event)?,
-            }
-        };
-        while let Ok(event) = check_rx.try_recv() {
-            persist_check_lifecycle(state, &db, &mut run, event)?;
-        }
-        baseline_passed = run
-            .baseline_checks
-            .iter()
-            .all(|check| check.status == CheckStatus::Passed);
-        if request.output == RunOutputMode::Human {
-            println!(
-                "Running baseline checks... {}",
-                if baseline_passed { "pass" } else { "FAIL" }
-            );
-        }
-        db.sync_run(&run)?;
-    }
+    native::resolve_check_programs(state, &mut run, &config, cancellation.clone()).await;
+    let programs_resolved = run.baseline_checks.is_empty();
+    db.sync_run(&run)?;
     if cancellation.is_cancelled() {
         if run.execution.is_some() {
             let failure = native::interrupted(&run);
@@ -773,7 +724,8 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             timestamp: Utc::now(),
             payload: serde_json::json!({
                 "commit": run.baseline_commit,
-                "checks_passed": baseline_passed,
+                "programs_resolved": programs_resolved,
+                "checks_deferred": true,
             }),
             ..EventRecord::default()
         },
@@ -1636,37 +1588,6 @@ fn finish_interrupted(state: &State, db: &mut Database, run: &mut RunRecord) -> 
             event_type: "run.interrupted".into(),
             timestamp: Utc::now(),
             payload: serde_json::json!({"candidate_count": run.candidates.len()}),
-            ..EventRecord::default()
-        },
-        run,
-    )
-}
-
-fn finish_failed(
-    state: &State,
-    db: &mut Database,
-    run: &mut RunRecord,
-    message: &str,
-) -> Result<()> {
-    run.status = RunStatus::Failed;
-    run.outcome.lifecycle = LifecycleState::Finished;
-    run.outcome.work_result = WorkResult::Failed;
-    run.outcome.verification = VerificationState::NotRun;
-    run.outcome.review = ReviewState::NotRequested;
-    run.outcome.phase = RunPhase::Finished;
-    run.completed_at = Some(Utc::now());
-    run.candidates
-        .sort_by(|left, right| left.label.cmp(&right.label));
-    db.sync_run(run)?;
-    persist_event(
-        state,
-        db,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: None,
-            event_type: "run.failed".into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({"error": message}),
             ..EventRecord::default()
         },
         run,
