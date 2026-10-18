@@ -140,6 +140,22 @@ Additional languages, or any graph or index, need evidence from failures observe
 use first. Keep facts derived from (S0, Δ), the run's baseline and its patch, so that
 they are always recomputable and need no stored index.
 
+## What Dispatch does by itself (approved 2026-10-17)
+
+Each clause is recorded and bounded, and arrives with the release that ships it.
+
+- **Warm checks and reuse.**
+  - Dispatch keeps one check workspace per project. It is used only under the project's
+    source lock, each check run in it is recorded as warm, and `dispatch clean` removes it.
+  - A pass may be reused for an identical tree, commands and execution fingerprint. It is
+    recorded as a reuse of the run that produced it.
+  - Failures are never reused.
+- A reused result is counted as reused, never as time saved.
+- A result cache is not a symbol index. The memo of passed checks records outcomes keyed by
+  a tree, commands and an execution fingerprint, and indexes nothing inside the tree; the
+  rule above against a persistent symbol or reference graph, index or LSP integration still
+  holds.
+
 ## Working method
 
 When changing Dispatch:

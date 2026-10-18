@@ -694,13 +694,42 @@ fn unavailable_baseline_tool_stops_before_model_invocation() -> Result<()> {
         first.to_str().unwrap(),
         f.root.join("verify").to_str().unwrap(),
     ])?;
-    let result = Fixture::result(&f.run(&[])?)?;
+    let output = f.run(&[])?;
+    let result = Fixture::result(&output)?;
     assert!(
         !marker.exists(),
         "program resolution must not execute checks"
     );
     assert_eq!(f.count(), 0);
     assert_eq!(result["execution"]["failure"], "baseline_infrastructure");
+    // It says which program is missing, and in words why the work stopped.
+    let missing = f.root.join("verify").display().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "check program not found: {missing} (from `{missing}`); the agent was not started"
+        )),
+        "{stderr}"
+    );
+    let human = f
+        .command()
+        .arg("run")
+        .arg(&f.source)
+        .args([
+            "--task",
+            "Add tests in src/lib.rs",
+            "--allow-unsafe-local",
+            "--plain",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains("Work stopped: the project's checks could not run on its starting point (S0), so the agent was not started"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Some("), "{stdout}");
+    assert_eq!(f.count(), 0);
     f.no_live_launches()
 }
 
@@ -738,6 +767,74 @@ fn lazy_baseline_agent_starts_before_checks() -> Result<()> {
         "agent must start before checks: {events:?}"
     );
     assert_eq!(f.count(), 1);
+    Ok(())
+}
+
+/// Commands the person listed in `checks.baseline` run on S0 before the
+/// agent, as they did before native starts became lazy. Without them,
+/// `checks.verify` stands in and runs only after the agent.
+#[test]
+fn an_explicit_baseline_runs_before_the_agent_and_the_default_does_not() -> Result<()> {
+    for explicit in [true, false] {
+        let f = Fixture::new("success")?;
+        let probe = f.root.join("probe");
+        executable(
+            &probe,
+            &format!(
+                "#!/bin/sh\nif [ ! -f '{root}/invocations' ]; then touch '{root}/before-agent'; fi\n",
+                root = f.root.display()
+            ),
+        )?;
+        let path = f.source.join("dispatch.yml");
+        let mut config: dispatch::config::Config =
+            serde_yaml::from_str(&fs::read_to_string(&path)?)?;
+        let probe = probe.to_str().unwrap().to_owned();
+        if explicit {
+            config.checks.baseline = vec![probe.clone()];
+        } else {
+            config.checks.verify = vec![probe.clone()];
+        }
+        fs::write(path, serde_yaml::to_string(&config)?)?;
+
+        let result = Fixture::result(&f.run(&[])?)?;
+        let run = f.loaded(result["run_id"].as_str().unwrap())?;
+        assert_eq!(f.count(), 1);
+        assert_eq!(
+            f.root.join("before-agent").exists(),
+            explicit,
+            "explicit: {explicit}"
+        );
+        let events = fs::read_to_string(f.state.join("runs").join(&run.id).join("events.jsonl"))?;
+        let events: Vec<Value> = events
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let baseline = &events
+            .iter()
+            .find(|e| e["event_type"] == "baseline.finished")
+            .unwrap()["payload"];
+        assert_eq!(baseline["checks_deferred"], !explicit);
+        if explicit {
+            assert_eq!(baseline["checks_passed"], true);
+            assert_eq!(run.baseline_checks.len(), 1);
+            assert_eq!(run.baseline_checks[0].command, probe);
+            let first_check = events
+                .iter()
+                .position(|e| e["event_type"] == "check.started")
+                .unwrap();
+            let started = events
+                .iter()
+                .position(|e| e["event_type"] == "attempt.started")
+                .unwrap();
+            assert!(
+                first_check < started,
+                "baseline must run before the agent: {events:?}"
+            );
+        } else {
+            assert!(baseline["checks_passed"].is_null());
+            assert!(run.baseline_checks.is_empty());
+        }
+    }
     Ok(())
 }
 

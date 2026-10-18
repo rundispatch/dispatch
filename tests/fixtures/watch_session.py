@@ -222,12 +222,16 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
     assert len(made)==1,made; made=made[0]
     subprocess.run([binary,'--state-dir',str(state),'reject',made],check=True,capture_output=True)
     kept=Path(meta(made)['attachment']['workspace']); assert kept.exists()
+    # A recorded pass is listed with the workspaces and goes only on confirmation.
+    passed=state/'memo'/('c'*64+'.json'); passed.parent.mkdir(exist_ok=True); passed.write_text('{}')
     with Session([binary,'--state-dir',str(state),'clean'],repo,captures,'clean-cancel',width=160,height=30) as ui:
-        ui.wait('Cancel');ui.send('\r');ui.wait('Nothing was removed');ui.finish()
+        ui.wait('recorded passes');ui.wait('Cancel');ui.send('\r');ui.wait('Nothing was removed');ui.finish()
     assert kept.exists(),'Enter alone removed a workspace'
+    assert passed.exists(),'a cancelled clean removed the recorded passes'
     with Session([binary,'--state-dir',str(state),'clean'],repo,captures,'clean-remove',width=160,height=30) as ui:
-        ui.wait('Cancel');ui.send('\x1b[A');ui.pump(.3);ui.send('\r');ui.wait('Removed 1');ui.finish()
+        ui.wait('Cancel');ui.send('\x1b[A');ui.pump(.3);ui.send('\r');ui.wait('Removed 1');ui.wait('recorded pass(es)');ui.finish()
     assert not kept.exists()
+    assert not (state/'memo').exists()
     # The source holds untracked worktrees, so the merged tree cannot be
     # known; it has not moved, so each finish checked once, in place.
     assert not (state/'check-workspaces').exists(),'a finish on an unmoved source used the check workspace'

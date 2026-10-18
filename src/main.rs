@@ -128,8 +128,9 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// Also run checks.verify on the current source with the Work's
-        /// change as of now, in a scratch copy. Applies nothing and changes
-        /// no verdict; accept still runs its own.
+        /// change as of now, in the project's check workspace, unless that
+        /// tree already passed them. Applies nothing and changes no verdict;
+        /// accept checks the source as it is then.
         #[arg(long)]
         merged: bool,
         /// Allow this check to run checks.verify on the host, when neither

@@ -193,11 +193,28 @@ uncommitted changes." Dispatch never changes settings, commits or pushes in resp
   every world movement, exactly like a native allocation run's watcher, for mid-run
   verdicts only. It is never validated and never applied.
 - **Finished** means Δ is frozen: `collect_diff(baseline, workspace, delta.patch)`,
-  then `checks.verify` runs **in the workspace itself** — it is the user's own
-  worktree, and the `--allow-unsafe-local` acknowledgement (or the one given at attach)
-  carries the authority for that. The candidate's `checks` and `diff_stats` are set,
-  `refresh_outcome` computes `work_result`/`verification`, and the run becomes
-  `review: Pending`.
+  then `checks.verify` runs on what would land (`attach::finish_checks`). The
+  `--allow-unsafe-local` acknowledgement (or the one given at attach, or the project's
+  check consent) carries the authority for that. The candidate's `checks` and
+  `diff_stats` are set, `refresh_outcome` computes `work_result`/`verification`, and the
+  run becomes `review: Pending`.
+  - **The source has not moved since the Work began** (the workspace's tree and the
+    current source with Δ are one tree, or, when that tree cannot be known, accept's
+    unmoved rule): the checks run once, **in the workspace itself**, the user's own
+    worktree.
+  - **The source moved:** they run on the current source with Δ, in the project's check
+    workspace, exactly as accept's merged checks do, recorded as `coherence.merged_checks`
+    with `by: "finish"`. A pass is the Work's verification, prints `finish: checked on the
+    current source with this Δ, as accept checks it`, and lets accept reuse it unless the
+    source moves again.
+  - **Only if that fails, or Δ no longer applies to the current source,** do the checks
+    run again in the workspace (S0 + Δ), to show whose change broke it. The summary then
+    gives both: the current source's FAIL lines, and S0 + Δ's result, which is the Work's
+    verification.
+  - Before any run, the verification memo is consulted ([coherence.md](coherence.md#the-verification-memo)).
+    A tree with a recorded pass runs nothing: finish records `checks.reused`, prints
+    `finish: checks: passed, reused from <run> at <time>`, and its check lines point at the
+    reused logs with 0.0 s.
   - **Wrapped**: finishes automatically the moment the agent process exits, whatever
     its exit code. A non-zero exit still freezes Δ; the candidate becomes `Failed`
     only if Δ itself cannot be collected (an unreadable workspace), otherwise
@@ -280,12 +297,12 @@ dispatch serve  [--root <path>] [--json]
 | `--allow-unsafe-local` | explicitly allows `checks.verify` to run on the host at `finish` time |
 | `--auto-apply` | sets `capabilities.integrate`: apply automatically once the work is ready and coherent |
 | `-- <command> [args...]` | selects the **wrapped** form: everything after `--` is the agent command Dispatch spawns and owns for the session |
-| `dispatch finish <run-id> [--allow-unsafe-local]` | foreign work only: freeze Δ, run `checks.verify` in the workspace, become an ordinary Ready result. The flag is recorded on the run (`attach.authorized {by: "human"}`), so accept's merged-tree checks run too |
+| `dispatch finish <run-id> [--allow-unsafe-local]` | foreign work only: freeze Δ, run `checks.verify` on what would land (in the workspace when the source has not moved, otherwise on the current source with Δ in the check workspace), become an ordinary Ready result. The flag is recorded on the run (`attach.authorized {by: "human"}`), so accept's merged-tree checks run too |
 | `dispatch close <run-id> --reason <reason>` | retire Work without a review: nothing is applied, committed or deleted (see "Closing Work" below) |
 | `dispatch start [--root <path>]` | run the project owner in the background (`serve --background` in its own session) and return |
 | `dispatch watch [--root <path>] [--json]` | the project view, live; holds no lock, records nothing |
 | `dispatch stop [--root <path>]` | stop exactly this root's owner |
-| `dispatch clean [--dry-run] [--yes]` | remove leftover workspaces Dispatch made, after listing them and asking; list, never remove, worktrees it did not make |
+| `dispatch clean [--dry-run] [--yes]` | remove leftover workspaces Dispatch made, the projects' check workspaces and the verification memo, after listing them and asking; list, never remove, worktrees it did not make |
 | `dispatch serve [--root <path>] [--json]` | the project owner in the foreground, with the view |
 
 Whether `attach` is wrapped or foreign is decided by whether a command follows `--`:
@@ -406,12 +423,21 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
      tick still evaluates from its own scratch patch, but leaves `delta-live.patch` and
      a vanished worktree to that loop. Its signal is a hash of its patch so
      far, taken with the trusted baseline repository into the owner's scratch
-     directory, with an index kept per run so only changed files are re-hashed. No
-     lock is held for this. When the world or that work moved:
-     - take the run's lock;
-     - observe the world against that run's own baseline and evaluate;
+     directory, with an index kept per run so only changed files are re-hashed. The
+     patch is taken again only when a status against that index sees the worktree
+     changed, and the patch the tick followed is the one it evaluates and writes as
+     `delta-live.patch`. Follows run side by side, at most one per core, and hold no
+     lock. When the world or that work moved:
+     - observe the world against that run's own baseline and evaluate, side by side
+       and without the run's lock. The owner looks at the source once per change of its
+       signal and shares that look with every Work: a file's hash is kept while its
+       size, times, inode and mode are unchanged, and taken again when the file changed
+       within 2 s of the last look; baseline trees are kept per commit; facts are
+       derived once per S0 commit and Δ. All of it lives in memory only;
      - drop `analysis_uncertain`-only reasons, the same way the mid-run watcher does
-       (a person may be mid-edit).
+       (a person may be mid-edit);
+     - then take the run's lock only to record: read the run again, and record only if
+       it is still unfinished and live or removed.
   3. Re-check every Ready, unapplied, review-pending result, native or attached. It
      is checked when it becomes Ready and whenever the world signal moves, with
      `coherence::live_validity`, which is exactly what `check` shows: a refusal by
@@ -440,7 +466,12 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
      verdict or apply of the owner's own.
 
   With `-v` the owner logs where each non-idle tick's time went (`-vv`: every tick):
-  signal, loading runs, following work, evaluations, re-checks and auto-apply.
+  signal, loading runs, following work, evaluations, re-checks, auto-apply,
+  footprints and pairs, ending with the tick's `total`:
+
+  ```text
+  tick: signal 18 ms · 1 runs loaded in 2 ms · 1 followed in 9 ms · 1 evaluated in 37 ms · 0 rechecked in 0 ms · auto-apply 0 ms · 0 footprinted in 0 ms · pairs in 0 ms · total 99 ms
+  ```
 - **`dispatch watch`** renders the same view from canonical state under a header
   naming who watches (`watched in the background since 10:02 (pid 812)`, or `not
   watched · dispatch start`, plus a note when the owner runs another Dispatch
@@ -593,6 +624,18 @@ the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
     to a running agent session.
   - "Nothing to clean" adds that Dispatch removes only the workspaces it made.
   - The run's record and Δ stay.
+  - **Check workspaces** (`<state>/check-workspaces/<sha256 of the source path>`, one per
+    project, see [coherence.md](coherence.md#integration-checks-l2)) are listed after
+    them, one line each: `<path> · internal check workspace`. The confirmation then says
+    that check workspaces hold temporary verification and build files and that Work
+    records are kept separately. Each is removed under its project's source lock; one in
+    use refuses with `the project's checks are in use: …`. The next merged check builds it
+    again from nothing.
+  - **The verification memo** is listed last, `<state>/memo · recorded passes (N)`, when it
+    holds any pass, so "Nothing to clean" is never said while one is recorded. It is
+    removed only after confirmation, after the workspaces, and `Removed N recorded
+    pass(es).` says so; `--dry-run`, Cancel and a refusal leave it. Nothing but reuse is
+    lost: the next check of each tree runs again.
 
 ## Work a runtime registers
 
@@ -608,7 +651,12 @@ runtime's event on stdin):
 - **Only in a watched project.** Only a project watched with `dispatch start` is
   followed. The integration root is always derived from the workspace's own Git
   repository, never taken from the event. Hook input is validated and bounded, and
-  anything malformed is refused whole.
+  anything malformed is refused whole. In a project nobody watches, a session start or
+  end costs no Git and no database: Dispatch reads the main worktree from the `.git`
+  files themselves and checks only that project's watch lock. Anything it cannot read
+  for certain (a symlinked `.git`, a separate Git directory or submodule, a config with
+  `worktree…`, `bare = true` or `[include…`) is left to Git. A workspace's removal is
+  never decided this way, because its Δ is kept whether or not the project is watched.
 - **A session starting in a separate worktree** registers Work the first time:
   - S0 is the worktree's exact world then, before the session's first turn;
   - registration finishes within a 40 s budget, counted from the hook process

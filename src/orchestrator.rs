@@ -694,6 +694,35 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
 
     native::resolve_check_programs(state, &mut run, &config, cancellation.clone()).await;
     let programs_resolved = run.baseline_checks.is_empty();
+    // Commands the person listed in `checks.baseline` run on S0 before the
+    // agent. Without them, S0 is checked only for what the candidate fails.
+    let eager = programs_resolved && !config.checks.baseline.is_empty();
+    if eager {
+        if request.output == RunOutputMode::Human {
+            println!("Running baseline checks...");
+        }
+        let id = run.id.clone();
+        let ran = native::check_on_s0(
+            state,
+            &db,
+            &mut run,
+            &config.checks.baseline,
+            &config,
+            cancellation.clone(),
+        )
+        .await;
+        native::finish_error(state, &db, &id, ran)?;
+        if request.output == RunOutputMode::Human {
+            let passed = run
+                .baseline_checks
+                .iter()
+                .all(|check| check.status == CheckStatus::Passed);
+            println!(
+                "Running baseline checks... {}",
+                if passed { "pass" } else { "FAIL" }
+            );
+        }
+    }
     db.sync_run(&run)?;
     if cancellation.is_cancelled() {
         if run.execution.is_some() {
@@ -725,7 +754,11 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             payload: serde_json::json!({
                 "commit": run.baseline_commit,
                 "programs_resolved": programs_resolved,
-                "checks_deferred": true,
+                "checks_deferred": !eager,
+                "checks_passed": eager.then(|| run
+                    .baseline_checks
+                    .iter()
+                    .all(|check| check.status == CheckStatus::Passed)),
             }),
             ..EventRecord::default()
         },
@@ -2290,7 +2323,7 @@ pub async fn check(
             Err(error) => println!("Merged checks: could not run — {error:#}"),
         }
         println!(
-            "Nothing was applied and no verdict changed. accept runs its own merged checks, because the source can move after this."
+            "Nothing was applied and no verdict changed. accept checks again only if the source moves; a tree with a recorded pass is not checked again."
         );
     }
     if !json {

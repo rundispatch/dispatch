@@ -22,7 +22,7 @@ does not change how agents are launched or admitted. It never starts an agent by
 
 | Concept | Meaning | Where it lives in the code |
 |---|---|---|
-| S0 | The snapshot the run started from. | The run's private baseline repository: `RunRecord.baseline_path`, `baseline_commit` (and `source_fingerprint`, the strict whole-tree hash). The baseline commit tracks only the paths the source's ignore rules include (repository `.gitignore` files and `info/exclude`); ignored files are still copied onto disk so build caches remain available, and a plain-directory source, which has no ignore rules, keeps tracking everything. |
+| S0 | The snapshot the run started from. | The run's private baseline repository: `RunRecord.baseline_path`, `baseline_commit` (and `source_fingerprint`: for a Git source, a hash of its tracked and non-ignored untracked files; under `coherence.accept: strict` and for a plain directory, the whole tree, ignored files included). The baseline commit tracks only the paths the source's ignore rules include (repository `.gitignore` files and `info/exclude`); ignored files are still copied onto disk so build caches remain available, and a plain-directory source, which has no ignore rules, keeps tracking everything. |
 | Δ | The patch the agent produced. | The candidate's `diff_path` (`git diff --binary --full-index --no-renames`). Mid-run, a work-in-progress patch of the live workspace. |
 | World (S1) | The source tree now, minus what its own ignore rules exclude. | Computed on demand as `world::WorldObservation`; never stored as a snapshot. |
 | MustHold | A fact the work relied on, derived from (S0, Δ). | `MustHold` (`kind`: `Signature` or `File`; `origin`: `Modified`, `Referenced` or `FileFallback`). |
@@ -168,24 +168,42 @@ returns the verdict together with `MergedChecks` (`Skipped(reason)`, `Passed(run
 `Failed(run or none)`), which accept prints, followed by one line per command.
 
 The steps below are `integration::run_merged`, the one merged-check runner. Accept's
-gate and `dispatch check --merged` both call it. `check --merged` is an explicit
-request, so it ignores `coherence.accept: strict` and `integration_checks: false` and
-runs whether or not the world moved, but it still needs a non-empty `checks.verify`,
-a non-empty Δ and authority: the Work's own `unsafe_local`, standing consent for
-exactly these commands, or `--allow-unsafe-local` on that check alone. It changes no
-verdict and applies nothing.
+gate, `dispatch check --merged` and attached `finish` on a moved source call it,
+through `integration::run_or_reuse`, which first asks the verification memo (below).
+`check --merged` is an explicit request, so it ignores `coherence.accept: strict` and
+`integration_checks: false` and runs whether or not the world moved, but it still
+needs a non-empty `checks.verify`, a non-empty Δ and authority: the Work's own
+`unsafe_local`, standing consent for exactly these commands, or
+`--allow-unsafe-local` on that check alone. For finished Work it applies accept's
+`Unmoved` rule: when the source has not moved since the Work began it runs nothing and
+prints `Merged checks: not run — …`, unless the memo holds a pass for that tree. It
+changes no verdict and applies nothing.
 
-1. Copy the current source into a scratch directory under the run directory
-   (`coherence-scratch-<id>`): for Git sources exactly the non-ignored files, so there
-   is no build cache; for plain directories the whole tree. Nested repositories are copied whole.
-2. `git apply` the patch there.
-3. Run each `checks.verify` command with the run's execution configuration and
-   timeout. Logs stay under `<run dir>/coherence-checks/<id>/`; the scratch copy is
-   removed on every exit path.
+1. Take the project's source lock (`apply::source_lock_path`). When another merged
+   check or apply holds it, print `Merged checks: waiting for the source lock on <path>`
+   once and wait.
+2. Prepare the project's check workspace (`source::prepare_check_workspace`):
+   `<state>/check-workspaces/<sha256 of the source path>`, one internal Git repository
+   per project. It is never a worktree of the source's repository, and its Git
+   directory and work tree are always named explicitly.
+   - The source's current world (for Git sources exactly the non-ignored files; for
+     plain directories the whole tree) is copied into a staging directory inside its
+     `.git`, staged into a kept index (`check.index`), and the patch is applied there
+     with `git apply --cached`. The staged tree's id is the run's `tree_id`.
+   - The checkout is then updated from its previous tree with `read-tree --reset -u`
+     after refreshing its index, and `git clean -fd` removes non-ignored leftovers.
+     Ignored build output and the times of unchanged files survive, so builds are
+     incremental.
+   - The checked-out tree is verified to equal the staged one, with no tracked
+     modification left. An internal `info/attributes` turns off every conversion, so
+     the checked bytes are the source's even under its own `.gitattributes`.
+3. Run each `checks.verify` command there with the run's execution configuration and
+   timeout. The load average is sampled first. Logs stay under
+   `<run dir>/coherence-checks/<id>/`. The workspace is kept for the next run.
 4. Any check that did not pass adds a reason (`integration_check_failed` with the
    command, what failed in the check's own words and the log path, or
    `analysis_uncertain` if it could not run) and the verdict
-   becomes `Refresh`. A failure to build the scratch tree or apply the patch also
+   becomes `Refresh`. A failure to build the check workspace or apply the patch also
    yields `Refresh` with `analysis_uncertain`. All passing sets the analysis level to `integration`.
    The words are an excerpt of the check's output: the first two lines that read
    like a failure (containing `FAIL`, `ERROR`, `Error`, `error:` or `panicked`, or
@@ -193,14 +211,57 @@ verdict and applies nothing.
    `ERROR: test_admin_token (…) / TypeError: validate() missing 1 required positional
    argument: 'token'`.
 
-There is no cooperative cancellation of these checks. At accept they run while the
-per-run and per-source apply locks are held, so another accept of the same run or
-source waits. `check --merged` takes no run lock.
+There is no cooperative cancellation of these checks. They run under the project's
+source lock, so merged checks and applies for one project run one at a time. At accept
+the run's lock is held too, and the apply takes the source lock again only after the
+gate. `check --merged` takes no run lock.
 
 Each run is recorded as one `coherence.merged_checks` event (see "Events"). Its
-`source` is observed just before the scratch copy is made, under
-`GIT_OPTIONAL_LOCKS=0`: `{"git": {"head", "dirty"}}` or the plain directory.
-Merged checks are not cached and a failing check is not retried.
+`source` is observed just before the check workspace is prepared, under
+`GIT_OPTIONAL_LOCKS=0`: `{"git": {"head", "dirty"}}` or the plain directory. It also
+records the `tree_id` that was checked, `warm: true` (the persistent workspace was used,
+which says nothing of how full its cache was) and `load_average`. A failing check is
+not retried.
+
+`dispatch clean` lists each check workspace and removes it after confirmation, under
+its source lock; the next run starts it again from nothing.
+
+### The verification memo
+
+`coherence::memo` keeps a record of passes, so a tree that passed its checks is not
+checked again with the same commands in the same environment, whichever of finish,
+`check --merged` or accept asks. It records outcomes, not code: nothing in it indexes a
+tree's contents.
+
+- **An entry** is one JSON file, `<state>/memo/<key digest>.json`, holding the key's
+  parts, the run that passed, its logs directory and the time. Only passes are
+  recorded, never failures.
+- **The key** is the SHA-256 of:
+  - the tree that was checked: for merged checks, the source's world
+    (`source::world_commit`) with Δ applied in a temporary index; for finish in the
+    workspace, the workspace's world. Both are Git tree ids, ignored files left out;
+  - the exact ordered commands;
+  - an execution fingerprint: the frozen `execution` settings, the Docker image id for
+    the docker backend, the environment a check gets (`PATH`, `HOME`, `TMPDIR`,
+    `LANG`), each command's program as `PATH` resolves it (symlinks followed, local
+    backend only) and the Dispatch version.
+- **No key, so the checks run as without it:** a plain directory; a Docker image that
+  cannot be identified; any Git failure; a tree holding an untracked nested repository
+  (the world leaves it out while the checks may see it); and a checkout where Git
+  converts file contents, so that two different files could make one tree:
+  `core.autocrlf` set to anything but `false`, `core.eol` set, or a `text`, `crlf`,
+  `eol`, `ident`, `filter` or `working-tree-encoding` attribute that is set for any
+  existing file, from any attributes file.
+- **A lookup** needs an exact key, an entry under 24 hours old, and its logs directory
+  still on disk. A hit runs nothing and records `checks.reused`, naming the run whose
+  pass and logs it reuses. Output says `passed, reused from <run> at <time>; logs: …`.
+- **A merged pass is stored** only when the key's tree is the `tree_id` the check
+  workspace actually staged, so a pass is never filed under a tree the checks did not
+  see. A finish in the workspace computes its key again after the run and stores the
+  pass only if it is unchanged.
+- **Removal.** Expired entries are ignored, not removed. `dispatch clean` lists the memo
+  (`<state>/memo · recorded passes (N)`) and removes it only after confirmation.
+- A reused result is counted as reused, never as time saved.
 
 ## The accept path
 
@@ -213,12 +274,13 @@ accept then judges has exactly the compared Δ; unfinished Work is refused. The 
 digest is recorded on the `review.accepted` or `review.rejected` event as
 `delta_digest`.
 
-`apply_locked` (used by `dispatch accept`, the review view and `dispatch apply`) takes
-the per-run and per-source locks and calls `coherence::gate`:
+`apply_locked` (used by `dispatch accept`, the review view and `dispatch apply`) runs
+under the run's lock, calls `coherence::gate`, whose merged checks take the source lock
+themselves, and then takes the per-source lock for the apply:
 
 - The configuration frozen with the run (`config.snapshot.yml` in the run directory)
   is read. If it cannot be read or parsed, the gate is `Legacy` (strict).
-- `coherence.accept: strict`, or a source whose whole-tree fingerprint equals the
+- `coherence.accept: strict`, or a source whose fingerprint equals the
   snapshot's: `Legacy`. The original all-or-nothing `safe_apply` runs. **Attached work
   (`run.mode == RunMode::Attached`) never takes the fingerprint half of this
   shortcut**: its S0 is a merge-base commit while its `source_fingerprint` is the
@@ -304,7 +366,7 @@ to 5 s). Every failure below returns `Skipped`, and every one except `run_busy` 
 | `outcome.verification == Passed` | `verification_failed`, `verification_inconclusive`, `verification_not_run`, or `verification_not_configured` |
 | On the local backend, `environment.unsafe_local` is true | `integration_checks_unavailable` |
 | The sole candidate's `diff_path` is non-empty | `empty_delta` |
-| The source lock is free within the run's `execution.timeout_secs` | `source_busy` |
+| The source lock is free within the run's `execution.timeout_secs`, after the gate (stage 2) | `source_busy` |
 
 `verification_not_configured` is never eligible: without `checks.verify` there is no
 L2, and the only evidence would be that the agent exited zero. No configuration key
@@ -318,10 +380,13 @@ applied with zero files changed.
 process holding no operation lock, or by a human review holding it; writing an event
 here would bump the run's `state_revision` out from under that owner.
 
-### Stage 2: the gate under both locks
+### Stage 2: the gate, then the source lock
 
-With both locks held, `decide()` (`src/orchestrator/apply.rs`) calls
-`coherence::gate` and applies a stricter authorization predicate than human accept:
+Under the run's lock, `decide()` (`src/orchestrator/apply.rs`) calls
+`coherence::gate` and applies a stricter authorization predicate than human accept.
+The gate's merged checks take the source lock themselves; the apply then takes it
+(`source_busy` if it stays held), and the digest fence refuses a source that moved in
+between:
 
 | Gate result | Authorized | Else |
 |---|---|---|
@@ -425,9 +490,12 @@ records no verdict; verdicts, liveness and interactions stay on the `poll_secs` 
   source's index under `index.lock`, and a person's own `git commit` cannot collide with
   it (before 0.4.13, from 0.4.5, it could). If the signal
   is unchanged nothing else happens.
-- If it moved, it observes the world, writes the work so far as a patch
-  (`source::snapshot_delta`, temporary Git index, no validation, to `delta-live.patch`
-  outside the workspace) and runs L0 and L1. It never runs L2.
+- If it moved, it observes the world, writes the work so far as a patch (no
+  validation, to `delta-live.patch` outside the workspace) and runs L0 and L1. It never
+  runs L2. The watcher keeps one Git index in a temporary directory for its life and
+  takes the patch again only when a `git status` against that index sees the workspace
+  changed (`source::snapshot_delta_if_changed_indexed`); without a temporary directory
+  it takes a fresh one each time.
 - `analysis_uncertain` reasons are dropped, and a `Refresh` that rested only on them
   becomes `Continue`, because a person may be mid-edit.
 - The watcher never touches the database or the run record. It sends a message over a
@@ -604,7 +672,8 @@ also gets the run's `outcome`, as for all events.
 | `run.stopped` | After a watcher stop. | `failure: "stale_work"`, `reason` |
 | `auto_apply.skipped` | An auto-apply attempt was not eligible (see "Automatic application" above). | `{"reason": <string>}` |
 | `auto_apply.blocked` | The gate, or its stricter authorization predicate, refused an auto-apply attempt. | `{"reason": <string>, "coherence": <Validity or null>}` |
-| `coherence.merged_checks` | Merged checks ran, at accept (a transition) or for `dispatch check --merged` (an observation that does not move the state revision). Not recorded for auto-apply's merged checks. | `by` (`accept` or `check`), `source`, `delta_digest`, `passed`, `duration_ms`, `results` (each command's `status`, `exit_code`, `duration_ms` and logs), `logs`; `patch` for `check` |
+| `coherence.merged_checks` | Merged checks ran, at accept (a transition), for `dispatch check --merged` (an observation that does not move the state revision), or at an attached finish on a moved source. Not recorded for auto-apply's merged checks. | `by` (`accept`, `check` or `finish`), `source`, `delta_digest`, `passed`, `duration_ms`, `results` (each command's `status`, `exit_code`, `duration_ms` and logs), `logs`, `tree_id`, `warm`, `load_average` (`[1, 5, 15 min]` or `null`); `patch` for `check`. A finish whose merged tree could not be built records `by`, `delta_digest`, `error` and `logs` |
+| `checks.reused` | finish, `check --merged` or accept found a recorded pass for the exact tree and ran nothing (see "The verification memo"). | `by`, `reused_run`, `logs` (the reused run's), `passed_at`, `key`, `tree`, `delta_digest`, `passed: true`; `source` for merged checks; `patch` for `check` |
 
 ## Configuration
 
@@ -625,7 +694,12 @@ Recomputed on every use: the world, symbol tables, facts and the verdict shown b
 `status`, `check`, `explain` and the control `result`. Accept never trusts a stored verdict.
 Interactions between Work are derived by the project owner from each Work's (S0, Δ).
 The file it keeps them in is disposable and removed when it stops; nothing about them
-is stored in the database or the run.
+is stored in the database or the run. The owner's file hashes, baseline trees and
+facts are kept in its memory only, for as long as it runs.
+
+Kept outside the database: the verification memo (`<state>/memo/`), which records
+passes, never verdicts or facts, and the check workspaces (`<state>/check-workspaces/`).
+Both are disposable; `dispatch clean` removes them.
 
 Stored: `RunRecord.coherence` in the run projection JSON (`runs.run_projection_json`
 and `run.json`): `refreshed_from`, the latest stored `validity` (with its world
@@ -646,7 +720,7 @@ such a run gets coherence checking at accept time because everything needed
 
 - No SQLite write transaction is held across parsing, `git` or checks; evaluation itself writes nothing to the database.
 - The watcher never writes state, and there is one writer of the run's revision.
-- Evaluation is read-only (`git apply --check` only); the scratch tree is separate from the source and removed afterwards.
+- Evaluation is read-only (`git apply --check` only); the check workspace is separate from the source and never one of its worktrees.
 - The apply is guarded by the evaluated world digest, before and after the dry run.
 - Strict mode and unmoved sources use the pre-existing `safe_apply` unchanged.
 - Nothing launches an agent except an explicit `run` or `refresh`; refresh needs the same acknowledgements again.
@@ -706,14 +780,14 @@ How to read it:
 - Same-symbol concurrent edits are `REFRESH` (`same_symbol_edited` or `patch_conflict`).
   A Python edit that only appends after the last line of a function is not seen as a same-symbol edit by the symbol layer; the patch check and your checks still apply.
 - Transitive behavior changes are caught only if `checks.verify` covers them.
-- Integration checks use your `checks.verify` on a scratch copy of the non-ignored files with no build cache
-  (a `cargo test` builds from scratch unless the command points `CARGO_TARGET_DIR` elsewhere), hold the apply locks while running, and cannot be cancelled.
+- Integration checks use your `checks.verify` in one check workspace per project, so one project's merged checks run one at a time. Its first run builds from nothing; later runs keep its ignored build output. They hold the project's source lock while running, and cannot be cancelled.
+- A recorded pass is reused only for an identical tree, commands and execution fingerprint. A check run from an agent's shell, whose `PATH` differs from yours, does not match; neither do two Dispatch versions. Plain directories, checkouts where Git converts file contents and trees holding an untracked nested repository get no record. A native run's own checks and its S0 checks do not use the memo.
   They do not run for a local-backend run that was not approved for local execution.
 - `dispatch check`, `status`, `explain`, the finish summary and a native result's summary evaluate L0 and L1 only, fresh and never stored; integration checks run at accept, or on request with `dispatch check --merged`, which records the run but changes no verdict. `check`, finish and the native summary also print `At accept: …`, what accept would verify now, and a `Next` step driven by the verdict: REFRESH and STOP never offer accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
 - Plain-directory sources cannot honor `.gitignore`; ignored build output counts as world change (the patch usually still applies).
 - Nested repositories and submodules are not analysed.
 - A source that moved since S0 does not stop a native run, including the continuation after a clarification answer: every attempt starts from the run's original snapshot, the mid-run watcher reports what the move means for the work, and the accept gate judges the result against the source as it is then. (Before 0.4.4 a continuation stopped with `source_drift` whenever the tree differed.)
-- The mid-run watcher covers native runs and wrapped attach, and observes by default. Every `poll_secs` it builds the work-in-progress patch with a temporary Git index (taken with the trusted baseline repository, so ignored build output never counts) and evaluates again when either the source's signal or that patch changed. A change that landed before the agent touched the same code is therefore reported once the agent touches it.
+- The mid-run watcher covers native runs and wrapped attach, and observes by default. Every `poll_secs` it builds the work-in-progress patch with a kept temporary Git index (taken with the trusted baseline repository, so ignored build output never counts; rebuilt only when the workspace changed) and evaluates again when either the source's signal or that patch changed. A change that landed before the agent touched the same code is therefore reported once the agent touches it.
 - Agent time after invalid is wall-clock time from attempt timestamps; it is not cost, and it is only meaningful for a run whose watcher stored an invalid verdict during the attempt.
 - Apply is not crash-atomic: a crash between `git apply` and the database update leaves patched source and an unapplied run (pre-existing).
 - Interactions between Work are advisory. They exist only while the project is

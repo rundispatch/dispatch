@@ -77,7 +77,9 @@ snapshot and the verdict.
   `files_only` and `integration`. The share of REFRESH from `FileFallback` facts
   measures the cost of the language gap.
 - **Integration check cost.** Wall-clock per L2 run and how often it flips a
-  verdict. L2 builds from scratch with no cache while holding the apply locks.
+  verdict. From 0.4.16, L2 runs in a warm check workspace per project under the
+  source lock, and a tree with a recorded pass is not checked again; count a reuse
+  as a reuse, never as time saved.
 - **Time to invalid versus attempt length.** From `first_invalid_at` and the
   attempt timestamps. If the world rarely moves during an attempt, mid-run
   detection has no economic value and the product is an accept gate.

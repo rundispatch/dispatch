@@ -325,6 +325,24 @@ pub fn store(run_dir: &Path, key: &Key, run_id: &str, logs: &Path) -> Result<()>
     crate::state::write_durably(&entry_path(run_dir, key), &serde_json::to_vec(&entry)?)
 }
 
+/// The memo's directory and how many passes it holds, or `None` when it
+/// holds none.
+pub fn recorded(state: &State) -> Result<Option<(PathBuf, usize)>> {
+    let dir = state.root.join(MEMO_DIRECTORY);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut passes = 0;
+    for entry in entries {
+        if entry?.path().extension().is_some_and(|ext| ext == "json") {
+            passes += 1;
+        }
+    }
+    Ok((passes > 0).then_some((dir, passes)))
+}
+
 /// Remove every recorded pass.
 pub fn clear(state: &State) -> Result<()> {
     match fs::remove_dir_all(state.root.join(MEMO_DIRECTORY)) {

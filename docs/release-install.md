@@ -51,6 +51,68 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.16
+
+No migration; the schema stays at 24. Existing records are not rewritten.
+- **Rollback.** Back up the whole state directory before upgrading, and roll back only by
+  restoring it. 0.4.15 reads 0.4.16's records and ignores the two new state directories; its
+  `dispatch clean` neither lists nor removes them, so delete `check-workspaces/` yourself if
+  you go back.
+- **Additive JSON and events.**
+  - `checks.reused`, recorded instead of `coherence.merged_checks` when finish, `check
+    --merged` or accept finds a recorded pass for the exact tree: `by` (`finish`, `check` or
+    `accept`), `reused_run`, `logs` (the reused run's), `passed_at`, `key`, `tree`, `source`,
+    `delta_digest` and `passed: true`; `patch` for `check`. When finish reuses a pass, its
+    candidate checks are recorded as passed with duration 0 and point at the reused logs.
+  - `coherence.merged_checks` gains `tree_id` (the Git tree that was checked), `warm`
+    (always `true`: the run used the project's check workspace) and `load_average` (1, 5 and
+    15 minutes when the checks started, or `null` where it cannot be read). `by` can now be
+    `finish`. A finish whose current source with Δ could not be built records `error` and
+    `logs` instead of results.
+  - `baseline.finished` gains `programs_resolved` and `checks_deferred`. Without
+    `checks.baseline`, a native run no longer runs a suite on S0 before the agent: it has
+    `checks_passed: null`, and `baseline_checks` holds only the commands checked on S0 after
+    the candidate failed them, so it is often empty with checks configured.
+  - `status --json` gains `checks_reused`, every `checks.reused` payload of the run, present
+    only when there is one. `check --merged --json` puts a reuse's payload in
+    `merged_checks`, and a skip as `{"skipped": "<why>"}`.
+- **New state directories.**
+  - `memo/`: one JSON file per pass, named by its key's digest. An entry is used for 24 hours
+    and only while the logs it names still exist. Expired entries stay until `dispatch clean`,
+    which lists it as `<state>/memo · recorded passes (N)` and removes it only after you
+    confirm.
+  - `check-workspaces/<sha256 of the source path>/`: one internal Git repository per project,
+    with the project's ignored build output. It can grow as large as your own build. `dispatch
+    clean` lists it and removes it after you confirm, unless its source lock is held.
+- **Changed behaviour.**
+  - **Finish on a moved source** checks the current source with Δ in the check workspace, not
+    the Work's workspace, and checks S0 + Δ in the workspace only when that fails. Consent
+    finishes do the same.
+  - **Native baselines.** Without `checks.baseline`, no checks run before the agent. Each
+    check's program is resolved first, and a missing one still stops the run, now saying
+    `` check program not found: <program> (from `<command>`); the agent was not started ``. Without `checks.baseline`, S0 is
+    checked afterwards with only the `checks.verify` commands the candidate failed, and
+    `baseline_checks` holds those. Commands you list in `checks.baseline` still run on S0
+    before the agent, as in 0.4.15, and `baseline.finished` then also records `checks_passed`
+    with `checks_deferred: false`. For Git sources, outside strict mode, the
+    source fingerprint covers tracked and non-ignored untracked files only, so a change to
+    ignored build output after a run no longer blocks its accept. Strict mode and plain
+    directories keep the whole-tree fingerprint. A native run that 0.4.15 made, in a Git source
+    with ignored build output, still checks as unmoved and accepts with 0.4.16.
+  - **Accept and auto-apply take the source lock after their gate,** no longer around it. The
+    gate's merged checks take it themselves. A second merged check or apply on the same
+    project waits, saying `Merged checks: waiting for the source lock on <path>` or `Apply:
+    waiting for the source lock on <path>`.
+  - **`dispatch check --merged`** on finished Work whose source has not moved runs nothing,
+    as accept does, unless a recorded pass is reused first. Its closing line now reads
+    `accept checks again only if the source moves; a tree with a recorded pass is not checked
+    again`.
+  - **Git failures.** A source whose `git rev-parse` fails for any reason other than "not a
+    git repository" is now an error carrying Git's message, no longer a plain directory.
+- **Restart the owner.** Run `dispatch stop && dispatch start` so the project owner is 0.4.16.
+  An older owner records verdicts as before, but re-reads every worktree each tick, and its
+  consent finishes neither consult the memo nor check what would land.
+
 ### Upgrading to 0.4.15
 
 No migration; the schema stays at 24. Existing records are not rewritten.

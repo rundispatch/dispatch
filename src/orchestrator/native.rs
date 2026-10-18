@@ -209,8 +209,8 @@ pub(super) fn emit(state: &State, run: &RunRecord, output: RunOutputMode) -> Res
                 print_single_result_summary(state, run, heading, false, human.as_ref());
             } else {
                 println!(
-                    "Work stopped: {:?}",
-                    run.execution.as_ref().and_then(|p| p.failure)
+                    "Work stopped: {}",
+                    stopped_because(run.execution.as_ref().and_then(|p| p.failure))
                 );
             }
             for attempt in &run.attempts {
@@ -239,6 +239,20 @@ pub(super) fn emit(state: &State, run: &RunRecord, output: RunOutputMode) -> Res
         }
     }
     Ok(())
+}
+
+/// Why work stopped before any result, in words.
+fn stopped_because(failure: Option<FailureKind>) -> String {
+    match failure {
+        Some(FailureKind::BaselineInfrastructure) => {
+            "the project's checks could not run on its starting point (S0), so the agent was not started".into()
+        }
+        Some(other) => serde_json::to_value(other)
+            .ok()
+            .and_then(|value| value.as_str().map(|name| name.replace('_', " ")))
+            .unwrap_or_else(|| "for an unrecorded reason".into()),
+        None => "no failure was recorded".into(),
+    }
 }
 
 pub(super) fn stop(
@@ -378,21 +392,9 @@ pub(super) async fn resolve_check_programs(
     let probes: Vec<String> = commands
         .iter()
         .map(|command| {
-            let words = shell_words::split(command).unwrap_or_default();
-            let program = words.first().map(String::as_str).unwrap_or("/bin/sh");
-            let program = if program.contains('=')
-                || program.contains([';', '&', '|', '<', '>', '(', ')', '$', '`', '\n'])
-                || matches!(
-                    program,
-                    "!" | "if" | "for" | "while" | "until" | "case" | "{"
-                ) {
-                "/bin/sh"
-            } else {
-                program
-            };
             format!(
                 "command -v {} >/dev/null || exit 127",
-                shell_words::quote(program)
+                shell_words::quote(&probed_program(command))
             )
         })
         .collect();
@@ -420,8 +422,62 @@ pub(super) async fn resolve_check_programs(
         .collect();
 }
 
-/// The sole S0 verification path: only normally failing candidate commands
-/// need a baseline result to distinguish a target defect from a broken S0.
+/// The program a check command's lookup probes: its first word, or the
+/// shell for anything that is shell syntax rather than a program.
+fn probed_program(command: &str) -> String {
+    let words = shell_words::split(command).unwrap_or_default();
+    let program = words.first().map(String::as_str).unwrap_or("/bin/sh");
+    if program.contains('=')
+        || program.contains([';', '&', '|', '<', '>', '(', ')', '$', '`', '\n'])
+        || matches!(
+            program,
+            "!" | "if" | "for" | "while" | "until" | "case" | "{"
+        )
+    {
+        "/bin/sh".into()
+    } else {
+        program.into()
+    }
+}
+
+/// What stops a run before its agent: a check program that cannot be
+/// found, or a baseline check that could not run at all.
+fn unrunnable_baseline(run_dir: &Path, checks: &[crate::CheckResult]) -> Option<String> {
+    let check = checks.iter().find(|c| {
+        !matches!(c.status, CheckStatus::Passed | CheckStatus::Failed)
+            || matches!(c.exit_code, Some(126 | 127))
+            || (c.status == CheckStatus::Failed && c.exit_code.is_none())
+    })?;
+    let how = match (&check.status, check.exit_code) {
+        (CheckStatus::TimedOut, _) => "timed out".to_owned(),
+        (_, Some(code)) => format!("exit {code}"),
+        (_, None) => "no exit status".to_owned(),
+    };
+    let command = &check.command;
+    Some(
+        if check
+            .stdout_path
+            .starts_with(run_dir.join("checks/programs"))
+        {
+            if check.exit_code == Some(127) {
+                format!(
+                    "check program not found: {} (from `{command}`); the agent was not started",
+                    probed_program(command)
+                )
+            } else {
+                format!(
+                    "check program could not be looked up for `{command}` ({how}); the agent was not started"
+                )
+            }
+        } else {
+            format!("baseline check could not run: `{command}` ({how}); the agent was not started")
+        },
+    )
+}
+
+/// The default S0 verification path, without `checks.baseline`: only
+/// normally failing candidate commands need a baseline result to
+/// distinguish a target defect from a broken S0.
 async fn check_failed_baseline(
     state: &State,
     db: &Database,
@@ -439,6 +495,19 @@ async fn check_failed_baseline(
     if commands.is_empty() {
         return Ok(());
     }
+    check_on_s0(state, db, run, &commands, config, cancellation).await
+}
+
+/// Run `commands` on a fresh copy of S0, recording each check's lifecycle,
+/// as `run.baseline_checks`.
+pub(super) async fn check_on_s0(
+    state: &State,
+    db: &Database,
+    run: &mut RunRecord,
+    commands: &[String],
+    config: &Config,
+    cancellation: CancellationToken,
+) -> Result<()> {
     let dir = state.run_dir(&run.id);
     let workspace = source::create_candidate_workspace(
         &run.baseline_path,
@@ -448,7 +517,7 @@ async fn check_failed_baseline(
     let output_dir = dir.join("checks/baseline");
     let checks = run_checks_with_observer(
         &workspace,
-        &commands,
+        commands,
         CheckPhase::Baseline,
         &output_dir,
         config.execution.clone(),
@@ -690,18 +759,14 @@ async fn drive_inner(
     );
     let initial = run.attempts.is_empty();
     if initial
-        && run.baseline_checks.iter().any(|c| {
-            !matches!(c.status, CheckStatus::Passed | CheckStatus::Failed)
-                || matches!(c.exit_code, Some(126 | 127))
-                || (c.status == CheckStatus::Failed && c.exit_code.is_none())
-        })
+        && let Some(reason) = unrunnable_baseline(&state.run_dir(&run.id), &run.baseline_checks)
     {
         stop(
             state,
             db,
             &mut run,
             FailureKind::BaselineInfrastructure,
-            "baseline checks did not pass; no model escalation",
+            &reason,
         )?;
         emit(state, &run, output)?;
         return Ok(run);
@@ -890,7 +955,11 @@ async fn drive_inner(
             )?;
         }
         let candidate = execution.candidate.clone();
-        if candidate.status == CandidateStatus::Completed && !cancellation.is_cancelled() {
+        // An explicit `checks.baseline` already ran on S0 before the agent.
+        if candidate.status == CandidateStatus::Completed
+            && !cancellation.is_cancelled()
+            && config.checks.baseline.is_empty()
+        {
             check_failed_baseline(
                 state,
                 db,

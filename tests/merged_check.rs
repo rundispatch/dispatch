@@ -326,7 +326,7 @@ fn check_merged_on_finished_work_after_the_source_moved_changes_nothing() {
     command_line(&out, "test -f src/new.rs", "PASS", 0);
     command_line(&out, "test -f src/lib.rs", "PASS", 0);
     assert!(
-        out.contains("accept runs its own merged checks, because the source can move after"),
+        out.contains("accept checks again only if the source moves; a tree with a recorded pass is not checked again"),
         "{out}"
     );
     let digest = f.digest(&id);

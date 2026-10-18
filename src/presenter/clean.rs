@@ -1,6 +1,6 @@
 //! `dispatch clean`: remove the workspaces Dispatch made for Work that is
-//! over, and internal check workspaces, only after the person confirms exactly
-//! what is listed. Nothing is ever removed by a timer. Workspaces you or an
+//! over, internal check workspaces and the verification memo, only after the
+//! person confirms exactly what is listed. Nothing is ever removed by a timer. Workspaces you or an
 //! agent's runtime made are listed, never removed.
 
 use super::*;
@@ -10,10 +10,17 @@ use std::{fs, path::PathBuf};
 pub async fn clean(state: &State, dry_run: bool, yes: bool, options: Options) -> Result<()> {
     let (listed, kept) = attach::cleanable(state)?;
     let check_workspaces = check_workspaces(state)?;
-    if !dry_run {
-        crate::coherence::memo::clear(state)?;
-    }
-    remove(state, &listed, &check_workspaces, dry_run, yes, options).await?;
+    let memo = crate::coherence::memo::recorded(state)?;
+    remove(
+        state,
+        &listed,
+        &check_workspaces,
+        &memo,
+        dry_run,
+        yes,
+        options,
+    )
+    .await?;
     if kept.is_empty() {
         return Ok(());
     }
@@ -44,11 +51,12 @@ async fn remove(
     state: &State,
     listed: &[attach::Cleanable],
     check_workspaces: &[PathBuf],
+    memo: &Option<(PathBuf, usize)>,
     dry_run: bool,
     yes: bool,
     options: Options,
 ) -> Result<()> {
-    if listed.is_empty() && check_workspaces.is_empty() {
+    if listed.is_empty() && check_workspaces.is_empty() && memo.is_none() {
         println!(
             "Nothing to clean: no workspace Dispatch made is left over. Dispatch removes only the workspaces it made; worktrees you or an agent's runtime made stay until you remove them."
         );
@@ -75,6 +83,9 @@ async fn remove(
             .iter()
             .map(|path| format!("  {} · internal check workspace", path.display())),
     );
+    if let Some((path, passes)) = memo {
+        lines.push(format!("  {} · recorded passes ({passes})", path.display()));
+    }
     let lines = lines.join("\n");
     if dry_run {
         println!("Would remove:\n{lines}\nNothing was removed.");
@@ -88,15 +99,26 @@ async fn remove(
             "dispatch clean asks before removing anything; pass --yes to remove the listed workspaces without asking, or --dry-run to only list them"
         );
         let mut ui = Ui::new(options)?;
-        let question = if check_workspaces.is_empty() {
-            format!(
-                "Remove these workspaces Dispatch made? Their work is over, and what they held is kept in each Work's changes.\n{lines}"
-            )
+        let mut question = String::from(if listed.is_empty() && check_workspaces.is_empty() {
+            "Remove the recorded passes?"
         } else {
-            format!(
-                "Remove these workspaces Dispatch made? Check workspaces hold temporary verification and build files; Work records are kept separately.\n{lines}"
-            )
-        };
+            "Remove these workspaces Dispatch made?"
+        });
+        if check_workspaces.is_empty() && !listed.is_empty() {
+            question.push_str(
+                " Their work is over, and what they held is kept in each Work's changes.",
+            );
+        }
+        if !check_workspaces.is_empty() {
+            question.push_str(
+                " Check workspaces hold temporary verification and build files; Work records are kept separately.",
+            );
+        }
+        if memo.is_some() {
+            question
+                .push_str(" Recorded passes only spare checking again a tree that already passed.");
+        }
+        let question = format!("{question}\n{lines}");
         let rows = [Choice::new("Remove them"), Choice::new("Cancel")];
         ui.select(&question, &rows, 1).await? == Some(0)
     };
@@ -119,7 +141,13 @@ async fn remove(
             removed += 1;
         }
     }
-    println!("Removed {removed} workspace(s) Dispatch made.");
+    if !listed.is_empty() || !check_workspaces.is_empty() {
+        println!("Removed {removed} workspace(s) Dispatch made.");
+    }
+    if let Some((_, passes)) = memo {
+        crate::coherence::memo::clear(state)?;
+        println!("Removed {passes} recorded pass(es).");
+    }
     Ok(())
 }
 

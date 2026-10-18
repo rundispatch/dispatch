@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         with session('setup-verify', ['--plain', 'setup', '--checks', '--verify', 'sh ./verify.sh --strict']) as ui:
             ui.wait('Save these checks?'); ui.wait('sh ./verify.sh --strict'); ui.wait('[1] >'); ui.send('\r')
             ui.wait('Approved checks saved'); ui.wait('2) Let Work run these checks'); ui.send('2\r')
-            ui.wait('code an agent wrote'); ui.wait('on this host'); ui.wait('merged scratch tree at accept'); ui.wait('2) Cancel'); ui.mark('consent')
+            ui.wait('code an agent wrote'); ui.wait('on this host'); ui.wait('check workspace at accept'); ui.wait('2) Cancel'); ui.mark('consent')
             ui.send('\r'); ui.wait('Nothing changed'); ui.finish()
         assert config.read_text() == 'checks:\n  verify:\n  - sh ./verify.sh --strict\n', config.read_text()
         assert not consents(), 'consent granted without the explicit choice'

@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.15 — experimental developer preview**
+**Dispatch 0.4.16 — experimental developer preview**
 
 <p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch; once one lands, the other no longer fits, and dispatch accept refuses it as REFRESH, leaving the source unchanged."></a></p>
 <p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
@@ -230,18 +230,30 @@ it is now. Nothing about it is trusted from an earlier moment.
   verdict: `Ready for review`, `Finished, but stale (REFRESH)` or
   `Finished, already in the source (STOP)`.
 - `dispatch check <id> --merged` also runs your `checks.verify` on the source as it
-  is now with the Work's change applied, in a scratch copy, exactly as accept would,
-  and prints one line per command (PASS/FAIL, exit code, duration, logs). For
-  unfinished attached Work, the change is taken from the workspace now, new
+  is now with the Work's change applied, in the project's check workspace, exactly as
+  accept would, and prints one line per command (PASS/FAIL, exit code, duration, logs).
+  For unfinished attached Work, the change is taken from the workspace now, new
   untracked files included, as `finish` would take it; the live patch is not
   touched. Nothing is applied and no verdict changes; one `coherence.merged_checks`
   event records the source state (Git HEAD and whether it had uncommitted changes,
-  or a plain directory), the Δ digest and each command's result and duration. It
-  exits 1 if a check fails. It needs the same authority as `finish`: the Work's own
-  `--allow-unsafe-local`, standing consent for exactly these checks (`dispatch
-  setup --checks`), or `--allow-unsafe-local` for this check alone, which is not
-  recorded on the Work. Accept still runs its own merged checks, because the source
-  can move after.
+  or a plain directory), the Δ digest, the checked tree and each command's result and
+  duration. It exits 1 if a check fails. It needs the same authority as `finish`: the
+  Work's own `--allow-unsafe-local`, standing consent for exactly these checks
+  (`dispatch setup --checks`), or `--allow-unsafe-local` for this check alone, which
+  is not recorded on the Work. For finished Work whose source has not moved since the
+  Work began it runs nothing, as accept does. Accept checks again only a tree that has
+  no recorded pass, because the source can move after.
+- **A tree that passed is not checked again.** A pass of `checks.verify` is recorded
+  for 24 hours, keyed by the exact tree that was checked (ignored files left out), the
+  ordered commands, and the environment they ran in (backend and image, `PATH`,
+  `HOME`, `TMPDIR`, `LANG`, where each program resolves, and the Dispatch version).
+  `finish`, `check --merged` and accept then run nothing for that tree, record
+  `checks.reused`, and say `passed, reused from <run> at <time>; logs: …`. Failures are
+  never recorded. Plain directories, sources where Git converts file contents
+  (`core.autocrlf`, `core.eol`, or a `text`, `eol`, `filter`, `ident`, `crlf` or
+  `working-tree-encoding` attribute) and trees holding an untracked nested repository
+  get no record, and their checks run every time. A reused result is counted as
+  reused, never as time saved.
 - `finish`, `check` and `diff --stat` print `Δ <12 hex>`, the start of the SHA-256
   of the patch bytes. `dispatch accept <id> --expect <digest>` (12 or more hex
   characters) refuses before anything else, naming both digests, if the frozen Δ
@@ -311,11 +323,14 @@ coherence:
 - A Python function that only gains optional parameters (defaults, `*args`,
   `**kwargs`) keeps code that calls it valid. Any other signature change to a
   function the work calls is a `REFRESH`; Rust signatures compare exactly.
-- Integration checks run your configured `checks.verify` on the merged tree in a
-  scratch copy of the non-ignored files, with no build cache. They hold the apply
-  locks while running. On the local backend they are skipped for a run that was not
-  itself approved for local execution. A check that fails, times out or cannot run
-  produces `REFRESH`.
+- Integration checks run your configured `checks.verify` on the merged tree in the
+  project's check workspace: one internal Git repository per project under the state
+  directory, never a worktree of yours, holding the source's non-ignored files with
+  the change applied. Ignored build output stays there between runs, so builds are
+  incremental after the first; `dispatch clean` removes it. They hold the project's
+  source lock while running, so one project's merged checks run one at a time. On the
+  local backend they are skipped for a run that was not itself approved for local
+  execution. A check that fails, times out or cannot run produces `REFRESH`.
 - Two edits to the same symbol are reported as `REFRESH`. Python appends at the very
   end of a function are not seen as same-symbol edits by the symbol layer; the patch
   check and your checks still apply.
@@ -347,7 +362,7 @@ dispatch finish <run-id>                                           # you say whe
 dispatch start                                                     # keeps a foreign attachment observed and applies it
 ```
 
-Dispatch is honest about what it saw: full confidence when S0 is the workspace as the work began (a workspace Dispatch made, or a session's start) or a real Git merge-base commit; partial confidence when it had to snapshot a directory at attach time, or when a session resumed in a worktree it had not seen, since earlier edits are then invisible to the patch. Attached Work that did not begin from the current source, such as a worktree made from HEAD while accepted changes were still uncommitted, says so once in `attach`, `status` and `watch`. A workspace Dispatch made is removed once its work is applied, and kept otherwise until you run `dispatch clean`, which lists what it would remove and asks first. It never removes a workspace that unfinished Work, or Work waiting for review, still uses, and it lists worktrees you or an agent's runtime made without removing them. `dispatch close <id> --reason <reason>` retires Work nobody will finish, or a result that is already in the source or replaced, without recording a review. See [attach.md](docs/attach.md).
+Dispatch is honest about what it saw: full confidence when S0 is the workspace as the work began (a workspace Dispatch made, or a session's start) or a real Git merge-base commit; partial confidence when it had to snapshot a directory at attach time, or when a session resumed in a worktree it had not seen, since earlier edits are then invisible to the patch. Attached Work that did not begin from the current source, such as a worktree made from HEAD while accepted changes were still uncommitted, says so once in `attach`, `status` and `watch`. A workspace Dispatch made is removed once its work is applied, and kept otherwise until you run `dispatch clean`, which lists what it would remove, project check workspaces and the record of passed checks included, and asks first. It never removes a workspace that unfinished Work, or Work waiting for review, still uses, and it lists worktrees you or an agent's runtime made without removing them. `dispatch close <id> --reason <reason>` retires Work nobody will finish, or a result that is already in the source or replaced, without recording a review. See [attach.md](docs/attach.md).
 
 See the [coherence reference](docs/coherence.md) for the model, rules, events and
 the fixture matrix, and [coherence validation](docs/coherence-validation.md) for
@@ -640,6 +655,8 @@ harnesses:
 ```
 
 Use the command that actually verifies the project, such as `pytest`, `npm test`, or `go test ./...`. Repository configuration cannot grant itself local-execution or environment-forwarding permission.
+
+Before a native run's agent starts, Dispatch makes sure each program in `checks.baseline` and `checks.verify` can be found, and runs the `checks.baseline` commands, if you listed any, on the run's snapshot (S0). With an empty `checks.baseline` nothing runs before the agent: afterwards, only the `checks.verify` commands that failed are run again on S0, to tell work that broke them from a project that was already broken.
 
 ## Local state and artifacts
 
