@@ -8,7 +8,7 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -23,7 +23,7 @@ use crate::{
         world::{Signal, observe, signal},
     },
     executor::CancellationToken,
-    source::snapshot_delta,
+    source::{snapshot_delta, snapshot_delta_if_changed_indexed},
 };
 
 /// The fewest seconds between two messages from one watcher, so a person
@@ -84,6 +84,13 @@ impl Drop for Watcher {
 async fn watch(spec: WatchSpec, tx: mpsc::UnboundedSender<WatchMsg>, stop: CancellationToken) {
     let mut policy = Policy::default();
     let mut last: Option<Signals> = None;
+    // The work's index, kept between checks so Git re-reads only what
+    // changed; without one, every check stages the whole workspace.
+    let index_dir = tempfile::Builder::new()
+        .prefix("dispatch-watch-")
+        .tempdir()
+        .ok();
+    let index = index_dir.as_ref().map(|dir| dir.path().join("index"));
     let mut ticker = tokio::time::interval(spec.poll);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -93,10 +100,13 @@ async fn watch(spec: WatchSpec, tx: mpsc::UnboundedSender<WatchMsg>, stop: Cance
         }
         let blocking_spec = spec.clone();
         let blocking_last = last.clone();
-        let checked = tokio::task::spawn_blocking(move || check(&blocking_spec, blocking_last))
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|result| result);
+        let blocking_index = index.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            check(&blocking_spec, blocking_index.as_deref(), blocking_last)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
         let evaluated = match checked {
             Ok((now, evaluated)) => {
                 last = Some(now);
@@ -127,9 +137,26 @@ type Signals = (Signal, Signal);
 /// rules (build output never counts) and never runs the workspace's own Git
 /// configuration. Following the work too means a change that landed before
 /// the agent touched the same code is still seen once the agent touches it.
-fn check(spec: &WatchSpec, previous: Option<Signals>) -> Result<(Signals, Option<Validity>)> {
+/// With `index`, the patch is taken again only when the workspace changed
+/// since that index, as the project owner follows Work.
+fn check(
+    spec: &WatchSpec,
+    index: Option<&Path>,
+    previous: Option<Signals>,
+) -> Result<(Signals, Option<Validity>)> {
     let world_signal = signal(&spec.source, &spec.kind)?;
-    snapshot_delta(&spec.baseline, &spec.workspace, &spec.delta_patch)?;
+    match index {
+        Some(index) => {
+            snapshot_delta_if_changed_indexed(
+                &spec.baseline,
+                &spec.workspace,
+                &spec.delta_patch,
+                index,
+                &spec.delta_patch,
+            )?;
+        }
+        None => snapshot_delta(&spec.baseline, &spec.workspace, &spec.delta_patch)?,
+    }
     let work_signal = Signal(hex::encode(Sha256::digest(fs::read(&spec.delta_patch)?)));
     let now = (world_signal, work_signal);
     if previous.as_ref() == Some(&now) {
@@ -219,7 +246,53 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::{AnalysisLevel, Reason};
+    use crate::{
+        AnalysisLevel, Reason,
+        source::{create_candidate_workspace, create_snapshot},
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn the_work_is_captured_again_only_when_the_workspace_changed() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), "one\n").unwrap();
+        let snapshot = create_snapshot(&source, &temp.path().join("run")).unwrap();
+        let workspace =
+            create_candidate_workspace(&snapshot.baseline_path, &temp.path().join("work")).unwrap();
+        let spec = WatchSpec {
+            source: fs::canonicalize(&source).unwrap(),
+            kind: snapshot.kind.clone(),
+            baseline: snapshot.baseline_path.clone(),
+            baseline_commit: snapshot.baseline_commit.clone(),
+            workspace: workspace.clone(),
+            delta_patch: temp.path().join("delta-live.patch"),
+            poll: Duration::from_secs(1),
+        };
+        let index = temp.path().join("index");
+        fs::write(workspace.join("a.txt"), "two\n").unwrap();
+        let (first, evaluated) = check(&spec, Some(&index), None).unwrap();
+        assert!(evaluated.is_some());
+        let captured = fs::metadata(&spec.delta_patch).unwrap().ino();
+
+        let (again, evaluated) = check(&spec, Some(&index), Some(first.clone())).unwrap();
+        assert_eq!(again, first);
+        assert!(evaluated.is_none());
+        assert_eq!(
+            fs::metadata(&spec.delta_patch).unwrap().ino(),
+            captured,
+            "an unchanged workspace is not captured again"
+        );
+
+        fs::write(workspace.join("b.txt"), "new\n").unwrap();
+        let (moved, evaluated) = check(&spec, Some(&index), Some(again)).unwrap();
+        assert_ne!(moved.1, first.1);
+        assert!(evaluated.is_some());
+        let patch = fs::read_to_string(&spec.delta_patch).unwrap();
+        assert!(patch.contains("+two") && patch.contains("+new"), "{patch}");
+    }
 
     fn reason(code: ReasonCode) -> Reason {
         Reason {

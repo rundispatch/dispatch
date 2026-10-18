@@ -5,8 +5,9 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -68,10 +69,25 @@ pub fn inspect_source(source: &Path) -> Result<(SourceKind, Option<String>)> {
 
     let mut inside = git_command(&source);
     inside.args(["rev-parse", "--is-inside-work-tree"]);
-    let output = inside
-        .output()
-        .with_context(|| "failed to run Git while inspecting the source")?;
-    if !output.status.success() || trim_ascii(&output.stdout) != b"true" {
+    let output = run_git(
+        inside,
+        None,
+        "failed to run Git while inspecting the source",
+    )?;
+    // Only Git's own "not a git repository" makes a plain directory: any
+    // other failure (a broken configuration, an unsafe owner) is not one.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.starts_with("fatal: not a git repository") {
+            return Ok((SourceKind::Directory, None));
+        }
+        bail!(
+            "failed to inspect the source {}: {}",
+            source.display(),
+            stderr.trim()
+        );
+    }
+    if trim_ascii(&output.stdout) != b"true" {
         return Ok((SourceKind::Directory, None));
     }
 
@@ -2003,7 +2019,18 @@ pub(crate) fn checked_output(command: Command, context: &str) -> Result<Output> 
 
 /// Run Git under the same timeout and output limits as `checked_output`, but
 /// leave the exit status to the caller and optionally feed standard input.
-pub(crate) fn run_git(mut command: Command, input: Option<&[u8]>, context: &str) -> Result<Output> {
+pub(crate) fn run_git(command: Command, input: Option<&[u8]>, context: &str) -> Result<Output> {
+    run_git_within(command, input, context, GIT_COMMAND_TIMEOUT)
+}
+
+/// `run_git` with its safety timeout given. A thread waits for the child, so
+/// the caller learns of its exit at once rather than at the next poll.
+fn run_git_within(
+    mut command: Command,
+    input: Option<&[u8]>,
+    context: &str,
+    timeout: Duration,
+) -> Result<Output> {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -2032,24 +2059,29 @@ pub(crate) fn run_git(mut command: Command, input: Option<&[u8]>, context: &str)
     let stderr = child.stderr.take().context("Git stderr was not captured")?;
     let stdout_reader = thread::spawn(move || read_limited(stdout));
     let stderr_reader = thread::spawn(move || read_limited(stderr));
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().with_context(|| context.to_owned())? {
-            break status;
-        }
-        if started.elapsed() >= GIT_COMMAND_TIMEOUT {
+    let (exited, exit) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _ = exited.send(child.wait());
+    });
+    let status = match exit.recv_timeout(timeout) {
+        Ok(status) => status.with_context(|| context.to_owned())?,
+        Err(_) => {
+            // The child leads its own group, so this kills it too and the
+            // waiter returns. Elsewhere it is left to exit by itself.
             kill_command_group(child_id);
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            #[cfg(unix)]
+            {
+                let _ = waiter.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+            }
             bail!(
                 "{context}: Git exceeded the {} second safety timeout",
-                GIT_COMMAND_TIMEOUT.as_secs()
+                timeout.as_secs()
             );
         }
-        thread::sleep(Duration::from_millis(20));
     };
+    let _ = waiter.join();
     kill_command_group(child_id);
     if let Some(writer) = stdin_writer {
         let _ = writer.join();
@@ -2181,7 +2213,7 @@ fn create_symlink(target: &Path, destination: &Path, source_link: &Path) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, time::Instant};
 
     use chrono::Utc;
     use tempfile::TempDir;
@@ -2351,6 +2383,48 @@ mod tests {
             inspect_source(&worktree).unwrap().0,
             SourceKind::GitWorktree
         );
+    }
+
+    #[test]
+    fn a_git_failure_other_than_no_repository_is_an_error_not_a_plain_directory() {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        write(&repository.join("file.txt"), "git\n");
+        initialize_user_repository(&repository);
+        write(&repository.join(".git/config"), "this is [not a config\n");
+        let error = inspect_source(&repository).unwrap_err();
+        assert!(format!("{error:#}").contains("bad config"), "{error:#}");
+        assert!(repo_identity(&repository).is_err());
+
+        // Git's own "not a git repository" still means a plain directory.
+        let plain = temp.path().join("plain");
+        write(&plain.join(".git/private"), "not a repository");
+        assert_eq!(
+            inspect_source(&plain).unwrap(),
+            (SourceKind::Directory, None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_git_reports_exit_and_output_and_its_timeout_still_fires() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "cat; echo said >&2; exit 3"]);
+        let output = super::run_git(command, Some(b"fed"), "the stand-in").unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"fed");
+        assert_eq!(output.stderr, b"said\n");
+
+        // A child that leaves a grandchild holding its output is killed with
+        // its group, so the timeout returns rather than waiting on the pipe.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 60 & sleep 60"]);
+        let started = Instant::now();
+        let error =
+            run_git_within(command, None, "the stand-in", Duration::from_millis(300)).unwrap_err();
+        assert!(format!("{error:#}").contains("safety timeout"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[test]

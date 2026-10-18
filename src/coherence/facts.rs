@@ -15,6 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Component, Path},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
@@ -575,6 +576,39 @@ fn file_fact(path: &str, bytes: &[u8]) -> MustHold {
         None,
         path.to_owned(),
     )
+}
+
+/// Facts derived once per (S0 commit, Δ digest), in memory only. They are a
+/// function of those two alone, so Work evaluated again as the world moves,
+/// and its footprint, share one derivation.
+/// Shared by Work evaluated side by side.
+#[derive(Default)]
+pub struct Memo(Mutex<HashMap<(String, String), Arc<Derived>>>);
+
+impl Memo {
+    /// What the patch `bytes` assumes about `work`'s baseline commit.
+    pub fn derive(&self, work: &WorkView, bytes: &[u8]) -> Result<Arc<Derived>> {
+        let key = (
+            work.baseline_commit.to_owned(),
+            hex::encode(Sha256::digest(bytes)),
+        );
+        if let Some(derived) = self.known().get(&key) {
+            return Ok(Arc::clone(derived));
+        }
+        let derived = Arc::new(derive_facts(work, &parse_patch(bytes))?);
+        Ok(Arc::clone(self.known().entry(key).or_insert(derived)))
+    }
+
+    /// Forget every derivation but those of `keep`'s (S0 commit, Δ digest).
+    pub fn retain(&self, keep: &HashSet<(String, String)>) {
+        self.known().retain(|key, _| keep.contains(key));
+    }
+
+    fn known(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Arc<Derived>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// What `delta` assumes about the baseline. Modified facts come first, then
@@ -1205,13 +1239,17 @@ fn read_s1(source: &Path, path: &str) -> Result<Option<Vec<u8>>> {
 
 /// The L1 verdict inputs for `work`: the reasons and how deep the analysis
 /// went. An unreadable baseline gives no reasons and `FilesOnly`.
-pub fn check(work: &WorkView, world: &WorldObservation) -> Result<(Vec<Reason>, AnalysisLevel)> {
+pub fn check(
+    work: &WorkView,
+    world: &WorldObservation,
+    memo: &Memo,
+) -> Result<(Vec<Reason>, AnalysisLevel)> {
     if !baseline_readable(work) {
         return Ok((Vec::new(), AnalysisLevel::FilesOnly));
     }
     let patch = fs::read(work.delta_patch)
         .with_context(|| format!("failed to read delta {}", work.delta_patch.display()))?;
-    let derived = derive_facts(work, &parse_patch(&patch))?;
+    let derived = memo.derive(work, &patch)?;
     let reasons = evaluate_facts(work, world, &derived.facts)?;
     let changed: HashSet<&str> = world
         .changes
@@ -1946,9 +1984,44 @@ diff --git a/y.rs b/y.rs\nindex 1..2 100644\n--- a/y.rs\n+++ b/y.rs\n\
         let mut work = repo.work();
         let nowhere = repo.root.path().join("nowhere");
         work.baseline = &nowhere;
-        let (reasons, analysis) = check(&work, &world).unwrap();
+        let (reasons, analysis) = check(&work, &world, &Memo::default()).unwrap();
         assert!(reasons.is_empty());
         assert_eq!(analysis, AnalysisLevel::FilesOnly);
+    }
+
+    #[test]
+    fn facts_are_derived_once_per_s0_commit_and_delta() {
+        let (repo, _) = handler_repo();
+        let bytes = repo.delta(&[("src/handler.rs", Some(HANDLER_DELTA))]);
+        let fresh = derive_facts(&repo.work(), &parse_patch(&bytes)).unwrap();
+        assert!(!fresh.facts.is_empty());
+        let memo = Memo::default();
+        assert_eq!(
+            memo.derive(&repo.work(), &bytes).unwrap().facts,
+            fresh.facts
+        );
+
+        // The same (S0 commit, Δ) is not derived again: a baseline that can
+        // no longer be read does not change what was found.
+        let nowhere = repo.root.path().join("nowhere");
+        let mut work = repo.work();
+        work.baseline = &nowhere;
+        assert_eq!(memo.derive(&work, &bytes).unwrap().facts, fresh.facts);
+        // `check` still bails out on it first.
+        let world = repo.world(&[("src/auth.rs", Some("pub fn validate() {}\n"))]);
+        let (reasons, analysis) = check(&work, &world, &memo).unwrap();
+        assert!(reasons.is_empty());
+        assert_eq!(analysis, AnalysisLevel::FilesOnly);
+
+        // Kept only while asked for: forgotten, it is derived again.
+        let key = (
+            repo.snapshot.baseline_commit.clone(),
+            hex::encode(Sha256::digest(&bytes)),
+        );
+        memo.retain(&HashSet::from([key]));
+        assert_eq!(memo.derive(&work, &bytes).unwrap().facts, fresh.facts);
+        memo.retain(&HashSet::new());
+        assert!(memo.derive(&work, &bytes).unwrap().facts.is_empty());
     }
 
     // ---- precise Modified facts ---------------------------------------------

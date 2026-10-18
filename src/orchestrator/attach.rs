@@ -1278,8 +1278,11 @@ pub(crate) fn observe_start(state: &State, run_id: &str, runs: &[RunRecord]) -> 
     Ok(run)
 }
 
+/// The unfinished attached Work in `workspace`.
 pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<Option<String>> {
-    find_active(state, |attachment| attachment.workspace == workspace)
+    find_active(state, "workspace", workspace, |attachment| {
+        attachment.workspace == workspace
+    })
 }
 
 /// Active Work of the project at `root` holding the open runtime session
@@ -1290,7 +1293,7 @@ pub(crate) fn find_session_attachment(
     provider: &str,
     session_id: &str,
 ) -> Result<Option<String>> {
-    find_active(state, |attachment| {
+    find_active(state, "integration_root", root, |attachment| {
         attachment.integration_root == root
             && attachment.sessions.iter().any(|session| {
                 session.provider == provider
@@ -1300,23 +1303,47 @@ pub(crate) fn find_session_attachment(
     })
 }
 
-/// One pass over the runs: the first unfinished attached Work `matches`.
+/// The newest unfinished attached Work `matches`, among the published runs
+/// whose attachment records `path` as its `field` (a path that never
+/// changes): one query, then only those runs are loaded.
 fn find_active(
     state: &State,
+    field: &str,
+    path: &Path,
     matches: impl Fn(&AttachmentRecord) -> bool,
 ) -> Result<Option<String>> {
-    for path in state.list_metadata_paths()? {
-        let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("invalid metadata at {}", path.display()))?;
-        let run = state.load_run(&projected.id)?;
-        if run.mode == RunMode::Attached
-            && run.outcome.lifecycle == LifecycleState::Working
-            && run.attachment.as_ref().is_some_and(&matches)
-        {
+    if !state.db_path().is_file() {
+        return Ok(None);
+    }
+    let database = Database::open(state.db_path())?;
+    let ids = database
+        .connection()
+        .prepare(
+            "SELECT id FROM runs WHERE run_mode = 'attached' \
+             AND json_extract(run_projection_json, '$.attachment.' || ?1) = ?2 \
+             ORDER BY id DESC",
+        )?
+        .query_map(rusqlite::params![field, path.to_string_lossy()], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(database);
+    for id in ids {
+        if !state.metadata_path(&id).is_file() {
+            continue; // not published yet
+        }
+        let run = state.load_run(&id)?;
+        if is_active(&run, &matches) {
             return Ok(Some(run.id));
         }
     }
     Ok(None)
+}
+
+fn is_active(run: &RunRecord, matches: impl Fn(&AttachmentRecord) -> bool) -> bool {
+    run.mode == RunMode::Attached
+        && run.outcome.lifecycle == LifecycleState::Working
+        && run.attachment.as_ref().is_some_and(matches)
 }
 
 /// `dispatch finish <id>`: freeze Δ, run verification on what would land

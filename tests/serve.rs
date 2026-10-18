@@ -493,6 +493,194 @@ fn serve_follows_foreign_work_that_edits_into_a_change_already_made() {
     });
 }
 
+/// One move of the root, seen by four Works at once: each gets the verdict
+/// its own (S0, Δ) earns against the source now, as if it were alone.
+#[test]
+fn works_sharing_one_moved_world_each_get_their_own_verdict() {
+    let fixture = Fixture::new();
+    let lib = |answer: &str, scale: &str, offset: &str| {
+        format!(
+            "pub fn answer() -> i32 {{\n    {answer}\n}}\n\n{scale}\n\n\
+             // one\n// two\n// three\n// four\n// five\n// six\n\n\
+             pub fn offset() -> i32 {{\n    {offset}\n}}\n"
+        )
+    };
+    let scale = "pub fn scale(x: i32) -> i32 {\n    x\n}";
+    fs::write(fixture.root.join("src/lib.rs"), lib("1", scale, "10")).unwrap();
+    fs::write(fixture.root.join("notes.txt"), "notes\n").unwrap();
+    git(&fixture.root, &["add", "-A"]);
+    git(
+        &fixture.root,
+        &["commit", "--quiet", "-m", "four functions"],
+    );
+
+    let edit = |name: &str, path: &str, text: &str| {
+        let workspace = fixture.extra_worktree(name);
+        let id = fixture.attach_workspace(&workspace, &[]);
+        fs::write(workspace.join(path), text).unwrap();
+        id
+    };
+    let conflicting = edit("conflict", "src/lib.rs", &lib("2", scale, "10"));
+    let caller = edit(
+        "caller",
+        "src/caller.rs",
+        "pub fn call_scale() -> i32 {\n    scale(2)\n}\n",
+    );
+    let unrelated = edit("unrelated", "notes.txt", "more notes\n");
+    let landed = edit("landed", "src/lib.rs", &lib("1", scale, "20"));
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(300), |value| value["type"] == "world");
+
+    let rescaled = "pub fn scale(x: i32, y: i32) -> i32 {\n    x * y\n}";
+    fs::write(fixture.root.join("src/lib.rs"), lib("3", rescaled, "20")).unwrap();
+    let ids = [&conflicting, &caller, &unrelated, &landed];
+    wait_until(Duration::from_secs(300), || {
+        ids.iter()
+            .all(|id| fixture.metadata(id)["coherence"]["validity"]["world_changed"] == true)
+    });
+    let verdict = |id: &str| {
+        let validity = fixture.metadata(id)["coherence"]["validity"].clone();
+        let codes: Vec<String> = validity["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|reason| reason["code"].as_str().unwrap().to_owned())
+            .collect();
+        (validity["decision"].as_str().unwrap().to_owned(), codes)
+    };
+    assert_eq!(
+        verdict(&conflicting),
+        ("refresh".into(), vec!["patch_conflict".into()])
+    );
+    assert_eq!(
+        verdict(&caller),
+        ("refresh".into(), vec!["fact_broken".into()])
+    );
+    assert_eq!(verdict(&unrelated), ("continue".into(), vec![]));
+    assert_eq!(
+        verdict(&landed),
+        ("stop".into(), vec!["already_applied".into()])
+    );
+}
+
+/// The owner's view of a project: its own runs only, newest first, each as
+/// `load_run` reads it. A read repairs a projection behind the committed run
+/// and does not write a current one.
+#[test]
+fn a_project_loads_only_its_own_runs_and_a_read_repairs_only_a_stale_projection() {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new();
+    let first = fixture.attach(&[]);
+    let second = fixture.attach_workspace(&fixture.extra_worktree("second"), &[]);
+    let other = fixture._temp.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("a.txt"), "a\n").unwrap();
+    git(&other, &["init", "--quiet"]);
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "--quiet", "-m", "other"]);
+    git(
+        &other,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "other-branch",
+            "../other-wt",
+        ],
+    );
+    let other_wt = fixture._temp.path().join("other-wt");
+    fixture
+        .dispatch(&[
+            "attach",
+            "--workspace",
+            other_wt.to_str().unwrap(),
+            "--root",
+            other.to_str().unwrap(),
+            "--allow-unsafe-local",
+        ])
+        .success();
+
+    // A projection one transition behind what is committed.
+    let path = fixture.metadata_path(&first);
+    let mut stale = fixture.metadata(&first);
+    stale["state_revision"] = (stale["state_revision"].as_u64().unwrap() - 1).into();
+    stale["task"] = "stale".into();
+    let stale = serde_json::to_string_pretty(&stale).unwrap();
+    fs::write(&path, &stale).unwrap();
+
+    let current = fixture.metadata_path(&second);
+    let written = fs::metadata(&current).unwrap().ino();
+    let state = dispatch::state::State {
+        root: fixture.state.clone(),
+    };
+    let runs = state.load_source_runs(&fixture.root).unwrap();
+    let ids: Vec<&str> = runs.iter().map(|run| run.id.as_str()).collect();
+    assert_eq!(ids, [second.as_str(), first.as_str()]);
+    for run in &runs {
+        assert_eq!(
+            serde_json::to_value(run).unwrap(),
+            serde_json::to_value(state.load_run(&run.id).unwrap()).unwrap()
+        );
+    }
+    assert_ne!(runs[1].task, "stale", "the committed copy is newer");
+    assert_eq!(
+        fixture.metadata(&first),
+        serde_json::to_value(&runs[1]).unwrap(),
+        "the stale projection was not repaired"
+    );
+    assert_eq!(
+        fs::metadata(&current).unwrap().ino(),
+        written,
+        "a current projection was rewritten"
+    );
+
+    // `load_run` alone repairs it too, and leaves it alone once current.
+    fs::write(&path, &stale).unwrap();
+    let run = state.load_run(&first).unwrap();
+    assert_eq!(
+        fixture.metadata(&first),
+        serde_json::to_value(&run).unwrap()
+    );
+    let repaired = fs::metadata(&path).unwrap().ino();
+    state.load_run(&first).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), repaired);
+}
+
+/// A workspace's Work is found from the runs recorded for that workspace
+/// alone: another run that cannot be read is not in the way, and Work that is
+/// over is not found.
+#[test]
+fn a_workspace_s_work_is_found_without_reading_every_run() {
+    let fixture = Fixture::new();
+    let id = fixture.attach(&[]);
+    let other = fixture.attach_workspace(&fixture.extra_worktree("other"), &[]);
+    fs::write(fixture.metadata_path(&other), "not a run").unwrap();
+    let workspace = fixture.workspace.to_str().unwrap();
+    let root = fixture.root.to_str().unwrap();
+    let again = [
+        "attach",
+        "--workspace",
+        workspace,
+        "--root",
+        root,
+        "--allow-unsafe-local",
+    ];
+    let refused = |fixture: &Fixture| Fixture::stderr(&fixture.dispatch(&again).failure());
+    assert!(
+        refused(&fixture).contains(&format!("workspace already attached as {id}")),
+        "{}",
+        refused(&fixture)
+    );
+
+    fixture
+        .dispatch(&["close", &id, "--reason", "unfinished"])
+        .success();
+    let next = fixture.attach(&[]);
+    assert_ne!(next, id);
+    assert!(refused(&fixture).contains(&next));
+}
+
 #[test]
 fn serve_auto_applies_ready_foreign_work_with_integrate() {
     let fixture = Fixture::new();

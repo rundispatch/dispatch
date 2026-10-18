@@ -100,6 +100,9 @@ impl State {
         Ok(())
     }
 
+    /// The run as committed, or as projected when the projection is newer
+    /// and the run has no execution policy. A `metadata.json` that is missing
+    /// or behind the committed run is repaired; a current one is not written.
     pub fn load_run(&self, id_or_prefix: &str) -> Result<RunRecord> {
         let id = self.resolve_run_id(id_or_prefix)?;
         let projected = fs::read(self.metadata_path(&id))
@@ -115,36 +118,75 @@ impl State {
             .map(|database| database.committed_run_projection(&id))
             .transpose()?
             .flatten();
-        let mut run = match (projected, committed) {
-            (Some(projected), Some(committed)) => {
-                if committed.execution.is_some()
-                    || committed.state_revision >= projected.state_revision
-                {
-                    self.save_run(&committed)?;
-                    committed
-                } else {
-                    projected
-                }
-            }
-            (Some(projected), None) => projected,
-            (None, Some(committed)) => {
-                self.save_run(&committed)?;
-                committed
-            }
-            (None, None) => bail!("run {id} has no readable metadata or committed projection"),
-        };
-        anyhow::ensure!(
-            run.id == id,
-            "run metadata identity does not match directory {id}"
-        );
+        let (mut run, behind) = current(&id, projected, committed)?;
+        if behind {
+            self.save_run(&run)?;
+        }
         if let Some(database) = database {
-            crate::orchestrator::native::repair_abandoned(self, &database, &mut run)?;
-            if let Some(policy) = &mut run.execution {
-                policy.questions = database.questions_for_run(&id)?;
-            }
+            self.complete(&database, &mut run)?;
             self.repair_event_projection(&id, &database.events_for_run(&id)?)?;
         }
         Ok(run)
+    }
+
+    /// Every published run whose source is `root`, newest first, each as
+    /// `load_run` reads it, through one connection and one query. Other
+    /// projects' runs are never read; only a projection behind its committed
+    /// run is written.
+    pub fn load_source_runs(&self, root: &Path) -> Result<Vec<RunRecord>> {
+        let mut runs = Vec::new();
+        if !self.db_path().is_file() {
+            for path in self.list_metadata_paths()? {
+                let run: RunRecord = serde_json::from_slice(&fs::read(&path)?)
+                    .with_context(|| format!("invalid metadata at {}", path.display()))?;
+                if run.source_path == root {
+                    runs.push(run);
+                }
+            }
+            return Ok(runs);
+        }
+        let database = crate::db::Database::open(self.db_path())?;
+        let rows = database
+            .connection()
+            .prepare(
+                "SELECT runs.id, runs.run_projection_json FROM runs \
+                 JOIN sources ON sources.id = runs.source_id WHERE sources.path = ?1",
+            )?
+            .query_map([root.to_string_lossy()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, committed) in rows {
+            // A run is published once its metadata is in `runs/`.
+            let Ok(projected) = fs::read(self.metadata_path(&id)) else {
+                continue;
+            };
+            let projected = serde_json::from_slice::<RunRecord>(&projected).ok();
+            let committed = committed
+                .map(|json| serde_json::from_str(&json).context("invalid committed run projection"))
+                .transpose()?;
+            let (mut run, behind) = current(&id, projected, committed)?;
+            if run.source_path != root {
+                continue;
+            }
+            if behind {
+                self.save_run(&run)?;
+            }
+            self.complete(&database, &mut run)?;
+            runs.push(run);
+        }
+        runs.sort_by(|left, right| right.id.cmp(&left.id));
+        Ok(runs)
+    }
+
+    /// What loading adds to the stored run: a native run whose supervisor is
+    /// gone is interrupted, and an execution policy gets its questions.
+    fn complete(&self, database: &crate::db::Database, run: &mut RunRecord) -> Result<()> {
+        crate::orchestrator::native::repair_abandoned(self, database, run)?;
+        if let Some(policy) = &mut run.execution {
+            policy.questions = database.questions_for_run(&run.id)?;
+        }
+        Ok(())
     }
 
     fn repair_event_projection(&self, run_id: &str, events: &[EventRecord]) -> Result<()> {
@@ -209,6 +251,36 @@ impl State {
         paths.reverse();
         Ok(paths)
     }
+}
+
+/// Which of a run's two stored copies `load_run` believes: the committed one,
+/// unless the projection is newer and the run has no execution policy. And
+/// whether the projection must be written again: it is missing, or the
+/// committed run is believed at another state revision.
+fn current(
+    id: &str,
+    projected: Option<RunRecord>,
+    committed: Option<RunRecord>,
+) -> Result<(RunRecord, bool)> {
+    let (run, behind) = match (projected, committed) {
+        (Some(projected), Some(committed)) => {
+            if committed.execution.is_some() || committed.state_revision >= projected.state_revision
+            {
+                let behind = committed.state_revision != projected.state_revision;
+                (committed, behind)
+            } else {
+                (projected, false)
+            }
+        }
+        (Some(projected), None) => (projected, false),
+        (None, Some(committed)) => (committed, true),
+        (None, None) => bail!("run {id} has no readable metadata or committed projection"),
+    };
+    anyhow::ensure!(
+        run.id == id,
+        "run metadata identity does not match directory {id}"
+    );
+    Ok((run, behind))
 }
 
 /// Replace `path` with `bytes` through a uniquely named temporary file in the
