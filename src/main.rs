@@ -592,6 +592,7 @@ async fn run() -> Result<()> {
             json,
             jsonl,
         } => {
+            keep_watching(&state, None)?;
             if json {
                 orchestrator::status_json(&state, run_id.as_deref(), &std::env::current_dir()?)
             } else if jsonl {
@@ -610,6 +611,7 @@ async fn run() -> Result<()> {
             merged,
             allow_unsafe_local,
         } => {
+            keep_watching(&state, None)?;
             orchestrator::check(
                 &state,
                 run_id.as_deref(),
@@ -644,6 +646,7 @@ async fn run() -> Result<()> {
         }
         Command::Attach(args) => {
             let workspace = args.workspace.unwrap_or_else(|| PathBuf::from("."));
+            keep_watching(&state, Some(args.root.as_ref().unwrap_or(&workspace)))?;
             let wrapped = !args.command.is_empty();
             let request = orchestrator::attach::AttachRequest {
                 workspace,
@@ -671,6 +674,7 @@ async fn run() -> Result<()> {
             run_id,
             allow_unsafe_local,
         } => {
+            keep_watching(&state, None)?;
             orchestrator::attach::finish(&state, &run_id, allow_unsafe_local).await?;
             Ok(())
         }
@@ -690,6 +694,7 @@ async fn run() -> Result<()> {
         Command::Stop { root } => orchestrator::background::stop(&state, root),
         Command::Watch { root, json } => {
             use std::io::IsTerminal;
+            keep_watching(&state, root.as_deref())?;
             // On a terminal, the view is where the person acts; piped, or
             // as JSON, or plain, it only reports.
             if json
@@ -768,6 +773,7 @@ async fn run() -> Result<()> {
             name_only,
         ),
         Command::Accept(args) => {
+            keep_watching(&state, None)?;
             let explanation = args.review.feedback.explanation.read()?;
             orchestrator::accept_or_reject_latest(
                 &state,
@@ -811,6 +817,18 @@ async fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Keep the project at `path` (by default the current directory) watched as
+/// `dispatch start` left it, before a command that works there; what that
+/// did, or why it could not, goes to stderr.
+fn keep_watching(state: &State, path: Option<&std::path::Path>) -> Result<()> {
+    let path = match path {
+        Some(path) => path.to_owned(),
+        None => std::env::current_dir()?,
+    };
+    orchestrator::background::ensure_current_at(state, &path);
+    Ok(())
 }
 
 /// After `run_dispatch` returns for `run`/`refresh`: report the result, and

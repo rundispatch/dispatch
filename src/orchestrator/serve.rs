@@ -45,7 +45,8 @@ use crate::{
 };
 
 /// `dispatch serve [--root <path>] [--json]`. Loops until Ctrl+C, SIGTERM or
-/// SIGHUP; a second `serve` on the same root refuses to start. The owner
+/// SIGHUP, or until the root or the state directory no longer exists; a
+/// second `serve` on the same root refuses to start. The owner
 /// decides and records; this loop only renders what it did. `background`
 /// is `dispatch start`'s owner: it renders nothing, and its stderr is a log
 /// that names each distinct error once.
@@ -98,11 +99,27 @@ async fn run(
     let mut view = View::default();
     let errors = Arc::new(Mutex::new(HashSet::new()));
     let _fast = FastLoop::start(state, &owner.root, background, Arc::clone(&errors))?;
+    let places = [
+        ("project", owner.root.clone(), identity(&owner.root)),
+        ("state directory", state.root.clone(), identity(&state.root)),
+    ];
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
             _ = &mut shutdown => return Ok(()),
+        }
+        // Nothing is left to watch, or to record it in: `serve` removes the
+        // record on its way out.
+        for (what, path, at_start) in &places {
+            if identity(path) != *at_start {
+                log_error(
+                    background,
+                    &errors,
+                    &format!("stopping: the {what} {} no longer exists", path.display()),
+                );
+                return Ok(());
+            }
         }
         let mut tick = owner.tick(state);
         // Work whose runtime removed its workspace, finished where the person
@@ -145,6 +162,23 @@ async fn run(
         // `render` prints only what differs from what is already shown.
         view.render(None, &tick.runs, json, owner.projection(), &[]);
         let _ = io::stdout().flush();
+    }
+}
+
+/// Which directory is at `path`, by one `stat`: its device and inode, so one
+/// made again in its place is another. The owner's own writes make the state
+/// directory again after it was removed.
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Some((0, 0))
     }
 }
 

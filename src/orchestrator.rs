@@ -1630,7 +1630,15 @@ fn finish_interrupted(state: &State, db: &mut Database, run: &mut RunRecord) -> 
 pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
     let run = match id {
         Some(id) => state.load_run(id)?,
-        None => load_latest_for_source(state, source_path, false)?,
+        None => {
+            let root = source::resolve_source(Some(source_path))?;
+            let Some(run) = latest_for_source(state, &root, false)? else {
+                println!("No Work in {} yet.", root.display());
+                println!("\nProject: {}", background::project_line(state, &root));
+                return Ok(());
+            };
+            run
+        }
     };
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
@@ -1722,7 +1730,15 @@ fn concurrent(state: &State, run: &RunRecord) -> Option<Vec<String>> {
 pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
     let run = match id {
         Some(id) => state.load_run(id)?,
-        None => load_latest_for_source(state, source_path, false)?,
+        None => {
+            let root = source::resolve_source(Some(source_path))?;
+            let Some(run) = latest_for_source(state, &root, false)? else {
+                // No Work here yet.
+                println!("null");
+                return Ok(());
+            };
+            run
+        }
     };
     let run = crate::coherence::with_live_validity(&run);
     let mut result = serde_json::to_value(run_result(&run))?;
@@ -1749,7 +1765,14 @@ pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Resul
 pub fn status_jsonl(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
     let run = match id {
         Some(id) => state.load_run(id)?,
-        None => load_latest_for_source(state, source_path, false)?,
+        None => {
+            let root = source::resolve_source(Some(source_path))?;
+            // No Work here yet: no lines.
+            let Some(run) = latest_for_source(state, &root, false)? else {
+                return Ok(());
+            };
+            run
+        }
     };
     let run = crate::coherence::with_live_validity(&run);
     let database = Database::open(state.db_path())?;
@@ -3365,15 +3388,21 @@ fn sole_candidate(run: &RunRecord) -> Result<&CandidateRecord> {
 
 fn load_latest_for_source(state: &State, source_path: &Path, single: bool) -> Result<RunRecord> {
     let source_path = source::resolve_source(Some(source_path))?;
+    latest_for_source(state, &source_path, single)?
+        .with_context(|| format!("no Dispatch runs for {}", source_path.display()))
+}
+
+/// The latest run for `source_path`, already resolved; `None` without one.
+fn latest_for_source(state: &State, source_path: &Path, single: bool) -> Result<Option<RunRecord>> {
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
         let run = state.load_run(&projected.id)?;
         if run.source_path == source_path && (!single || run.candidates.len() == 1) {
-            return Ok(run);
+            return Ok(Some(run));
         }
     }
-    bail!("no Dispatch runs for {}", source_path.display())
+    Ok(None)
 }
 
 /// The result an ID-less `accept` or `reject` (`command`) decides: the only

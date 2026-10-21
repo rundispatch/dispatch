@@ -5,6 +5,7 @@
 //! is trusted only while it names the exact live process.
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -35,6 +36,15 @@ pub(crate) struct WatcherRecord {
     pub background: bool,
     #[serde(default)]
     pub discovery_ready: bool,
+    /// The canonical path of the executable that started the owner (version
+    /// 2); none in version 1 records.
+    #[serde(default)]
+    pub exe: Option<PathBuf>,
+    /// The variables checks receive, as the owner `start` spawned had them
+    /// (version 2): a revived or upgraded owner runs with these, not with
+    /// whatever its reviver had.
+    #[serde(default)]
+    pub environment: Option<BTreeMap<String, String>>,
 }
 
 pub(crate) enum Watcher {
@@ -98,13 +108,15 @@ pub(crate) fn write_record(state: &State, root: &Path, background: bool) -> Resu
     watchers_dir(state)?;
     let path = record_path(state, root);
     let record = WatcherRecord {
-        version: 1,
+        version: 2,
         root: root.to_owned(),
         identity: ProcessIdentity::current(),
         started_at: Utc::now(),
         dispatch_version: VERSION.to_owned(),
         background,
         discovery_ready: false,
+        exe: this_exe(),
+        environment: Some(crate::executor::safe_local_environment()),
     };
     write_atomically(&path, &serde_json::to_vec_pretty(&record)?)
 }
@@ -275,7 +287,8 @@ const NO_CHECKS: &str = "  No checks are configured, so Work here is not verifie
 /// closing the terminal does not stop it; its stderr is
 /// `watchers/<key>.log`. In a project without checks, a terminal is offered
 /// the detected ones first; without a terminal it watches at once and says
-/// so. Nothing of the project runs here.
+/// so. Nothing of the project runs here. An owner of another version is
+/// replaced when `ensure_current` may.
 #[cfg(unix)]
 pub async fn start(
     state: &State,
@@ -283,21 +296,22 @@ pub async fn start(
     verbose: u8,
     options: crate::presenter::Options,
 ) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
     state.initialize()?;
     let root = source::resolve_source(root.as_deref())?;
     // A broken configuration fails here, before anything is spawned.
     let (config, _) = Config::discover(&root, None)?;
-    if let Watcher::Watched(_) = watcher(state, &root)?
-        && wait_for_existing_discovery(state, &root)?
-    {
-        println!(
-            "Already watching {}: {}",
-            root.display(),
-            describe(state, &root)
-        );
-        return Ok(());
+    if let Watcher::Watched(_) = watcher(state, &root)? {
+        ensure_current(state, &root)?;
+        if let Watcher::Watched(_) = watcher(state, &root)?
+            && wait_for_existing_discovery(state, &root)?
+        {
+            println!(
+                "Already watching {}: {}",
+                root.display(),
+                describe(state, &root)
+            );
+            return Ok(());
+        }
     }
     let mut unchecked = config.checks.verify.is_empty();
     if unchecked && crate::presenter::suitable() {
@@ -307,22 +321,70 @@ pub async fn start(
         };
         unchecked = !saved;
     }
+    let log = open_log(state, &root, true)?;
+    match spawn_owner(state, &root, verbose, log, None)? {
+        Ready::Started => {
+            println!("✓ Watching {}", root.display());
+            println!(
+                "  Dispatch is running in the background. See it: dispatch watch · Stop: dispatch stop"
+            );
+            if unchecked {
+                println!("{NO_CHECKS}");
+            }
+        }
+        Ready::Existing => println!(
+            "Already watching {}: {}",
+            root.display(),
+            describe(state, &root)
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub async fn start(
+    _state: &State,
+    _root: Option<PathBuf>,
+    _verbose: u8,
+    _options: crate::presenter::Options,
+) -> Result<()> {
+    anyhow::bail!("watching in the background needs a Unix system; use dispatch serve")
+}
+
+/// The owner's log, `watchers/<key>.log`, private to the user: `start`
+/// begins it again, a restart adds to it.
+#[cfg(unix)]
+fn open_log(state: &State, root: &Path, truncate: bool) -> Result<(fs::File, PathBuf)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     watchers_dir(state)?;
-    let log = record_path(state, &root).with_extension("log");
-    let file = {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&log)
-            .with_context(|| format!("failed to create {}", log.display()))?;
-        // `mode` applies only when the file is new; a log left by an earlier
-        // version keeps whatever it had.
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file
-    };
+    let log = record_path(state, root).with_extension("log");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(truncate)
+        .append(!truncate)
+        .mode(0o600)
+        .open(&log)
+        .with_context(|| format!("failed to create {}", log.display()))?;
+    // `mode` applies only when the file is new; a log left by an earlier
+    // version keeps whatever it had.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok((file, log))
+}
+
+/// `dispatch serve --background` for `root`, in its own session, writing to
+/// `log`.
+#[cfg(unix)]
+fn command(
+    state: &State,
+    root: &Path,
+    verbose: u8,
+    log: &fs::File,
+    environment: Option<&BTreeMap<String, String>>,
+) -> Result<std::process::Command> {
+    use std::os::unix::process::CommandExt;
+
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command.arg("--state-dir").arg(&state.root);
     for _ in 0..verbose {
@@ -330,11 +392,17 @@ pub async fn start(
     }
     command
         .args(["serve", "--background", "--root"])
-        .arg(&root)
-        .current_dir(&root)
+        .arg(root)
+        .current_dir(root)
         .stdin(std::process::Stdio::null())
-        .stdout(file.try_clone()?)
-        .stderr(file);
+        .stdout(log.try_clone()?)
+        .stderr(log.try_clone()?);
+    if let Some(environment) = environment {
+        for name in crate::executor::safe_local_environment().keys() {
+            command.env_remove(name);
+        }
+        command.envs(environment);
+    }
     // SAFETY: setsid is async-signal-safe and touches only the child.
     unsafe {
         command.pre_exec(|| {
@@ -344,36 +412,47 @@ pub async fn start(
             Ok(())
         });
     }
-    let mut child = command
+    Ok(command)
+}
+
+/// How a spawned owner became ready.
+#[cfg(unix)]
+enum Ready {
+    /// The owner spawned here watches, its discovery done.
+    Started,
+    /// Another process's owner won the race for the root, and is ready.
+    Existing,
+}
+
+/// Spawn the background owner for `root`, with `environment` when it is
+/// given, and wait until it, or one that won the race for the root, has
+/// completed its first discovery.
+#[cfg(unix)]
+fn spawn_owner(
+    state: &State,
+    root: &Path,
+    verbose: u8,
+    (file, log): (fs::File, PathBuf),
+    environment: Option<&BTreeMap<String, String>>,
+) -> Result<Ready> {
+    let mut child = command(state, root, verbose, &file, environment)?
         .spawn()
         .context("failed to start the background owner")?;
     let deadline = std::time::Instant::now() + OWNER_WAIT;
     loop {
-        if let Some(record) = read_record(state, &root)
+        if let Some(record) = read_record(state, root)
             && record.identity.pid == child.id()
             && is_exact(&record)
             && record.discovery_ready
         {
-            println!("✓ Watching {}", root.display());
-            println!(
-                "  Dispatch is running in the background. See it: dispatch watch · Stop: dispatch stop"
-            );
-            if unchecked {
-                println!("{NO_CHECKS}");
-            }
-            return Ok(());
+            return Ok(Ready::Started);
         }
         if child.try_wait()?.is_some() {
             // Another `start` may have won the race for this root.
-            if let Watcher::Watched(_) = watcher(state, &root)?
-                && wait_for_existing_discovery(state, &root)?
+            if let Watcher::Watched(_) = watcher(state, root)?
+                && wait_for_existing_discovery(state, root)?
             {
-                println!(
-                    "Already watching {}: {}",
-                    root.display(),
-                    describe(state, &root)
-                );
-                return Ok(());
+                return Ok(Ready::Existing);
             }
             let text = fs::read_to_string(&log).unwrap_or_default();
             let tail: Vec<&str> = text.lines().rev().take(5).collect();
@@ -395,14 +474,177 @@ pub async fn start(
     }
 }
 
+/// This process's executable, canonicalized: what a version 2 record names.
+fn this_exe() -> Option<PathBuf> {
+    std::env::current_exe().and_then(fs::canonicalize).ok()
+}
+
+/// Whether `version` is older than this one, by its numeric dotted parts. A
+/// version that does not read as one is not older.
+fn older(version: &str) -> bool {
+    fn parts(version: &str) -> Option<Vec<u64>> {
+        version
+            .split(['-', '+'])
+            .next()?
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect()
+    }
+    matches!((parts(version), parts(VERSION)), (Some(old), Some(new)) if old < new)
+}
+
+/// Whether this binary may replace the owner `record` names: it was
+/// started from this very executable, upgraded in place since; or, for a
+/// record that does not say, it runs an older Dispatch. An older binary, or
+/// another install, never replaces an owner.
+fn replaceable(record: &WatcherRecord) -> bool {
+    match &record.exe {
+        Some(exe) => this_exe().as_ref() == Some(exe),
+        None => older(&record.dispatch_version),
+    }
+}
+
+/// Keep `root` watched as `dispatch start` left it (contract A):
+/// - its background owner stopped without `dispatch stop` (a reboot, a
+///   crash), so the record is there and the serve lock free: start it again;
+/// - it runs another Dispatch and `replaceable` allows it: stop it and start
+///   this one.
+///
+/// Either runs with the environment the record keeps. Each says so in one
+/// line on stderr; stdout is left to the command. A configuration that does
+/// not read spawns nothing, says why, and leaves the record. Anything else
+/// is left alone, and an owner left on another version keeps the note in
+/// `watcher_line`.
+#[cfg(unix)]
+pub fn ensure_current(state: &State, root: &Path) -> Result<()> {
+    match watcher(state, root)? {
+        Watcher::NotWatched => {
+            let Some(record) = read_record(state, root).filter(|record| record.background) else {
+                return Ok(());
+            };
+            if let Err(error) = Config::discover(root, None) {
+                eprintln!("Could not watch {} again: {error:#}", root.display());
+                return Ok(());
+            }
+            let log = open_log(state, root, false)?;
+            if let Ready::Started = spawn_owner(state, root, 0, log, record.environment.as_ref())? {
+                eprintln!("Watching {} again: its owner had stopped.", root.display());
+            }
+        }
+        Watcher::Watched(Some(record))
+            if record.background
+                && record.dispatch_version != VERSION
+                && replaceable(&record)
+                && is_exact(&record) =>
+        {
+            // The owner there keeps watching until this one can.
+            if let Err(error) = Config::discover(root, None) {
+                eprintln!(
+                    "Could not restart watching {} with Dispatch {VERSION}: {error:#}",
+                    root.display()
+                );
+                return Ok(());
+            }
+            terminate(state, root, &record)?;
+            let log = open_log(state, root, false)?;
+            if let Ready::Started = spawn_owner(state, root, 0, log, record.environment.as_ref())? {
+                eprintln!(
+                    "Restarted watching {} with Dispatch {VERSION} (was {}).",
+                    root.display(),
+                    record.dispatch_version
+                );
+            }
+        }
+        Watcher::Watched(_) => {}
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
-pub async fn start(
-    _state: &State,
-    _root: Option<PathBuf>,
-    _verbose: u8,
-    _options: crate::presenter::Options,
-) -> Result<()> {
-    anyhow::bail!("watching in the background needs a Unix system; use dispatch serve")
+pub fn ensure_current(_state: &State, _root: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// `ensure_current` for the project `path` is in: its repository's main
+/// worktree, or the directory itself. It never fails the command it runs
+/// before, which reports a path that does not resolve itself; anything else
+/// that goes wrong is one line on stderr.
+pub fn ensure_current_at(state: &State, path: &Path) {
+    let Ok(path) = fs::canonicalize(path) else {
+        return;
+    };
+    let root = match crate::runtime::main_worktree(&path) {
+        Some(Some(root)) => Ok(root),
+        Some(None) => Ok(path),
+        None => source::repo_identity(&path).map(|repo| repo.map_or(path, |r| r.main_worktree)),
+    };
+    if let Err(error) = root.and_then(|root| ensure_current(state, &root)) {
+        eprintln!("Dispatch could not bring back watching here: {error:#}");
+    }
+}
+
+/// Whether `root`'s owner stopped without `dispatch stop`: what a hook that
+/// found the serve lock free asks before going to Git.
+pub(crate) fn stopped_owner(state: &State, root: &Path) -> bool {
+    read_record(state, root).is_some_and(|record| record.background)
+}
+
+/// A hook's `ensure_current`, for a root whose serve lock it found free:
+/// when its background owner stopped without `dispatch stop`, start it again
+/// with the environment its record keeps, and return at once, without
+/// waiting for discovery. A configuration that does not read spawns nothing.
+/// The line goes to the owner's log: a hook's stdout reaches the agent.
+/// Whether an owner is on its way.
+#[cfg(unix)]
+pub(crate) fn revive_in_background(state: &State, root: &Path) -> bool {
+    use std::io::Write;
+
+    let Some(record) = read_record(state, root).filter(|record| record.background) else {
+        return false;
+    };
+    let Ok((mut file, _)) = open_log(state, root, false) else {
+        return false;
+    };
+    let spawned = Config::discover(root, None)
+        .and_then(|_| command(state, root, 0, &file, record.environment.as_ref()))
+        .and_then(|mut command| {
+            command
+                .spawn()
+                .context("failed to start the background owner")
+        });
+    let line = match &spawned {
+        Ok(_) => format!("Watching {} again: its owner had stopped.", root.display()),
+        Err(error) => format!("Could not watch {} again: {error:#}", root.display()),
+    };
+    let _ = writeln!(file, "{} {line}", Utc::now().to_rfc3339());
+    spawned.is_ok()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn revive_in_background(_state: &State, _root: &Path) -> bool {
+    false
+}
+
+/// Signal exactly the owner `record` names, which holds `root`'s serve lock,
+/// and wait until it lets go.
+#[cfg(unix)]
+fn terminate(state: &State, root: &Path, record: &WatcherRecord) -> Result<()> {
+    let pid = i32::try_from(record.identity.pid).context("watcher pid out of range")?;
+    // SAFETY: SIGTERM to the one process identified by the caller.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to signal the watcher");
+    }
+    let deadline = std::time::Instant::now() + OWNER_WAIT;
+    while let Watcher::Watched(_) = watcher(state, root)? {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the watcher for {} (pid {pid}) did not stop within {} s",
+            root.display(),
+            OWNER_WAIT.as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
 }
 
 /// `dispatch stop [--root <path>]`: stop exactly the process that watches
@@ -427,21 +669,7 @@ pub fn stop(state: &State, root: Option<PathBuf>) -> Result<()> {
             lock_path(state, &root).display()
         );
     };
-    let pid = i32::try_from(record.identity.pid).context("watcher pid out of range")?;
-    // SAFETY: SIGTERM to the one process identified above.
-    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to signal the watcher");
-    }
-    let deadline = std::time::Instant::now() + OWNER_WAIT;
-    while let Watcher::Watched(_) = watcher(state, &root)? {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "the watcher for {} (pid {pid}) did not stop within {} s",
-            root.display(),
-            OWNER_WAIT.as_secs()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    terminate(state, &root, &record)?;
     println!("✓ Dispatch stopped watching {}.", root.display());
     Ok(())
 }

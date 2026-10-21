@@ -82,20 +82,26 @@ jobs:
         run: |
           sha256sum dispatch-*.tar.gz > SHA256SUMS
           sha256sum -c SHA256SUMS
+      # The one-line installer, uploaded beside the archives, installs these.
+      - name: Install with scripts/install.sh from these assets
+        run: |
+          DISPATCH_RELEASE_URL="file://$PWD/dist" DISPATCH_INSTALL_DIR="$RUNNER_TEMP/bin" \
+            sh scripts/install.sh
+          "$RUNNER_TEMP/bin/dispatch" version | grep -Fx "dispatch ${RELEASE_TAG#v}"
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
-              dist/dispatch-*.tar.gz dist/SHA256SUMS \
+              dist/dispatch-*.tar.gz dist/SHA256SUMS scripts/install.sh \
               --clobber
           else
             # A tag with a hyphen (v0.2.0-rc.1) is a prerelease, never "latest".
             prerelease=""
             case "$RELEASE_TAG" in *-*) prerelease="--prerelease" ;; esac
             gh release create "$RELEASE_TAG" \
-              dist/dispatch-*.tar.gz dist/SHA256SUMS \
+              dist/dispatch-*.tar.gz dist/SHA256SUMS scripts/install.sh \
               --verify-tag \
               --title "Dispatch $RELEASE_TAG" \
               --notes-file .github/release-notes.md \

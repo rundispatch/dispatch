@@ -128,7 +128,11 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
     let root = source::repo_identity(&workspace)?
         .context("the checkout lost its repository")?
         .main_worktree;
-    if !matches!(background::watcher(state, &root)?, Watcher::Watched(_)) {
+    // A project whose owner stopped without `dispatch stop` is still watched:
+    // its owner comes back while this session is registered.
+    if !matches!(background::watcher(state, &root)?, Watcher::Watched(_))
+        && !background::revive_in_background(state, &root)
+    {
         return Ok(Reply::Silent);
     }
     match event.kind {
@@ -179,15 +183,19 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
 
 /// Whether a session in `cwd` is outside every watched project, decided from
 /// the files alone, without Git or the database: there is no repository
-/// there, or the serve lock of the one there is free. Anything it cannot
-/// read for certain is left to Git.
+/// there, or the serve lock of the one there is free and no owner stopped
+/// without `dispatch stop`. Anything it cannot read for certain is left to
+/// Git.
 fn unwatched(state: &State, cwd: &Path) -> bool {
     let Ok(cwd) = std::fs::canonicalize(cwd) else {
         return false;
     };
     match main_worktree(&cwd) {
         Some(None) => true,
-        Some(Some(root)) => matches!(background::watcher(state, &root), Ok(Watcher::NotWatched)),
+        Some(Some(root)) => {
+            matches!(background::watcher(state, &root), Ok(Watcher::NotWatched))
+                && !background::stopped_owner(state, &root)
+        }
         None => false,
     }
 }
@@ -197,7 +205,7 @@ fn unwatched(state: &State, cwd: &Path) -> bool {
 /// shape this does not read: a `.git` that is not a repository, a separate
 /// Git directory or submodule, or a configuration that may move the work
 /// tree.
-fn main_worktree(cwd: &Path) -> Option<Option<PathBuf>> {
+pub(crate) fn main_worktree(cwd: &Path) -> Option<Option<PathBuf>> {
     for directory in cwd.ancestors() {
         let dot_git = directory.join(".git");
         let Ok(metadata) = std::fs::symlink_metadata(&dot_git) else {
