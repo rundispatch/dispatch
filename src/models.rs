@@ -449,6 +449,7 @@ pub enum FactOrigin {
     Modified,
     Referenced,
     FileFallback,
+    Mentioned,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -472,6 +473,7 @@ pub enum AnalysisLevel {
 pub enum ReasonCode {
     FactBroken,
     FactMissing,
+    MentionChanged,
     SameSymbolEdited,
     PatchConflict,
     AlreadyApplied,

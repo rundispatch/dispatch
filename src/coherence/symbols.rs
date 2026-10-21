@@ -126,6 +126,63 @@ pub fn identifiers_in(
     }
 }
 
+/// Keep byte and line positions while hiding comments and Python docstrings
+/// from path-token detection in a candidate's post-image.
+pub fn without_comments_and_docstrings(lang: Lang, source: &[u8]) -> Result<Vec<u8>> {
+    let tree = parse(lang, source)?;
+    let mut masked = source.to_vec();
+    let mut cur = tree.root_node().walk();
+    loop {
+        let node = cur.node();
+        if node.kind().ends_with("comment") {
+            mask(&mut masked, node);
+        } else if lang == Lang::Python
+            && let Some(docstring) = docstring_statement(node)
+        {
+            mask(&mut masked, docstring);
+        }
+        if cur.goto_first_child() {
+            continue;
+        }
+        while !cur.goto_next_sibling() {
+            if !cur.goto_parent() {
+                return Ok(masked);
+            }
+        }
+    }
+}
+
+fn mask(source: &mut [u8], node: Node) {
+    for byte in &mut source[node.byte_range()] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+fn docstring_statement(scope: Node) -> Option<Node> {
+    match scope.kind() {
+        "module" => {}
+        "block"
+            if scope.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "class_definition" | "function_definition")
+            }) => {}
+        _ => return None,
+    }
+    let mut cur = scope.walk();
+    let statement = scope
+        .named_children(&mut cur)
+        .find(|child| !child.kind().ends_with("comment"))?;
+    if statement.kind() != "expression_statement"
+        || !statement
+            .named_child(0)
+            .is_some_and(|child| matches!(child.kind(), "string" | "concatenated_string"))
+    {
+        return None;
+    }
+    Some(statement)
+}
+
 fn parse(lang: Lang, source: &[u8]) -> Result<tree_sitter::Tree> {
     let language = match lang {
         Lang::Rust => tree_sitter_rust::LANGUAGE,

@@ -196,6 +196,9 @@ pub fn coherence_text(validity: &Validity) -> String {
         Decision::Continue if !validity.world_changed => {
             "Coherence: CONTINUE — world unchanged".into()
         }
+        Decision::Continue if !validity.reasons.is_empty() => {
+            format!("Coherence: CONTINUE — {}", validity.reasons[0].detail)
+        }
         Decision::Continue => format!(
             "Coherence: CONTINUE — {} file{} changed underneath, none affect this work",
             validity.changed_files,
