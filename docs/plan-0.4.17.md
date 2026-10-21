@@ -290,10 +290,123 @@ New clauses under "What Dispatch does by itself":
 
 ## 7. Execution log
 
-(empty)
+Built with workers wrapped by the pinned Dispatch 0.4.16 (`fa11caf`, state
+`~/dispatch-dev/state-0417`). Every packet landed with `accept --expect`, CI validated each
+landing on draft PR #27, and no coherence override was needed. Beyond the plan:
+- P8 added distribution on four platforms and download counts, which the user asked for during
+  the build.
+- P7 and P9 fixed intermittent failures, by the user's standard that every CI job passes.
+- Q fixed the findings of the line-by-line review of the packets Codex and Hermes Agent built,
+  by the user's rule.
+- Two REFRESH verdicts were re-applied 3-way (P5b, Rb), and P2 was re-applied twice (P2b with
+  the review's fixes, P2c on top of P4).
+
+### P0 (2026-10-21)
+
+The Claude Code probe, the native start profile, the first-use and upgrade baselines and the
+override fixtures in §2, with their scripts in `~/dispatch-dev/p0-0417/`.
+
+### Packets, in landing order
+
+| Packet | Worker | Work | Finish | Landed |
+|---|---|---|---|---|
+| P6 native start, part 2 | Hermes Agent 0.18.2 | `01M5DT6FZAF9Q802PWSA2P2CPP` | CONTINUE, 800 passed | `33dc805`, `--expect 5eb57359cde0`; source unmoved, no rerun |
+| P1 install and stay running | Claude Code | `01M5DT6FZBKNEP7FW7P9TQKH7S` | CONTINUE, 813 passed on the current source | `010f748`, `--expect ee14cda7e4d5`; reused that pass |
+| P5 mentions | Codex 0.155.1, gpt-6-sol | `01M5DT6FZARGWDXMPV1RN4TJEB` | REFRESH: a path its test code named (`src/main.rs`) was a strong fact under 0.4.16; 824 passed | not landed: superseded by P5b |
+| P5b P5's Δ re-applied | the integrator, no agent | `01M5F6F8NQAF4NF13VKGVBTA7G` | CONTINUE; reused P5's pass | `a5fa0d8`, `--expect cfe714569fe3`; source unmoved |
+| P3 session end and resume | Claude Code | `01M5E6NR88VAKVDS9X101H257M` | CONTINUE; the merged run failed on its own race, S0 passed | `4a55522`, `--expect 4989c912297f`; merged checks rerun (834 passed) |
+| P4 needs you | Claude Code | `01M5FG4XZ2Z79CNGBASK61FW7V` | CONTINUE, 845 passed | `aeb2ac8`, `--expect 12c8afa471db`; source unmoved |
+| P8 four platforms, download counts | Claude Code | `01M5FH5A8DXPHK0F9GAKWQCN7Z` | CONTINUE, 851 passed on the current source | `12fe021`, `--expect aa78089e3efd`; waited 710 s for the source lock, then reused that pass |
+| P7 session races under load | Claude Code | `01M5FG4XZ23R2S986H45H2EN59` | CONTINUE, 856 passed on the current source | `ba0fafa`, `--expect b2ccb9ce5d85`; reused that pass |
+| Q review fixes, test-code mentions | Claude Code | `01M5FMB91RGBDAAPPSE24FDEPN` | CONTINUE; merged run 806/4 and S0 795/4, on P3's races | `5c2b0b2`, `--expect c64163483e30`; merged checks on top of P7 (864 passed) |
+| P2 one setup pass | Codex 0.155.1, gpt-6-sol | `01M5DT6FZBJ02N96WHXBGD0FVZ` | REFRESH: its patch no longer applied | not landed: superseded by P2c |
+| P2b P2 with the review's fixes | Claude Code | `01M5FHGP8KYZ9KDTWGGDWEJRTB` | REFRESH: its patch no longer applied after P4 | not landed: superseded by P2c |
+| P2c P2b on top of P4, hook update | Claude Code | `01M5FNBX912MDZ6P586Q9JJMRD` | CONTINUE, 872 passed on the current source | `f12c60c`, `--expect 61751df9031b`; reused that pass |
+| P9 the remaining intermittent failures | Claude Code | `01M5FZE4M22CZ9XMP8F7Q0219E` | CONTINUE, 876 passed | `c4780dc`, `--expect 3ec4c582a0f3`; source unmoved |
+| R docs, version | Claude Code | `01M5FR1GSH2FDC34FD14NH1Z4E` | REFRESH: README.md changed under it (P2c); 876 passed on the current source | not landed: superseded by Rb |
+| Rb R's Δ re-applied | the integrator, no agent | `01M5GAPEJDVFBFNZBRRC3Q0F51` | CONTINUE; reused R's pass | `076904d`, `--expect 13764678c456`; source unmoved |
+
+- **The review of non-Claude work** (`~/dispatch-dev/notes-0417/review-non-claude.md`):
+  - P6: 3 findings; P5: 5; P2: 7.
+  - All were fixed by Claude Code, in Q and P2b, and kept in P2c.
+  - All were verified in the code before landing.
+- **Defects found before they landed:**
+  - **R, checking every claim on a combined build:**
+    - a typed `attach` or `finish` under standing consent recorded no authority, so accept
+      applied on a moved source without the merged checks;
+    - setup left `dispatch.setup-lock` in the project, so a first Work reported it as a
+      difference from S0.
+    - P2c fixed both, with tests that fail on the code before.
+  - **P2c:** 0.4.16's four Claude Code hooks would have read as "changed by hand" once P4's
+    six were current, so setup would never have updated them.
+- **Intermittent failures** (the standard: a flaky test is a defect). Counts are from CI's
+  stress image, whole test binaries:
+  - **P7:**
+    - a tick acting on a record loaded before Hermes's hook recorded its removal;
+    - a worktree being deleted read as unlocked;
+    - a tick holding the run lock read as a finish in progress;
+    - discovery reopening before the `SessionStart` hook;
+    - four test-only races.
+    - `session_end` failed 12 of 12 runs on the old code and 0 of 30 after; `runtime_hooks`
+      2 of 12, then 0 of 30.
+  - **P9:**
+    - the hook's join and accept waited a fixed 5 s for a run lock that legitimate holders
+      exceed under load;
+    - a stop held back by the mid-run message gap (60.9 s, now about 1 s);
+    - a Hermes worktree listed before its lock;
+    - `start` after its owner died;
+    - three test races its loops found.
+    - `discovery` failed 1 of 51 runs, then 0 of 30; `coherence_watch` 2 of 45, then 0 of 30;
+      `needs_you` 2 of 10, then 0 of 20.
+- **CI on PR #27:**
+  - the stress job failed on `a5fa0d8`, `4a55522` and `aeb2ac8`, all on races P7 fixed;
+  - every job was green on `fde3972`, `33dc805`, `010f748`, `12fe021` and on every commit
+    from `ba0fafa` on;
+  - the release build matrix was green on all four runners from `12fe021` on.
+
+### Workers, as their harnesses reported
+
+- **Codex (P5):** 3h37m; 375,652 tokens: input 337,897 (+19,915,776 cached), output 37,755
+  (reasoning 17,093).
+- **Codex (P2):** 774,663 tokens: input 733,243 (+17,842,944 cached), output 41,420 (reasoning
+  19,108). "Worked for 16h 2m 59s", wall clock with approvals and idle time.
+- **Hermes Agent (P6):** 2h29m, 176 tool calls; tokens not shown.
+- **Claude Code** (P1, P2b, P2c, P3, P4, P7, P8, P9, Q, R): usage not reported at exit.
+
+### Against §6
+
+- **First use:** the install line and 2 Dispatch commands (`setup`, `accept`) to a first
+  landed change. Measured end to end on a release build, with a stand-in for Claude Code.
+  Met.
+- **Upgrade:** 0.4.16 upgraded in place through `install.sh`. The next command printed
+  `Restarted watching … with Dispatch 0.4.17 (was 0.4.16).`. Met.
+- **Overrides:** none. The three 0.4.14 patterns no longer REFRESH, and the matrix passes on
+  both source kinds. Met.
+- **Sessions:** met.
+  - A tick's p50 was 47 ms without a consent finish and 43 ms with one running (P3; poll 2 s,
+    7 Works).
+  - No resumed Work's S0 holds unreviewed Δ (P3's and P7's tests).
+- **Native start:** not met.
+  - 10.8 s median against the 10 s target: 10.6, 10.8 and 11.0 s alone, at load 7.3 to 18.2.
+  - 0.4.16 took a 45.7 s median at the same load, so this is about 4 times faster.
+  - P6's profile puts the rest in the opens the fingerprints still make.
+- **Suite runs:** 17 for 11 landed Works (1.55), with 6 reuses. Met.
+- **Orphans:** an independent full run on the final tree passed 876, 0 failed, and left the
+  owner list as it was (16 before and after, none from the run). Met.
 
 ## Carried, not in this release
 
+- Native start's remaining 0.8 s over target: the fingerprints still open each file they hash
+  (P6's profile).
+- `record_session_end` and `record_needs_you` wait 3 s for the run's lock inside Claude Code's
+  5 s hook timeouts (P9's open question 1).
+- A second `SessionStart` in one worktree can give up while the first waits for busy Work
+  (P9's open question 2).
+- `EARLIER` holds one earlier hook set; the next release that changes the set makes it a list
+  (P2c).
+- `f` in `watch` still asks before a finish under consent (P2c).
+- The `ubuntu-22.04` runner deprecation and the glibc floor (P8): a decision for the user.
 - A guard for a capture that overlaps a removal (0.4.15 P5's note).
 - Ties between same-second modification times in `freshest_patch`.
-- The 0.4.15 stress failure in `hermes_worktrees`, not seen since.
+
+The 0.4.15 stress failure in `hermes_worktrees`, carried since, was found and fixed (P7).

@@ -185,7 +185,10 @@ setup`, your agent's session, and `dispatch accept`.
   0.4.17 start, the source fingerprints, which still open each file, took about as many
   samples opening files as the copy took in all (2,769 and 2,624).
 
-  MEASURE: native start with 0.4.17 on the same repository at ordinary load (runs, seconds, load averages)
+  On the final code, at ordinary load: 10.6, 10.8 and 11.0 s (median 10.8 s) with 0.4.17
+  alone, its own runs raising the 1-minute load from 7.3 to 18.2. Alternating with 0.4.16 at
+  6.9 to 17.3, 0.4.16 took 74.4, 44.5 and 45.7 s (median 45.7 s) and 0.4.17 15.2, 12.0 and
+  11.7 s (median 12.0 s). The 10 s target this release set itself was missed by 0.8 s.
 
 ### Fixes found under load
 
@@ -229,11 +232,39 @@ upgrading: the next command restarts the owner.
 ### Measurements
 
 Counted from recorded events and logs:
-- MEASURE: suite runs per landed Work for this build, with `checks.reused` counted (gate: at most 1.75)
-- MEASURE: overrides on this build (`accept --despite-refresh`), and whether the three 0.4.14 patterns still REFRESH
-- MEASURE: native start at ordinary load (contract target: at most 10 s on this repository)
-- MEASURE: first use, install to a first landed change on the first-use fixture, in Dispatch commands (gate: at most 3; 0.4.16: 6 plus a manual install)
+- **First use:** the install line and two Dispatch commands, `dispatch setup` and `dispatch
+  accept`, from nothing to a landed change (0.4.16: six, and a manual install). Measured on a
+  release build in a fresh home, with a stand-in for Claude Code (a process holding the
+  worktree's lock, and the hooks setup installed, run with payloads shaped like Claude Code's):
+  one setup pass saved the detected checks and their consent, installed the hooks and started
+  watching; the owner finished the session's Work 8 s after it ended; accept reused that pass.
+- **Upgrade:** with 0.4.16 installed and watching a project, 0.4.17 installed over it with
+  `install.sh`; the next `dispatch status` printed `Restarted watching … with Dispatch 0.4.17
+  (was 0.4.16).`, and nothing else was needed.
+- **This build's own suite runs:** 17 for 11 landed Works, 1.55 per landed Work, and 6 reuses:
+  four accepts reused the pass their finish had recorded, and two re-applied Works' finishes
+  reused the pass of the Work each replaced. Two runs were finishes of Works replaced after
+  their patches stopped applying. P3's and Q's finishes each ran the merged checks, which
+  failed on the session races this release fixes, and then ran again on S0.
+- **Overrides:** none. Where a verdict was REFRESH, the frozen Δ was re-applied 3-way on the
+  current source instead: P5's, because 0.4.16 counted a path its test code named as a
+  dependency, and R's, because README.md changed under it. The three patterns behind 0.4.14's
+  overrides no longer REFRESH.
+- **Native start at ordinary load:** 10.8 s median on the final code, against a 10 s target
+  (above).
 
 A reused result is counted as reused, never as time saved.
+
+Built with Dispatch: each packet's worker ran in a workspace Dispatch 0.4.16 made, on three
+harnesses. Claude Code built install and owner restart (P1), session end and resume (P3),
+waiting on you (P4), the session races found under load (P7), distribution and download
+counts (P8), the remaining intermittent failures (P9), the docs (R), and the fixes from the
+review (Q); Codex built mentions (P5) and the setup pass (P2); Hermes Agent built native start
+(P6). The Codex and Hermes Agent packets were reviewed line by line, and Claude Code fixed
+the findings: Q for P5 and P6, and P2b, which re-applied P2 with its seven fixes; P2c then put
+P2b on top of P4 with the hook update. Every packet landed with `dispatch accept --expect`,
+and no verdict was overridden. Checking every claim against a build of the branch, R found
+that a typed `attach` under consent recorded no authority, so accept skipped the merged
+checks, and that setup left a lock file in the project; P2c fixed both before it landed.
 
 Site impact: install is `curl -fsSL https://rundispatch.sh/install | sh` (or `curl -fsSL https://github.com/rundispatch/dispatch/releases/latest/download/install.sh | sh`) into `~/.local/bin`, with `DISPATCH_INSTALL_DIR` and `DISPATCH_VERSION`, printing `Installed dispatch <version> at <path>` and, off `PATH`, the `export PATH=…` line to add; releases add `dispatch-macos-x86_64.tar.gz` and `dispatch-linux-aarch64.tar.gz` and `install.sh` as assets; the quick start is install, `dispatch setup`, work, `dispatch accept`; bare `dispatch setup` on a terminal is one pass (Project checks multi-select with `Other command…`, `Save selected checks`, `Continue without checks` or `Keep current checks`, `Cancel setup`; `Allow checks for this project?` with Allow/Cancel and a new consent text; `Claude Code hooks · Install` or `· Update` with Install/Skip; `Project setup is ready. Agents Dispatch launches can be configured separately.` with `Done` / `Agents Dispatch launches…`; then watching starts) and provider accounts moved under `Agents Dispatch launches…`; `dispatch setup` without a terminal fails with `setup needs a terminal to choose project checks, allow them, and install hooks; use dispatch setup --checks --verify '<command>' to save exact checks without one`; check consent from 0.4.16 or earlier no longer holds (`check consent no longer holds: it did not cover typed attach, finish, or session end`) and setup asks again saying `The earlier consent no longer holds: …`; typed `attach` and `finish` need no `--allow-unsafe-local` when consent holds (recorded as `attach.authorized` by project consent, so accept runs merged checks), and their refusal now ends `pass --allow-unsafe-local, or give this project standing consent for these checks with dispatch setup`; `finish --allow-unsafe-local` and `refresh --allow-unsafe-local` help changed; native `run` and `refresh` prompt `[1] This run only  [2] Allow for this project  [Enter] Cancel:` instead of `[y/N]`, and a piped `2` fails with `allowing for this project needs a terminal, so nothing was granted; answer 1 for this run only, or pass --allow-unsafe-local`; Claude Code hooks are six (`Notification` matched to `permission_prompt|idle_prompt|agent_needs_input` and `Stop`, 5 s each, added), the Update prompt shows `Hook command, unchanged: …` and `Dispatch's hooks there are replaced by exactly these:`, a hand-edited hook reads `Claude Code hooks: changed by hand in <path>; setup leaves that file as it is.`, and Remove says `Only Dispatch's own hooks are removed, hook by hook`; commands print `Watching <root> again: its owner had stopped.`, `Restarted watching <root> with Dispatch <new> (was <old>).`, `Could not watch <root> again: …` or `Could not restart watching <root> with Dispatch <new>: …`, and `start` no longer advises `dispatch stop && dispatch start` after an upgrade in place; the owner exits when its project or state directory is deleted; `status` with no Work prints `No Work in <root> yet.` and the `Project:` line, `status --json` prints `null` and `status --jsonl` nothing; with consent, Work a Claude Code or Hermes session registered is finished by the owner when the session ends and its process is gone, a resumed session's Work starts from the same S0 and the old Work is closed as `superseded by <id>`, and a typed `finish` or `close` during that finish says `Work <id> is being finished by its project's owner, as you allowed (checks running); wait for it, or close it once it is ready`; the `SessionStart` reply `Dispatch is tracking this worktree as Work <id>; see it with dispatch watch.` now also appears when discovery saw the session first; `status` and `watch` show `waiting on you: <permission|input|turn ended> · <message>`, `watch` has a needs-you group with state `waiting` and the next steps `Its session asks for your permission: answer it there.` or `Its session waits for your next prompt: continue it there, or f finish when it is done.`, and `watch --json` work lines gain `needs_you`; a wrapped `attach` prints `Attached work <id> finished: <heading>` with `Coherence`, `At accept`, `Review` and `Then` instead of `next: dispatch check <id>`; a path named only in a Rust or Python comment or docstring makes no fact, one in test code or a file without symbol support is weak (`mention_changed: mentioned file <path> changed since the work started`, `Coherence: CONTINUE — …; the merged checks decide at accept`, or `…; the merged checks passed`), and without runnable checks it is REFRESH with `analysis_uncertain: merged checks cannot run — <why>` first; `dispatch accept` and `reject` of a result another process holds wait, first printing `Waiting for Work <id>: another process is using it.` on stderr.
