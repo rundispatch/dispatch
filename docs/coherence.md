@@ -25,10 +25,10 @@ does not change how agents are launched or admitted. It never starts an agent by
 | S0 | The snapshot the run started from. | The run's private baseline repository: `RunRecord.baseline_path`, `baseline_commit` (and `source_fingerprint`: for a Git source, a hash of its tracked and non-ignored untracked files; under `coherence.accept: strict` and for a plain directory, the whole tree, ignored files included). The baseline commit tracks only the paths the source's ignore rules include (repository `.gitignore` files and `info/exclude`); ignored files are still copied onto disk so build caches remain available, and a plain-directory source, which has no ignore rules, keeps tracking everything. |
 | Δ | The patch the agent produced. | The candidate's `diff_path` (`git diff --binary --full-index --no-renames`). Mid-run, a work-in-progress patch of the live workspace. |
 | World (S1) | The source tree now, minus what its own ignore rules exclude. | Computed on demand as `world::WorldObservation`; never stored as a snapshot. |
-| MustHold | A fact the work relied on, derived from (S0, Δ). | `MustHold` (`kind`: `Signature` or `File`; `origin`: `Modified`, `Referenced` or `FileFallback`). |
+| MustHold | A fact the work relied on, derived from (S0, Δ). | `MustHold` (`kind`: `Signature` or `File`; `origin`: `Modified`, `Referenced`, `FileFallback` or `Mentioned`, a weak fact). |
 | Validity | The verdict. | `Validity { decision, evaluated_at, world_digest, world_changed, changed_files, reasons, analysis }`. |
 | Decision | What to do. | `Decision`: `Continue`, `Refresh`, `Stop`. |
-| Reason | Why, with evidence. | `Reason { code, fact_id, path, detail }`; `ReasonCode` is `fact_broken`, `fact_missing`, `same_symbol_edited`, `patch_conflict`, `already_applied`, `integration_check_failed`, `analysis_uncertain`. |
+| Reason | Why, with evidence. | `Reason { code, fact_id, path, detail }`; `ReasonCode` is `fact_broken`, `fact_missing`, `same_symbol_edited`, `patch_conflict`, `already_applied`, `integration_check_failed`, `analysis_uncertain`, `mention_changed`. |
 | Analysis level | How deep the check went. | `AnalysisLevel`: `symbols`, `files_only`, `integration`. |
 | Per-run record | Latest verdict and lineage. | `RunRecord.coherence: Option<CoherenceRecord>` with `version` (1), `refreshed_from`, `facts`, `validity`, `first_invalid_at`. |
 
@@ -45,7 +45,8 @@ Facts are derived only from S0 and Δ, so they can be recomputed at any time.
 | `fact_broken` | L1: a referenced declaration's contract, or a watched file's bytes, changed | `Refresh` |
 | `fact_missing` | L1: the declaration or file no longer exists | `Refresh` |
 | `same_symbol_edited` | L1: a declaration the patch edits was also edited in the source | `Refresh` |
-| `analysis_uncertain` | L1: a file that holds a fact does not parse; L2: a check could not run | `Refresh` at accept; dropped mid-run |
+| `mention_changed` | L1: a file named only by a weak mention (`Mentioned`) changed or is gone | `Continue` when the merged checks can run, which then decide at accept; otherwise `Refresh` |
+| `analysis_uncertain` | L1: a file that holds a fact does not parse; L2: a check could not run; a weak-only `Continue` whose merged checks cannot run | `Refresh` at accept; dropped mid-run |
 | `integration_check_failed` | L2: a configured check failed or timed out on the merged tree | `Refresh` |
 
 At most 20 reasons are kept in a `Validity`; result projections keep 5.
@@ -134,13 +135,42 @@ Everything is read from the baseline commit through the hardened Git wrappers.
   (an exact tracked path, or a bare or partial name that matches exactly one tracked
   file). The fact is the SHA-256 of the baseline bytes. An added file in an unsupported
   language produces no fact.
+- **Mentions** (`facts::mentioned_files`, with `symbols::code_and_tests`). Each changed
+  `.rs`/`.py` file's post-image is parsed once with tree-sitter into two copies that keep
+  every byte and line position: its code outside test items, and its test items.
+  - A path named in a Rust or Python comment, doc comment or docstring (module, class or
+    function) makes no fact. Code on a line with a trailing comment still counts.
+  - A path named in test code makes a weak fact, origin `Mentioned`, even inside a string or
+    `include_str!`. Test code is a Rust item under `#[cfg(test)]` (the attribute exactly,
+    then the item it applies to), a `.rs` file under a `tests/` directory, and a Python file
+    named `test_*.py` or `*_test.py` or under `tests/`.
+  - A path named in a file without symbol support (YAML, Markdown, TOML, shell, …) makes a
+    weak fact too.
+  - A path used by other code, in a string literal or `include_str!` (`open("x.json")`),
+    stays a strong `FileFallback` fact. When the same path is named both ways, the strong
+    fact wins.
+  - When a post-image cannot be built or does not parse, its added lines are read as before,
+    with the file's own origin, so a Rust file whose `#[cfg(test)]` module cannot be parsed
+    stays strong: the conservative side.
 - Facts are deduplicated by id (`sha256(kind|path|subject)` prefix), ordered Modified,
-  Referenced, File, and capped at 200.
+  Referenced, File, and capped at 200; strong mentions come before weak ones at the cap,
+  and strong failures before weak reasons at the 20-reason cap.
 
 **Evaluating facts**: only facts whose path is among the world's changed files are
 checked, always from what is on disk now.
 
 - `File` fact: file gone is `fact_missing`; different bytes is `fact_broken`.
+- Weak (`Mentioned`) fact: either change is `mention_changed`, with the plain fact as its
+  detail (`mentioned file Cargo.lock changed since the work started`). Alone, it leaves the
+  verdict `Continue`, and the merged checks decide at accept. When those cannot run for the
+  run's frozen configuration and authority (any reason `integration::checks_skipped`
+  gives, or an error), the verdict is `Refresh` with one `analysis_uncertain` reason first, `merged
+  checks cannot run — <why>`, so the REFRESH headline says why. The accept gate applies the
+  same rule: a weak-only `Continue` whose merged checks come back skipped is blocked. The
+  summary line reads `Coherence: CONTINUE — <first reason>; the merged checks decide at
+  accept`, or `…; the merged checks passed` once they have. These verdicts can be
+  overridden like other analysis reasons (`accept --despite-refresh`), and the checks must
+  still run and pass.
 - `Signature` fact: file gone is `fact_missing`; file does not parse is `analysis_uncertain`;
   no declaration with that qualified name is `fact_missing`.
   For a `Modified` fact, no declaration with the same `full_fp` (or `sig_fp` for
@@ -505,7 +535,8 @@ records no verdict; verdicts, liveness and interactions stay on the `poll_secs` 
 - A message is sent only when the decision differs from the last one sent (a run is
   assumed valid until a message says otherwise), or when the verdict is still invalid
   for a different world digest. At most one message per 60 seconds; a held-back
-  verdict is sent later unless superseded.
+  verdict is sent later unless superseded. A verdict that stops the attempt
+  (`mid_run: stop`: `Stop`, and `Refresh` with `stop_on_refresh`) is never held back.
 - The applied verdict is stored via `remember_validity`, which stamps `first_invalid_at`
   the first time a non-`Continue` verdict is stored.
 - `mid_run: stop`: after `coherence.stopped` is recorded, the attempt's cancellation
@@ -776,7 +807,8 @@ How to read it:
 
 ## Known limits
 
-- Symbol facts: Rust and Python only. Other languages get file-level facts; any change to such a file is `REFRESH`, even a harmless one.
+- Symbol facts: Rust and Python only. Other languages get file-level facts; any change to such a file is `REFRESH`, even a harmless one. A file only mentioned by path from test code or from a file without symbol support is a weak fact, decided by the merged checks; when they cannot run, it is `REFRESH` too.
+- Comments and test code are recognized only in Rust and Python. `#![cfg(test)]`, `#[cfg(all(test, …))]` and a file reached only through `#[cfg(test)] mod x;` are not test code, so paths there stay strong.
 - Referenced symbols bind by unique base name, not by name resolution; ambiguous, very common and short names are skipped. Names left unbound, and files whose baseline could not be analysed, are counted internally but not reported.
 - Same-symbol concurrent edits are `REFRESH` (`same_symbol_edited` or `patch_conflict`).
   A Python edit that only appends after the last line of a function is not seen as a same-symbol edit by the symbol layer; the patch check and your checks still apply.

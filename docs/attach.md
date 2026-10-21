@@ -294,10 +294,10 @@ dispatch serve  [--root <path>] [--json]
 | `--task <text>` | describes the attached work; never sent to the agent |
 | `--agent <name>` | free-text label (`claude`, `codex`, `cursor`, anything else); never guessed — `None` becomes `"external"` |
 | `--pid <n>` | the foreign agent's process ID, for liveness only, never signaled |
-| `--allow-unsafe-local` | explicitly allows `checks.verify` to run on the host at `finish` time |
+| `--allow-unsafe-local` | explicitly allows `checks.verify` to run on the host at `finish` time; not needed when the project's check consent covers exactly its checks |
 | `--auto-apply` | sets `capabilities.integrate`: apply automatically once the work is ready and coherent |
 | `-- <command> [args...]` | selects the **wrapped** form: everything after `--` is the agent command Dispatch spawns and owns for the session |
-| `dispatch finish <run-id> [--allow-unsafe-local]` | foreign work only: freeze Δ, run `checks.verify` on what would land (in the workspace when the source has not moved, otherwise on the current source with Δ in the check workspace), become an ordinary Ready result. The flag is recorded on the run (`attach.authorized {by: "human"}`), so accept's merged-tree checks run too |
+| `dispatch finish <run-id> [--allow-unsafe-local]` | foreign work only: freeze Δ, run `checks.verify` on what would land (in the workspace when the source has not moved, otherwise on the current source with Δ in the check workspace), become an ordinary Ready result. The flag is recorded on the run (`attach.authorized {by: "human"}`), so accept's merged-tree checks run too. Without the flag, the project's check consent for exactly these checks is enough, and is recorded the same way (`by: "project consent"`) |
 | `dispatch close <run-id> --reason <reason>` | retire Work without a review: nothing is applied, committed or deleted (see "Closing Work" below) |
 | `dispatch start [--root <path>]` | run the project owner in the background (`serve --background` in its own session) and return |
 | `dispatch watch [--root <path>] [--json]` | the project view, live; holds no lock, records nothing |
@@ -320,8 +320,12 @@ on `stderr` and exits non-zero:
    the integration root"*
 4. plain-directory foreign attach — *"a plain directory can be attached only by
    wrapping the agent command"*
-5. `checks.verify` configured without the acknowledgement — *"finish runs your
-   checks.verify on the host; pass --allow-unsafe-local"*
+5. `checks.verify` configured without the acknowledgement and without the project's
+   check consent for exactly those checks — *"finish runs your checks.verify on the host;
+   pass --allow-unsafe-local, or give this project standing consent for these checks with
+   dispatch setup"*. With that consent, `attach` and `finish` record it on the Work
+   (`attach.authorized {by: "project consent"}`), so accept runs its merged checks as it
+   does for the flag.
 6. the workspace is already attached — *"workspace already attached as `<id>`"*
 
 `dispatch finish` on a run that is not an active, single-candidate attachment refuses
@@ -353,15 +357,35 @@ Dispatch does not own this agent's execution, only its observation.
   installed would otherwise kill the wrapper by its default disposition and orphan the
   agent instead of forwarding the signal to it.
 - On exit, the wrapper finishes the Work (freezes Δ, runs `checks.verify`), applies it
-  if `--auto-apply` was given, and only then prints its own single line — after the
-  agent has fully released the terminal. The process exit code is the agent's own exit
+  if `--auto-apply` was given, and only then prints — after the agent has fully released
+  the terminal. Without `--auto-apply` it prints the end of finish's own summary: the
+  verdict heading, `Coherence`, `At accept` and the next commands. With it, it prints the
+  auto-apply outcome.
+
+  ```text
+  Attached work 01M5FRJKMFTXCP65J9H72R066A finished: Ready for review
+
+  Coherence: CONTINUE — world unchanged
+
+  At accept
+    merged checks would not run now — the source has not moved since the Work began, so the merged result is the Work's own tree
+
+  Review
+    dispatch diff 01M5FRJKMFTXCP65J9H72R066A
+
+  Then
+    dispatch accept 01M5FRJKMFTXCP65J9H72R066A
+    dispatch reject 01M5FRJKMFTXCP65J9H72R066A
+  ```
+
+  Before 0.4.17 it printed `Attached work <id> finished; next: dispatch check <id>`. The process exit code is the agent's own exit
   code, when the wrapper's own bookkeeping (creation, then finishing) succeeded; a
   bookkeeping failure exits 1 instead (creation failures never start the agent at all).
 
 ## The project owner: `start`, `stop`, `serve` and `watch`
 
-The owner loops until Ctrl+C, SIGTERM or SIGHUP. Nothing is applied or launched on
-start or exit. `dispatch serve` runs it in the foreground with the view;
+The owner loops until Ctrl+C, SIGTERM or SIGHUP, or until its project or Dispatch's state
+directory is gone. Nothing is applied or launched on start or exit. `dispatch serve` runs it in the foreground with the view;
 `dispatch start` runs it in the background and returns.
 
 - **Identity and lock.** `locks/serve-<sha256(root)>.lock` (`flock`). A second owner
@@ -370,8 +394,35 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   machine reboots, so nothing can claim a project is watched when it is not.
 - **The record.** Once it holds the lock, the owner writes
   `watchers/<sha256(root)>.json`: root, `ProcessIdentity` (pid, start time, boot),
-  start time, Dispatch version, background or foreground. It removes the record
-  when it stops. The record only says whom `stop` may signal.
+  start time, Dispatch version, background or foreground, and, since version 2 of the
+  record (0.4.17), `exe`, the canonical path of the binary, and `environment`, the
+  `PATH`, `HOME`, `TMPDIR` and `LANG` checks receive. It removes the record when it
+  stops. The record says whom `stop` may signal, and what to bring back.
+- **Watching comes back** (`background::ensure_current`). A project watched with
+  `dispatch start` is watched again by the next Dispatch command or hook there, after a
+  reboot, a crash or an upgrade in place, until `dispatch stop`. Until that command or hook
+  runs, nothing watches it. A foreground `serve` is never brought back.
+  - **A background record left with the lock free** means the owner died without `stop`
+    (a reboot, a crash). `status`, `watch`, `attach`, `finish`, `check`, `accept` and
+    `start` start it again, with the recorded environment, wait for its first scan, and
+    say on stderr `Watching <root> again: its owner had stopped.`. A Claude Code or Hermes
+    hook spawns it without waiting and writes that line to the owner's log, never to
+    stdout, then goes on as in a watched project. While `dispatch.yml` does not parse,
+    nothing is spawned, the record stays, and the line is `Could not watch <root> again:
+    …`.
+  - **A held lock and another version.** When the record's `exe` is this binary (an
+    upgrade in place), or, for a version 1 record without `exe`, when this version is
+    newer, the command stops the owner (SIGTERM, then waits for the lock) and starts this
+    one with the recorded environment: `Restarted watching <root> with Dispatch <new> (was
+    <old>).`. The configuration is read first; if it fails, the old owner keeps watching
+    and the line is `Could not restart watching <root> with Dispatch <new>: …`. An older
+    binary, or another install path, never replaces an owner: `status` and `watch` keep
+    naming the version it runs. Hooks only revive a dead owner; they never replace one.
+  - Nothing of this reaches stdout, so `--json` output is unchanged.
+- **The owner exits when its project or state directory is gone.** It records the
+  `(dev, inode)` of both when it starts, compares them with two `stat` calls per tick, and
+  on a difference logs `stopping: the project|state directory <path> no longer exists`,
+  removes its record and exits.
 - **`dispatch start`** checks `dispatch.yml` and returns "Already watching" if the
   lock is held. Otherwise it starts `dispatch serve --background --root <root>`:
   - in its own session (`setsid`), so closing the terminal does not stop it;
@@ -390,9 +441,15 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   live process (same pid, start time and boot), then waits for the lock. A record
   from before a crash or a reboot never names a live process, so it is never
   signalled; a lock held by an unidentified process is refused, naming the lock.
-- **Two loops.** The owner runs a fast loop on a thread of its own beside the tick,
-  so it keeps going while the tick waits, for example on a project's checks for Work
-  finished by consent. It stops before the owner releases the project.
+- **Two loops.** The owner runs a fast loop on a thread of its own beside the tick. It
+  stops before the owner releases the project.
+- **Finishes by consent run as tasks** (`serve::Finishes`), one per Work, each with a
+  cancellation token, so the tick never waits for a project's checks. Each loop the owner
+  reaps the tasks that ended (an error is logged once, and that Work is not tried again by
+  this owner), handles reopen notes (cancelling the old Work's finish first; see "Session
+  end and resume"), ticks, then spawns a finish for each Work that `finishes_by_consent`
+  holds for and that has no task. On every exit, running finishes are cancelled and
+  awaited, their checks killed, and the Work stays Working for the next owner.
 - **The fast loop** (about once a second: one pass, then a one-second wait; there is
   no setting):
   1. Load the root's runs and run discovery (see "Work that appears without hooks"):
@@ -417,7 +474,8 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
      Work that is still `not_observed` and was published after this owner started (see
      "The source at the start"); each such Work costs one events query per owner
      lifetime. Then read the session locks of the runtime-made Work it follows for
-     liveness (see "Liveness from the session lock").
+     liveness (see "Liveness from the session lock"), and clear the "waiting on you" mark
+     of Work whose session moved (see "Waiting on you"): one `stat` per waiting Work.
   2. Follow every active attached run whose live owner state is not `Live` (a live
      wrapper is that wrapper's own business). For Work the fast loop follows, the
      tick still evaluates from its own scratch patch, but leaves `delta-live.patch` and
@@ -475,7 +533,7 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
 - **`dispatch watch`** renders the same view from canonical state under a header
   naming who watches (`watched in the background since 10:02 (pid 812)`, or `not
   watched · dispatch start`, plus a note when the owner runs another Dispatch
-  version).
+  version that this binary does not replace).
   - It checks every second for a new event id or a change of watcher, and redraws
     at least every 30 s so finished Work ages out.
   - It holds no lock and records nothing of its own, so leaving it (`q` or
@@ -527,7 +585,9 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
       atomically and removed when it exits. Readers ignore it unless an owner
       holds the project.
   - `dispatch status` ends with the same line (`Project: …`), followed by a "Found, not
-    tracked" section when there is something to list. For attached Work that is not
+    tracked" section when there is something to list. In a project with no Work it prints
+    `No Work in <root> yet.` and that line, and exits 0; `status --json` prints `null`,
+    and `status --jsonl` prints nothing. For attached Work that is not
     finished, its Candidate block reads `Runtime unknown`, `Tracked for 12m` and
     `Files changed <n> now`, or `unknown` as above. There is no Diff line until the
     Work is finished, and its Workspace section adds `agent running (pid N)` while the
@@ -584,8 +644,9 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   every tick but prints only what changed** since the last redraw — the whole block is
   only ever redrawn if at least one line in it differs from what is already on screen.
   `--json` instead emits one `{"type":"work", "run_id", "agent", "verdict", "state",
-  "reason", "origin", "s0", "verification", "review", "applied_by"}` object per run
-  whose displayed fields changed (the last five since 0.4.3), and one
+  "reason", "origin", "s0", "verification", "review", "applied_by", "needs_you"}` object
+  per run whose displayed fields changed (`origin` to `applied_by` since 0.4.3,
+  `needs_you` since 0.4.17), and one
   `{"type":"world", "digest"}` object whenever the observed world moved.
 
 ## Workspaces Dispatch makes
@@ -645,9 +706,28 @@ owner finds the worktree ("Work that appears without hooks", below). Either way
 there is one Work per worktree. Hermes's hook registers nothing; it keeps the
 exact Δ of Work discovery found ("Hermes Agent", below).
 
-With Claude Code's hooks installed (`dispatch setup` → Runtime integrations), the
-runtime tells Dispatch about its sessions (`dispatch hook claude`, which reads the
-runtime's event on stdin):
+With Claude Code's hooks installed, the runtime tells Dispatch about its sessions
+(`dispatch hook claude`, which reads the runtime's event on stdin). `dispatch setup`
+offers them when `claude` is on `PATH`, showing the exact additions, with focus on Skip.
+There are six, each a `command` hook running `'<dispatch>' --state-dir '<state>' hook
+claude`:
+
+| Event | Matcher | Timeout | Since |
+|---|---|---|---|
+| `SessionStart` | | 60 s | 0.4.6 |
+| `SessionEnd` | | 5 s | 0.4.6 |
+| `WorktreeRemove` | | 300 s | 0.4.6 |
+| `PreToolUse` | `ExitWorktree` | 300 s | 0.4.6 |
+| `Notification` | `permission_prompt\|idle_prompt\|agent_needs_input` | 5 s | 0.4.17 |
+| `Stop` | | 5 s | 0.4.17 |
+
+A settings file holding exactly the four an earlier Dispatch installed is offered as an
+Update, showing the hooks it becomes, for the same executable (`Hook command, unchanged:
+…`) or another. Hooks of Dispatch's edited by hand are left alone and reported as `changed
+by hand`; the "Agents Dispatch launches…" → Runtime integrations menu removes them (`Only
+Dispatch's own hooks are removed, hook by hook`), then installs them again. A person's own
+hooks, in the same file or the same entry, are kept on install, update and removal.
+
 - **Only in a watched project.** Only a project watched with `dispatch start` is
   followed. The integration root is always derived from the workspace's own Git
   repository, never taken from the event. Hook input is validated and bounded, and
@@ -678,13 +758,18 @@ runtime's event on stdin):
     whose `registration_ms` is counted from the session's process start). The
     plan with the full rules is `docs/plan-0.4.10.md` §3.
   - later sessions in that worktree (resume, clear, compact, a fork into it, a
-    replayed event) are recorded on the same Work;
+    replayed event) are recorded on the same Work. A `SessionStart` that finds its
+    Work held (the owner recording a verdict, a typed `dispatch finish` running its
+    checks) waits for it within the hook's 40 s budget; if the Work finished
+    meanwhile, the session goes on from that result;
   - the watching owner observes the source at the start once, after the Work is
     published (see "The source at the start"); registration and the hook reply say
     nothing about it;
-  - an ended session never ends the Work. `status` and `watch` say the session
-    ended: finish to freeze its changes (`dispatch finish <id>`), or resume it; or
-    close it (`dispatch close <id> --reason unfinished`);
+  - an ended session does not end the Work by itself. Without the project's check
+    consent, `status` and `watch` say the session ended: finish to freeze its changes
+    (`dispatch finish <id>`), or resume it; or close it (`dispatch close <id> --reason
+    unfinished`). With it, the owner finishes it once the session's process is gone
+    (see "Session end and resume");
   - Claude Code reports a worktree session's end (`SessionEnd`) from the main
     checkout, not the worktree. When an end names no Work by its directory,
     Dispatch records it on the unfinished Work of that project holding the same
@@ -702,10 +787,15 @@ runtime's event on stdin):
   its own. It gets that authority in one of two ways:
   - **A person's `dispatch finish <id> --allow-unsafe-local`**, recorded on the
     run.
-  - **The project's check consent**, granted in `dispatch setup --checks`.
+  - **The project's check consent**, granted in `dispatch setup` (or `dispatch setup
+    --checks`) on a terminal.
     - It is stored at `<state>/projects/<sha256(root)>.json` and names the root
       and the exact effective `checks.verify` commands. It is never stored in the
       repository, so a repository cannot grant itself host execution.
+    - Version 2 (0.4.17) also covers typed `attach` and `finish`, and Work the owner
+      finishes when its session ends. A version 1 consent no longer holds (`check
+      consent no longer holds: it did not cover typed attach, finish, or session end`)
+      until `dispatch setup` asks again.
     - Work registered or found while it holds is created with local authority
       (`attach.authorized {by: "project consent"}`).
     - When `checks.verify` changes, it no longer holds until the person approves
@@ -723,10 +813,10 @@ runtime's event on stdin):
     `dispatch close <id> --reason workspace-removed`, which closes it and keeps the
     Δ in the run. `reject` refuses it, because there is no result to judge.
   - With the project's check consent still holding, for the same commands the
-    Work was authorized with, the owner does that `finish` on its next tick
-    (`finish_reason: by_consent`). The Work becomes Ready, or shows its failed
-    checks, and waits for review. This happens after the hook returns, so the
-    hook's budget is unchanged.
+    Work was authorized with, the owner does that `finish` as a task of its own,
+    from its next tick (`finish_reason: by_consent`). The Work becomes Ready, or
+    shows its failed checks, and waits for review. This happens after the hook
+    returns, so the hook's budget is unchanged.
   - Only an empty Δ closes the Work.
   - If a followed workspace vanishes without the hook, the owner keeps the last Δ it
     followed (`delta-last-seen.patch`), and records when that patch was written as
@@ -757,6 +847,89 @@ runtime's event on stdin):
       persists, the owner may be stuck: `dispatch stop` ends it, and close then goes
       ahead without those changes. If that last Δ was empty, the Work closes by itself
       with no changes.
+
+### Session end and resume
+
+With the person's standing consent for the project's checks, the owner finishes Work a
+runtime registered (Claude Code or Hermes, by hook or discovery) once all of these hold
+(`attach::finishes_by_consent`):
+- the Work is Working, registered with the project's consent, and its checks are exactly the
+  ones consent names now;
+- every session it has ended, by the runtime's `SessionEnd` (or Hermes's hook) or by
+  liveness;
+- the session's process is gone, judged by the worktree's lock
+  (`liveness::session_process_gone`): a lock naming a pid that no longer runs with the lock's
+  start time, as a closed terminal leaves it, or no lock at all, as `/exit` leaves it.
+
+`/clear` and `/resume` end a session in a process that keeps running, so they finish
+nothing. `SessionEnd` itself only records the end, within its 5 s timeout. The finish is the
+one above ("Δ and finished": Δ frozen, the memo first, checks in place when the source is
+unmoved, in the check workspace when it moved), recorded as `finish_reason: by_consent`
+with `attach.finished`'s `workspace_removed: null`. It runs as a task of its own, so the
+owner's ticks and other Work's verdicts go on while its checks run. Nothing is applied. Codex
+and Cursor send no end, and a Claude session in a worktree Claude Code did not make has no
+lock to judge, so that Work is finished by a person.
+
+While the owner finishes Work, it keeps `runs/<id>/finishing-by-consent` with its pid. A typed
+`dispatch finish` or `dispatch close` on that Work waits a moment, then says `Work <id> is
+being finished by its project's owner, as you allowed (checks running); wait for it, or close
+it once it is ready`.
+
+**Resume.** A session that starts again in a worktree whose latest Work from that runtime
+awaits review (Ready, review pending, not applied, not closed), or is being finished by consent, does not
+join it:
+- the new Work begins from that Work's S0 and provenance, so its Δ holds both sessions'
+  changes, and records `work.reopened {reopens: <old>, provenance}`;
+- the earlier Work closes as superseded by it, its Δ kept, its review `not_requested`, with
+  `work.closed {reason: "superseded", by: "reopen", replacement}`. A finish still running is
+  cancelled first and its checks killed;
+- the note `<state>/reopen/<old id>`, written before the new Work is published, makes this
+  survive a crash: the owner closes the earlier Work within a tick when the hook could not.
+
+Either the `SessionStart` hook (`source: resume`) or discovery (a new running lock on the
+worktree) may see the session first; the outcome is the same, and the hook's reply names the
+new Work: `Dispatch is tracking this worktree as Work <id>; see it with dispatch watch.`. A
+session resumed while the owner merely holds the Work's lock for a moment (a tick recording a
+verdict) joins that Work, as `/clear` does. Attribution follows the worktree, never the
+session ID, since `/resume` can carry a conversation into another worktree.
+
+When the earlier Work's S0 can no longer be read (Git prunes unreferenced objects in time),
+the session starts Work of its own from the worktree as it is, the earlier Work stays for
+its own review, and the new Work records `work.not_reopened {reopens, reason}`.
+
+```sql
+SELECT run_id, json_extract(payload_json, '$.reopens') FROM events WHERE event_type = 'work.reopened';
+SELECT run_id FROM events WHERE event_type = 'work.closed' AND json_extract(payload_json, '$.by') = 'reopen';
+SELECT run_id, json_extract(payload_json, '$.reopens'), json_extract(payload_json, '$.reason')
+  FROM events WHERE event_type = 'work.not_reopened';
+```
+
+### Waiting on you
+
+Claude Code's `Notification` hook (matched to `permission_prompt`, `idle_prompt` and
+`agent_needs_input`) and `Stop` hook mark the worktree's Work in a watched project, and never
+reply, so they never keep Claude working:
+- `permission_prompt` is `permission`; `idle_prompt` and `agent_needs_input` are `input`;
+  `Stop` is `turn ended`, "waiting for your next prompt". Any other notification changes
+  nothing. A newer mark replaces the older one.
+- The mark is recorded on the Work (`attachment.needs_you`) and as `runtime.needs_you {kind,
+  message, at, transcript, session_id}`.
+- `dispatch status` prints `waiting on you: permission · Claude needs your permission · for
+  2m`. `dispatch watch` lists the Work under "needs you", with state `waiting` and the next
+  step `Its session asks for your permission: answer it there.` or `Its session waits for
+  your next prompt: continue it there, or f finish when it is done.`; a piped row ends with `·
+  waiting on you: <kind> · <message>`. `watch --json` work lines carry `needs_you: {kind,
+  message, since}` or `null`, and `state` stays `working`.
+- The owner clears it when the session moves again, and records `runtime.needs_you_cleared
+  {by}`: `transcript` when Claude wrote its transcript after the mark (for `turn ended`, more
+  than 10 s after it, since Claude records the end of a turn itself after the hook);
+  `session_end` when the session ended; `work_finished` when the Work is no longer Working.
+  A session end hides the mark at once, before the owner clears it.
+
+```sql
+SELECT run_id, json_extract(payload_json, '$.kind'), timestamp FROM events WHERE event_type = 'runtime.needs_you';
+SELECT run_id, json_extract(payload_json, '$.by'), timestamp FROM events WHERE event_type = 'runtime.needs_you_cleared';
+```
 
 ### Work that appears without hooks
 
@@ -857,7 +1030,9 @@ its source:
   a worktree there on the first scan is listed, not tracked; a later one locked by a
   running process is registered with that process, one whose process is gone is
   registered with its session ended (`process_gone`), and one without the lock is
-  listed after the 3 s grace. S0 is its merge base, the agent `hermes`, and its one
+  listed after the 3 s grace. Hermes locks its worktree a moment after making it; a
+  worktree listed before its lock appeared is registered once the lock names the
+  process that made it. S0 is its merge base, the agent `hermes`, and its one
   session is the worktree's name, `hermes-<8 hex>`, with `source: "discovered"` and
   `started_at` from the mtime of the worktree's `.git` file. Hermes's own session ID
   never reaches discovery and is not recorded. The owner's log says `discovery: found a
@@ -964,7 +1139,9 @@ when another pid takes a Hermes lock no session is ended for it:
   session whose worktree was removed while it ran ends the same way.
 - **Nothing else.** A lock never seen running, or a process whose start cannot be read,
   proves nothing, and nothing is recorded. A session a hook already ended stays as it
-  was, so there is one end. Nothing is finished, applied, closed or signalled. A
+  was, so there is one end. Liveness itself finishes, applies, closes and signals nothing;
+  an end it records can let the owner finish the Work by consent ("Session end and
+  resume"). A
   person's attach (`workspace_owner: user`), with or without `--pid`, is never touched.
 - **Cost.** One `ps` per followed lock per tick, plus one identity lookup when a new
   process is recorded. The identity is written under the run's lock only when it
@@ -1069,14 +1246,18 @@ In addition to the existing coherence, application and review events (see
 | `attach.started` | the wrapped form's agent process has been spawned | `{"agent_process": <ProcessIdentity>}` |
 | `attach.finished` | `finish` (either explicit or on agent exit) freezes Δ | `{"reason": <FinishReason>, "workspace_removed": <WorkspaceRemoval> \| null}`; `workspace_removed` since 0.4.15, `{at, exact, last_seen_at}` |
 | `attach.adopted` | `serve` takes over observation of an orphaned run | `{"owner_state": "adopted"}` |
-| `attach.authorized` | Work gains local authority: from the project's check consent, or from a person's `finish --allow-unsafe-local` | `{"unsafe_local": true, "by": "project consent" \| "human"}` |
+| `attach.authorized` | Work gains local authority: from the project's check consent (at registration, or a typed `attach` or `finish` that ran on it), or from a person's `finish --allow-unsafe-local` | `{"unsafe_local": true, "by": "project consent" \| "human"}` |
 | `runtime.session_started` | a hook records a new session on existing Work | `{"session": <RuntimeSession>}` |
 | `runtime.session_ended` | a hook's `SessionEnd`, Hermes's hook when Hermes keeps its worktree, or the owner from the session lock ("Liveness from the session lock") | `{"provider", "session_id", "reason"}`; Hermes's hook gives `shutdown`, the owner's reasons are `process_gone` and `lock_released` |
 | `runtime.agent_running` | the owner records the process a session lock names, once it runs | `{"agent_process": <ProcessIdentity>, "previous"}` |
 | `runtime.agent_gone` | the owner clears it, once that process is gone or its lock released | `{"agent_process": null, "previous": <ProcessIdentity>}` |
+| `runtime.needs_you` | Claude Code's `Notification` or `Stop` hook marks the Work (0.4.17) | `{"kind": "permission" \| "input" \| "turn_ended", "message", "at", "transcript", "session_id"}` |
+| `runtime.needs_you_cleared` | the owner clears that mark (0.4.17) | `{"by": "transcript" \| "session_end" \| "work_finished"}` |
+| `work.reopened` | a resumed session's Work begins from an earlier Work's S0 (0.4.17) | `{"reopens": <old id>, "provenance"}` |
+| `work.not_reopened` | it could not, because that S0 can no longer be read (0.4.17) | `{"reopens": <old id>, "reason"}` |
 | `workspace.removed` | the workspace is gone: kept exactly by a hook (Claude Code's or Hermes's), or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes", "last_seen_at"}`; `last_seen_at` since 0.4.15 |
 | `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
-| `work.closed` | a person closed Work (`dispatch close`, or `c` in `watch`). Before 0.4.12, a person rejected unfinished Work whose workspace was gone | `{"reason": "unfinished" \| "workspace_removed" \| "already_present" \| "superseded", "by": "human", "world_digest"?, "replacement"?}` |
+| `work.closed` | a person closed Work (`dispatch close`, or `c` in `watch`), or a resumed session superseded it (`by: "reopen"`, 0.4.17). Before 0.4.12, a person rejected unfinished Work whose workspace was gone | `{"reason": "unfinished" \| "workspace_removed" \| "already_present" \| "superseded", "by": "human" \| "reopen", "world_digest"?, "replacement"?}` |
 | `interaction.landed` | after `result.applied`: what the owner's view said about this Work and the others in progress | `measure::Landing` (see [coherence.md](coherence.md#measuring-interactions-measurers)) |
 | `interaction.outcome` | the owner's first verdict on one of those others after this Work landed | `measure::Outcome` |
 
@@ -1179,12 +1360,23 @@ directory, exactly as it already refuses any newer schema.
   worktree that lives and vanishes between two passes is missed.
 - Interactions between Work are advisory, exist only while an owner watches the
   project, and never change a verdict or block anything.
-- `serve` never launches, kills or refreshes anything. It finishes Work only when
-  the project's check consent holds and a runtime removed the Work's workspace
-  with its exact Δ kept; Work kept only as last seen waits for a person. Otherwise
-  wrapped attach and a human (`dispatch finish`) are the only things that finish a
-  Work. A session that ended, by a hook or by its
-  lock, never finishes it.
+- `serve` never launches or refreshes anything, and kills only the checks of its own
+  finishes when it cancels them. It finishes Work only when the project's check consent
+  holds and either a runtime removed the Work's workspace with its exact Δ kept, or a
+  Claude Code or Hermes session ended with its process gone; Work kept only as last
+  seen waits for a person. Otherwise wrapped attach and a human (`dispatch finish`)
+  are the only things that finish a Work.
+- A finish by consent that fails (an error, not failing checks) is not tried again by
+  the same owner; finish it yourself, or it is tried again when the owner restarts.
+- A worktree removed while its finish by consent runs: the runtime's removal waits up
+  to 60 s for the finish, then fails, and the worktree stays. Its changes were already
+  kept when the finish began.
+- "Waiting on you" comes only from Claude Code's hooks. A `turn ended` mark clears at
+  the first transcript write more than 10 s after it, so a prompt typed within those
+  10 s clears it only at the agent's next write; a person's own `Stop` hook slower
+  than 10 s clears it early.
+- Owners come back only when a Dispatch command or hook runs in the project; there is
+  no launchd or systemd agent.
 - No foreign process is ever signaled. `--pid` and the wrapper's own child PID are
   liveness-only.
 - Discovery recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's

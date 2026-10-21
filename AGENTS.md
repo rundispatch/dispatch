@@ -27,15 +27,16 @@ how Dispatch carries the work; they support the promise and are not separate
 product theses. Keep selection local and explicit: one configured profile or an
 explicit `--agent`, fed into the same execution core.
 
-Public claims about coherence must match what is shipped and measured. Today
-that is an accept-time gate with symbol-level facts for Rust and Python, file-level
-facts elsewhere, an advisory mid-run watcher on native runs, and advisory
-interactions between unintegrated Work while a project is watched. Claim
-precision for interactions only from recorded outcomes (the documented queries),
-quoted as counts, and only as agreement with Dispatch's own later verdict. Do not claim
-tokens, minutes or money saved until a real run was stopped and the attempt
-timestamps show it. The metrics that decide whether the thesis holds, and what
-would falsify it, are in `docs/coherence-validation.md`.
+Public claims about coherence must match what is shipped and measured. Today that is
+an accept-time gate with symbol-level facts for Rust and Python, file-level facts
+elsewhere, weak facts for paths named only in test code or in files without symbol
+support (the merged checks decide those at accept), an advisory mid-run watcher on
+native runs, and advisory interactions between unintegrated Work while a project is
+watched. Claim precision for interactions only from recorded outcomes (the
+documented queries), quoted as counts, and only as agreement with Dispatch's own
+later verdict. Do not claim tokens, minutes or money saved until a real run was
+stopped and the attempt timestamps show it. The metrics that decide whether the
+thesis holds, and what would falsify it, are in `docs/coherence-validation.md`.
 
 ## Architectural ownership
 
@@ -155,6 +156,15 @@ Each clause is recorded and bounded, and arrives with the release that ships it.
   a tree, commands and an execution fingerprint, and indexes nothing inside the tree; the
   rule above against a persistent symbol or reference graph, index or LSP integration still
   holds.
+- **Session end** (arrives with 0.4.17). With standing check consent, a runtime-reported
+  session end, once the session's process is gone, may freeze Δ and run the consented
+  checks. It never applies. A resumed session continues from the same S0, and the
+  unreviewed result is closed as superseded.
+- **Standing consent** (arrives with 0.4.17). Standing consent given in a terminal is the
+  unsafe-local acknowledgement for exactly its commands.
+- **Owner restart** (arrives with 0.4.17). A project watched with `dispatch start` and
+  never stopped is watched again by the next Dispatch command or hook there, after a
+  reboot or an in-place upgrade. One line says so; `dispatch stop` ends it.
 
 ## Working method
 

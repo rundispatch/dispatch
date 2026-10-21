@@ -145,7 +145,8 @@ enum Command {
     /// Finish attached external work: freeze the delta, verify, become ready.
     Finish {
         run_id: String,
-        /// Required when the integration root configures checks.verify.
+        /// Allow this finish to run checks.verify on the host, when neither
+        /// the Work nor standing consent already does.
         #[arg(long)]
         allow_unsafe_local: bool,
     },
