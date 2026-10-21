@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use super::attach::{self, AttachRequest, Registered, RuntimeStart};
 use crate::{
-    RuntimeSession,
+    BaselineProvenance, RunRecord, RuntimeSession,
     db::Database,
     lock::OperationLock,
     source,
@@ -80,6 +80,13 @@ pub struct Registration {
     pub consented: bool,
     /// When the hook process started: registration latency is measured from it.
     pub started_at: DateTime<Utc>,
+    /// The Work this session goes on from, whose S0 is `s0_commit`
+    /// (`attach::reopenable`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopens: Option<String>,
+    /// The Work this session would have gone on from, and why it could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_reopened: Option<(String, String)>,
 }
 
 /// The content of the `decision` file.
@@ -343,17 +350,34 @@ fn work(state: &State, mut registration: Registration) -> Result<Started> {
     )?;
     fault("after_lock");
     publish_durable(state, &workspace)?;
-    if let Some(run_id) = attach::find_active_attachment(state, &workspace)? {
+    // A session that starts again over a result nobody reviewed goes on from
+    // that result's S0, so the new Work's Δ holds both; the workspace, never
+    // the session ID, says which Work it is.
+    let (reopens, not_reopened) = go_on_from(
+        &workspace,
+        attach::reopenable(state, &workspace, &registration.session.provider)?,
+    );
+    if reopens.is_none()
+        && let Some(run_id) = attach::find_active_attachment(state, &workspace)?
+    {
         attach::record_session_start(state, &run_id, registration.session)?;
         return Ok(Started::Existing);
     }
     // Authority to run the project's checks comes only from the person's
     // consent for exactly these checks, never from the session.
     registration.consented = crate::consent::consent(state, &registration.root)?.is_valid();
-    registration.s0_commit = source::world_commit(&workspace)?;
+    registration.s0_commit = match &reopens {
+        Some((_, commit)) => commit.clone(),
+        None => source::world_commit(&workspace)?,
+    };
+    registration.reopens = reopens.map(|(old, _)| old);
+    registration.not_reopened = not_reopened;
     fault("after_s0_commit");
     let prepared = attach::prepare(state, request(&registration))?;
     let dir = directory(state, &registration.run_id);
+    if let Some(old) = &registration.reopens {
+        attach::note_reopen(state, old, &registration.run_id)?;
+    }
     write_durably(
         &dir.join(RECORD),
         &serde_json::to_vec_pretty(&registration)?,
@@ -371,9 +395,62 @@ fn work(state: &State, mut registration: Registration) -> Result<Started> {
         Some(Registered {
             started_at: registration.started_at,
             via: "hook",
+            reopens: registration.reopens.clone(),
+            not_reopened: registration.not_reopened.clone(),
         }),
     )?;
+    // While another process holds it, as its finish does, its note stays
+    // for the project owner.
+    if let Some(old) = &registration.reopens {
+        let _ = attach::supersede_reopened(state, old, &registration.run_id);
+    }
     Ok(Started::Published)
+}
+
+/// The ID of the Work a session would go on from, with its S0 commit, or
+/// with why it cannot.
+type Reopen = (String, String);
+
+/// The Work a session goes on from and its S0, or, when that S0 can no
+/// longer be read (`git gc` prunes it in time), that Work and why, so the
+/// session starts Work of its own and the old Work stays for its review.
+fn go_on_from(workspace: &Path, old: Option<RunRecord>) -> (Option<Reopen>, Option<Reopen>) {
+    let Some(old) = old else {
+        return (None, None);
+    };
+    match s0_commit(workspace, &old) {
+        Ok(commit) => (Some((old.id, commit)), None),
+        Err(error) => (None, Some((old.id, format!("{error:#}")))),
+    }
+}
+
+/// The commit in the project's repository that is `run`'s S0, every object
+/// of its tree readable.
+fn s0_commit(workspace: &Path, run: &RunRecord) -> Result<String> {
+    let Some(
+        BaselineProvenance::WorkspaceAtStart { commit } | BaselineProvenance::Discovered { commit },
+    ) = run
+        .attachment
+        .as_ref()
+        .map(|attachment| &attachment.provenance)
+    else {
+        anyhow::bail!("Work {} records no S0 commit to go on from", run.id);
+    };
+    let mut readable = source::git_command(workspace);
+    readable.args([
+        "rev-list",
+        "--objects",
+        "--missing=error",
+        "--no-walk",
+        commit,
+    ]);
+    let output = readable.output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "its S0 commit {commit} can no longer be read: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(commit.clone())
 }
 
 /// The deadline passed, or the worker gave up: decide pending or untracked,
@@ -444,6 +521,7 @@ fn request(registration: &Registration) -> AttachRequest {
             resumed: registration.resumed,
             commit: registration.s0_commit.clone(),
             discovered: false,
+            reopens: registration.reopens.clone(),
         }),
     }
 }
@@ -468,17 +546,27 @@ pub(crate) fn discovered(
         return Ok(None);
     };
     publish_durable(state, workspace)?;
-    if attach::find_active_attachment(state, workspace)?.is_some() {
+    let (reopens, not_reopened) = go_on_from(
+        workspace,
+        attach::reopenable(state, workspace, &session.provider)?,
+    );
+    if reopens.is_none() && attach::find_active_attachment(state, workspace)?.is_some() {
         return Ok(None);
     }
-    let commit = source::merge_base(root, workspace)?
-        .context("the worktree shares no history with the project")?;
+    let commit = match &reopens {
+        Some((_, commit)) => commit.clone(),
+        None => source::merge_base(root, workspace)?
+            .context("the worktree shares no history with the project")?,
+    };
+    let reopens = reopens.map(|(old, _)| old);
     let name = workspace
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let registered = Registered {
         started_at: session.started_at,
         via: "discovery",
+        reopens: reopens.clone(),
+        not_reopened,
     };
     let request = AttachRequest {
         workspace: workspace.to_owned(),
@@ -496,15 +584,24 @@ pub(crate) fn discovered(
             resumed: false,
             commit,
             discovered: true,
+            reopens: reopens.clone(),
         }),
     };
     let run_id = ulid::Ulid::new().to_string();
     let building = begin(state, &run_id)?;
+    if let Some(old) = &reopens {
+        attach::note_reopen(state, old, &run_id)?;
+    }
     let published = attach::prepare(state, request)
         .and_then(|prepared| attach::build(state, &prepared, &run_id))
         .and_then(|built| attach::publish(state, &run_id, Some(built), Some(registered)));
     match published {
-        Ok(_) => Ok(Some(run_id)),
+        Ok(_) => {
+            if let Some(old) = &reopens {
+                let _ = attach::supersede_reopened(state, old, &run_id);
+            }
+            Ok(Some(run_id))
+        }
         Err(error) => {
             building.remove();
             Err(error)
@@ -646,6 +743,8 @@ fn settle(
         Some(Registered {
             started_at: registration.started_at,
             via,
+            reopens: registration.reopens.clone(),
+            not_reopened: registration.not_reopened.clone(),
         }),
     )?;
     Ok(Settled::Published)

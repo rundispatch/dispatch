@@ -127,6 +127,40 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
     }
 }
 
+/// Whether the process that ran `run`'s sessions is gone, by its worktree's
+/// lock, for a worktree Claude Code or Hermes made in the project at `root`:
+/// the lock names a process that no longer runs (a closed terminal leaves
+/// the lock behind), or there is no lock, as the runtime releases it when it
+/// exits. Either way, the process Dispatch recorded as the agent must not
+/// run either. Anything that cannot be told, including a worktree no
+/// runtime made, which has no lock to judge by, is not gone.
+pub(crate) fn session_process_gone(root: &Path, run: &RunRecord) -> bool {
+    let Some(attachment) = run.attachment.as_ref() else {
+        return false;
+    };
+    let recorded_runs = attachment
+        .agent_process
+        .as_ref()
+        .is_some_and(|agent| process::identity_state(agent) == IdentityState::ExactLive);
+    let workspace = attachment.workspace.as_path();
+    let signals = claude::worktree_signals(workspace);
+    let lock_gone = if claude::made_by_claude(root, workspace, &signals) {
+        match &signals.lock {
+            None => true,
+            Some(lock @ Lock::Session { .. }) => claude::liveness(lock) == Liveness::Gone,
+            Some(Lock::Other(_)) => false,
+        }
+    } else if hermes::made(root, workspace) {
+        match hermes::locked_pid(workspace) {
+            Some(pid) => hermes::liveness(pid, workspace) == Liveness::Gone,
+            None => signals.lock.is_none(),
+        }
+    } else {
+        false
+    };
+    lock_gone && !recorded_runs
+}
+
 /// The exact identity of the process a session lock names, if it runs.
 fn running(workspace: &Path, pid: u32, start: Option<&str>) -> Option<ProcessIdentity> {
     if lock_liveness(workspace, pid, start) != Liveness::Running {

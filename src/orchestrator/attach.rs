@@ -41,6 +41,7 @@ use crate::{
         world,
     },
     db::Database,
+    executor::CancellationToken,
     lock::OperationLock,
     process, source,
     state::{State, write_atomically, write_text},
@@ -75,9 +76,13 @@ pub struct RuntimeStart {
     pub session: RuntimeSession,
     pub resumed: bool,
     /// The commit `source::world_commit` made of the workspace, or the merge
-    /// base when `discovered`.
+    /// base when `discovered`, or the S0 of the Work it `reopens`.
     pub commit: String,
     pub discovered: bool,
+    /// The Work of this workspace, unreviewed or being finished, that the
+    /// session goes on from (`reopenable`): the new Work takes its S0 and
+    /// attribution.
+    pub reopens: Option<String>,
 }
 
 /// The `source_fingerprint` of attached Work outside strict mode: not a
@@ -221,7 +226,10 @@ pub(crate) fn prepare(state: &State, request: AttachRequest) -> Result<Prepared>
         "finish runs your checks.verify on the host; pass --allow-unsafe-local"
     );
 
-    if !managed && let Some(existing_id) = find_active_attachment(state, &workspace)? {
+    if !managed
+        && let Some(existing_id) = find_active_attachment(state, &workspace)?
+        && runtime.and_then(|runtime| runtime.reopens.as_ref()) != Some(&existing_id)
+    {
         bail!("workspace already attached as {existing_id}");
     }
 
@@ -294,7 +302,15 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         let snapshot = source::materialize_baseline_from_commit(workspace, &runtime.commit, &dir)
             .map_err(|error| error.context("could not record S0"))?;
         let commit = runtime.commit.clone();
-        let (provenance, confidence) = if runtime.discovered {
+        let (provenance, confidence) = if let Some(old) = &runtime.reopens {
+            // It goes on from the Work it reopens: the same S0, attributed
+            // as that Work's was.
+            let old = state
+                .load_run(old)?
+                .attachment
+                .context("not attached Work")?;
+            (old.provenance, old.confidence)
+        } else if runtime.discovered {
             // The worktree appeared after watching began: every change in it
             // is its runtime's.
             (
@@ -531,6 +547,10 @@ pub(crate) struct Registered {
     /// `hook`, `owner`, or `discovery` when the owner found the session
     /// without a hook; then `started_at` is the session's start.
     pub via: &'static str,
+    /// The Work it reopens (`RuntimeStart::reopens`).
+    pub reopens: Option<String>,
+    /// The Work it would have reopened, and why it could not.
+    pub not_reopened: Option<(String, String)>,
 }
 
 /// Publish run `run_id` from its registration directory: record it in the
@@ -582,6 +602,37 @@ pub(crate) fn publish(
                 event_type: "attach.created".into(),
                 timestamp: Utc::now(),
                 payload,
+                ..EventRecord::default()
+            },
+        )?;
+    }
+    if let Some(old) = registered.as_ref().and_then(|r| r.reopens.as_ref())
+        && !has(REOPENED)
+    {
+        let provenance = run.attachment.as_ref().map(|a| a.provenance.clone());
+        db.commit_transition(
+            &mut run,
+            EventRecord {
+                run_id: run_id.to_owned(),
+                candidate_label: None,
+                event_type: REOPENED.into(),
+                timestamp: Utc::now(),
+                payload: serde_json::json!({"reopens": old, "provenance": provenance}),
+                ..EventRecord::default()
+            },
+        )?;
+    }
+    if let Some((old, reason)) = registered.as_ref().and_then(|r| r.not_reopened.as_ref())
+        && !has(NOT_REOPENED)
+    {
+        db.commit_transition(
+            &mut run,
+            EventRecord {
+                run_id: run_id.to_owned(),
+                candidate_label: None,
+                event_type: NOT_REOPENED.into(),
+                timestamp: Utc::now(),
+                payload: serde_json::json!({"reopens": old, "reason": reason}),
                 ..EventRecord::default()
             },
         )?;
@@ -1017,6 +1068,7 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
         run,
         allow_unsafe_local,
         FinishReason::ProcessExit { code },
+        &CancellationToken::new(),
     )
     .await?;
     let run_id = run.id.clone();
@@ -1305,13 +1357,25 @@ pub(crate) fn find_session_attachment(
 
 /// The newest unfinished attached Work `matches`, among the published runs
 /// whose attachment records `path` as its `field` (a path that never
-/// changes): one query, then only those runs are loaded.
+/// changes).
 fn find_active(
     state: &State,
     field: &str,
     path: &Path,
     matches: impl Fn(&AttachmentRecord) -> bool,
 ) -> Result<Option<String>> {
+    Ok(find_latest(state, field, path, |run| is_active(run, &matches))?.map(|run| run.id))
+}
+
+/// The newest published attached run that `matches`, among those whose
+/// attachment records `path` as its `field`: one query, then only those runs
+/// are loaded.
+fn find_latest(
+    state: &State,
+    field: &str,
+    path: &Path,
+    matches: impl Fn(&RunRecord) -> bool,
+) -> Result<Option<RunRecord>> {
     if !state.db_path().is_file() {
         return Ok(None);
     }
@@ -1333,8 +1397,8 @@ fn find_active(
             continue; // not published yet
         }
         let run = state.load_run(&id)?;
-        if is_active(&run, &matches) {
-            return Ok(Some(run.id));
+        if matches(&run) {
+            return Ok(Some(run));
         }
     }
     Ok(None)
@@ -1366,10 +1430,10 @@ pub(crate) async fn finish_quietly(
     let resolved_run_id = state.resolve_run_id(run_id)?;
     // A moment's wait: the project owner holds this lock briefly while it
     // checks the Work. A live wrapper holds it for the whole session.
-    let _run_lock = OperationLock::acquire_wait(
-        &state.run_dir(&resolved_run_id).join(".operation.lock"),
+    let _run_lock = typed_run_lock(
+        state,
+        &resolved_run_id,
         "attached work has a foreground owner",
-        Duration::from_secs(5),
     )?;
     let run = state.load_run(&resolved_run_id)?;
     anyhow::ensure!(
@@ -1410,6 +1474,7 @@ pub(crate) async fn finish_quietly(
         run,
         allow_unsafe_local,
         FinishReason::Explicit,
+        &CancellationToken::new(),
     )
     .await?;
 
@@ -1423,13 +1488,15 @@ pub(crate) async fn finish_quietly(
 /// `reason`, and commit `attach.finished` + `run.finished`. The caller holds
 /// the run's operation lock and has already checked that the run is an
 /// active, single-candidate attachment; this prints nothing, so each caller
-/// presents the result in its own words.
+/// presents the result in its own words. Once `cancel` is cancelled, the
+/// checks are stopped and nothing is recorded: the Work stays as it was.
 pub(super) async fn finish_locked(
     state: &State,
     db: &mut Database,
     mut run: RunRecord,
     allow_unsafe_local: bool,
     reason: FinishReason,
+    cancel: &CancellationToken,
 ) -> Result<RunRecord> {
     let run_dir = state.run_dir(&run.id);
     let workspace = run.candidates[0].workspace_path.clone();
@@ -1498,7 +1565,7 @@ pub(super) async fn finish_locked(
             run.environment.unsafe_local || allow_unsafe_local,
             "finish runs your checks.verify on the host; pass --allow-unsafe-local"
         );
-        run.candidates[0].checks = finish_checks(state, &run, &workspace, &config).await?;
+        run.candidates[0].checks = finish_checks(state, &run, &workspace, &config, cancel).await?;
     }
 
     run.candidates[0].status = CandidateStatus::Completed;
@@ -1561,6 +1628,7 @@ async fn finish_checks(
     run: &RunRecord,
     workspace: &Path,
     config: &Config,
+    cancel: &CancellationToken,
 ) -> Result<Vec<crate::CheckResult>> {
     use crate::coherence::{integration, memo};
     let run_dir = state.run_dir(&run.id);
@@ -1591,27 +1659,31 @@ async fn finish_checks(
     };
     if !one_tree {
         let logs = integration::new_logs(&run_dir);
-        let (kind, payload) =
-            match integration::run_or_reuse(run, patch, config, &run_dir, &logs, None).await {
-                Ok(ran) if ran.passed() => {
-                    let (kind, payload) = ran.event("finish", &digest);
-                    super::record_observation(state, run, kind, payload)?;
-                    return Ok(match &ran.reused {
-                        Some(entry) => reused_results(verify, &entry.logs),
-                        None => ran.results,
-                    });
-                }
-                Ok(ran) => ran.event("finish", &digest),
-                Err(error) => (
-                    "coherence.merged_checks",
-                    serde_json::json!({
-                        "by": "finish",
-                        "delta_digest": digest,
-                        "error": format!("{error:#}"),
-                        "logs": logs,
-                    }),
-                ),
-            };
+        // Dropped when cancelled, which kills the checks' process group.
+        let merged = tokio::select! {
+            merged = integration::run_or_reuse(run, patch, config, &run_dir, &logs, None) => merged,
+            _ = cancel.cancelled() => bail!(CANCELLED),
+        };
+        let (kind, payload) = match merged {
+            Ok(ran) if ran.passed() => {
+                let (kind, payload) = ran.event("finish", &digest);
+                super::record_observation(state, run, kind, payload)?;
+                return Ok(match &ran.reused {
+                    Some(entry) => reused_results(verify, &entry.logs),
+                    None => ran.results,
+                });
+            }
+            Ok(ran) => ran.event("finish", &digest),
+            Err(error) => (
+                "coherence.merged_checks",
+                serde_json::json!({
+                    "by": "finish",
+                    "delta_digest": digest,
+                    "error": format!("{error:#}"),
+                    "logs": logs,
+                }),
+            ),
+        };
         super::record_observation(state, run, kind, payload)?;
     }
     if let Some(entry) = in_place
@@ -1625,14 +1697,16 @@ async fn finish_checks(
         return Ok(reused_results(verify, &entry.logs));
     }
     let logs = run_dir.join("checks/verify");
-    let results = crate::executor::run_checks_with_config(
+    let results = crate::executor::run_checks_with_config_and_cancel(
         workspace,
         verify,
         CheckPhase::Verify,
         &logs,
         execution.clone(),
+        cancel.clone(),
     )
     .await;
+    anyhow::ensure!(!cancel.is_cancelled(), CANCELLED);
     let passed = results
         .iter()
         .all(|result| result.status == crate::CheckStatus::Passed);
@@ -1780,32 +1854,37 @@ pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u6
     Ok(files_changed)
 }
 
-/// Finish Work whose workspace was removed with its exact changes kept, when
-/// the person consented to the project's checks running by themselves: the
-/// checks run as `finish_checks` runs them, S0 + Δ in a workspace rebuilt
-/// from S0 and those changes, and the Work
-/// becomes an ordinary result awaiting review. Only when the consent still
-/// holds for exactly the commands this Work would run. Returns whether it
-/// finished; a run another process holds is left for the next try.
-pub(super) async fn finish_by_consent(state: &State, run_id: &str) -> Result<bool> {
-    let Ok(_lock) = OperationLock::acquire(
-        &state.run_dir(run_id).join(".operation.lock"),
-        "attached work has a foreground owner",
-    ) else {
+/// Why a finish stopped without recording anything: its session came back.
+const CANCELLED: &str = "the finish was cancelled";
+
+/// Recorded on Work that reopened another, which it supersedes.
+pub(crate) const REOPENED: &str = "work.reopened";
+
+/// Recorded on Work that started on its own because the Work its session
+/// would have gone on from could not be reopened, with the reason.
+pub(crate) const NOT_REOPENED: &str = "work.not_reopened";
+
+/// Whether the person's consent finishes `run` now, judged from its record
+/// and its workspace without its lock: active attached Work, registered
+/// with the project's consent, whose workspace was removed with its exact
+/// changes kept or whose session is over (`session_over`), while that
+/// consent holds for exactly the checks it would run. Nothing is applied.
+pub(crate) fn finishes_by_consent(state: &State, run: &RunRecord) -> Result<bool> {
+    let Some(attachment) = run.attachment.as_ref() else {
         return Ok(false);
     };
-    let run = state.load_run(run_id)?;
-    let removed_exactly = run
-        .attachment
-        .as_ref()
-        .and_then(|attachment| attachment.workspace_removed.as_ref())
-        .is_some_and(|removal| removal.exact);
     if run.mode != RunMode::Attached
         || run.outcome.lifecycle != LifecycleState::Working
-        || !removed_exactly
         || !run.environment.unsafe_local
         || run.candidates.len() != 1
     {
+        return Ok(false);
+    }
+    let over = match &attachment.workspace_removed {
+        Some(removal) => removal.exact,
+        None => session_over(run),
+    };
+    if !over {
         return Ok(false);
     }
     let project = crate::consent::project_root(&run.source_path)?;
@@ -1813,15 +1892,237 @@ pub(super) async fn finish_by_consent(state: &State, run_id: &str) -> Result<boo
     else {
         return Ok(false);
     };
-    let runs = crate::coherence::run_config(&state.run_dir(run_id))
+    let checks = crate::coherence::run_config(&state.run_dir(&run.id))
         .map(|config| config.checks.verify)
         .unwrap_or_default();
-    if runs != consented {
+    Ok(checks == consented)
+}
+
+/// Whether the session of Work that Claude Code or Hermes registered, by
+/// hook or by discovery, is over: every session it recorded has its end
+/// recorded, by hook or by liveness, and the process is gone by the
+/// worktree's lock (`liveness::session_process_gone`). `/clear` and `/resume`
+/// keep the process, so they never end it. Codex and Cursor report no end.
+fn session_over(run: &RunRecord) -> bool {
+    let Some(attachment) = run.attachment.as_ref() else {
+        return false;
+    };
+    registered_by_runtime(attachment)
+        && matches!(attachment.agent.as_deref(), Some("claude" | "hermes"))
+        && !attachment.sessions.is_empty()
+        && attachment
+            .sessions
+            .iter()
+            .all(|session| session.ended_at.is_some())
+        && super::liveness::session_process_gone(&run.source_path, run)
+}
+
+fn registered_by_runtime(attachment: &AttachmentRecord) -> bool {
+    matches!(
+        attachment.provenance,
+        BaselineProvenance::WorkspaceAtStart { .. } | BaselineProvenance::Discovered { .. }
+    )
+}
+
+/// Finish `run_id` by the person's consent (`finishes_by_consent`, judged
+/// again under the run's lock) as `finish` does, and it becomes a result
+/// awaiting review. The project owner runs it as a task of its own, and
+/// `cancel` stops its checks and leaves the Work as it was. Returns whether
+/// it finished; a run another process holds is left for the next try.
+pub(super) async fn finish_by_consent(
+    state: &State,
+    run_id: &str,
+    cancel: CancellationToken,
+) -> Result<bool> {
+    let Ok(_lock) = OperationLock::acquire(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+    ) else {
+        return Ok(false);
+    };
+    let run = state.load_run(run_id)?;
+    if cancel.is_cancelled() || !finishes_by_consent(state, &run)? {
         return Ok(false);
     }
+    let finishing = state.run_dir(run_id).join(FINISHING);
+    fs::write(&finishing, std::process::id().to_string())?;
     let mut db = Database::open(state.db_path())?;
-    finish_locked(state, &mut db, run, false, FinishReason::ByConsent).await?;
+    let finished =
+        finish_locked(state, &mut db, run, false, FinishReason::ByConsent, &cancel).await;
+    let _ = fs::remove_file(&finishing);
+    finished?;
     Ok(true)
+}
+
+/// Written by the project owner, with its pid, while its finish by consent
+/// holds the run's lock.
+const FINISHING: &str = "finishing-by-consent";
+
+/// The run's lock for a typed command, after a moment's wait. When the
+/// project owner's finish by consent holds it (`FINISHING`, by a process
+/// that still runs), the error says so.
+fn typed_run_lock(state: &State, run_id: &str, busy: &str) -> Result<OperationLock> {
+    let run_dir = state.run_dir(run_id);
+    OperationLock::acquire_wait(
+        &run_dir.join(".operation.lock"),
+        busy,
+        Duration::from_secs(5),
+    )
+    .map_err(|error| {
+        let owner = fs::read_to_string(run_dir.join(FINISHING))
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok());
+        match owner {
+            Some(pid) if crate::process::pid_exists(pid) => anyhow::anyhow!(
+                "Work {run_id} is being finished by its project's owner, as you allowed \
+                 (checks running); wait for it, or close it once it is ready"
+            ),
+            _ => error,
+        }
+    })
+}
+
+/// The Work of `workspace` that a session of `provider` starting there goes
+/// on from, rather than starting Work over the changes in it: the latest
+/// Work of that runtime there, registered by hook or discovery, whose
+/// workspace was never removed, and that is a result awaiting review or is
+/// being finished now: its sessions ended, the agent Dispatch recorded no
+/// longer runs, and its lock is held. `/clear` ends a session in a process
+/// that still runs, so it carries on with the same Work.
+pub(crate) fn reopenable(
+    state: &State,
+    workspace: &Path,
+    provider: &str,
+) -> Result<Option<RunRecord>> {
+    let latest = find_latest(state, "workspace", workspace, |run| {
+        run.attachment.as_ref().is_some_and(|attachment| {
+            attachment.workspace == workspace && attachment.agent.as_deref() == Some(provider)
+        })
+    })?;
+    let Some(run) = latest else {
+        return Ok(None);
+    };
+    let Some(attachment) = run.attachment.as_ref() else {
+        return Ok(None);
+    };
+    if !registered_by_runtime(attachment) || attachment.workspace_removed.is_some() {
+        return Ok(None);
+    }
+    let unreviewed = awaits_review(&run) && run.outcome.closed.is_none();
+    let finishing = run.outcome.lifecycle == LifecycleState::Working
+        && !attachment.sessions.is_empty()
+        && attachment.sessions.iter().all(|s| s.ended_at.is_some())
+        && attachment.agent_process.as_ref().is_none_or(|agent| {
+            process::identity_state(agent) != process::IdentityState::ExactLive
+        })
+        && OperationLock::is_held(&state.run_dir(&run.id).join(".operation.lock"))?;
+    Ok((unreviewed || finishing).then_some(run))
+}
+
+/// Where notes of Work to close as superseded by Work that reopened it are
+/// kept, one file per old Work holding the new Work's ID.
+fn reopen_notes(state: &State) -> PathBuf {
+    state.root.join("reopen")
+}
+
+/// Before Work that reopens `old` is published: note durably that `old` is
+/// to close as superseded by `new`. The note stays until it has.
+pub(crate) fn note_reopen(state: &State, old: &str, new: &str) -> Result<()> {
+    crate::state::write_durably(&reopen_notes(state).join(old), new.as_bytes())
+}
+
+/// The reopen notes of Work in the project at `root` whose new Work is
+/// published, as (old, new). A note whose new Work will never be published
+/// is removed.
+pub(crate) fn reopen_noted(state: &State, root: &Path) -> Result<Vec<(String, String)>> {
+    let Ok(listing) = fs::read_dir(reopen_notes(state)) else {
+        return Ok(Vec::new());
+    };
+    let mut noted = Vec::new();
+    for entry in listing {
+        let entry = entry?;
+        let old = entry.file_name().to_string_lossy().into_owned();
+        let new = fs::read_to_string(entry.path())?.trim().to_owned();
+        if new.is_empty() {
+            continue;
+        }
+        if !state.metadata_path(&new).is_file() {
+            if !registration::directory(state, &new).exists() && !state.run_dir(&new).exists() {
+                let _ = fs::remove_file(entry.path());
+            }
+            continue;
+        }
+        if state
+            .load_run(&old)
+            .is_ok_and(|run| run.source_path == root)
+        {
+            noted.push((old, new));
+        }
+    }
+    Ok(noted)
+}
+
+/// Close `old` as superseded by `new`, the Work that reopened it from the
+/// same S0, as `dispatch close --reason superseded` closes it: Work still
+/// active is frozen first from its workspace, a result keeps its Δ, and no
+/// review is recorded. Then the note goes. Returns `false` while another
+/// process holds `old`; `true` once it is closed, or nothing is left to
+/// close.
+pub(crate) fn supersede_reopened(state: &State, old: &str, new: &str) -> Result<bool> {
+    let Ok(_lock) = OperationLock::acquire(
+        &state.run_dir(old).join(".operation.lock"),
+        "attached work has a foreground owner",
+    ) else {
+        return Ok(false);
+    };
+    let mut run = state.load_run(old)?;
+    let active = run.outcome.lifecycle == LifecycleState::Working && run.candidates.len() == 1;
+    if run.outcome.closed.is_none() && (active || awaits_review(&run)) {
+        let now = Utc::now();
+        if active {
+            if !workspace_gone(&run) {
+                let candidate = run.candidates[0].clone();
+                run.candidates[0].diff_stats = source::collect_diff(
+                    &run.baseline_path,
+                    &candidate.workspace_path,
+                    &candidate.diff_path,
+                )?;
+            }
+            cancel_work(&mut run, now, CloseReason::Superseded.as_str());
+        } else {
+            run.outcome.review = ReviewState::NotRequested;
+            run.outcome.phase = RunPhase::Finished;
+        }
+        run.outcome.closed = Some(Closure {
+            reason: CloseReason::Superseded,
+            at: now,
+            replacement: Some(new.to_owned()),
+            explanation: None,
+        });
+        let mut db = Database::open(state.db_path())?;
+        db.sync_run(&run)?;
+        persist_event(
+            state,
+            &db,
+            EventRecord {
+                run_id: old.to_owned(),
+                candidate_label: None,
+                event_type: "work.closed".into(),
+                timestamp: now,
+                payload: serde_json::json!({
+                    "reason": CloseReason::Superseded,
+                    "by": "reopen",
+                    "replacement": new,
+                }),
+                ..EventRecord::default()
+            },
+            &mut run,
+        )?;
+    }
+    match fs::remove_file(reopen_notes(state).join(old)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(true),
+    }
 }
 
 /// The project owner found the workspace of active Work gone without being
@@ -1982,11 +2283,7 @@ pub fn close(state: &State, request: CloseRequest) -> Result<String> {
         Some(other) => Some(state.resolve_run_id(other)?),
         None => None,
     };
-    let _lock = OperationLock::acquire_wait(
-        &state.run_dir(&id).join(".operation.lock"),
-        "Work is held by its Dispatch owner",
-        Duration::from_secs(5),
-    )?;
+    let _lock = typed_run_lock(state, &id, "Work is held by its Dispatch owner")?;
     let mut run = state.load_run(&id)?;
     let reasons = close_reasons(&run)?;
     anyhow::ensure!(
@@ -2264,7 +2561,11 @@ mod last_seen_tests {
             value["attachment"]["workspace_removed"]["last_seen_at"],
             "2023-11-14T22:13:20Z"
         );
-        assert!(!finish_by_consent(&state, &run.id).await.unwrap());
+        assert!(
+            !finish_by_consent(&state, &run.id, CancellationToken::new())
+                .await
+                .unwrap()
+        );
         assert_eq!(
             state.load_run(&run.id).unwrap().outcome.lifecycle,
             LifecycleState::Working

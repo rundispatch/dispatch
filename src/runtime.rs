@@ -299,6 +299,8 @@ fn start(
         resumed,
         consented: false,
         started_at: began.1,
+        reopens: None,
+        not_reopened: None,
     };
     // The full id: sessions started together share their first characters.
     Ok(
