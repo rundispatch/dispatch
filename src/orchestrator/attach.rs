@@ -1050,6 +1050,7 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
         workspace: workspace.clone(),
         delta_patch: run_dir.join("delta-live.patch"),
         poll: Duration::from_secs(poll_secs),
+        stopping: Vec::new(),
     });
 
     let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
@@ -1181,27 +1182,34 @@ fn print_auto_apply_outcome(run: &RunRecord, outcome: &ApplyOutcome) {
 /// 6.9's reattach rule).
 /// Record another runtime session on active Work: a resume, a clear, a
 /// compaction or a fork into the same workspace. The same session reported
-/// twice is recorded once.
+/// twice is recorded once. Waits up to `wait` for the run's lock, which a
+/// tick holds to record, and a typed command for as long as it runs: a
+/// `finish` through its checks. `false`: the Work finished meanwhile, and a
+/// session never joins finished Work.
 pub(crate) fn record_session_start(
     state: &State,
     run_id: &str,
     session: RuntimeSession,
-) -> Result<()> {
+    wait: Duration,
+) -> Result<bool> {
     let _lock = OperationLock::acquire_wait(
         &state.run_dir(run_id).join(".operation.lock"),
         "attached work has a foreground owner",
-        Duration::from_secs(5),
+        wait,
     )?;
     let mut run = state.load_run(run_id)?;
+    if run.outcome.lifecycle == LifecycleState::Finished {
+        return Ok(false);
+    }
     let Some(attachment) = run.attachment.as_mut() else {
-        return Ok(());
+        return Ok(true);
     };
     if attachment.sessions.iter().any(|known| {
         known.provider == session.provider
             && known.session_id == session.session_id
             && known.ended_at.is_none()
     }) {
-        return Ok(());
+        return Ok(true);
     }
     attachment.sessions.push(session.clone());
     // A long-lived workspace sees many sessions; the Work keeps the latest.
@@ -1221,7 +1229,8 @@ pub(crate) fn record_session_start(
             ..EventRecord::default()
         },
         &mut run,
-    )
+    )?;
+    Ok(true)
 }
 
 /// Record that a runtime session ended. Nothing else changes: an ended

@@ -112,11 +112,13 @@ impl Project {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
-    /// Who authorized the Work's host commands, event by event.
+    /// Who authorized the Work's host commands, event by event, from the
+    /// lines written in full: the owner may be appending one as this reads.
     fn authorized(&self, id: &str) -> Vec<String> {
         fs::read_to_string(self.state.run_dir(id).join("events.jsonl"))
             .unwrap()
-            .lines()
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .filter(|event| event["event_type"] == "attach.authorized")
             .map(|event| event["payload"]["by"].as_str().unwrap().to_owned())

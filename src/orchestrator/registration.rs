@@ -315,10 +315,11 @@ pub(crate) fn register(
         *DEADLINE.lock().unwrap() = Some(sender.clone());
     }
     let worker_state = state.clone();
-    std::thread::spawn(move || {
-        let _ = sender.send(work(&worker_state, registration));
-    });
     let budget = budget();
+    let deadline = began + budget;
+    std::thread::spawn(move || {
+        let _ = sender.send(work(&worker_state, registration, deadline));
+    });
     let wait = budget.saturating_sub(began.elapsed());
     // Under `<boundary>:deadline`, only the worker's boundary is the deadline.
     #[cfg(debug_assertions)]
@@ -343,7 +344,8 @@ pub(crate) fn register(
 }
 
 /// The worker: S0, `registration.json`, the run, the decision, publishing.
-fn work(state: &State, mut registration: Registration) -> Result<Started> {
+/// Joining existing Work waits for its lock until `deadline`, the hook's.
+fn work(state: &State, mut registration: Registration, deadline: Instant) -> Result<Started> {
     let workspace = registration.workspace.clone();
     let _lock = OperationLock::acquire_wait(
         &workspace_lock(state, &workspace),
@@ -355,13 +357,18 @@ fn work(state: &State, mut registration: Registration) -> Result<Started> {
     // A session that starts again over a result nobody reviewed goes on from
     // that result's S0, so the new Work's Δ holds both; the workspace, never
     // the session ID, says which Work it is.
-    let (reopens, not_reopened) = go_on_from(
-        &workspace,
-        attach::reopenable(state, &workspace, &registration.session.provider)?,
-    );
-    if reopens.is_none()
-        && let Some(run_id) = attach::find_active_attachment(state, &workspace)?
-    {
+    let (reopens, not_reopened) = loop {
+        let (reopens, not_reopened) = go_on_from(
+            &workspace,
+            attach::reopenable(state, &workspace, &registration.session.provider)?,
+        );
+        let active = match reopens {
+            None => attach::find_active_attachment(state, &workspace)?,
+            Some(_) => None,
+        };
+        let Some(run_id) = active else {
+            break (reopens, not_reopened);
+        };
         // Discovery may have registered it a moment ago, or reopened Work
         // when a resumed session locked the worktree before this hook: this
         // session hears of its Work here, whichever came first.
@@ -372,9 +379,12 @@ fn work(state: &State, mut registration: Registration) -> Result<Started> {
                 let sessions = &attachment.sessions;
                 !sessions.is_empty() && sessions.iter().all(|s| s.source == "discovered")
             });
-        attach::record_session_start(state, &run_id, registration.session)?;
-        return Ok(Started::Existing(unannounced.then_some(run_id)));
-    }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if attach::record_session_start(state, &run_id, registration.session.clone(), wait)? {
+            return Ok(Started::Existing(unannounced.then_some(run_id)));
+        }
+        // Finished while this waited: a result to go on from, now.
+    };
     // Authority to run the project's checks comes only from the person's
     // consent for exactly these checks, never from the session.
     registration.consented = crate::consent::consent(state, &registration.root)?.is_valid();

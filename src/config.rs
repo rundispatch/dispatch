@@ -61,6 +61,17 @@ impl CoherenceConfig {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The mid-run verdicts that stop an attempt: none unless `mid_run` is
+    /// `stop`, and a refresh only with `stop_on_refresh`.
+    pub fn stopping(&self) -> Vec<crate::Decision> {
+        use crate::Decision;
+        match self.mid_run {
+            MidRunMode::Observe => Vec::new(),
+            MidRunMode::Stop if self.stop_on_refresh => vec![Decision::Stop, Decision::Refresh],
+            MidRunMode::Stop => vec![Decision::Stop],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

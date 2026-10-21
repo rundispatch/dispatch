@@ -2019,7 +2019,7 @@ pub(crate) fn review_target(
     state: &State,
     command: &ReviewCommand,
 ) -> Result<(RunRecord, OperationLock)> {
-    let (run, lock) = locked_delivery(state, command, true)?;
+    let (run, lock) = locked_delivery(state, command, true, true)?;
     anyhow::ensure!(
         run.outcome.review == ReviewState::Pending,
         "result has already been reviewed"
@@ -2031,25 +2031,40 @@ pub(crate) fn review_target(
 /// A review judges a delivered result: attached work that is still active has
 /// no patch yet (`dispatch finish` produces it), and a native run waiting on a
 /// question is answered, not reviewed.
-/// The run's delivered result, under its lock. A person's command waits a
-/// moment for the lock, which the project owner holds briefly while it checks
-/// the Work. `exact_revision` is for a review of the result as it was shown:
-/// the command line names a run, not a revision, and a verdict the owner
-/// records meanwhile is not a change to the result.
+/// The run's delivered result, under its lock. A person's command waits for
+/// the lock: what holds a delivered result is the project owner recording a
+/// verdict, another review, or an auto-apply running the merged checks, each
+/// bounded by the run's timeout; anything else is refused, after a moment.
+/// `exact_revision` is for a review of the result as it was shown: the
+/// command line names a run, not a revision, and a verdict the owner records
+/// meanwhile is not a change to the result. Unless `quiet`, a wait is said.
 fn locked_delivery(
     state: &State,
     command: &ReviewCommand,
     exact_revision: bool,
+    quiet: bool,
 ) -> Result<(RunRecord, OperationLock)> {
     let id = state.resolve_run_id(&command.run_id)?;
     anyhow::ensure!(
         id == command.run_id,
         "review requires the complete run identity"
     );
+    let wait = state
+        .load_run(&id)
+        .ok()
+        .filter(|run| {
+            run.outcome.lifecycle == LifecycleState::Finished
+                && run.outcome.work_result == WorkResult::Ready
+        })
+        .map_or(5, |run| run.environment.timeout_secs);
+    let path = state.run_dir(&id).join(".operation.lock");
+    if !quiet && OperationLock::is_held(&path)? {
+        eprintln!("Waiting for Work {id}: another process is using it.");
+    }
     let lock = OperationLock::acquire_wait(
-        &state.run_dir(&id).join(".operation.lock"),
+        &path,
         "run has a foreground owner",
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(wait),
     )?;
     let run = state.load_run(&id)?;
     anyhow::ensure!(
@@ -2227,7 +2242,7 @@ pub(crate) fn decide(
     // One lock covers the review and the apply. A result may be reviewed
     // again (the latest revision stands), so this does not require a
     // pending review the way the interactive delivery does.
-    let (run, _lock) = locked_delivery(state, &command, false)?;
+    let (run, _lock) = locked_delivery(state, &command, false, quiet)?;
     if !quiet && let Some(label) = last_seen_changes(&run) {
         println!("{label}");
     }

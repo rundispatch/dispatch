@@ -206,10 +206,13 @@ impl Project {
         self.run(id)["attachment"]["needs_you"].clone()
     }
 
+    /// The events of `kind` written in full: the owner may be appending one
+    /// as this reads, and a line is whole once its newline is.
     fn events(&self, id: &str, kind: &str) -> Vec<Value> {
         fs::read_to_string(self.state.join("runs").join(id).join("events.jsonl"))
             .unwrap()
-            .lines()
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .filter(|event| event["event_type"] == kind)
             .collect()
@@ -344,6 +347,17 @@ impl Watch {
             }
         }
     }
+
+    /// The next Work line for `id` whose mark is not `mark`: a line for
+    /// another change, the owner's first verdict say, may come first.
+    fn next_mark(&self, id: &str, mark: &Value) -> Value {
+        loop {
+            let line = self.next_work(id);
+            if line["needs_you"] != *mark {
+                return line;
+            }
+        }
+    }
 }
 
 impl Drop for Watch {
@@ -362,7 +376,7 @@ fn watch_json_emits_a_work_line_when_the_mark_changes_and_when_it_clears() {
     assert_eq!(watch.next_work(&id)["needs_you"], Value::Null);
 
     p.notification("permission_prompt", "Claude needs your permission");
-    let line = watch.next_work(&id);
+    let line = watch.next_mark(&id, &Value::Null);
     let needs_you = &line["needs_you"];
     assert_eq!(needs_you["kind"], "permission", "{line}");
     assert_eq!(needs_you["message"], "Claude needs your permission");
@@ -370,10 +384,14 @@ fn watch_json_emits_a_work_line_when_the_mark_changes_and_when_it_clears() {
     assert_eq!(line["state"], "working");
 
     p.stop();
-    assert_eq!(watch.next_work(&id)["needs_you"]["kind"], "turn_ended");
+    let line = watch.next_mark(&id, needs_you);
+    assert_eq!(line["needs_you"]["kind"], "turn_ended", "{line}");
 
     written_at(&p.transcript, SystemTime::now() + Duration::from_secs(3600));
-    assert_eq!(watch.next_work(&id)["needs_you"], Value::Null);
+    assert_eq!(
+        watch.next_mark(&id, &line["needs_you"])["needs_you"],
+        Value::Null
+    );
     assert_eq!(p.cleared(&id), "transcript");
 }
 

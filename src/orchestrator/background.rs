@@ -323,8 +323,12 @@ async fn start_inner(
     let root = source::resolve_source(root.as_deref())?;
     // A broken configuration fails here, before anything is spawned.
     let (config, _) = Config::discover(&root, None)?;
-    if let Watcher::Watched(_) = watcher(state, &root)? {
-        ensure_current(state, &root)?;
+    if let Watcher::Watched(record) = watcher(state, &root)? {
+        // Only an owner of another version is replaced here: one that
+        // stopped meanwhile is started below, as any stopped owner is.
+        if let Some(record) = record {
+            replace_older(state, &root, &record)?;
+        }
         if let Watcher::Watched(_) = watcher(state, &root)?
             && wait_for_existing_discovery(state, &root)?
         {
@@ -554,31 +558,39 @@ pub fn ensure_current(state: &State, root: &Path) -> Result<()> {
                 eprintln!("Watching {} again: its owner had stopped.", root.display());
             }
         }
-        Watcher::Watched(Some(record))
-            if record.background
-                && record.dispatch_version != VERSION
-                && replaceable(&record)
-                && is_exact(&record) =>
-        {
-            // The owner there keeps watching until this one can.
-            if let Err(error) = Config::discover(root, None) {
-                eprintln!(
-                    "Could not restart watching {} with Dispatch {VERSION}: {error:#}",
-                    root.display()
-                );
-                return Ok(());
-            }
-            terminate(state, root, &record)?;
-            let log = open_log(state, root, false)?;
-            if let Ready::Started = spawn_owner(state, root, 0, log, record.environment.as_ref())? {
-                eprintln!(
-                    "Restarted watching {} with Dispatch {VERSION} (was {}).",
-                    root.display(),
-                    record.dispatch_version
-                );
-            }
-        }
-        Watcher::Watched(_) => {}
+        Watcher::Watched(Some(record)) => replace_older(state, root, &record)?,
+        Watcher::Watched(None) => {}
+    }
+    Ok(())
+}
+
+/// `ensure_current`'s second case: the background owner `record` names runs
+/// another Dispatch that `replaceable` allows replacing.
+#[cfg(unix)]
+fn replace_older(state: &State, root: &Path, record: &WatcherRecord) -> Result<()> {
+    if !(record.background
+        && record.dispatch_version != VERSION
+        && replaceable(record)
+        && is_exact(record))
+    {
+        return Ok(());
+    }
+    // The owner there keeps watching until this one can.
+    if let Err(error) = Config::discover(root, None) {
+        eprintln!(
+            "Could not restart watching {} with Dispatch {VERSION}: {error:#}",
+            root.display()
+        );
+        return Ok(());
+    }
+    terminate(state, root, record)?;
+    let log = open_log(state, root, false)?;
+    if let Ready::Started = spawn_owner(state, root, 0, log, record.environment.as_ref())? {
+        eprintln!(
+            "Restarted watching {} with Dispatch {VERSION} (was {}).",
+            root.display(),
+            record.dispatch_version
+        );
     }
     Ok(())
 }

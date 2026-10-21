@@ -641,6 +641,48 @@ fn a_session_that_starts_again_after_a_finish_goes_on_from_the_old_s0() {
     assert_eq!(changed, ["notes.txt", "src/lib.rs"]);
 }
 
+/// A session that starts while a person's `dispatch finish` runs the checks
+/// waits for that finish, which holds the Work, then goes on from its result
+/// as a session starting just after it would. The check takes longer than a
+/// tick holds the Work.
+#[test]
+fn a_session_that_starts_during_a_typed_finish_goes_on_from_its_result() {
+    let p = Project::new("echo $$ > $MARKS/started; sleep 6; echo ran >> $MARKS/ran");
+    p.consent();
+    let agent = Agent::start();
+    let worktree = p.worktree("x", &agent);
+    p.watch();
+    let old = registered(&p, &worktree, &agent);
+    p.edit(&worktree, 2);
+    let finish = Command::new(assert_cmd::cargo_bin!("dispatch"))
+        .arg("--state-dir")
+        .arg(&p.state)
+        .args(["finish", &old])
+        .current_dir(&p.root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("the finish's check started", || {
+        p.marks.join("started").is_file()
+    });
+
+    // `/clear`: the same process, a new session.
+    let reply = p.session_start(&worktree, "after-clear", "clear");
+    let finish = finish.wait_with_output().unwrap();
+    assert!(finish.status.success(), "{}", text(&finish));
+    let new = other_than(&p, &old);
+    assert!(
+        reply.contains(&format!("tracking this worktree as Work {new}")),
+        "{reply}"
+    );
+    assert_reopened(&p, &old, &new);
+    let sessions = p.run(&new)["attachment"]["sessions"].clone();
+    assert_eq!(sessions[0]["session_id"], "after-clear", "{sessions}");
+    assert_eq!(p.checks_run(), 1, "only the typed finish ran checks");
+    agent.stop();
+}
+
 /// Once `git gc` has pruned the old S0, the session starts Work of its own,
 /// says why it could not go on from the old one, and leaves that for review.
 #[test]

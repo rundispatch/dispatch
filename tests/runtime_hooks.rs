@@ -495,9 +495,11 @@ fn a_worktree_that_vanishes_unannounced_can_be_finished_from_last_seen_changes()
             .unwrap()
             .contains("    2")
     );
+    // Lines written in full: the owner may be appending one as this reads.
     let events = fs::read_to_string(p.run_dir(&id).join("events.jsonl")).unwrap();
     let events: Vec<Value> = events
-        .lines()
+        .split_inclusive('\n')
+        .filter_map(|line| line.strip_suffix('\n'))
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(

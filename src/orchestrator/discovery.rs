@@ -248,8 +248,12 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
             }
             continue;
         }
-        if inventory.entries.iter().any(|e| e.path == found.path) {
-            continue;
+        if let Some(at) = inventory.entries.iter().position(|e| e.path == found.path) {
+            if !locked_by_its_maker(&inventory.entries[at], found) {
+                continue;
+            }
+            inventory.entries.remove(at);
+            changed = true;
         }
         // The process a session's lock names, and whether it runs.
         let (name, locked) = match &found.made {
@@ -334,6 +338,20 @@ fn relocked(run: &RunRecord, lock: &Lock) -> bool {
             .iter()
             .any(|s| s.session_id == format!("lock:{name}@{pid}"));
     over && run.outcome.closed.is_none() && !seen && claude::liveness(lock) == Liveness::Running
+}
+
+/// Whether a worktree `listed` without a lock is now locked by the Hermes
+/// process that made it. Hermes makes its worktree and then locks it, two
+/// Git commands that a busy machine can hold apart for longer than `GRACE`:
+/// it was listed while Hermes was still making it.
+fn locked_by_its_maker(listed: &InventoryEntry, found: &Found) -> bool {
+    listed.lock.is_none()
+        && matches!(found.made, Made::Hermes(_))
+        && found
+            .lock
+            .as_deref()
+            .and_then(hermes::lock_pid)
+            .is_some_and(|pid| hermes::liveness(pid, &found.path) == Liveness::Running)
 }
 
 fn lock_pid(lock: &Lock) -> Option<u32> {

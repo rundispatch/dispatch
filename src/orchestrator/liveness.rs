@@ -398,7 +398,13 @@ mod tests {
                 end_reason: None,
                 model: None,
             };
-            record_session_start(&self.state, &self.run_id, session).unwrap();
+            record_session_start(
+                &self.state,
+                &self.run_id,
+                session,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
         }
 
         fn lock(&self, pid: u32, start: &str) {
@@ -721,7 +727,13 @@ mod tests {
             end_reason: None,
             model: None,
         };
-        record_session_start(&p.state, &p.run_id, session).unwrap();
+        record_session_start(
+            &p.state,
+            &p.run_id,
+            session,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         let identity = process::process_identity(agent.id());
         if identity.start.is_none() || identity.boot.is_none() {
             return None;

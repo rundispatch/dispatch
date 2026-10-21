@@ -8,7 +8,6 @@ use super::*;
 use crate::{
     AttemptDetail, Clarification, FailureKind, GoalExecution, QuestionState,
     coherence::watch::{WatchMsg, WatchSpec, Watcher},
-    config::MidRunMode,
 };
 
 pub(crate) fn local_uid() -> u32 {
@@ -349,12 +348,8 @@ fn apply_watch(
 ) -> Result<()> {
     let validity = message.validity;
     apply::persist_verdict(state, db, run, &validity)?;
-    let policy = &config.coherence;
-    let stops = validity.decision == Decision::Stop
-        || (validity.decision == Decision::Refresh && policy.stop_on_refresh);
     if let Some(stale) = stale
-        && policy.mid_run == MidRunMode::Stop
-        && stops
+        && config.coherence.stopping().contains(&validity.decision)
     {
         transition(
             state,
@@ -897,6 +892,7 @@ async fn drive_inner(
                 workspace: candidate.workspace_path.clone(),
                 delta_patch: dir.join("delta-live.patch"),
                 poll: Duration::from_secs(config.coherence.poll_secs),
+                stopping: config.coherence.stopping(),
             })
         });
         let mut stale: Option<String> = None;
