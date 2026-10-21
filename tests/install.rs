@@ -1,14 +1,16 @@
 //! `scripts/install.sh` against a local release directory: what a release
-//! publishes (the archive and `SHA256SUMS`), served from `file://`. Nothing
-//! is fetched from the network, and the install directory, home and state
-//! are temporary.
+//! publishes (the archives and `SHA256SUMS`), served from `file://` or from
+//! a local server that redirects as the website and GitHub do. Nothing is
+//! fetched from the network, and the install directory, home and state are
+//! temporary.
 #![cfg(unix)]
 
 use std::{
     fs,
+    io::{BufRead, BufReader},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
@@ -22,10 +24,20 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn platform() -> (&'static str, Option<(&'static str, &'static str)>) {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => ("macos-arm64", None),
+        ("macos", "x86_64") => ("macos-x86_64", None),
         ("linux", "x86_64") => ("linux-x86_64", None),
+        ("linux", "aarch64") => ("linux-aarch64", None),
         _ => ("linux-x86_64", Some(("Linux", "x86_64"))),
     }
 }
+
+/// Every archive a release publishes.
+const PLATFORMS: [&str; 4] = [
+    "macos-arm64",
+    "macos-x86_64",
+    "linux-x86_64",
+    "linux-aarch64",
+];
 
 struct Install {
     temp: tempfile::TempDir,
@@ -58,39 +70,58 @@ impl Install {
         install
     }
 
-    fn asset(&self) -> String {
-        format!("dispatch-{}.tar.gz", platform().0)
-    }
-
     /// Publish this build as the release; `checksum` overrides the one
     /// `SHA256SUMS` lists.
     fn publish(&self, checksum: Option<&str>) {
-        let package = self.temp.path().join("package");
-        let _ = fs::remove_dir_all(&package);
-        fs::create_dir_all(&package).unwrap();
-        fs::copy(assert_cmd::cargo_bin!("dispatch"), package.join("dispatch")).unwrap();
-        fs::write(package.join("LICENSE"), "test\n").unwrap();
-        let archive = self.release.join(self.asset());
-        let status = Command::new("tar")
-            .arg("-czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&package)
-            .args(["LICENSE", "dispatch"])
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let digest = hex::encode(Sha256::digest(fs::read(&archive).unwrap()));
+        let binary = fs::read(assert_cmd::cargo_bin!("dispatch")).unwrap();
+        self.release_of(&[(platform().0, &binary)], checksum);
+    }
+
+    /// Publish a release of these platforms' archives, each holding its
+    /// `dispatch`, and nothing else.
+    fn release_of(&self, archives: &[(&str, &[u8])], checksum: Option<&str>) {
+        fs::remove_dir_all(&self.release).unwrap();
+        fs::create_dir_all(&self.release).unwrap();
+        let mut sums = format!("{}  dispatch-other.tar.gz\n", "0".repeat(64));
+        for (platform, binary) in archives {
+            let package = self.temp.path().join("package");
+            let _ = fs::remove_dir_all(&package);
+            fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("dispatch"), binary).unwrap();
+            fs::set_permissions(package.join("dispatch"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            fs::write(package.join("LICENSE"), "test\n").unwrap();
+            let asset = format!("dispatch-{platform}.tar.gz");
+            let archive = self.release.join(&asset);
+            let status = Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&package)
+                .args(["LICENSE", "dispatch"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let digest = hex::encode(Sha256::digest(fs::read(&archive).unwrap()));
+            sums.push_str(&format!("{}  {asset}\n", checksum.unwrap_or(&digest)));
+        }
+        fs::write(self.release.join("SHA256SUMS"), sums).unwrap();
+    }
+
+    /// A `sysctl` that says whether this shell runs under Rosetta, or, with
+    /// `None`, fails as on an Intel Mac, which lacks the OID.
+    fn sysctl(&self, translated: Option<&str>) {
+        let path = self.tools.join("sysctl");
+        let answer = match translated {
+            Some(value) => format!("echo {value}"),
+            None => "echo 'unknown oid' >&2; exit 1".into(),
+        };
         fs::write(
-            self.release.join("SHA256SUMS"),
-            format!(
-                "{}  dispatch-other.tar.gz\n{}  {}\n",
-                "0".repeat(64),
-                checksum.unwrap_or(&digest),
-                self.asset()
-            ),
+            &path,
+            format!("#!/bin/sh\n[ \"$*\" = \"-n sysctl.proc_translated\" ] || exit 1\n{answer}\n"),
         )
         .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// A `uname` that reports `system` and `machine`.
@@ -328,7 +359,276 @@ fn another_platform_is_refused_saying_which() {
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "dispatch install: there is no Dispatch release for FreeBSD amd64; releases are built \
-         for macOS on Apple silicon (arm64) and Linux on x86_64\n"
+         for macOS on Apple silicon (arm64) and Intel (x86_64), and Linux on x86_64 and \
+         aarch64\n"
     );
     assert!(!install.bin.exists());
+}
+
+/// A `dispatch` that says which archive it came from.
+fn fake(platform: &str) -> Vec<u8> {
+    format!("#!/bin/sh\necho \"dispatch from {platform}\"\n").into_bytes()
+}
+
+/// Each machine installs its own archive from a release of all four: what
+/// `uname` says, and on an Intel-looking Mac whether the shell is a Rosetta
+/// one on Apple silicon.
+#[test]
+fn each_platform_installs_its_own_archive() {
+    let install = Install::new();
+    let fakes: Vec<_> = PLATFORMS.iter().map(|p| (*p, fake(p))).collect();
+    let archives: Vec<_> = fakes.iter().map(|(p, b)| (*p, b.as_slice())).collect();
+    install.release_of(&archives, None);
+    for (system, machine, translated, expected) in [
+        ("Darwin", "arm64", Some("0"), "macos-arm64"),
+        ("Darwin", "x86_64", Some("0"), "macos-x86_64"),
+        ("Darwin", "x86_64", None, "macos-x86_64"),
+        ("Darwin", "x86_64", Some("1"), "macos-arm64"),
+        // Only a Mac asks.
+        ("Linux", "x86_64", Some("1"), "linux-x86_64"),
+        ("Linux", "aarch64", Some("1"), "linux-aarch64"),
+        ("Linux", "arm64", Some("1"), "linux-aarch64"),
+    ] {
+        install.uname(system, machine);
+        install.sysctl(translated);
+        let output = install.install();
+        let case = format!("{system} {machine} {translated:?}");
+        assert!(output.status.success(), "{case}: {}", text(&output));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!(
+                "Downloading dispatch-{expected}.tar.gz from file://"
+            )),
+            "{case}: {}",
+            text(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!(
+                "Installed dispatch from {expected} at {}",
+                install.installed().display()
+            )),
+            "{case}: {}",
+            text(&output)
+        );
+        assert!(output.stderr.is_empty(), "{case}: {}", text(&output));
+    }
+}
+
+/// 0.4.16 published macOS on arm64 and Linux on x86_64 only: on another of
+/// the four machines its release says it has no build for it, before
+/// downloading anything.
+#[test]
+fn a_release_without_this_platforms_archive_says_so() {
+    let install = Install::new();
+    let fakes = [
+        ("macos-arm64", fake("macos-arm64")),
+        ("linux-x86_64", fake("linux-x86_64")),
+    ];
+    install.release_of(
+        &[(fakes[0].0, &fakes[0].1), (fakes[1].0, &fakes[1].1)],
+        None,
+    );
+    for (system, machine, name, asset) in [
+        ("Linux", "aarch64", "Linux on aarch64", "linux-aarch64"),
+        ("Darwin", "x86_64", "macOS on Intel", "macos-x86_64"),
+    ] {
+        install.uname(system, machine);
+        install.sysctl(Some("0"));
+        let output = install.install();
+        assert!(!output.status.success(), "{}", text(&output));
+        assert_eq!(
+            text(&output),
+            format!(
+                "dispatch install: this release has no build for {name}: file://{}/SHA256SUMS \
+                 lists no dispatch-{asset}.tar.gz; nothing was installed\n",
+                install.release.display()
+            )
+        );
+        assert!(!install.bin.exists());
+    }
+}
+
+/// Serves a release the way the website and GitHub do, through redirects.
+struct Server(Child, u16);
+
+impl Server {
+    fn start(root: &Path) -> Self {
+        let mut child = Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/release_server.py"))
+            .arg(root)
+            .arg(format!("v{VERSION}"))
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let port = line.trim().parse().expect("the server prints its port");
+        Self(child, port)
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.1)
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `curl -fsSL <site>/install | sh`, from a directory that holds nothing:
+/// the script comes through the site's redirect and GitHub's own, reads
+/// nothing beside itself, and fetches its archive and `SHA256SUMS` through
+/// GitHub's redirects too.
+#[test]
+fn installs_piped_from_curl_through_redirects() {
+    let install = Install::new();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"),
+        install.release.join("install.sh"),
+    )
+    .unwrap();
+    let server = Server::start(&install.release);
+    let elsewhere = install.temp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "curl -fsSL \"$1/install\" | sh",
+            "sh",
+            &server.url(""),
+        ])
+        .current_dir(&elsewhere)
+        .env_clear()
+        .env("HOME", &install.home)
+        .env("SHELL", "/bin/zsh")
+        .env("PATH", format!("{}:{SYSTEM_PATH}", install.tools.display()))
+        .env(
+            "DISPATCH_RELEASE_URL",
+            server.url("/releases/latest/download"),
+        )
+        .env("DISPATCH_INSTALL_DIR", &install.bin)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "Installed dispatch {VERSION} at {}",
+            install.installed().display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("not on your PATH"),
+        "the script ran to its end: {stdout}"
+    );
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+/// The archive `scripts/package-local.py` names, by this machine or by an
+/// explicit target, is the one `install.sh` asks for there, and its
+/// `BUILD.json` says the same platform and architecture.
+#[test]
+fn the_packager_names_each_archive_as_the_installer_asks_for_it() {
+    let install = Install::new();
+    // The packager and what it reads, in a repository of their own: it
+    // hashes the tracked sources and records HEAD.
+    let source = install.temp.path().join("source");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for file in [
+        "scripts/package-local.py",
+        "Cargo.toml",
+        "LICENSE",
+        "docs/release-install.md",
+    ] {
+        fs::create_dir_all(source.join(file).parent().unwrap()).unwrap();
+        fs::copy(root.join(file), source.join(file)).unwrap();
+    }
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"],
+        &[
+            "-c",
+            "user.name=Dispatch Tests",
+            "-c",
+            "user.email=tests@dispatch.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "source",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&source)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+    let built = install.temp.path().join("built");
+    fs::create_dir_all(&built).unwrap();
+    let binary = built.join("dispatch");
+    fs::write(&binary, format!("#!/bin/sh\necho \"dispatch {VERSION}\"\n")).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    // This machine's own name only where it is one of the four.
+    let native = platform().1.is_none().then_some(None);
+    for target in native
+        .into_iter()
+        .chain([Some("linux-aarch64"), Some("macos-x86_64")])
+    {
+        fs::remove_dir_all(&install.release).unwrap();
+        let mut package = Command::new("python3");
+        package
+            .arg(source.join("scripts/package-local.py"))
+            .arg(&binary)
+            .arg(&install.release)
+            .env("PYTHONDONTWRITEBYTECODE", "1");
+        if let Some(target) = target {
+            package.args(["--target", target]);
+        }
+        let output = package.output().unwrap();
+        assert!(output.status.success(), "{target:?}: {}", text(&output));
+        let expected = target.unwrap_or(platform().0);
+        assert!(
+            install
+                .release
+                .join(format!("dispatch-{expected}.tar.gz"))
+                .is_file(),
+            "{target:?}: {}",
+            text(&output)
+        );
+        let build: Value =
+            serde_json::from_slice(&fs::read(install.release.join("BUILD.json")).unwrap()).unwrap();
+        assert_eq!(
+            format!(
+                "{}-{}",
+                build["platform"].as_str().unwrap(),
+                build["architecture"].as_str().unwrap()
+            ),
+            expected
+        );
+        match expected {
+            "linux-aarch64" => install.uname("Linux", "aarch64"),
+            "macos-x86_64" => {
+                install.uname("Darwin", "x86_64");
+                install.sysctl(Some("0"));
+            }
+            _ => {}
+        }
+        let output = install.install();
+        assert!(output.status.success(), "{target:?}: {}", text(&output));
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("Downloading dispatch-{expected}.tar.gz from")),
+            "{target:?}: {}",
+            text(&output)
+        );
+    }
 }

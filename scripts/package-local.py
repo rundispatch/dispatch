@@ -5,14 +5,17 @@ Reproducible archive metadata. Rebuild reproducibility is not implied.
 import argparse, gzip, hashlib, io, json, platform, re, subprocess, tarfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
+TARGETS=('macos-arm64','macos-x86_64','linux-x86_64','linux-aarch64')
 parser=argparse.ArgumentParser();parser.add_argument('binary',type=Path);parser.add_argument('output',type=Path)
+# A cross build names its target: the host's own machine is then not the binary's.
+parser.add_argument('--target',choices=TARGETS,help='the archive is dispatch-<target>; default: this machine, as uname -m says')
 args=parser.parse_args();binary=args.binary.resolve();out=args.output.resolve();out.mkdir(parents=True,exist_ok=True)
 hashof=lambda data:hashlib.sha256(data).hexdigest()
 version=subprocess.check_output([str(binary),'version'],text=True).strip()
 expected=re.search(r'^version = "([^"]+)"', (ROOT/'Cargo.toml').read_text(), re.M).group(1)
 if version != 'dispatch '+expected: raise SystemExit('Binary version does not match this source; build the candidate first.')
-platform_name={'Darwin':'macos','Linux':'linux'}.get(platform.system(),platform.system().lower())
-arch={'aarch64':'arm64'}.get(platform.machine(),platform.machine())
+if args.target: platform_name,arch=args.target.split('-',1)
+else: platform_name,arch={'Darwin':'macos','Linux':'linux'}.get(platform.system(),platform.system().lower()),platform.machine()
 tracked=subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard'],cwd=ROOT).split(b'\0')
 paths=sorted(set(p.decode() for p in tracked if p))
 # Freeze runtime source, fixtures and build contract, excluding generated evidence/reports.

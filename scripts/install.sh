@@ -3,7 +3,12 @@
 # verify it against the release's SHA256SUMS, and put `dispatch` into
 # ${DISPATCH_INSTALL_DIR:-$HOME/.local/bin}.
 #
-#   curl -fsSL https://github.com/rundispatch/dispatch/releases/latest/download/install.sh | sh
+#   curl -fsSL https://rundispatch.sh/install | sh
+#
+# The site redirects to this script as the latest release publishes it,
+# https://github.com/rundispatch/dispatch/releases/latest/download/install.sh,
+# which works the same. Builds exist for macOS and Linux, each on arm64 and
+# x86_64. The script reads nothing beside itself, so it runs from a pipe.
 #
 # DISPATCH_VERSION=0.4.17 installs that release instead of the latest one.
 # DISPATCH_RELEASE_URL takes the archive and SHA256SUMS from another base URL
@@ -27,9 +32,19 @@ fail() {
 system="$(uname -s)"
 machine="$(uname -m)"
 case "$system-$machine" in
-  Darwin-arm64) platform=macos-arm64 ;;
-  Linux-x86_64) platform=linux-x86_64 ;;
-  *) fail "there is no Dispatch release for $system $machine; releases are built for macOS on Apple silicon (arm64) and Linux on x86_64" ;;
+  Darwin-arm64) platform=macos-arm64 name="macOS on Apple silicon" ;;
+  Darwin-x86_64)
+    # A shell under Rosetta on Apple silicon says x86_64; the arm64 build
+    # runs there natively.
+    if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ]; then
+      platform=macos-arm64 name="macOS on Apple silicon"
+    else
+      platform=macos-x86_64 name="macOS on Intel"
+    fi
+    ;;
+  Linux-x86_64) platform=linux-x86_64 name="Linux on x86_64" ;;
+  Linux-aarch64 | Linux-arm64) platform=linux-aarch64 name="Linux on aarch64" ;;
+  *) fail "there is no Dispatch release for $system $machine; releases are built for macOS on Apple silicon (arm64) and Intel (x86_64), and Linux on x86_64 and aarch64" ;;
 esac
 asset="dispatch-$platform.tar.gz"
 
@@ -56,11 +71,14 @@ staged=
 trap 'rm -rf "$tmp"; [ -z "$staged" ] || rm -f "$staged"' EXIT
 trap 'exit 1' HUP INT TERM
 
-echo "Downloading $asset from $base"
-curl -fsSL "$base/$asset" -o "$tmp/$asset" || fail "could not download $base/$asset"
+# SHA256SUMS first: it says whether this release has a build for this
+# machine at all.
 curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || fail "could not download $base/SHA256SUMS"
 expected="$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$tmp/SHA256SUMS")"
-[ -n "$expected" ] || fail "SHA256SUMS lists no $asset; nothing was installed"
+[ -n "$expected" ] ||
+  fail "this release has no build for $name: $base/SHA256SUMS lists no $asset; nothing was installed"
+echo "Downloading $asset from $base"
+curl -fsSL "$base/$asset" -o "$tmp/$asset" || fail "could not download $base/$asset"
 actual="$(digest "$tmp/$asset" | awk '{ print $1 }')"
 [ "$actual" = "$expected" ] ||
   fail "$asset does not match SHA256SUMS (expected $expected, got $actual); nothing was installed"
