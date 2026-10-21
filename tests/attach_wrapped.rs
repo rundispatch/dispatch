@@ -276,10 +276,19 @@ fn wrapped_attach_runs_the_agent_with_inherited_stdio_and_finishes() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let id = f.only_run_id();
+    // The verdict and the next step, in finish's words.
     assert!(
-        stdout.starts_with(&format!("Attached work {id} finished")),
+        stdout.starts_with(&format!("Attached work {id} finished: Ready for review\n")),
         "stdout did not begin with the post-exit line: {stdout:?}"
     );
+    assert!(stdout.contains("Coherence: CONTINUE"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Then\n  dispatch accept {id}\n  dispatch reject {id}\n"
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("next: dispatch check"), "{stdout}");
 
     let metadata = f.metadata(&id);
     assert_eq!(metadata["outcome"]["work_result"], "ready");

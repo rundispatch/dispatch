@@ -1525,10 +1525,12 @@ def plain(binary, base):
     assert HEADER.match(watcher["watcher"]), watcher
     for raw, (_, want) in zip(records[1:], expected):
         record = json.loads(raw)
-        keys = sorted(want) + ["interactions"]
+        keys = sorted(want) + ["interactions", "needs_you"]
         assert list(record) == sorted(keys), ("0.4.10 key order (sorted)", list(record))
         assert record["interactions"] in (None, []) or isinstance(record["interactions"], list), record
         record.pop("interactions")
+        # No session here waits on anyone (contract D).
+        assert record.pop("needs_you") is None, record
         assert record == want, (record, want)
     # `--plain` on a terminal is the same report, not the interactive view.
     session = Session([binary, "--state-dir", str(project.state), "--plain", "watch"], project.root,

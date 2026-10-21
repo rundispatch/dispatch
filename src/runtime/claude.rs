@@ -1,7 +1,8 @@
-//! Claude Code's hooks (`SessionStart`, `SessionEnd`, and the two ways a
+//! Claude Code's hooks (`SessionStart`, `SessionEnd`, the two ways a
 //! worktree is deleted: `WorktreeRemove` at session exit, and `PreToolUse` of
 //! the `ExitWorktree` tool with `action: remove`, which does not run
-//! `WorktreeRemove`) as `RuntimeEvent`s, and the reply Claude Code shows the
+//! `WorktreeRemove`; and `Notification` and `Stop`, when the session waits on
+//! the person) as `RuntimeEvent`s, and the reply Claude Code shows the
 //! person. Everything Claude-specific ends here.
 
 use std::{sync::mpsc, time::Duration};
@@ -10,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::{EventKind, Reply, RuntimeEvent};
-use crate::state::State;
+use crate::{NeedsYouKind, state::State};
 
 #[derive(Deserialize)]
 struct Input {
@@ -31,7 +32,22 @@ struct Input {
     tool_name: Option<String>,
     #[serde(default)]
     tool_input: serde_json::Value,
+    /// `Notification`: what kind, and Claude's words for it.
+    #[serde(default)]
+    notification_type: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    transcript_path: Option<std::path::PathBuf>,
 }
+
+/// The `Notification` types that mean the session waits on the person, the
+/// matcher setup installs; any other type is ignored here too.
+const WAITING: [(&str, NeedsYouKind); 3] = [
+    ("permission_prompt", NeedsYouKind::Permission),
+    ("idle_prompt", NeedsYouKind::Input),
+    ("agent_needs_input", NeedsYouKind::Input),
+];
 
 /// The event in a hook's input, or `None` for an event Dispatch does not use.
 pub fn parse(input: &[u8]) -> Result<Option<RuntimeEvent>> {
@@ -60,6 +76,25 @@ pub fn parse(input: &[u8]) -> Result<Option<RuntimeEvent>> {
         {
             EventKind::WorkspaceRemoved
         }
+        "Notification" => {
+            let Some((_, kind)) = WAITING
+                .iter()
+                .find(|(name, _)| input.notification_type.as_deref() == Some(*name))
+            else {
+                return Ok(None);
+            };
+            EventKind::NeedsYou {
+                kind: *kind,
+                message: input.message.unwrap_or_default(),
+                transcript: input.transcript_path,
+            }
+        }
+        // The turn ended: Claude waits for the next prompt.
+        "Stop" => EventKind::NeedsYou {
+            kind: NeedsYouKind::TurnEnded,
+            message: "waiting for your next prompt".into(),
+            transcript: input.transcript_path,
+        },
         _ => return Ok(None),
     };
     let cwd = match (&kind, input.worktree_path) {
@@ -101,6 +136,11 @@ pub fn handle(state: &State, input: &[u8]) -> Output {
         Ok(None) => return notice(Ok(Reply::Silent)),
         Err(error) => return notice(Err(error)),
     };
+    // Recorded only, never replied to: `Stop`'s stdout reaches Claude Code.
+    if matches!(event.kind, EventKind::NeedsYou { .. }) {
+        let _ = super::ingest(state, event);
+        return notice(Ok(Reply::Silent));
+    }
     if !matches!(event.kind, EventKind::WorkspaceRemoved) {
         return notice(super::ingest(state, event));
     }
@@ -144,14 +184,23 @@ fn notice(reply: Result<Reply>) -> Output {
     }
 }
 
-/// The hook events Dispatch installs, with the timeout each gets. A
-/// `WorktreeRemove` hook outlasts `REMOVAL_DEADLINE`, so Dispatch always
-/// decides before Claude Code gives up on it.
-const INSTALLED: [(&str, Option<&str>, u64); 4] = [
+/// The hook events Dispatch installs, with the matcher and timeout each
+/// gets. A `WorktreeRemove` hook outlasts `REMOVAL_DEADLINE`, so Dispatch
+/// always decides before Claude Code gives up on it. Claude Code matches a
+/// `Notification` matcher of plain words separated by `|` exactly against
+/// `notification_type` (its hooks reference), so only the types in `WAITING`
+/// run Dispatch at all.
+const INSTALLED: [(&str, Option<&str>, u64); 6] = [
     ("SessionStart", None, 60),
     ("SessionEnd", None, 5),
     ("WorktreeRemove", None, 300),
     ("PreToolUse", Some("ExitWorktree"), 300),
+    (
+        "Notification",
+        Some("permission_prompt|idle_prompt|agent_needs_input"),
+        5,
+    ),
+    ("Stop", None, 5),
 ];
 
 /// For Work in a `claude --worktree` workspace that began from source other
@@ -183,27 +232,62 @@ pub fn hook_command(state: &State) -> Result<String> {
     ))
 }
 
-fn ours(entry: &serde_json::Value) -> bool {
-    entry["hooks"].as_array().is_some_and(|hooks| {
-        hooks.iter().any(|hook| {
-            hook["command"]
-                .as_str()
-                .is_some_and(|command| command.ends_with(" hook claude"))
+/// Whether `hook` is one Dispatch installed: a command running some Dispatch
+/// executable with its state directory, `hook claude`. Only such a hook is
+/// ever replaced or removed, never an entry or another hook beside it.
+fn ours(hook: &serde_json::Value) -> bool {
+    hook["type"] == "command"
+        && hook["command"].as_str().is_some_and(|command| {
+            command.starts_with('\'')
+                && command.contains("' --state-dir '")
+                && command.ends_with("' hook claude")
         })
-    })
 }
 
-/// `settings` without Dispatch's hooks: every other setting and hook as it was.
-pub fn without_hooks(mut settings: serde_json::Value) -> serde_json::Value {
-    if let Some(hooks) = settings["hooks"].as_object_mut() {
-        for (event, _, _) in INSTALLED {
-            if let Some(entries) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) {
-                entries.retain(|entry| !ours(entry));
-                if entries.is_empty() {
-                    hooks.remove(event);
+/// Dispatch's hooks in `settings`, under any event, as `(event, matcher,
+/// command, timeout)`, sorted.
+fn installed(settings: &serde_json::Value) -> Vec<(String, Option<String>, String, Option<u64>)> {
+    let mut found = Vec::new();
+    for (event, entries) in settings["hooks"].as_object().into_iter().flatten() {
+        for entry in entries.as_array().into_iter().flatten() {
+            for hook in entry["hooks"].as_array().into_iter().flatten() {
+                if ours(hook) {
+                    found.push((
+                        event.clone(),
+                        entry["matcher"].as_str().map(str::to_owned),
+                        hook["command"].as_str().unwrap_or_default().to_owned(),
+                        hook["timeout"].as_u64(),
+                    ));
                 }
             }
         }
+    }
+    found.sort();
+    found
+}
+
+/// `settings` without Dispatch's hooks, under whichever event an earlier
+/// Dispatch put them: every other setting and hook as it was. An entry is
+/// removed only when nothing but Dispatch's hooks was in it.
+pub fn without_hooks(mut settings: serde_json::Value) -> serde_json::Value {
+    if let Some(hooks) = settings["hooks"].as_object_mut() {
+        for entries in hooks.values_mut() {
+            let Some(entries) = entries.as_array_mut() else {
+                continue;
+            };
+            for entry in entries.iter_mut() {
+                if let Some(list) = entry["hooks"].as_array_mut()
+                    && list.iter().any(ours)
+                {
+                    list.retain(|hook| !ours(hook));
+                    if list.is_empty() {
+                        *entry = serde_json::Value::Null;
+                    }
+                }
+            }
+            entries.retain(|entry| !entry.is_null());
+        }
+        hooks.retain(|_, entries| entries.as_array().is_none_or(|e| !e.is_empty()));
         if hooks.is_empty() {
             settings.as_object_mut().map(|s| s.remove("hooks"));
         }
@@ -236,18 +320,27 @@ pub fn with_hooks(settings: serde_json::Value, command: &str) -> Result<serde_js
     Ok(settings)
 }
 
-/// Whether Dispatch's hooks are in the settings at `path`.
-pub fn hooks_installed(path: &std::path::Path) -> Result<bool> {
+fn read_settings(path: &std::path::Path) -> Result<Option<serde_json::Value>> {
     let Ok(bytes) = std::fs::read(path) else {
-        return Ok(false);
+        return Ok(None);
     };
-    let settings: serde_json::Value =
-        serde_json::from_slice(&bytes).context("Claude Code settings are not valid JSON")?;
-    Ok(INSTALLED.iter().any(|(event, _, _)| {
-        settings["hooks"][event]
-            .as_array()
-            .is_some_and(|entries| entries.iter().any(ours))
-    }))
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .context("Claude Code settings are not valid JSON")
+}
+
+/// Whether any of Dispatch's hooks, from this Dispatch or an earlier one, are
+/// in the settings at `path`.
+pub fn hooks_installed(path: &std::path::Path) -> Result<bool> {
+    Ok(read_settings(path)?.is_some_and(|settings| !installed(&settings).is_empty()))
+}
+
+/// Whether the settings at `path` hold exactly the hooks installing would
+/// leave, running `command`. Hooks an earlier Dispatch installed, or another
+/// executable's, are not current: installing again replaces them.
+pub fn hooks_current(path: &std::path::Path, command: &str) -> Result<bool> {
+    let wanted = with_hooks(serde_json::json!({}), command)?;
+    Ok(read_settings(path)?.is_some_and(|settings| installed(&settings) == installed(&wanted)))
 }
 
 /// Rewrite the settings at `path` with `change`, after keeping a backup
@@ -570,6 +663,214 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(settings, theirs);
         assert!(!hooks_installed(&path).unwrap());
+    }
+
+    /// The probe's payloads (`Notification`, `Stop`), paths replaced.
+    fn probe(event: &str, extra: serde_json::Value) -> Vec<u8> {
+        let mut payload = serde_json::json!({
+            "session_id": "96fce6bd-fe23-4b1c-bd1e-b171635c421b",
+            "transcript_path": "/home/u/.claude/projects/p/96fce6bd.jsonl",
+            "cwd": "/repo/.claude/worktrees/probe-a",
+            "scratchpad_dir": "/tmp/scratch",
+            "prompt_id": "7e92d8c0-ed66-464a-845b-98f1cc4cff83",
+            "hook_event_name": event,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            payload[key] = value.clone();
+        }
+        payload.to_string().into_bytes()
+    }
+
+    #[test]
+    fn notifications_that_wait_on_the_person_and_stop_are_marks_and_nothing_else_is() {
+        let mark = |input: Vec<u8>| match parse(&input).unwrap().map(|event| event.kind) {
+            Some(EventKind::NeedsYou {
+                kind,
+                message,
+                transcript,
+            }) => {
+                assert_eq!(
+                    transcript.as_deref(),
+                    Some(std::path::Path::new(
+                        "/home/u/.claude/projects/p/96fce6bd.jsonl"
+                    ))
+                );
+                Some((kind, message))
+            }
+            Some(_) => panic!("not a mark"),
+            None => None,
+        };
+        let notification = |kind: &str, message: &str| {
+            probe(
+                "Notification",
+                serde_json::json!({"notification_type": kind, "message": message}),
+            )
+        };
+        assert_eq!(
+            mark(notification(
+                "permission_prompt",
+                "Claude needs your permission"
+            )),
+            Some((
+                NeedsYouKind::Permission,
+                "Claude needs your permission".into()
+            ))
+        );
+        assert_eq!(
+            mark(notification(
+                "idle_prompt",
+                "Claude is waiting for your input"
+            )),
+            Some((
+                NeedsYouKind::Input,
+                "Claude is waiting for your input".into()
+            ))
+        );
+        assert_eq!(
+            mark(notification("agent_needs_input", "x")).unwrap().0,
+            NeedsYouKind::Input
+        );
+        let stop = probe(
+            "Stop",
+            serde_json::json!({
+                "permission_mode": "default", "effort": {"level": "high"},
+                "stop_hook_active": false, "last_assistant_message": "done",
+                "background_tasks": [], "session_crons": [],
+            }),
+        );
+        assert_eq!(
+            mark(stop),
+            Some((
+                NeedsYouKind::TurnEnded,
+                "waiting for your next prompt".into()
+            ))
+        );
+        for other in ["auth_success", "elicitation_dialog", "agent_completed"] {
+            assert_eq!(mark(notification(other, "x")), None, "{other}");
+        }
+        assert_eq!(mark(probe("Notification", serde_json::json!({}))), None);
+        // The matcher setup installs names exactly the types parsed as marks.
+        let names: Vec<&str> = WAITING.iter().map(|(name, _)| *name).collect();
+        assert!(INSTALLED.contains(&("Notification", Some(&names.join("|")), 5)));
+    }
+
+    #[test]
+    fn a_mark_is_never_replied_to() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = State {
+            root: temp.path().join("state"),
+        };
+        let output = handle(
+            &state,
+            &probe(
+                "Notification",
+                serde_json::json!({"notification_type": "permission_prompt", "message": "m"}),
+            ),
+        );
+        assert_eq!((output.stdout.as_str(), output.code), ("", 0));
+        // Malformed: still silent, as `Stop`'s stdout would reach Claude Code.
+        let output = handle(
+            &state,
+            &probe(
+                "Stop",
+                serde_json::json!({"transcript_path": "relative.jsonl"}),
+            ),
+        );
+        assert_eq!((output.stdout.as_str(), output.code), ("", 0));
+    }
+
+    #[test]
+    fn the_new_hooks_get_five_seconds_and_removal_keeps_every_hook_not_dispatchs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        // The person's own Notification and Stop hooks, one of them in the
+        // same entry Dispatch will be found in after an upgrade below.
+        let theirs = serde_json::json!({
+            "hooks": {
+                "Notification": [{"hooks": [{"type": "command", "command": "moshi-hook notify"}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": "afplay done.aiff", "timeout": 2}]}],
+            },
+        });
+        std::fs::write(&path, theirs.to_string()).unwrap();
+        install_hooks(&path, COMMAND).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let notifications = settings["hooks"]["Notification"].as_array().unwrap();
+        assert_eq!(notifications.len(), 2, "{notifications:?}");
+        assert_eq!(notifications[0], theirs["hooks"]["Notification"][0]);
+        assert_eq!(
+            notifications[1],
+            serde_json::json!({
+                "matcher": "permission_prompt|idle_prompt|agent_needs_input",
+                "hooks": [{"type": "command", "command": COMMAND, "timeout": 5}],
+            })
+        );
+        let stops = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stops.len(), 2, "{stops:?}");
+        assert_eq!(stops[0], theirs["hooks"]["Stop"][0]);
+        assert_eq!(
+            stops[1],
+            serde_json::json!({"hooks": [{"type": "command", "command": COMMAND, "timeout": 5}]})
+        );
+        assert!(hooks_current(&path, COMMAND).unwrap());
+        assert!(!hooks_current(&path, "'/moved/dispatch' --state-dir '/s' hook claude").unwrap());
+
+        uninstall_hooks(&path).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings, theirs);
+
+        // A person's hook put beside Dispatch's in one entry stays.
+        let shared = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": COMMAND, "timeout": 5},
+            {"type": "command", "command": "say done"},
+        ]}]}});
+        assert_eq!(
+            without_hooks(shared),
+            serde_json::json!({"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "say done"},
+            ]}]}})
+        );
+        // A command that only ends like Dispatch's is not Dispatch's.
+        let lookalike = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "my-tool hook claude"},
+        ]}]}});
+        assert_eq!(without_hooks(lookalike.clone()), lookalike);
+    }
+
+    #[test]
+    fn an_earlier_dispatchs_hooks_are_recognised_and_upgraded_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        // The four hooks 0.4.16 installed, from another install path.
+        let old = "'/old/dispatch' --state-dir '/s' hook claude";
+        let entry = |timeout: u64| serde_json::json!({"hooks": [{"type": "command", "command": old, "timeout": timeout}]});
+        let mut tool = entry(300);
+        tool["matcher"] = "ExitWorktree".into();
+        let earlier = serde_json::json!({"hooks": {
+            "SessionStart": [entry(60)],
+            "SessionEnd": [entry(5)],
+            "WorktreeRemove": [entry(300)],
+            "PreToolUse": [tool],
+            "Stop": [{"hooks": [{"type": "command", "command": "afplay done.aiff"}]}],
+        }});
+        std::fs::write(&path, earlier.to_string()).unwrap();
+        assert!(hooks_installed(&path).unwrap());
+        assert!(!hooks_current(&path, COMMAND).unwrap());
+        assert!(!hooks_current(&path, old).unwrap(), "two hooks are missing");
+
+        install_hooks(&path, COMMAND).unwrap();
+        install_hooks(&path, COMMAND).unwrap();
+        assert!(hooks_current(&path, COMMAND).unwrap());
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let text = settings.to_string();
+        assert!(!text.contains("/old/dispatch"), "{text}");
+        assert_eq!(text.matches(COMMAND).count(), INSTALLED.len(), "{text}");
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "afplay done.aiff"
+        );
     }
 
     #[test]

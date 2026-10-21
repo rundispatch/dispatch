@@ -1659,6 +1659,9 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
             println!("{line}");
         }
     }
+    if let Some(mark) = attach::waiting_on_you(&run) {
+        println!("\n{}", attach::waiting_detail(mark));
+    }
     if let Some(attachment) = &run.attachment {
         println!("\nWorkspace");
         for line in workspace_details(&run, attachment) {

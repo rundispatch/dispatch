@@ -33,9 +33,9 @@ use crate::{
     ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
     AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, CloseReason,
     Closure, Config, DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState,
-    ManagedWorkspace, OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus,
-    RuntimeSession, SourceAtStart, StartObservation, StartPath, VerificationState, WaitingOn,
-    WorkResult, WorkspaceOwner, WorkspaceRemoval,
+    ManagedWorkspace, NeedsYou, NeedsYouKind, OwnerState, ReviewState, RunMode, RunOutcome,
+    RunPhase, RunRecord, RunStatus, RuntimeSession, SourceAtStart, StartObservation, StartPath,
+    VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
     coherence::{
         watch::{WatchSpec, Watcher},
         world,
@@ -472,6 +472,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
             .map(|runtime| vec![runtime.session.clone()])
             .unwrap_or_default(),
         workspace_removed: None,
+        needs_you: None,
     };
 
     let run = RunRecord {
@@ -1080,7 +1081,10 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
         let outcome = auto_apply(state, &run_id)?;
         print_auto_apply_outcome(&run, &outcome);
     } else {
-        println!("Attached work {run_id} finished; next: dispatch check {run_id}");
+        print_verdict_and_next(
+            state,
+            &crate::coherence::with_kept_validity(&run, &state.run_dir(&run_id)),
+        );
     }
 
     Ok(code.unwrap_or(1))
@@ -1240,6 +1244,150 @@ pub(crate) fn record_session_end(
             ..EventRecord::default()
         },
         &mut run,
+    )
+}
+
+/// Record that a session of Work `run_id` waits on a person; a later mark
+/// replaces it. Within the 5 s timeout setup installs for these hooks.
+pub(crate) fn record_needs_you(state: &State, run_id: &str, mark: NeedsYou) -> Result<()> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(3),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    let Some(attachment) = run.attachment.as_mut() else {
+        return Ok(());
+    };
+    attachment.needs_you = Some(mark.clone());
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "runtime.needs_you".into(),
+            timestamp: mark.at,
+            payload: serde_json::json!({
+                "kind": mark.kind,
+                "message": mark.message,
+                "at": mark.at,
+                "transcript": mark.transcript,
+                "session_id": mark.session_id,
+            }),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
+}
+
+/// Why the mark on `run` no longer holds, judged with one `stat` of its
+/// transcript: its session ended, the Work is no longer in progress, or the
+/// transcript was written after the mark. Claude Code writes its own record
+/// of a turn's end once the `Stop` hooks return, so a `turn_ended` mark
+/// counts only writes from `TURN_SETTLE` after it.
+pub(crate) fn needs_you_cleared(run: &RunRecord) -> Option<&'static str> {
+    let attachment = run.attachment.as_ref()?;
+    let mark = attachment.needs_you.as_ref()?;
+    if run.outcome.lifecycle != LifecycleState::Working {
+        return Some("work_finished");
+    }
+    if session_ended(attachment, mark) {
+        return Some("session_end");
+    }
+    let settle = match mark.kind {
+        NeedsYouKind::TurnEnded => TURN_SETTLE,
+        _ => Duration::ZERO,
+    };
+    let written = fs::metadata(mark.transcript.as_ref()?)
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    (DateTime::<Utc>::from(written) > mark.at + settle).then_some("transcript")
+}
+
+const TURN_SETTLE: Duration = Duration::from_secs(10);
+
+/// Clear the mark on Work `run_id` for `by`, unless a newer one replaced it
+/// meanwhile. Returns whether it cleared.
+pub(crate) fn clear_needs_you(
+    state: &State,
+    run_id: &str,
+    at: DateTime<Utc>,
+    by: &str,
+) -> Result<bool> {
+    // Busy (a hook, or a finish): the next tick looks again.
+    let Ok(_lock) = OperationLock::acquire(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+    ) else {
+        return Ok(false);
+    };
+    let mut run = state.load_run(run_id)?;
+    let Some(attachment) = run.attachment.as_mut() else {
+        return Ok(false);
+    };
+    if attachment
+        .needs_you
+        .as_ref()
+        .is_none_or(|mark| mark.at != at)
+    {
+        return Ok(false);
+    }
+    attachment.needs_you = None;
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "runtime.needs_you_cleared".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"by": by}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(true)
+}
+
+/// What Work in progress waits on you for, as `watch` and `status` show it:
+/// its mark while the Work is in progress and the session that set it has
+/// not ended. The owner clears it once the session moves.
+pub(crate) fn waiting_on_you(run: &RunRecord) -> Option<&NeedsYou> {
+    let attachment = run.attachment.as_ref()?;
+    let mark = attachment.needs_you.as_ref()?;
+    (run.outcome.lifecycle == LifecycleState::Working && !session_ended(attachment, mark))
+        .then_some(mark)
+}
+
+fn session_ended(attachment: &AttachmentRecord, mark: &NeedsYou) -> bool {
+    attachment.sessions.iter().any(|session| {
+        session.provider == mark.provider
+            && session.session_id == mark.session_id
+            && session.ended_at.is_some_and(|ended| ended >= mark.at)
+    })
+}
+
+/// "waiting on you: <kind>", and the runtime's words.
+pub(crate) fn waiting_line(mark: &NeedsYou) -> String {
+    let mut line = format!("waiting on you: {}", mark.kind.words());
+    if !mark.message.is_empty() {
+        line.push_str(" · ");
+        line.push_str(&mark.message);
+    }
+    line
+}
+
+/// `waiting_line`, and for how long.
+pub(crate) fn waiting_detail(mark: &NeedsYou) -> String {
+    format!(
+        "{} · for {}",
+        waiting_line(mark),
+        super::elapsed((Utc::now() - mark.at).num_seconds())
     )
 }
 
@@ -2437,6 +2585,23 @@ fn run_finished_event(run: &RunRecord) -> EventRecord {
     }
 }
 
+/// The end of `print_finish_summary`, as a wrapped agent's exit shows it:
+/// what finish judged and the next step, in finish's words. `run` is a
+/// `with_kept_validity` copy.
+#[cfg(unix)]
+fn print_verdict_and_next(state: &State, run: &RunRecord) {
+    println!(
+        "Attached work {} finished: {}\n",
+        run.id,
+        ready_heading(run)
+    );
+    let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+    if awaits_review(run) {
+        print_standing(state, run, validity);
+    }
+    print_review_commands(run, validity);
+}
+
 /// A short equivalent of `print_single_result_summary` for attached work:
 /// that function requires a routing or allocation decision, which attached
 /// work never has. `run` is a `with_kept_validity` copy.
@@ -2533,6 +2698,72 @@ mod last_seen_tests {
         .unwrap();
         fs::write(workspace.join("file.txt"), "after\n").unwrap();
         (temp, state, run)
+    }
+
+    #[test]
+    fn a_mark_holds_until_its_session_moves_and_a_turns_own_record_is_not_a_move() {
+        let (temp, state, run) = attached();
+        let transcript = temp.path().join("session.jsonl");
+        fs::write(&transcript, "{}\n").unwrap();
+        let at = Utc::now();
+        let written = |after: i64| {
+            let when = std::time::SystemTime::from(at + chrono::Duration::seconds(after));
+            fs::File::options()
+                .write(true)
+                .open(&transcript)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        };
+        let mark = |kind| NeedsYou {
+            kind,
+            message: "Claude needs your permission".into(),
+            at,
+            transcript: Some(transcript.clone()),
+            provider: "claude".into(),
+            session_id: "s1".into(),
+        };
+        record_needs_you(&state, &run.id, mark(NeedsYouKind::Permission)).unwrap();
+        let mut run = state.load_run(&run.id).unwrap();
+        assert_eq!(
+            waiting_line(waiting_on_you(&run).unwrap()),
+            "waiting on you: permission · Claude needs your permission"
+        );
+        written(-1);
+        assert_eq!(needs_you_cleared(&run), None);
+        written(1);
+        assert_eq!(needs_you_cleared(&run), Some("transcript"));
+
+        // Claude records a turn's end after the `Stop` hooks return.
+        let attachment = run.attachment.as_mut().unwrap();
+        attachment.needs_you = Some(mark(NeedsYouKind::TurnEnded));
+        assert_eq!(needs_you_cleared(&run), None);
+        written(11);
+        assert_eq!(needs_you_cleared(&run), Some("transcript"));
+
+        written(-1);
+        let attachment = run.attachment.as_mut().unwrap();
+        attachment.sessions.push(RuntimeSession {
+            provider: "claude".into(),
+            session_id: "s1".into(),
+            source: "startup".into(),
+            started_at: at - chrono::Duration::seconds(60),
+            ended_at: Some(at + chrono::Duration::seconds(5)),
+            end_reason: Some("clear".into()),
+            model: None,
+        });
+        assert_eq!(waiting_on_you(&run), None);
+        assert_eq!(needs_you_cleared(&run), Some("session_end"));
+        run.attachment.as_mut().unwrap().sessions.clear();
+        run.outcome.lifecycle = LifecycleState::Finished;
+        assert_eq!(waiting_on_you(&run), None);
+        assert_eq!(needs_you_cleared(&run), Some("work_finished"));
+
+        // Only the mark it judged: a newer one stays.
+        assert!(!clear_needs_you(&state, &run.id, at - chrono::Duration::seconds(1), "x").unwrap());
+        assert!(clear_needs_you(&state, &run.id, at, "transcript").unwrap());
+        let run = state.load_run(&run.id).unwrap();
+        assert_eq!(run.attachment.unwrap().needs_you, None);
     }
 
     #[tokio::test]

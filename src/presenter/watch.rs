@@ -185,7 +185,12 @@ fn item(
     let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
     let line = orchestrator::work_line(run, validity);
     let name = named[run.id.as_str()].to_owned();
-    let state = line.state;
+    let waiting = orchestrator::attach::waiting_on_you(run);
+    let state = if waiting.is_some() {
+        "waiting"
+    } else {
+        line.state
+    };
     let group = match state {
         "working" | "idle" => Group::InProgress,
         "applied" | "rejected" | "closed" | "finished" => Group::Done,
@@ -215,6 +220,13 @@ fn item(
         run.outcome.review == ReviewState::Pending && run.outcome.work_result == WorkResult::Ready;
 
     let mut details = Vec::new();
+    if let Some(mark) = waiting {
+        details.push(Detail::new(
+            "Waiting",
+            orchestrator::attach::waiting_detail(mark),
+            0,
+        ));
+    }
     if let Some(label) = orchestrator::last_seen_changes(run) {
         details.push(Detail::new("Changes", label, 0));
     }
@@ -263,7 +275,9 @@ fn item(
                 "STOP" => vec!["STOP · its changes are already in the source".to_owned()],
                 _ => vec!["not checked yet".to_owned()],
             };
-            if matches!(state, "working" | "idle") && matches!(verdict, "REFRESH" | "STOP") {
+            if matches!(state, "working" | "idle" | "waiting")
+                && matches!(verdict, "REFRESH" | "STOP")
+            {
                 lines.push("Advisory while the agent works: nothing is stopped.".into());
             }
             let extra = lines.split_off(1);
@@ -281,7 +295,7 @@ fn item(
             }
         }
     }
-    if group == Group::InProgress {
+    if group == Group::InProgress || waiting.is_some() {
         details.push(Detail::new("Progress", progress(run, context), 1));
     }
     details.push(Detail::new(
@@ -357,7 +371,18 @@ fn item(
         .attachment
         .as_ref()
         .map(|attachment| shown_path(&attachment.workspace, context.root, context.home));
-    let (next, keys) = next(run, &line, short, verdict, checks, context);
+    let (next, keys) = match waiting.map(|mark| mark.kind) {
+        Some(crate::NeedsYouKind::Permission) => (
+            "Its session asks for your permission: answer it there.".into(),
+            vec![],
+        ),
+        Some(_) => (
+            "Its session waits for your next prompt: continue it there, or f finish when it is done."
+                .into(),
+            vec![FINISH],
+        ),
+        None => next(run, &line, short, verdict, checks, context),
+    };
     Item {
         id: run.id.clone(),
         short: short.to_owned(),
@@ -2030,6 +2055,7 @@ mod tests {
             }],
             workspace_removed: None,
             source_at_start: None,
+            needs_you: None,
         });
         run
     }
@@ -2575,6 +2601,51 @@ mod tests {
             "{:?}",
             item.details
         );
+    }
+
+    /// A session waiting on the person puts its Work among what needs you,
+    /// says what for and how to answer, until its session ends.
+    #[test]
+    fn work_whose_session_waits_on_you_needs_you_and_says_what_for() {
+        let mark = |kind| crate::NeedsYou {
+            kind,
+            message: "Claude needs your permission".into(),
+            at: chrono::Utc::now() - chrono::Duration::seconds(125),
+            transcript: None,
+            provider: "claude".into(),
+            session_id: "s1".into(),
+        };
+        let mut waiting = working(worktree("01W", "auth-ctx", 1));
+        waiting.attachment.as_mut().unwrap().needs_you =
+            Some(mark(crate::NeedsYouKind::Permission));
+        let busy = working(worktree("01B", "billing", 0));
+        let all = items(&[busy.clone(), waiting.clone()]);
+        assert_eq!(all[0].id, "01W", "needs you comes first");
+        let item = &all[0];
+        assert_eq!((item.group, item.state), (Group::NeedsYou, "waiting"));
+        assert_eq!(
+            lines(item, "Waiting"),
+            ["waiting on you: permission · Claude needs your permission · for 2m"]
+        );
+        assert_eq!(
+            item.next,
+            "Its session asks for your permission: answer it there."
+        );
+        assert!(lines(item, "Progress")[0].starts_with("files: unknown"));
+        assert_eq!(all[1].group, Group::InProgress);
+
+        let attachment = waiting.attachment.as_mut().unwrap();
+        attachment.needs_you = Some(mark(crate::NeedsYouKind::TurnEnded));
+        let item = items(std::slice::from_ref(&waiting)).remove(0);
+        assert!(lines(&item, "Waiting")[0].starts_with("waiting on you: turn ended"));
+        assert_eq!(item.keys, [FINISH]);
+
+        // Its session ended: it waits on nobody.
+        let attachment = waiting.attachment.as_mut().unwrap();
+        attachment.sessions[0].ended_at = Some(chrono::Utc::now());
+        let item = items(&[waiting]).remove(0);
+        assert_eq!((item.group, item.state), (Group::InProgress, "idle"));
+        assert!(item.details.iter().all(|detail| detail.label != "Waiting"));
     }
 
     /// Discovered Work of an agent whose session end Dispatch cannot see says

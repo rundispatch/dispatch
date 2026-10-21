@@ -6,7 +6,8 @@
 //! auto-applies attached Work whose `capabilities.integrate` is true. It
 //! finishes Work only by the person's consent to the project's checks, once
 //! its session is over or its workspace removed, each finish a task of its
-//! own, and closes Work a resumed session went on from. It never launches,
+//! own, and closes Work a resumed session went on from. It clears "waiting
+//! on you" once a waiting session moves again. It never launches,
 //! kills or refreshes an agent. `dispatch watch` renders the same view from
 //! canonical state and owns nothing.
 
@@ -785,6 +786,7 @@ impl Owner {
         if let Err(error) = super::liveness::observe(state, &self.root, &runs) {
             tick.report(&error);
         }
+        clear_needs_you(state, &runs, &mut tick);
         let moved = tick.moved || tick.adopted;
         self.reevaluate(state, &runs, &mut tick, moved);
         let started = Instant::now();
@@ -916,6 +918,26 @@ impl Owner {
             tick.report(&error);
             Vec::new()
         })
+    }
+}
+
+/// Clear "waiting on you" on Work whose session moved again
+/// (`attach::needs_you_cleared`): one `stat` per waiting Work.
+fn clear_needs_you(state: &State, runs: &[RunRecord], tick: &mut Tick) {
+    for run in runs {
+        let Some(by) = super::attach::needs_you_cleared(run) else {
+            continue;
+        };
+        let at = run
+            .attachment
+            .as_ref()
+            .and_then(|a| a.needs_you.as_ref())
+            .map(|m| m.at);
+        match at.map(|at| super::attach::clear_needs_you(state, &run.id, at, by)) {
+            Some(Ok(true)) => tick.persisted = true,
+            Some(Err(error)) => tick.report(&error),
+            _ => {}
+        }
     }
 }
 
@@ -1701,6 +1723,10 @@ fn short_ids<'a>(rows: &[&'a RunRecord]) -> HashMap<&'a str, &'a str> {
 /// kept apart from the verdict.
 fn row(run: &RunRecord, id: &str, interactions: Option<&Projection>) -> String {
     let mut line = format!("{id} · {}", describe(run).0);
+    if let Some(mark) = super::attach::waiting_on_you(run) {
+        line.push_str(" · ");
+        line.push_str(&super::attach::waiting_line(mark));
+    }
     if let Some(summary) = interactions.and_then(|p| p.summary(&run.id)) {
         line.push_str(" · ");
         line.push_str(&summary);
@@ -1760,7 +1786,14 @@ impl View {
                 let (line, decision) = describe(run);
                 // `null` while nothing watches the project: not known.
                 let concurrent = interactions.map(|p| p.json(&run.id));
-                let key = format!("{line} {concurrent:?}");
+                let needs_you = super::attach::waiting_on_you(run).map(|mark| {
+                    serde_json::json!({
+                        "kind": mark.kind,
+                        "message": mark.message,
+                        "since": mark.at,
+                    })
+                });
+                let key = format!("{line} {concurrent:?} {needs_you:?}");
                 if shown.get(&run.id) != Some(&key) {
                     println!(
                         "{}",
@@ -1778,6 +1811,7 @@ impl View {
                             "applied_by": line.applied_by,
                             "overridden": line.verdict == "overridden",
                             "interactions": concurrent,
+                            "needs_you": needs_you,
                         })
                     );
                     shown.insert(run.id.clone(), key);

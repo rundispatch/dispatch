@@ -633,6 +633,43 @@ pub struct AttachmentRecord {
     /// was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_at_start: Option<SourceAtStart>,
+    /// A session here is waiting on a person, as its runtime said, until it
+    /// moves again (`runtime::needs_you`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_you: Option<NeedsYou>,
+}
+
+/// A runtime session waiting on a person: for a permission, for input, or at
+/// the end of its turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeedsYou {
+    pub kind: NeedsYouKind,
+    /// The runtime's own words.
+    pub message: String,
+    pub at: DateTime<Utc>,
+    /// The session's transcript: written to again when the session moves.
+    #[serde(default)]
+    pub transcript: Option<PathBuf>,
+    pub provider: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NeedsYouKind {
+    Permission,
+    Input,
+    TurnEnded,
+}
+
+impl NeedsYouKind {
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Input => "input",
+            Self::TurnEnded => "turn ended",
+        }
+    }
 }
 
 /// The one observation of the integration source when Work began. Never
@@ -1070,6 +1107,7 @@ mod tests {
             sessions: Vec::new(),
             workspace_removed: None,
             source_at_start: None,
+            needs_you: None,
         }
     }
 
