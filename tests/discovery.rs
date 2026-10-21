@@ -556,11 +556,16 @@ fn a_hook_and_discovery_give_one_work_whichever_sees_the_worktree_first() {
     assert!(reply.contains("tracking this worktree as Work"), "{reply}");
     p.mark_claude(&hooked, Some(&session_lock("hooked", std::process::id())));
 
-    // Discovery first, then the session's hook joins its Work.
+    // Discovery first, then the session's hook joins its Work and names it,
+    // as it would had it registered the Work itself.
     let found = p.running("found");
     wait_until("discovered Work", || p.runs_in(&found).len() == 1);
     let reply = p.session_start(&found, "s-found");
-    assert_eq!(reply.trim(), "");
+    let id = p.runs_in(&found)[0]["id"].as_str().unwrap().to_owned();
+    assert!(
+        reply.contains(&format!("tracking this worktree as Work {id}")),
+        "{reply}"
+    );
 
     p.ticks();
     let [hooked_run] = p.runs_in(&hooked).try_into().unwrap();

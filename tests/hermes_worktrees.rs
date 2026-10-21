@@ -135,10 +135,13 @@ impl Project {
         run
     }
 
+    /// The kinds of the events written in full: the owner may be appending
+    /// one as this reads, and a line is whole once its newline is.
     fn events(&self, id: &str) -> Vec<String> {
-        fs::read_to_string(self.state.join("runs").join(id).join("events.jsonl"))
-            .unwrap()
-            .lines()
+        let text =
+            fs::read_to_string(self.state.join("runs").join(id).join("events.jsonl")).unwrap();
+        text.split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
             .map(|line| serde_json::from_str::<Value>(line).unwrap()["event_type"].to_string())
             .collect()
     }
@@ -382,13 +385,23 @@ fn a_session_outliving_its_removed_worktree_still_ends() {
     assert_eq!(p.run(&worktree)["outcome"]["lifecycle"], "working");
 }
 
-/// Liveness records the session's end, then lets go of the agent: wait for both.
+/// Liveness records the session's end, then lets go of the agent: wait for
+/// both, and say what was recorded instead if they never come.
 fn session_ended(p: &Project) {
-    wait_until("the session's end", || {
-        let run = p.run(&p.worktree());
-        run["attachment"]["sessions"][0]["end_reason"] == "process_gone"
-            && run["attachment"]["agent_process"].is_null()
-    });
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let attachment = p.run(&p.worktree())["attachment"].clone();
+        if attachment["sessions"][0]["end_reason"] == "process_gone"
+            && attachment["agent_process"].is_null()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the session's end: {attachment}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// With no remote-tracking refs Hermes counts no commit as unpushed, so it

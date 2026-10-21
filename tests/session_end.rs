@@ -306,10 +306,13 @@ impl Project {
         run
     }
 
+    /// The events of `kind` written in full: the owner may be appending one
+    /// as this reads, and a line is whole once its newline is.
     fn events(&self, id: &str, kind: &str) -> Vec<Value> {
         fs::read_to_string(self.state.join("runs").join(id).join("events.jsonl"))
             .unwrap()
-            .lines()
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .filter(|event| event["event_type"] == kind)
             .collect()
@@ -473,9 +476,12 @@ fn without_consent_a_session_end_is_only_recorded() {
     p.ticks();
     let run = p.run(&id);
     assert_eq!(run["outcome"]["lifecycle"], "working", "{run}");
-    assert_eq!(
-        run["attachment"]["sessions"][0]["end_reason"],
-        "prompt_input_exit"
+    // The lock goes before `SessionEnd`: a tick between them records the
+    // end first, and the first end recorded stands.
+    let reason = &run["attachment"]["sessions"][0]["end_reason"];
+    assert!(
+        reason == "prompt_input_exit" || reason == "lock_released",
+        "{run}"
     );
     assert_eq!(p.checks_run(), 0);
 }
@@ -573,6 +579,10 @@ fn assert_reopened(p: &Project, old: &str, new: &str) {
     assert_eq!(old_run["outcome"]["application"], "not_applied");
     let kept = fs::read_to_string(p.state.join("runs").join(old).join("delta.patch")).unwrap();
     assert!(kept.contains("+    2"), "{kept}");
+    // Its event may be written a moment after the record.
+    wait_until("the closing event", || {
+        !p.events(old, "work.closed").is_empty()
+    });
     let [closed] = p.events(old, "work.closed").try_into().unwrap();
     assert_eq!(closed["payload"]["by"], "reopen");
     assert_eq!(closed["payload"]["replacement"], new);
@@ -591,10 +601,10 @@ fn assert_reopened(p: &Project, old: &str, new: &str) {
         fs::read_to_string(baseline.join("src/lib.rs")).unwrap(),
         "pub fn f() -> i32 {\n    1\n}\n"
     );
-    assert!(
-        !p.state.join("reopen").join(old).exists(),
-        "the note is gone"
-    );
+    // Removed once the old Work is closed, a moment after.
+    wait_until("the note gone", || {
+        !p.state.join("reopen").join(old).exists()
+    });
 }
 
 /// Here a person finished the Work, and the session ends after.
@@ -686,6 +696,88 @@ fn a_session_whose_old_s0_is_gone_starts_work_of_its_own() {
     resumed.stop();
 }
 
+/// Work a person finished, whose worktree a resumed session has locked
+/// again and discovery has seen, before the session's `SessionStart`: under
+/// load, discovery's next look comes first. The old Work, and the new Work
+/// discovery made, with the resumed process. `prune` removes the old S0
+/// first, as `git gc` would.
+fn relocked_and_discovered(
+    p: &Project,
+    worktree: &Path,
+    agent: Agent,
+    prune: bool,
+) -> (String, String, Agent) {
+    let old = registered(p, worktree, &agent);
+    p.edit(worktree, 2);
+    let finish = p.dispatch(&["finish", &old]);
+    assert!(finish.status.success(), "{}", text(&finish));
+    exit(p, worktree, agent);
+    if prune {
+        let s0 = s0(&p.run(&old));
+        fs::remove_file(p.root.join(".git/objects").join(&s0[..2]).join(&s0[2..])).unwrap();
+    }
+    let resumed = Agent::start();
+    p.lock(worktree, Some(&resumed.lock("x")));
+    wait_until("discovery's Work", || p.runs().len() == 2);
+    let new = other_than(p, &old);
+    let created = p.events(&new, "attach.created");
+    assert_eq!(created[0]["payload"]["via"], "discovery");
+    (old, new, resumed)
+}
+
+/// Whichever comes first, the session hears which Work it is: the hook
+/// joins the Work discovery reopened and names it, as it would its own.
+#[test]
+fn a_session_discovery_reopened_first_is_told_its_work() {
+    let p = Project::new(COUNTED);
+    p.consent();
+    let agent = Agent::start();
+    let worktree = p.worktree("x", &agent);
+    p.watch();
+    let (old, new, resumed) = relocked_and_discovered(&p, &worktree, agent, false);
+
+    let reply = p.session_start(&worktree, SESSION, "resume");
+    assert!(
+        reply.contains(&format!("tracking this worktree as Work {new}")),
+        "{reply}"
+    );
+    assert_eq!(p.runs().len(), 2);
+    assert_reopened(&p, &old, &new);
+    let sessions = p.run(&new)["attachment"]["sessions"].clone();
+    assert_eq!(sessions[1]["session_id"], SESSION, "{sessions}");
+    // Once a hook has told a session, a later one in it is silent.
+    assert_eq!(p.session_start(&worktree, SESSION, "clear"), "");
+    resumed.stop();
+}
+
+/// With its old S0 pruned, discovery starts the Work from the worktree as
+/// the session found it, as the hook would: the old change is the old
+/// Work's to review, not the new Work's too.
+#[test]
+fn a_session_discovery_could_not_reopen_starts_from_the_worktree_as_found() {
+    let p = Project::new(COUNTED);
+    p.consent();
+    let agent = Agent::start();
+    let worktree = p.worktree("x", &agent);
+    p.watch();
+    let (old, new, resumed) = relocked_and_discovered(&p, &worktree, agent, true);
+
+    let reply = p.session_start(&worktree, SESSION, "resume");
+    assert!(
+        reply.contains(&format!("tracking this worktree as Work {new}")),
+        "{reply}"
+    );
+    let [refused] = p.events(&new, "work.not_reopened").try_into().unwrap();
+    assert_eq!(refused["payload"]["reopens"], old);
+    let baseline = PathBuf::from(p.run(&new)["baseline_path"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(baseline.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    2\n}\n"
+    );
+    assert_eq!(p.run(&old)["outcome"]["review"], "pending");
+    resumed.stop();
+}
+
 /// A person who types `finish` or `close` while the owner finishes the Work
 /// by their consent is told so, not only that it is busy.
 #[test]
@@ -718,13 +810,9 @@ fn a_typed_command_during_the_owners_finish_says_why_it_waits() {
     fs::write(p.marks.join("gate"), b"released\n").unwrap();
     let run = p.until(&id, "finished by consent", finished);
     assert_eq!(run["outcome"]["closed"], Value::Null, "{run}");
-    assert!(
-        !p.state
-            .join("runs")
-            .join(&id)
-            .join("finishing-by-consent")
-            .exists()
-    );
+    // Removed once the finish lets go of the Work, a moment after.
+    let finishing = p.state.join("runs").join(&id).join("finishing-by-consent");
+    wait_until("the finish's mark gone", || !finishing.exists());
 }
 
 #[test]

@@ -284,8 +284,10 @@ fn log(run_id: &str, message: &str) {
 
 /// What the worker thread of a session start ended in.
 enum Started {
-    /// The workspace already had Work; the session is recorded on it.
-    Existing,
+    /// The workspace already had Work; the session is recorded on it. With
+    /// that Work's ID when only discovery had seen its sessions, so no hook
+    /// has told one about it.
+    Existing(Option<String>),
     Published,
     /// The deadline decided first; the worker stopped.
     Lost,
@@ -295,8 +297,8 @@ enum Started {
 /// (`docs/plan-0.4.10.md` §3), deciding by `BUDGET` after `began`, the
 /// hook process's start. `registration` is complete but for `s0_commit` and
 /// `consented`, which the worker fills in. `None`: the workspace already had
-/// Work and the session was recorded on it. An error is untracked, with its
-/// reason.
+/// Work a hook told a session about, and the session was recorded on it. An
+/// error is untracked, with its reason.
 pub(crate) fn register(
     state: &State,
     registration: Registration,
@@ -322,9 +324,9 @@ pub(crate) fn register(
     #[cfg(debug_assertions)]
     let wait = if at_boundary { Duration::MAX } else { wait };
     let failure = match receiver.recv_timeout(wait) {
-        Ok(Ok(Started::Existing)) => {
+        Ok(Ok(Started::Existing(unannounced))) => {
             building.remove();
-            return Ok(None);
+            return Ok(unannounced.map(|run_id| Outcome::Registered { run_id }));
         }
         Ok(Ok(Started::Published)) => return Ok(Some(Outcome::Registered { run_id })),
         Ok(Ok(Started::Lost)) | Err(_) => None,
@@ -360,8 +362,18 @@ fn work(state: &State, mut registration: Registration) -> Result<Started> {
     if reopens.is_none()
         && let Some(run_id) = attach::find_active_attachment(state, &workspace)?
     {
+        // Discovery may have registered it a moment ago, or reopened Work
+        // when a resumed session locked the worktree before this hook: this
+        // session hears of its Work here, whichever came first.
+        let unannounced = state
+            .load_run(&run_id)?
+            .attachment
+            .is_some_and(|attachment| {
+                let sessions = &attachment.sessions;
+                !sessions.is_empty() && sessions.iter().all(|s| s.source == "discovered")
+            });
         attach::record_session_start(state, &run_id, registration.session)?;
-        return Ok(Started::Existing);
+        return Ok(Started::Existing(unannounced.then_some(run_id)));
     }
     // Authority to run the project's checks comes only from the person's
     // consent for exactly these checks, never from the session.
@@ -528,10 +540,11 @@ fn request(registration: &Registration) -> AttachRequest {
 
 /// Register `session`, which the project owner found running in `workspace`,
 /// a worktree its runtime made after watching began (`discovery`): S0 is the
-/// worktree's merge base with `root`, published like a hook's Work. Under the
+/// worktree's merge base with `root` (the old S0 when it reopens Work, the
+/// worktree as found when it cannot), published like a hook's Work. Under the
 /// workspace lock, taken without waiting. `None`: the lock is held, or the
 /// workspace has Work by now, a hook's included; a later hook joins this
-/// Work as it would join its own.
+/// Work as it would join its own, and names it to its session.
 pub(crate) fn discovered(
     state: &State,
     root: &Path,
@@ -555,6 +568,9 @@ pub(crate) fn discovered(
     }
     let commit = match &reopens {
         Some((_, commit)) => commit.clone(),
+        // Its earlier Work keeps its own Δ for review: as a hook's would,
+        // this Work begins from the worktree as the session found it.
+        None if not_reopened.is_some() => source::world_commit(workspace)?,
         None => source::merge_base(root, workspace)?
             .context("the worktree shares no history with the project")?,
     };

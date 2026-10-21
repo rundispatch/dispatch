@@ -2082,29 +2082,43 @@ pub(super) async fn finish_by_consent(
     run_id: &str,
     cancel: CancellationToken,
 ) -> Result<bool> {
-    let Ok(_lock) = OperationLock::acquire(
-        &state.run_dir(run_id).join(".operation.lock"),
-        "attached work has a foreground owner",
-    ) else {
-        return Ok(false);
-    };
-    let run = state.load_run(run_id)?;
-    if cancel.is_cancelled() || !finishes_by_consent(state, &run)? {
-        return Ok(false);
-    }
+    // From before the lock is taken until it is let go, so a session that
+    // starts again meanwhile never joins Work being finished (`reopenable`).
     let finishing = state.run_dir(run_id).join(FINISHING);
     fs::write(&finishing, std::process::id().to_string())?;
-    let mut db = Database::open(state.db_path())?;
-    let finished =
-        finish_locked(state, &mut db, run, false, FinishReason::ByConsent, &cancel).await;
+    let finished = async {
+        let Ok(_lock) = OperationLock::acquire(
+            &state.run_dir(run_id).join(".operation.lock"),
+            "attached work has a foreground owner",
+        ) else {
+            return Ok(false);
+        };
+        let run = state.load_run(run_id)?;
+        if cancel.is_cancelled() || !finishes_by_consent(state, &run)? {
+            return Ok(false);
+        }
+        let mut db = Database::open(state.db_path())?;
+        finish_locked(state, &mut db, run, false, FinishReason::ByConsent, &cancel).await?;
+        Ok(true)
+    }
+    .await;
     let _ = fs::remove_file(&finishing);
-    finished?;
-    Ok(true)
+    finished
 }
 
 /// Written by the project owner, with its pid, while its finish by consent
-/// holds the run's lock.
+/// holds the run's lock or is about to take it.
 const FINISHING: &str = "finishing-by-consent";
+
+/// Whether the project owner's finish by consent holds `run_id`'s lock, or
+/// is about to: its `FINISHING` names a process that still runs. Any other
+/// holder, a tick recording a verdict say, is not finishing it.
+fn finishing_by_consent(state: &State, run_id: &str) -> bool {
+    fs::read_to_string(state.run_dir(run_id).join(FINISHING))
+        .ok()
+        .and_then(|pid| pid.trim().parse().ok())
+        .is_some_and(crate::process::pid_exists)
+}
 
 /// The run's lock for a typed command, after a moment's wait. When the
 /// project owner's finish by consent holds it (`FINISHING`, by a process
@@ -2117,15 +2131,13 @@ fn typed_run_lock(state: &State, run_id: &str, busy: &str) -> Result<OperationLo
         Duration::from_secs(5),
     )
     .map_err(|error| {
-        let owner = fs::read_to_string(run_dir.join(FINISHING))
-            .ok()
-            .and_then(|pid| pid.trim().parse().ok());
-        match owner {
-            Some(pid) if crate::process::pid_exists(pid) => anyhow::anyhow!(
+        if finishing_by_consent(state, run_id) {
+            anyhow::anyhow!(
                 "Work {run_id} is being finished by its project's owner, as you allowed \
                  (checks running); wait for it, or close it once it is ready"
-            ),
-            _ => error,
+            )
+        } else {
+            error
         }
     })
 }
@@ -2135,8 +2147,9 @@ fn typed_run_lock(state: &State, run_id: &str, busy: &str) -> Result<OperationLo
 /// Work of that runtime there, registered by hook or discovery, whose
 /// workspace was never removed, and that is a result awaiting review or is
 /// being finished now: its sessions ended, the agent Dispatch recorded no
-/// longer runs, and its lock is held. `/clear` ends a session in a process
-/// that still runs, so it carries on with the same Work.
+/// longer runs, and the owner's finish by consent holds its lock or is about
+/// to (any other holder, a tick say, finishes nothing). `/clear` ends a
+/// session in a process that still runs, so it carries on with the same Work.
 pub(crate) fn reopenable(
     state: &State,
     workspace: &Path,
@@ -2163,7 +2176,7 @@ pub(crate) fn reopenable(
         && attachment.agent_process.as_ref().is_none_or(|agent| {
             process::identity_state(agent) != process::IdentityState::ExactLive
         })
-        && OperationLock::is_held(&state.run_dir(&run.id).join(".operation.lock"))?;
+        && finishing_by_consent(state, &run.id);
     Ok((unreviewed || finishing).then_some(run))
 }
 
@@ -2810,6 +2823,57 @@ mod last_seen_tests {
         let restored: RunRecord = serde_json::from_value(old).unwrap();
         let restored = serde_json::to_value(restored).unwrap();
         assert!(restored["attachment"]["workspace_removed"]["last_seen_at"].is_null());
+    }
+
+    /// Found under load: a tick holding the run's lock for a moment read as
+    /// a finish in progress, so a session starting again got new Work and
+    /// the old one closed as superseded, though nothing was finishing it.
+    #[test]
+    fn only_the_owners_finish_by_consent_is_a_finish_a_session_reopens() {
+        let (_temp, state, run) = attached();
+        // A hook's Work whose one session ended, its process gone.
+        let mut run = state.load_run(&run.id).unwrap();
+        let attachment = run.attachment.as_mut().unwrap();
+        attachment.agent = Some("claude".into());
+        attachment.provenance = BaselineProvenance::WorkspaceAtStart { commit: "c".into() };
+        attachment.sessions.push(RuntimeSession {
+            provider: "claude".into(),
+            session_id: "s".into(),
+            source: "startup".into(),
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            end_reason: Some("prompt_input_exit".into()),
+            model: None,
+        });
+        let workspace = attachment.workspace.clone();
+        Database::open(state.db_path())
+            .unwrap()
+            .sync_run(&run)
+            .unwrap();
+        state.save_run(&run).unwrap();
+        let reopens = || {
+            reopenable(&state, &workspace, "claude")
+                .unwrap()
+                .map(|run| run.id)
+        };
+
+        // A tick holds the lock.
+        let lock = state.run_dir(&run.id).join(".operation.lock");
+        let held = OperationLock::acquire(&lock, "a tick").unwrap();
+        assert_eq!(reopens(), None);
+        // The owner's finish holds it.
+        let finishing = state.run_dir(&run.id).join(FINISHING);
+        fs::write(&finishing, std::process::id().to_string()).unwrap();
+        assert_eq!(reopens(), Some(run.id.clone()));
+        // The finish wrote its mark, and has yet to take the lock.
+        drop(held);
+        assert_eq!(reopens(), Some(run.id.clone()));
+        // An owner killed during its finish left its mark behind.
+        let gone = std::process::Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait_with_output().unwrap();
+        fs::write(&finishing, pid.to_string()).unwrap();
+        assert_eq!(reopens(), None);
     }
 
     #[tokio::test]
