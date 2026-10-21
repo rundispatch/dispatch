@@ -21,15 +21,197 @@ pub async fn standalone(
     }
     anyhow::ensure!(
         suitable(),
-        "setup requires a terminal for explicit funding confirmation; use dispatch resources for noninteractive status"
+        if provider.is_some() {
+            "setup requires a terminal for explicit funding confirmation; use dispatch resources for noninteractive status"
+        } else {
+            "setup needs a terminal to choose project checks, allow them, and install hooks; use dispatch setup --checks --verify '<command>' to save exact checks without one"
+        }
     );
     options.plain |= std::env::var("TERM").is_ok_and(|v| v == "dumb");
     let mut ui = Ui::new(options)?;
     if project_checks {
         project_checks_menu(&mut ui, state, &std::env::current_dir()?, &verify).await
-    } else {
+    } else if provider.is_some() {
         accounts(&mut ui, state, provider).await
+    } else {
+        project_setup(&mut ui, state, &std::env::current_dir()?, options).await
     }
+}
+
+/// One explicit pass for a project: save checks, authorize those exact
+/// checks, offer observation hooks, then start watching.
+async fn project_setup(
+    ui: &mut Ui,
+    state: &State,
+    source: &std::path::Path,
+    options: Options,
+) -> Result<()> {
+    let mut carry_on =
+        choose_project_checks(ui, source).await? && allow_project_checks(ui, state, source).await?;
+    for runtime in [Runtime::Claude, Runtime::Hermes] {
+        if carry_on && which::which(runtime.program()).is_ok() {
+            carry_on = hook_step(ui, state, runtime, false).await?;
+        }
+    }
+    if !carry_on {
+        return ui.commit(SETUP_STOPPED);
+    }
+    let rows = [
+        Choice::new("Done"),
+        Choice::new("Agents Dispatch launches…"),
+    ];
+    // Accounts are optional and come last; Enter alone finishes setup.
+    let agents = ui
+        .select(
+            "Project setup is ready. Agents Dispatch launches can be configured separately.",
+            &rows,
+            0,
+        )
+        .await?;
+    if agents.is_none() {
+        return ui.commit(SETUP_STOPPED);
+    }
+    if agents == Some(1) {
+        accounts(ui, state, None).await?;
+    }
+    // `start` prints the watching lines. Close the screen first, so a live
+    // viewport has restored the terminal before they are printed.
+    drop(ui.screen.take());
+    crate::orchestrator::background::start_after_setup(state, Some(source.into()), 0, options).await
+}
+
+/// What setup says when the person backs out of a step.
+const SETUP_STOPPED: &str = "Setup stopped; later steps were left unchanged.";
+
+/// A selection is toggled in place; Save is the only choice that writes.
+/// Existing commands stay selected until changed, including commands that
+/// are no longer detected from filenames.
+async fn choose_project_checks(ui: &mut Ui, source: &std::path::Path) -> Result<bool> {
+    let expected = setup::project_config_bytes(source)?;
+    let existing = crate::consent::effective_checks(source)?;
+    let detected = setup::check_choices(source);
+    let mut commands: Vec<String> = detected.iter().map(ToString::to_string).collect();
+    for command in &existing {
+        if !commands.contains(command) {
+            commands.push(command.clone());
+        }
+    }
+    let mut selected: Vec<bool> = commands.iter().map(|c| existing.contains(c)).collect();
+    loop {
+        let mut rows = commands
+            .iter()
+            .zip(&selected)
+            .map(|(command, selected)| {
+                Choice::new(format!("[{}] {command}", if *selected { "x" } else { " " }))
+            })
+            .collect::<Vec<_>>();
+        let other = rows.len();
+        rows.push(Choice::new("Other command…"));
+        rows.push(Choice::new("Save selected checks"));
+        rows.push(Choice::new(if existing.is_empty() {
+            "Continue without checks"
+        } else {
+            "Keep current checks"
+        }));
+        rows.push(Choice::new("Cancel setup"));
+        let current = if existing.is_empty() {
+            "Current checks: none".to_owned()
+        } else {
+            format!("Current checks:\n  {}", existing.join("\n  "))
+        };
+        let body = format!(
+            "Project checks\n{current}\nSelect each command, then Save selected checks. Checks run project code with your permissions."
+        );
+        match ui.select(&body, &rows, other + 2).await? {
+            Some(i) if i < commands.len() => selected[i] = !selected[i],
+            Some(i) if i == other => {
+                if let Input::Submit(typed) = ui
+                    .command_prompt("Other check command (one line, run on this host)")
+                    .await?
+                {
+                    let typed = typed.trim();
+                    anyhow::ensure!(
+                        !typed.is_empty() && !typed.contains(['\n', '\r']),
+                        "a check is one non-empty command line"
+                    );
+                    if let Some(i) = commands.iter().position(|command| command == typed) {
+                        selected[i] = true;
+                    } else {
+                        commands.push(typed.to_owned());
+                        selected.push(true);
+                    }
+                }
+            }
+            Some(i) if i == other + 1 => {
+                let chosen = commands
+                    .iter()
+                    .zip(&selected)
+                    .filter_map(|(command, selected)| selected.then_some(command.clone()))
+                    .collect::<Vec<_>>();
+                if chosen
+                    .iter()
+                    .all(|command| detected.contains(&command.as_str()))
+                {
+                    let chosen = chosen.iter().map(String::as_str).collect::<Vec<_>>();
+                    setup::save_checks(source, &chosen, expected)?;
+                } else {
+                    // A typed or existing command is approved by its exact text.
+                    setup::save_typed_checks(source, &chosen, expected)?;
+                }
+                ui.commit(&format!(
+                    "Checks saved to dispatch.yml: {}",
+                    if chosen.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        chosen.join(", ")
+                    }
+                ))?;
+                return Ok(true);
+            }
+            Some(i) if i == other + 2 => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
+}
+
+async fn allow_project_checks(
+    ui: &mut Ui,
+    state: &State,
+    source: &std::path::Path,
+) -> Result<bool> {
+    use crate::consent::{self, CheckConsent};
+    let root = consent::project_root(source)?;
+    let commands = consent::effective_checks(&root)?;
+    if commands.is_empty() {
+        ui.commit("No checks are configured; check consent was not granted.")?;
+        return Ok(true);
+    }
+    let standing = match consent::consent(state, &root)? {
+        CheckConsent::Valid(_) => {
+            ui.commit("Check consent already holds for these exact commands.")?;
+            return Ok(true);
+        }
+        CheckConsent::NotGranted => "No standing check consent has been given.",
+        CheckConsent::Changed { .. } => "The checks changed; the earlier consent no longer holds.",
+        CheckConsent::OutdatedScope => {
+            "The earlier consent no longer holds: Dispatch now also runs these checks when you attach or finish Work yourself, and when a session ends."
+        }
+        CheckConsent::UnsupportedVersion(_) => {
+            "This consent record uses a version Dispatch cannot read; please allow these checks again."
+        }
+    };
+    let body = format!(
+        "Allow checks for this project?\nExact commands:\n  {}\n{standing}\n{}",
+        commands.join("\n  "),
+        consent::SCOPE
+    );
+    let rows = [Choice::new("Allow"), Choice::new("Cancel")];
+    if ui.select(&body, &rows, 1).await? != Some(0) {
+        return Ok(false);
+    }
+    consent::grant_exact(state, &root, &commands)?;
+    ui.commit("Check consent saved in Dispatch's state for these exact commands.")?;
+    Ok(true)
 }
 
 /// `dispatch setup --checks --verify …` without a terminal: save exactly
@@ -42,6 +224,12 @@ fn save_given_checks(state: &State, source: &std::path::Path, verify: &[String])
     let standing = match consent::consent(state, &consent::project_root(source)?)? {
         consent::CheckConsent::Valid(_) => {
             "Work here already runs exactly these checks by themselves."
+        }
+        consent::CheckConsent::OutdatedScope => {
+            "Earlier consent no longer holds: it did not cover typed attach, finish, or session-end checks. Reapprove with dispatch setup --checks in a terminal. A single finish can run them with --allow-unsafe-local."
+        }
+        consent::CheckConsent::UnsupportedVersion(_) => {
+            "The check consent version is unsupported. Reapprove with dispatch setup --checks in a terminal. A single finish can run them with --allow-unsafe-local."
         }
         _ => {
             "They do not run by themselves: allowing that needs dispatch setup --checks in a \
@@ -180,137 +368,222 @@ pub(super) async fn accounts(
 /// Claude Code's session hooks and Hermes's session-end hook, which let Work
 /// appear by itself in watched projects and keep a worktree's changes before
 /// its runtime removes it. They are observation hooks, not a resource: no
-/// account, model or funding is involved. Installing shows exactly what is
-/// added and where, and needs a deliberate choice; focus starts on Cancel.
+/// account, model or funding is involved.
 async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
-    use crate::runtime::{claude, hermes};
-    let path = claude::settings_path()?;
-    let installed = claude::hooks_installed(&path)?;
-    let hermes_path = hermes::config_path()?;
-    let hermes_installed = hermes::installed(&hermes_path);
-    let action = if installed {
-        "Remove Claude Code hooks"
-    } else {
-        "Install Claude Code hooks"
+    let found = |runtime: Runtime| -> Result<(std::path::PathBuf, Result<Change>)> {
+        let path = runtime.path()?;
+        let command = runtime.command(state)?;
+        let change = runtime
+            .found(&path)
+            .map(|found| Change::of(&found, &command));
+        Ok((path, change))
     };
-    let hermes_action = if matches!(hermes_installed, Ok(true)) {
-        "Remove the Hermes hook"
-    } else {
-        "Install the Hermes hook"
+    let (path, claude) = found(Runtime::Claude)?;
+    let claude = claude?;
+    let (hermes_path, hermes) = found(Runtime::Hermes)?;
+    let installed = |change: &Change| match change {
+        Change::Install => "not installed",
+        _ => "installed",
     };
     let body = format!(
         "Runtime integrations\nClaude Code hooks: {} ({})\nHermes hook: {} ({})\nWith them, a Claude Code session in its own worktree of a project you watch \
          (dispatch start) appears as Work by itself; a session in the checkout itself is told Dispatch cannot follow it. \
          Hermes's hook keeps a hermes --worktree session's exact changes before Hermes removes its worktree.",
-        if installed {
-            "installed"
-        } else {
-            "not installed"
-        },
+        installed(&claude),
         path.display(),
-        match hermes_installed {
-            Ok(true) => "installed",
-            Ok(false) => "not installed",
+        match &hermes {
+            Ok(change) => installed(change),
             Err(_) => "unknown, its config.yaml is unreadable",
         },
         hermes_path.display()
     );
     let rows = [
-        Choice::new(action),
-        Choice::new(hermes_action),
+        Choice::new(format!("{} Claude Code hooks", claude.verb())),
+        Choice::new(format!(
+            "{} the Hermes hook",
+            hermes.unwrap_or(Change::Install).verb()
+        )),
         Choice::new("Back"),
     ];
-    match ui.select(&body, &rows, 0).await? {
-        Some(0) => {}
-        Some(1) => return hermes_hook(ui, state, &hermes_path).await,
+    let runtime = match ui.select(&body, &rows, 0).await? {
+        Some(0) => Runtime::Claude,
+        Some(1) => Runtime::Hermes,
         _ => return Ok(()),
-    }
-    let command = claude::hook_command(state)?;
-    let consent = if installed {
-        format!(
-            "Remove Dispatch's hooks from {}?\nOnly the entries running `... hook claude` are removed; a backup is kept beside the file.",
-            path.display()
-        )
-    } else {
-        format!(
-            "Add these hooks to {}?\n{}\nOther settings and hooks are kept (key order may change); a backup is kept beside the file.",
-            path.display(),
-            claude::hooks_preview(&command)
-        )
     };
-    let confirm = if installed { "Remove" } else { "Install" };
-    let rows = [Choice::new(confirm), Choice::new("Cancel")];
-    if ui.select(&consent, &rows, 1).await? != Some(0) {
-        return Ok(());
+    hook_step(ui, state, runtime, true).await.map(drop)
+}
+
+/// A runtime whose own configuration takes Dispatch's hook.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Runtime {
+    Claude,
+    Hermes,
+}
+
+impl Runtime {
+    fn program(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Hermes => "hermes",
+        }
     }
-    let backup = if installed {
-        claude::uninstall_hooks(&path)?
-    } else {
-        claude::install_hooks(&path, &command)?
-    };
-    let kept = backup.map_or_else(String::new, |backup| {
-        format!(" Previous settings: {}.", backup.display())
-    });
-    ui.commit(&format!(
-        "Claude Code hooks {}.{kept}",
-        if installed { "removed" } else { "installed" }
-    ))
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code hooks",
+            Self::Hermes => "Hermes hook",
+        }
+    }
+
+    fn path(self) -> Result<std::path::PathBuf> {
+        match self {
+            Self::Claude => crate::runtime::claude::settings_path(),
+            Self::Hermes => crate::runtime::hermes::config_path(),
+        }
+    }
+
+    fn command(self, state: &State) -> Result<String> {
+        match self {
+            Self::Claude => crate::runtime::claude::hook_command(state),
+            Self::Hermes => crate::runtime::hermes::hook_command(state),
+        }
+    }
+
+    fn found(self, path: &std::path::Path) -> Result<crate::runtime::Hook> {
+        match self {
+            Self::Claude => crate::runtime::claude::hook(path),
+            Self::Hermes => crate::runtime::hermes::hook(path),
+        }
+    }
+}
+
+/// What a hook step changes in a runtime's configuration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Install,
+    Update,
+    Remove,
+}
+
+impl Change {
+    /// Install when there is no hook of Dispatch's, Update when Dispatch's
+    /// runs another command or is an earlier Dispatch's, and Remove otherwise.
+    fn of(found: &crate::runtime::Hook, command: &str) -> Self {
+        use crate::runtime::Hook;
+        match found {
+            Hook::Absent => Self::Install,
+            Hook::Exact(other) if other != command => Self::Update,
+            Hook::Earlier(_) => Self::Update,
+            _ => Self::Remove,
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Install => "Install",
+            Self::Update => "Update",
+            Self::Remove => "Remove",
+        }
+    }
 }
 
 /// Hermes's consent stays Hermes's: Dispatch never writes its allowlist.
 const HERMES_CONSENT: &str = "Hermes asks you to allow the hook the first time it runs it; \
      a run without a terminal needs hermes --accept-hooks.";
 
-/// Install or remove the `on_session_finalize` hook in Hermes's
-/// `config.yaml`, which is kept byte for byte: Dispatch appends one block, or
-/// removes exactly that block, and never rewrites the rest.
-async fn hermes_hook(ui: &mut Ui, state: &State, path: &std::path::Path) -> Result<()> {
-    use crate::runtime::hermes;
-    let installed = hermes::installed(path)?;
-    let command = hermes::hook_command(state)?;
-    let consent = if installed {
-        format!(
-            "Remove Dispatch's hook from {}?\nOnly the block Dispatch added is removed, and only as Dispatch added it; a backup is kept beside the file.",
-            path.display()
-        )
-    } else {
-        match hermes::addition(path, &command)? {
+/// One runtime's hook, the step both setup's pass and Runtime integrations
+/// take. It shows exactly what changes and where, with the existing and new
+/// command on an Update, and needs a deliberate choice: focus starts on Skip,
+/// or on Cancel in the menu. Only the menu (`menu`) removes; setup leaves a
+/// hook that already runs this Dispatch, or that was changed by hand, as it
+/// is. Returns false when the person backed out.
+async fn hook_step(ui: &mut Ui, state: &State, runtime: Runtime, menu: bool) -> Result<bool> {
+    use crate::runtime::{Hook, claude, hermes};
+    let name = runtime.name();
+    let path = runtime.path()?;
+    let command = runtime.command(state)?;
+    let found = runtime.found(&path)?;
+    let change = Change::of(&found, &command);
+    let shown = path.display();
+    if change == Change::Remove && !menu {
+        ui.commit(&if found == Hook::Changed {
+            format!("{name}: changed by hand in {shown}; setup leaves that file as it is.")
+        } else {
+            format!("{name}: already running this Dispatch ({shown}).")
+        })?;
+        return Ok(true);
+    }
+    // An earlier Dispatch's hooks may already run this one, upgraded in place.
+    let commands = match &found {
+        Hook::Exact(previous) | Hook::Earlier(previous) if *previous != command => {
+            format!("Existing hook command: {previous}\nNew hook command: {command}")
+        }
+        _ => format!("Hook command, unchanged: {command}"),
+    };
+    let what = match (runtime, change) {
+        (Runtime::Claude, Change::Install) => format!(
+            "Add these hooks to {shown}?\n{}\nOther settings and hooks are kept (key order may change); a backup is kept beside the file.",
+            claude::hooks_preview(&command)
+        ),
+        (Runtime::Claude, Change::Update) => format!(
+            "Update Dispatch's hooks in {shown}?\n{commands}\nDispatch's hooks there are replaced by exactly these:\n{}\nOther settings and hooks are kept; a backup is kept beside the file.",
+            claude::hooks_preview(&command)
+        ),
+        (Runtime::Claude, Change::Remove) => format!(
+            "Remove Dispatch's hooks from {shown}?\nOnly Dispatch's own hooks are removed, hook by hook; a backup is kept beside the file."
+        ),
+        (Runtime::Hermes, Change::Install) => match hermes::addition(&path, &command)? {
             hermes::Addition::Append(block) => format!(
-                "Add this to the end of {}?\n{}\nEvery other byte of the file is kept; a backup is kept beside the file. {HERMES_CONSENT}",
-                path.display(),
+                "Add this to the end of {shown}?\n{}\nEvery other byte of the file is kept; a backup is kept beside the file. {HERMES_CONSENT}",
                 block.trim_start_matches('\n')
             ),
             hermes::Addition::ByHand(lines) => {
-                return ui.commit(&format!(
-                    "{} has a hooks: key of its own, so Dispatch leaves the file alone. Add these lines under it by hand:\n{}{HERMES_CONSENT}",
-                    path.display(),
-                    lines
-                ));
+                ui.commit(&format!(
+                    "{shown} has a hooks: key of its own, so Dispatch leaves the file alone. Add these lines under it by hand:\n{lines}{HERMES_CONSENT}"
+                ))?;
+                return Ok(true);
             }
-        }
+        },
+        (Runtime::Hermes, Change::Update) => format!(
+            "Update Dispatch's hook in {shown}?\n{commands}\nOnly the command in Dispatch's block changes; a backup is kept beside the file. {HERMES_CONSENT}"
+        ),
+        (Runtime::Hermes, Change::Remove) => format!(
+            "Remove Dispatch's hook from {shown}?\nOnly the block Dispatch added is removed, and only as Dispatch added it; a backup is kept beside the file."
+        ),
     };
-    let confirm = if installed { "Remove" } else { "Install" };
-    let rows = [Choice::new(confirm), Choice::new("Cancel")];
-    if ui.select(&consent, &rows, 1).await? != Some(0) {
-        return Ok(());
+    let rows = [
+        Choice::new(change.verb()),
+        Choice::new(if menu { "Cancel" } else { "Skip" }),
+    ];
+    let body = format!("{name} · {}\n{what}", change.verb());
+    match ui.select(&body, &rows, 1).await? {
+        Some(0) => {}
+        choice => return Ok(choice.is_some()),
     }
-    let backup = if installed {
-        hermes::uninstall(path)?
-    } else {
-        hermes::install(path, &command)?
+    let backup = match (runtime, change) {
+        (Runtime::Claude, Change::Remove) => claude::uninstall_hooks(&path)?,
+        (Runtime::Claude, _) => claude::install_hooks(&path, &command)?,
+        (Runtime::Hermes, Change::Install) => hermes::install(&path, &command)?,
+        (Runtime::Hermes, Change::Update) => hermes::update(&path, &command)?,
+        (Runtime::Hermes, Change::Remove) => hermes::uninstall(&path)?,
     };
     let kept = backup.map_or_else(String::new, |backup| {
-        format!(" Previous config: {}.", backup.display())
+        format!(" Previous configuration: {}.", backup.display())
     });
     ui.commit(&format!(
-        "Hermes hook {}.{kept}{}",
-        if installed { "removed" } else { "installed" },
-        if installed {
-            String::new()
-        } else {
+        "{name} {} in {shown}.{kept}{}",
+        match change {
+            Change::Install => "installed",
+            Change::Update => "updated",
+            Change::Remove => "removed",
+        },
+        if (runtime, change) == (Runtime::Hermes, Change::Install) {
             format!(" {HERMES_CONSENT}")
+        } else {
+            String::new()
         }
-    ))
+    ))?;
+    Ok(true)
 }
 
 /// A profile as a menu row: selecting it revalidates. A disabled profile
@@ -575,6 +848,12 @@ async fn project_checks_menu(
         consent::CheckConsent::Changed { .. } => {
             "Work here asks first: you allowed other commands, and the checks changed since."
         }
+        consent::CheckConsent::OutdatedScope => {
+            "Work here asks first: the earlier consent did not cover typed attach, finish, or session-end checks."
+        }
+        consent::CheckConsent::UnsupportedVersion(_) => {
+            "Work here asks first: this consent record uses an unsupported version."
+        }
         consent::CheckConsent::NotGranted => "Work here asks you before running them.",
     };
     let body = format!("Project checks\n{listed}\n{standing}");
@@ -603,7 +882,7 @@ async fn project_checks_menu(
             if ui.select(&body, &rows, 1).await? != Some(0) {
                 return ui.commit("Nothing changed.");
             }
-            consent::grant(state, &root)?;
+            consent::grant_exact(state, &root, &commands)?;
             ui.commit("Work in this project will run these checks by themselves.")
         }
         _ => Ok(()),

@@ -76,22 +76,25 @@ for line in sys.stdin:
     # cancellation never renews it.
     config=re.sub(r'valid_until: [^\n]+','valid_until: 2020-01-01T00:00:00Z',config)
     (state/'resources.yml').write_text(config);expired=(state/'resources.yml').read_bytes()
-    with session('revalidate',['setup']) as ui:
+    with session('revalidate',['setup','codex']) as ui:
+        ui.wait('Other model ID');ui.send('\x1b');ui.wait('Add Codex')
         ui.wait('needs revalidation');ui.mark('expired');ui.send('4\r');ui.wait('Authorize this resource?');ui.send('\r');ui.wait('Not authorized')
         assert (state/'resources.yml').read_bytes()==expired
         ui.wait('Add Codex');ui.send('4\r');ui.wait('Authorize this resource?');ui.mark('refresh');ui.send('1\r');ui.wait('Resource saved')
         ui.wait('expires in');ui.send('7\r');ui.finish()
     refreshed=(state/'resources.yml').read_bytes();assert max(map(int,re.findall(rb'authorization_revision: (\d+)',refreshed)))>2
     auth=json.loads((root/'auth.json').read_text());auth['email']='different@example.invalid';(root/'auth.json').write_text(json.dumps(auth))
-    with session('account-change',['setup']) as ui:
-        ui.wait('Add Codex');ui.send('4\r');ui.wait('account changed');ui.mark('blocked');ui.wait('Add Codex');ui.send('7\r');ui.finish()
+    with session('account-change',['setup','codex']) as ui:
+        ui.wait('Other model ID');ui.send('\x1b');ui.wait('Add Codex')
+        ui.send('4\r');ui.wait('account changed');ui.mark('blocked');ui.wait('Add Codex');ui.send('7\r');ui.finish()
     assert (state/'resources.yml').read_bytes()==refreshed
     auth['authMethod']='api';(root/'auth.json').write_text(json.dumps(auth))
     with session('unsupported',['setup','claude']) as ui:
         ui.wait('Resource unchanged');ui.wait('Add Codex');ui.send('7\r');ui.finish()
     # Login: choose the provider, then Open (focused) or Cancel; never typed.
-    with session('login',['setup']) as ui:
-        ui.wait('Add Codex');ui.send('5\r');ui.wait('Provider login changes');ui.send('2\r')
+    with session('login',['setup','codex']) as ui:
+        ui.wait('Other model ID');ui.send('\x1b');ui.wait('Add Codex')
+        ui.send('5\r');ui.wait('Provider login changes');ui.send('2\r')
         ui.wait('Open codex login');ui.send('\r');ui.wait('Fixture device login');ui.send('\r');ui.wait('Add Codex');ui.mark('return');ui.send('7\r');ui.finish()
     assert (state/'resources.yml').read_bytes()==refreshed
     (source/'verify.sh').write_text('exit 0\n')
@@ -159,7 +162,8 @@ for line in sys.stdin:
     claude_settings=home/'.claude'/'settings.json'
     hooks_env=dict(env,CLAUDE_CONFIG_DIR=str(home/'.claude'))
     # Plain mode, so each menu arrives as whole numbered lines.
-    with Session([binary,'--state-dir',str(used),'--plain','setup'],source,captures,'integrations',env=hooks_env,width=100,height=36) as ui:
+    with Session([binary,'--state-dir',str(used),'--plain','setup','codex'],source,captures,'integrations',env=hooks_env,width=100,height=36) as ui:
+        ui.wait('Other model ID');ui.send('\r');ui.wait('Effort for');ui.send('\r');ui.wait('2) Cancel');ui.send('\r')
         ui.wait('5) Runtime integrations');ui.send('5\r');ui.wait('1) Install Claude Code hooks');ui.send('1\r')
         ui.wait('hook claude');ui.wait('2) Cancel');ui.mark('hooks-consent');ui.send('\r')
         ui.wait('6) Back');assert not claude_settings.exists(), 'Enter alone installed hooks'
@@ -173,7 +177,8 @@ for line in sys.stdin:
     hermes_home=root/'hermes-home';hermes_home.mkdir()
     hermes_config=hermes_home/'config.yaml';theirs=b'# mine\nmodel:\n  default: x  # keep\n'
     hermes_config.write_bytes(theirs)
-    with Session([binary,'--state-dir',str(used),'--plain','setup'],source,captures,'hermes-hook',env=dict(hooks_env,HERMES_HOME=str(hermes_home)),width=100,height=36) as ui:
+    with Session([binary,'--state-dir',str(used),'--plain','setup','codex'],source,captures,'hermes-hook',env=dict(hooks_env,HERMES_HOME=str(hermes_home)),width=100,height=36) as ui:
+        ui.wait('Other model ID');ui.send('\r');ui.wait('Effort for');ui.send('\r');ui.wait('2) Cancel');ui.send('\r')
         ui.wait('5) Runtime integrations');ui.send('5\r');ui.wait('Hermes hook: not installed');ui.wait('2) Install the Hermes hook');ui.send('2\r')
         ui.wait('on_session_finalize');ui.wait('--accept-hooks');ui.wait('2) Cancel');ui.mark('hermes-consent');ui.send('\r')
         ui.wait('6) Back');assert hermes_config.read_bytes()==theirs, 'Enter alone installed the Hermes hook'

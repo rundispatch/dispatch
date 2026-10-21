@@ -353,10 +353,10 @@ full eligibility and authorization rules.
 
 ### Attach your own agent
 
-`dispatch attach` puts work from an agent Dispatch did not launch — Claude Code, Codex, Cursor, a script — under the same coherence checking, in its own worktree:
+`dispatch attach` puts work from an agent Dispatch did not launch — Claude Code, Codex, Cursor, a script — under the same coherence checking, in its own worktree. After `dispatch setup` saves this project's checks and you allow those exact checks, the first example can auto-apply an eligible result:
 
 ```sh
-dispatch attach --auto-apply -- claude -p "add input validation"   # from your checkout: Dispatch makes the workspace
+dispatch attach --auto-apply -- claude -p "add input validation"   # from your checkout, with standing consent for its checks
 dispatch attach --workspace ../scratch --agent codex --auto-apply  # or observe one already running
 dispatch finish <run-id>                                           # you say when it's done
 dispatch start                                                     # keeps a foreign attachment observed and applies it

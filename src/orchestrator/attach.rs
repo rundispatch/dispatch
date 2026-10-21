@@ -163,6 +163,8 @@ pub(crate) struct Prepared {
     repo_key: Option<String>,
     config: Config,
     config_path: Option<PathBuf>,
+    /// Standing consent, not the flag, authorizes its checks.
+    by_consent: bool,
 }
 
 pub(crate) fn prepare(state: &State, request: AttachRequest) -> Result<Prepared> {
@@ -219,11 +221,20 @@ pub(crate) fn prepare(state: &State, request: AttachRequest) -> Result<Prepared>
 
     let (config, config_path) = Config::discover(&root, None)?;
     config.validate()?;
-    // Runtime-registered Work carries no authority to run checks: a person
-    // gives it at `dispatch finish`.
+    // A typed attach may proceed when standing consent covers exactly these
+    // checks, and the Work carries that authority as it would the flag's. A
+    // runtime registers Work separately and records its authority from the
+    // project's consent during registration.
+    let by_consent = !config.checks.verify.is_empty()
+        && !request.allow_unsafe_local
+        && runtime.is_none()
+        && crate::consent::consented(state, &root, &config.checks.verify);
     anyhow::ensure!(
-        config.checks.verify.is_empty() || request.allow_unsafe_local || runtime.is_some(),
-        "finish runs your checks.verify on the host; pass --allow-unsafe-local"
+        config.checks.verify.is_empty()
+            || request.allow_unsafe_local
+            || runtime.is_some()
+            || by_consent,
+        "finish runs your checks.verify on the host; pass --allow-unsafe-local, or give this project standing consent for these checks with dispatch setup"
     );
 
     if !managed
@@ -242,6 +253,7 @@ pub(crate) fn prepare(state: &State, request: AttachRequest) -> Result<Prepared>
         repo_key: workspace_identity.map(|identity| identity.key),
         config,
         config_path,
+        by_consent,
     })
 }
 
@@ -249,6 +261,7 @@ pub(crate) fn prepare(state: &State, request: AttachRequest) -> Result<Prepared>
 pub(crate) struct Built {
     run: RunRecord,
     created: EventRecord,
+    by_consent: bool,
 }
 
 /// Assemble run `run_id` in `registrations/<run_id>/`, which the caller made
@@ -264,10 +277,11 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         repo_key,
         config,
         config_path,
+        by_consent,
     } = prepared;
     let is_wrapped = request.command.is_some();
     let runtime = request.runtime.as_ref();
-    let unsafe_local = request.allow_unsafe_local;
+    let unsafe_local = request.allow_unsafe_local || *by_consent;
     let dir = registration::directory(state, run_id);
     let run_dir = state.run_dir(run_id);
     let published = |path: PathBuf| match path.strip_prefix(&dir) {
@@ -539,7 +553,11 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         }),
         ..EventRecord::default()
     };
-    Ok(Built { run, created })
+    Ok(Built {
+        run,
+        created,
+        by_consent: *by_consent,
+    })
 }
 
 /// Who published runtime-registered Work, and when its hook started.
@@ -574,11 +592,14 @@ pub(crate) fn publish(
         );
         return state.load_run(run_id);
     }
+    let by_consent = built.as_ref().is_some_and(|built| built.by_consent);
     let mut db = Database::open(state.db_path())?;
     let mut run = match db.committed_run_projection(run_id)? {
         Some(run) => run,
         None => {
-            let Built { mut run, created } = built.context("the Work was not built")?;
+            let Built {
+                mut run, created, ..
+            } = built.context("the Work was not built")?;
             db.commit_run_transition(&mut run, created)?;
             run
         }
@@ -638,7 +659,10 @@ pub(crate) fn publish(
             },
         )?;
     }
-    if registered.is_some() && run.environment.unsafe_local && !has("attach.authorized") {
+    if (registered.is_some() || by_consent)
+        && run.environment.unsafe_local
+        && !has("attach.authorized")
+    {
         db.commit_transition(
             &mut run,
             EventRecord {
@@ -1597,20 +1621,33 @@ pub(crate) async fn finish_quietly(
 
     let mut db = Database::open(state.db_path())?;
     let mut run = run;
-    if allow_unsafe_local && !run.environment.unsafe_local {
-        // The person's acknowledgement is the run's from now on, so the checks
-        // on the merged tree run at accept too, as for work attached with it.
+    // The person's acknowledgement, or their standing consent for exactly the
+    // Work's checks, is the run's from now on, so the checks on the merged
+    // tree run at accept too, as for work attached with it.
+    let by = if run.environment.unsafe_local {
+        None
+    } else if allow_unsafe_local {
+        Some("human")
+    } else {
+        crate::coherence::run_config(&state.run_dir(&run.id))
+            .is_some_and(|config| {
+                !config.checks.verify.is_empty()
+                    && crate::consent::consented(state, &run.source_path, &config.checks.verify)
+            })
+            .then_some("project consent")
+    };
+    if let Some(by) = by {
         run.environment.unsafe_local = true;
         db.sync_run(&run)?;
         persist_event(
             state,
             &db,
             EventRecord {
-                run_id: run_id.to_owned(),
+                run_id: run.id.clone(),
                 candidate_label: None,
                 event_type: "attach.authorized".into(),
                 timestamp: Utc::now(),
-                payload: serde_json::json!({"unsafe_local": true, "by": "human"}),
+                payload: serde_json::json!({"unsafe_local": true, "by": by}),
                 ..EventRecord::default()
             },
             &mut run,
@@ -1710,8 +1747,10 @@ pub(super) async fn finish_locked(
     let config = crate::coherence::run_config(&run_dir);
     if let Some(config) = config.filter(|config| !config.checks.verify.is_empty()) {
         anyhow::ensure!(
-            run.environment.unsafe_local || allow_unsafe_local,
-            "finish runs your checks.verify on the host; pass --allow-unsafe-local"
+            run.environment.unsafe_local
+                || allow_unsafe_local
+                || crate::consent::consented(state, &run.source_path, &config.checks.verify),
+            "finish runs your checks.verify on the host; pass --allow-unsafe-local, or give this project standing consent for these checks with dispatch setup"
         );
         run.candidates[0].checks = finish_checks(state, &run, &workspace, &config, cancel).await?;
     }

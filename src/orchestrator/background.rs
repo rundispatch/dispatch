@@ -296,6 +296,29 @@ pub async fn start(
     verbose: u8,
     options: crate::presenter::Options,
 ) -> Result<()> {
+    start_inner(state, root, verbose, options, true).await
+}
+
+/// Setup already offered checks, including the option to continue without
+/// them. Start watching without asking the same question a second time.
+#[cfg(unix)]
+pub async fn start_after_setup(
+    state: &State,
+    root: Option<PathBuf>,
+    verbose: u8,
+    options: crate::presenter::Options,
+) -> Result<()> {
+    start_inner(state, root, verbose, options, false).await
+}
+
+#[cfg(unix)]
+async fn start_inner(
+    state: &State,
+    root: Option<PathBuf>,
+    verbose: u8,
+    options: crate::presenter::Options,
+    offer_checks: bool,
+) -> Result<()> {
     state.initialize()?;
     let root = source::resolve_source(root.as_deref())?;
     // A broken configuration fails here, before anything is spawned.
@@ -314,7 +337,7 @@ pub async fn start(
         }
     }
     let mut unchecked = config.checks.verify.is_empty();
-    if unchecked && crate::presenter::suitable() {
+    if unchecked && offer_checks && crate::presenter::suitable() {
         let Some(saved) = crate::presenter::start_checks(&root, options).await? else {
             println!("Not watching {}: nothing was changed.", root.display());
             return Ok(());
@@ -645,6 +668,16 @@ fn terminate(state: &State, root: &Path, record: &WatcherRecord) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+pub async fn start_after_setup(
+    state: &State,
+    root: Option<PathBuf>,
+    verbose: u8,
+    options: crate::presenter::Options,
+) -> Result<()> {
+    start(state, root, verbose, options).await
 }
 
 /// `dispatch stop [--root <path>]`: stop exactly the process that watches

@@ -10,7 +10,7 @@ use std::{sync::mpsc, time::Duration};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::{EventKind, Reply, RuntimeEvent};
+use super::{EventKind, Hook, Reply, RuntimeEvent};
 use crate::{NeedsYouKind, state::State};
 
 #[derive(Deserialize)]
@@ -203,6 +203,15 @@ const INSTALLED: [(&str, Option<&str>, u64); 6] = [
     ("Stop", None, 5),
 ];
 
+/// The hooks every Dispatch from 0.4.6 to 0.4.16 installed. Settings holding
+/// exactly these are Dispatch's own, to be updated, not changed by hand.
+const EARLIER: [(&str, Option<&str>, u64); 4] = [
+    ("SessionStart", None, 60),
+    ("SessionEnd", None, 5),
+    ("WorktreeRemove", None, 300),
+    ("PreToolUse", Some("ExitWorktree"), 300),
+];
+
 /// For Work in a `claude --worktree` workspace that began from source other
 /// than the project's (`runtime::start_advice`). Advice only: Dispatch never
 /// changes the setting, commits or pushes.
@@ -245,24 +254,20 @@ fn ours(hook: &serde_json::Value) -> bool {
 }
 
 /// Dispatch's hooks in `settings`, under any event, as `(event, matcher,
-/// command, timeout)`, sorted.
-fn installed(settings: &serde_json::Value) -> Vec<(String, Option<String>, String, Option<u64>)> {
+/// hook)`, sorted by event and matcher.
+fn installed(settings: &serde_json::Value) -> Vec<(String, Option<String>, serde_json::Value)> {
     let mut found = Vec::new();
     for (event, entries) in settings["hooks"].as_object().into_iter().flatten() {
         for entry in entries.as_array().into_iter().flatten() {
             for hook in entry["hooks"].as_array().into_iter().flatten() {
                 if ours(hook) {
-                    found.push((
-                        event.clone(),
-                        entry["matcher"].as_str().map(str::to_owned),
-                        hook["command"].as_str().unwrap_or_default().to_owned(),
-                        hook["timeout"].as_u64(),
-                    ));
+                    let matcher = entry["matcher"].as_str().map(str::to_owned);
+                    found.push((event.clone(), matcher, hook.clone()));
                 }
             }
         }
     }
-    found.sort();
+    found.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     found
 }
 
@@ -297,6 +302,14 @@ pub fn without_hooks(mut settings: serde_json::Value) -> serde_json::Value {
 
 /// `settings` with exactly one set of Dispatch's hooks, running `command`.
 pub fn with_hooks(settings: serde_json::Value, command: &str) -> Result<serde_json::Value> {
+    with_set(settings, &INSTALLED, command)
+}
+
+fn with_set(
+    settings: serde_json::Value,
+    set: &[(&str, Option<&str>, u64)],
+    command: &str,
+) -> Result<serde_json::Value> {
     let mut settings = without_hooks(settings);
     anyhow::ensure!(
         settings.is_object(),
@@ -305,7 +318,7 @@ pub fn with_hooks(settings: serde_json::Value, command: &str) -> Result<serde_js
     if !settings["hooks"].is_object() {
         settings["hooks"] = serde_json::json!({});
     }
-    for (event, matcher, timeout) in INSTALLED {
+    for &(event, matcher, timeout) in set {
         let mut entry = serde_json::json!({
             "hooks": [{"type": "command", "command": command, "timeout": timeout}]
         });
@@ -320,27 +333,28 @@ pub fn with_hooks(settings: serde_json::Value, command: &str) -> Result<serde_js
     Ok(settings)
 }
 
-fn read_settings(path: &std::path::Path) -> Result<Option<serde_json::Value>> {
+/// Dispatch's hooks in the settings at `path`, hook by hook: exact when they
+/// are just the hooks `with_hooks` writes, all running one command, and
+/// earlier when they are just the hooks an earlier Dispatch wrote.
+pub fn hook(path: &std::path::Path) -> Result<Hook> {
     let Ok(bytes) = std::fs::read(path) else {
-        return Ok(None);
+        return Ok(Hook::Absent);
     };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .context("Claude Code settings are not valid JSON")
-}
-
-/// Whether any of Dispatch's hooks, from this Dispatch or an earlier one, are
-/// in the settings at `path`.
-pub fn hooks_installed(path: &std::path::Path) -> Result<bool> {
-    Ok(read_settings(path)?.is_some_and(|settings| !installed(&settings).is_empty()))
-}
-
-/// Whether the settings at `path` hold exactly the hooks installing would
-/// leave, running `command`. Hooks an earlier Dispatch installed, or another
-/// executable's, are not current: installing again replaces them.
-pub fn hooks_current(path: &std::path::Path, command: &str) -> Result<bool> {
-    let wanted = with_hooks(serde_json::json!({}), command)?;
-    Ok(read_settings(path)?.is_some_and(|settings| installed(&settings) == installed(&wanted)))
+    let settings: serde_json::Value =
+        serde_json::from_slice(&bytes).context("Claude Code settings are not valid JSON")?;
+    let found = installed(&settings);
+    let Some((_, _, first)) = found.first() else {
+        return Ok(Hook::Absent);
+    };
+    let command = first["command"].as_str().unwrap_or_default().to_owned();
+    let written = |set| with_set(serde_json::json!({}), set, &command).map(|s| installed(&s));
+    Ok(if found == written(&INSTALLED)? {
+        Hook::Exact(command)
+    } else if found == written(&EARLIER)? {
+        Hook::Earlier(command)
+    } else {
+        Hook::Changed
+    })
 }
 
 /// Rewrite the settings at `path` with `change`, after keeping a backup
@@ -656,13 +670,30 @@ mod tests {
             settings["hooks"]["WorktreeRemove"][0]["hooks"][0]["timeout"],
             300
         );
-        assert!(hooks_installed(&path).unwrap());
+        assert_eq!(
+            hook(&path).unwrap(),
+            Hook::Exact("'/moved/dispatch' --state-dir '/s' hook claude".into())
+        );
+        // An entry edited by hand, or one of them missing, is no longer exact.
+        let installed = settings.clone();
+        let mut edited = installed.clone();
+        edited["hooks"]["WorktreeRemove"][0]["hooks"][0]["timeout"] = 30.into();
+        let mut missing = installed.clone();
+        missing["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("SessionEnd");
+        for changed in [edited, missing] {
+            std::fs::write(&path, changed.to_string()).unwrap();
+            assert_eq!(hook(&path).unwrap(), Hook::Changed, "{changed}");
+        }
+        std::fs::write(&path, installed.to_string()).unwrap();
 
         uninstall_hooks(&path).unwrap();
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(settings, theirs);
-        assert!(!hooks_installed(&path).unwrap());
+        assert_eq!(hook(&path).unwrap(), Hook::Absent);
     }
 
     /// The probe's payloads (`Notification`, `Stop`), paths replaced.
@@ -812,8 +843,7 @@ mod tests {
             stops[1],
             serde_json::json!({"hooks": [{"type": "command", "command": COMMAND, "timeout": 5}]})
         );
-        assert!(hooks_current(&path, COMMAND).unwrap());
-        assert!(!hooks_current(&path, "'/moved/dispatch' --state-dir '/s' hook claude").unwrap());
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
 
         uninstall_hooks(&path).unwrap();
         let settings: serde_json::Value =
@@ -842,26 +872,48 @@ mod tests {
     fn an_earlier_dispatchs_hooks_are_recognised_and_upgraded_once() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
-        // The four hooks 0.4.16 installed, from another install path.
+        // The four hooks 0.4.16 installed, from this install path or another.
         let old = "'/old/dispatch' --state-dir '/s' hook claude";
-        let entry = |timeout: u64| serde_json::json!({"hooks": [{"type": "command", "command": old, "timeout": timeout}]});
-        let mut tool = entry(300);
-        tool["matcher"] = "ExitWorktree".into();
-        let earlier = serde_json::json!({"hooks": {
-            "SessionStart": [entry(60)],
-            "SessionEnd": [entry(5)],
-            "WorktreeRemove": [entry(300)],
-            "PreToolUse": [tool],
-            "Stop": [{"hooks": [{"type": "command", "command": "afplay done.aiff"}]}],
-        }});
-        std::fs::write(&path, earlier.to_string()).unwrap();
-        assert!(hooks_installed(&path).unwrap());
-        assert!(!hooks_current(&path, COMMAND).unwrap());
-        assert!(!hooks_current(&path, old).unwrap(), "two hooks are missing");
+        let earlier = |command: &str| {
+            let entry = |timeout: u64| serde_json::json!({"hooks": [{"type": "command", "command": command, "timeout": timeout}]});
+            let mut tool = entry(300);
+            tool["matcher"] = "ExitWorktree".into();
+            serde_json::json!({"hooks": {
+                "SessionStart": [entry(60)],
+                "SessionEnd": [entry(5)],
+                "WorktreeRemove": [entry(300)],
+                "PreToolUse": [tool],
+                "Stop": [{"hooks": [{"type": "command", "command": "afplay done.aiff"}]}],
+            }})
+        };
+        let found = |settings: &serde_json::Value| {
+            std::fs::write(&path, settings.to_string()).unwrap();
+            hook(&path).unwrap()
+        };
+        assert_eq!(found(&earlier(COMMAND)), Hook::Earlier(COMMAND.into()));
+        // Hook by hook: a person's hook beside one of Dispatch's is theirs.
+        let mut shared = earlier(COMMAND);
+        shared["hooks"]["SessionEnd"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "command", "command": "say bye"}));
+        assert_eq!(found(&shared), Hook::Earlier(COMMAND.into()));
+        // Edited by hand, or two executables at once: not as any Dispatch
+        // wrote it.
+        let mut timeout = earlier(COMMAND);
+        timeout["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"] = 10.into();
+        let mut key = earlier(COMMAND);
+        key["hooks"]["SessionEnd"][0]["hooks"][0]["async"] = true.into();
+        let mut mixed = earlier(COMMAND);
+        mixed["hooks"]["SessionEnd"][0]["hooks"][0]["command"] = old.into();
+        for changed in [timeout, key, mixed] {
+            assert_eq!(found(&changed), Hook::Changed, "{changed}");
+        }
+        assert_eq!(found(&earlier(old)), Hook::Earlier(old.into()));
 
         install_hooks(&path, COMMAND).unwrap();
         install_hooks(&path, COMMAND).unwrap();
-        assert!(hooks_current(&path, COMMAND).unwrap());
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let text = settings.to_string();
@@ -888,6 +940,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");
         assert!(install_hooks(&path, COMMAND).unwrap().is_none());
-        assert!(hooks_installed(&path).unwrap());
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
     }
 }

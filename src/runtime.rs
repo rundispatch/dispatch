@@ -66,6 +66,21 @@ pub enum EventKind {
     },
 }
 
+/// Dispatch's hook in a runtime's own configuration, as that runtime's
+/// module recognises it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Hook {
+    Absent,
+    /// Exactly as Dispatch writes it, running this command.
+    Exact(String),
+    /// Exactly as an earlier Dispatch wrote it, running this command: hooks
+    /// this Dispatch updates.
+    Earlier(String),
+    /// A `… hook <provider>` hook not as any Dispatch wrote it: edited, or
+    /// added by hand.
+    Changed,
+}
+
 /// What the runtime should be told.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reply {
@@ -305,10 +320,7 @@ fn removed(state: &State, workspace: &Path) -> Result<Reply> {
     // changes are already kept, so nothing here may fail the hook.
     let consented = state
         .load_run(&run_id)
-        .is_ok_and(|run| run.environment.unsafe_local)
-        && crate::consent::project_root(workspace)
-            .and_then(|project| crate::consent::consent(state, &project))
-            .is_ok_and(|consent| consent.is_valid());
+        .is_ok_and(|run| attach::finishes_by_consent(state, &run).unwrap_or(false));
     Ok(Reply::Notice(if files_changed == 0 {
         format!("Dispatch closed Work {id}: the worktree held no changes.")
     } else if consented {

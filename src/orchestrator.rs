@@ -13,7 +13,7 @@ use std::{
     ffi::OsString,
     fs,
     future::Future,
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -297,7 +297,7 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
     println!();
     if config.execution.backend == "local" {
         println!(
-            "Found {ready} installed real harness(es). Real harnesses and project checks are blocked on the host unless each run explicitly uses --allow-unsafe-local."
+            "Found {ready} installed real harness(es). Real harnesses and project checks need --allow-unsafe-local or terminal-granted standing consent for their exact commands."
         );
         println!("Deterministic fake harnesses are ready without that opt-in.");
     } else {
@@ -436,22 +436,104 @@ fn harness_name(id: &str) -> &str {
     }
 }
 
-fn authorize_local_commands(label: &str, output: RunOutputMode) -> Result<()> {
-    anyhow::ensure!(
-        output == RunOutputMode::Human,
-        "machine output requires --allow-unsafe-local when local execution needs authorization"
-    );
-    print!(
-        "Dispatch will run {label} with your user permissions in an isolated candidate workspace. Continue? [y/N] "
-    );
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    anyhow::ensure!(
-        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-        "local execution was not authorized; explicitly accept the risk with --allow-unsafe-local for non-interactive use, or use --backend docker"
-    );
-    Ok(())
+/// What allows a native launch's host commands: the flag, standing consent
+/// for exactly them, or an answer given once, kept for this run.
+struct NativeAuthority<'a> {
+    state: &'a State,
+    source: &'a Path,
+    output: RunOutputMode,
+    allowed_by_flag: bool,
+    this_run: Vec<crate::consent::NativeCommands>,
+}
+
+impl NativeAuthority<'_> {
+    async fn authorize(&mut self, harness: &str, config: &Config) -> Result<Option<PathBuf>> {
+        if self.allowed_by_flag || config.execution.backend != "local" {
+            return Ok(None);
+        }
+        if harness.starts_with("fake-")
+            && config.checks.baseline.is_empty()
+            && config.checks.verify.is_empty()
+        {
+            return Ok(None);
+        }
+        let harness_config = config.harnesses.get(harness);
+        let detection = adapter_for(harness, &config.harnesses)?.detect().await;
+        let executable = detection.executable.with_context(|| {
+            format!(
+                "harness {harness} is unavailable: {}",
+                detection
+                    .detail
+                    .as_deref()
+                    .unwrap_or("executable not found")
+            )
+        })?;
+        let commands = crate::consent::NativeCommands {
+            root: crate::consent::project_root(self.source)?,
+            harness: harness.to_owned(),
+            executable: executable.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve agent executable {}",
+                    executable.display()
+                )
+            })?,
+            baseline: config.checks.baseline.clone(),
+            verify: config.checks.verify.clone(),
+            model: harness_config.model.clone(),
+            effort: harness_config.effort.clone(),
+            provider: harness_config.provider.clone(),
+            extra_args: harness_config.extra_args.clone(),
+            service_mode: harness_config.allocation_service_mode.clone(),
+        };
+        if self.this_run.contains(&commands)
+            || crate::consent::native_consented(self.state, &commands)?
+        {
+            return Ok(Some(commands.executable));
+        }
+        anyhow::ensure!(
+            self.output == RunOutputMode::Human,
+            "machine output requires --allow-unsafe-local when local execution needs authorization"
+        );
+        println!(
+            "Dispatch will run {} ({}) with your user permissions on this host. Local execution is not sandboxed.",
+            harness_name(harness),
+            commands.executable.display()
+        );
+        println!("The agent works in an isolated candidate workspace.");
+        for (label, checks) in [
+            ("Baseline checks", &commands.baseline),
+            ("Verification checks", &commands.verify),
+        ] {
+            println!("{label}:");
+            if checks.is_empty() {
+                println!("  (none)");
+            } else {
+                for check in checks {
+                    println!("  {check}");
+                }
+            }
+        }
+        print!("[1] This run only  [2] Allow for this project  [Enter] Cancel: ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        let executable = commands.executable.clone();
+        // A piped answer may allow this run, never the project.
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "1" | "y" | "yes" => {}
+            "2" if io::stdin().is_terminal() && io::stdout().is_terminal() => {
+                crate::consent::grant_native(self.state, &commands)?;
+            }
+            "2" => bail!(
+                "allowing for this project needs a terminal, so nothing was granted; answer 1 for this run only, or pass --allow-unsafe-local"
+            ),
+            _ => bail!(
+                "local execution was not authorized; explicitly accept the risk with --allow-unsafe-local for non-interactive use, or use --backend docker"
+            ),
+        }
+        self.this_run.push(commands);
+        Ok(Some(executable))
+    }
 }
 
 pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecord> {
@@ -488,12 +570,13 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         "no coding agent is set up for Dispatch to launch: run `dispatch setup`, or pass --agent claude|codex|cursor|hermes. To protect work you run yourself, use `dispatch attach` (no setup needed)."
     );
     let fixed_harness = request.agent.clone();
-    let mut local_authorized = request.allow_unsafe_local;
-    if allocation_requested && config.execution.backend == "local" && !local_authorized {
-        // Discovery executes configured programs too: obtain host consent before probes.
-        authorize_local_commands("configured coding-agent commands", request.output)?;
-        local_authorized = true;
-    }
+    let mut authority = NativeAuthority {
+        state,
+        source: &source_path,
+        output: request.output,
+        allowed_by_flag: request.allow_unsafe_local,
+        this_run: Vec::new(),
+    };
     // One agent per run, chosen by a configured profile or by `--agent`.
     let (harness, allocation) = if allocation_requested {
         let decision = select_available_resource(
@@ -504,6 +587,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             request.agent.as_deref(),
             request.model.as_deref(),
             request.effort.as_deref(),
+            &mut authority,
         )
         .await?;
         (decision.selected.harness.clone(), Some(decision))
@@ -527,8 +611,12 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         || !config.checks.baseline.is_empty()
         || !config.checks.verify.is_empty();
     let unsafe_local = config.execution.backend == "local" && executes_untrusted_host_code;
-    if unsafe_local && !local_authorized {
-        authorize_local_commands(harness_name(&harness), request.output)?;
+    // The executable consent was given for is the one launched.
+    if unsafe_local
+        && let Some(executable) = authority.authorize(&harness, &config).await?
+        && let Some(configured) = config.harnesses.get_mut(&harness)
+    {
+        configured.executable = Some(executable);
     }
 
     if request.output == RunOutputMode::Human
@@ -1051,6 +1139,7 @@ async fn select_available_resource(
     agent: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
+    authority: &mut NativeAuthority<'_>,
 ) -> Result<crate::AllocationDecision> {
     let mut exclusions = Vec::new();
     let db = Database::open(state.db_path())?;
@@ -1079,7 +1168,11 @@ async fn select_available_resource(
         {
             Some("explicit model or effort constraint".into())
         } else {
-            let adapter = adapter_for(&profile.harness, &config.harnesses)?;
+            let mut harnesses = config.harnesses.clone();
+            harnesses.bind_profile(profile);
+            let mut candidate_config = config.clone();
+            candidate_config.harnesses = harnesses;
+            let adapter = adapter_for(&profile.harness, &candidate_config.harnesses)?;
             if config.execution.backend == "local" && !adapter.detect().await.available {
                 Some(format!("{} executable unavailable", profile.harness))
             } else if let Err(error) = profile.eligibility() {
@@ -1089,9 +1182,14 @@ async fn select_available_resource(
             {
                 Some(funding_refused_message(profile, &refusal))
             } else {
-                let mut harnesses = config.harnesses.clone();
-                harnesses.bind_profile(profile);
-                let adapter = adapter_for(&profile.harness, &harnesses)?;
+                if let Some(executable) = authority
+                    .authorize(&profile.harness, &candidate_config)
+                    .await?
+                    && let Some(configured) = candidate_config.harnesses.get_mut(&profile.harness)
+                {
+                    configured.executable = Some(executable);
+                }
+                let adapter = adapter_for(&profile.harness, &candidate_config.harnesses)?;
                 let request = HarnessRunRequest::new(source, "", source);
                 match adapter
                     .preflight(&Executor::new(config.execution.clone()), &request)
@@ -2394,7 +2492,7 @@ fn prepare_merged(
     if config.execution.backend == "local"
         && !request.allow_unsafe_local
         && !run.environment.unsafe_local
-        && !consented(state, run, &config.checks.verify)
+        && !crate::consent::consented(state, &run.source_path, &config.checks.verify)
     {
         bail!(
             "check --merged runs checks.verify on the host; pass --allow-unsafe-local, or give this project standing consent for these checks with dispatch setup --checks"
@@ -2427,15 +2525,6 @@ fn prepare_merged(
         run.id
     );
     Ok((config, logs, patch))
-}
-
-/// Whether the project's standing consent covers exactly `commands`.
-fn consented(state: &State, run: &RunRecord, commands: &[String]) -> bool {
-    crate::consent::project_root(&run.source_path)
-        .and_then(|project| crate::consent::consent(state, &project))
-        .is_ok_and(|consent| {
-            matches!(consent, crate::consent::CheckConsent::Valid(approved) if approved == commands)
-        })
 }
 
 /// Record an event that observes `run` without changing it: the run's state
@@ -2563,8 +2652,8 @@ pub struct RefreshOptions {
 }
 
 /// `dispatch refresh`: the request for a new run of the same task on the
-/// current source. It repeats the original launch choices and demands the same
-/// explicit acknowledgements again; it never touches the old run.
+/// current source. It repeats the original launch choices and authorizes the
+/// new commands through `run_dispatch`; it never touches the old run.
 pub fn refresh_request(
     state: &State,
     run_id: Option<&str>,
@@ -2581,9 +2670,6 @@ pub fn refresh_request(
     );
     ensure_unapplied_ready(&run, "refresh")?;
     let mut missing = Vec::new();
-    if run.environment.unsafe_local && !options.allow_unsafe_local {
-        missing.push("--allow-unsafe-local");
-    }
     if !run.environment.forwarded_env.is_empty() && !options.allow_forwarded_env {
         missing.push("--allow-forwarded-env");
     }

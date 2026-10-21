@@ -290,7 +290,7 @@ struct RunArgs {
 struct RefreshArgs {
     run_id: Option<String>,
 
-    /// Required again if the original run executed on the host.
+    /// Allow host execution when no standing native consent covers this launch.
     #[arg(long)]
     allow_unsafe_local: bool,
 

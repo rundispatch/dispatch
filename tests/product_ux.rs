@@ -80,6 +80,55 @@ fn no_configured_agent_is_refused_and_explicit_agent_runs() -> anyhow::Result<()
     Ok(())
 }
 
+/// Allowing a project needs a terminal: a piped `2` grants nothing and runs
+/// nothing, and a piped `y` allows that one run and no later one.
+#[test]
+fn a_piped_answer_allows_one_run_and_never_the_project() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let source = temp.path().join("repo");
+    let state = temp.path().join("state");
+    let bin = temp.path().join("bin");
+    let marker = temp.path().join("agents-ran");
+    repository(&source)?;
+    agent(&bin.join("cursor-agent"), "cursor", &marker)?;
+    let run = |answer: &str| {
+        cargo_bin_cmd!("dispatch")
+            .current_dir(&source)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .args(["--state-dir"])
+            .arg(&state)
+            .args(["run", "Fix the greeting typo", "--agent", "cursor"])
+            .write_stdin(answer)
+            .assert()
+    };
+    let granted = || {
+        fs::read_dir(state.join("projects")).map_or(0, |entries| {
+            entries
+                .filter(|entry| {
+                    entry.as_ref().is_ok_and(|entry| {
+                        entry.file_name().to_string_lossy().starts_with("native-")
+                    })
+                })
+                .count()
+        })
+    };
+
+    run("2\n").failure().stderr(predicates::str::contains(
+        "needs a terminal, so nothing was granted",
+    ));
+    assert!(!marker.exists(), "a refused launch ran the agent");
+    assert_eq!(granted(), 0);
+
+    run("y\n").success();
+    assert_eq!(fs::read_to_string(&marker)?, "cursor\n");
+    assert_eq!(granted(), 0);
+    run("")
+        .failure()
+        .stderr(predicates::str::contains("--allow-unsafe-local"));
+    assert_eq!(fs::read_to_string(&marker)?, "cursor\n");
+    Ok(())
+}
+
 #[test]
 fn latest_project_diff_accept_reject_and_explain_need_no_run_id() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;

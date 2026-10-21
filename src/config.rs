@@ -135,6 +135,15 @@ impl HarnessesConfig {
             _ => &self.codex,
         }
     }
+    pub fn get_mut(&mut self, harness: &str) -> Option<&mut HarnessConfig> {
+        match harness {
+            "claude" => Some(&mut self.claude),
+            "codex" => Some(&mut self.codex),
+            "cursor" => Some(&mut self.cursor),
+            "hermes" => Some(&mut self.hermes),
+            _ => None,
+        }
+    }
     pub fn bind_profile(&mut self, profile: &ResourceProfile) {
         let config = match profile.harness.as_str() {
             "claude" => &mut self.claude,

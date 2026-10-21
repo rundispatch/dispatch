@@ -1,7 +1,6 @@
-//! First use without a terminal ceremony: `dispatch start` in a project
-//! without checks watches at once, and `dispatch setup --checks --verify`
-//! saves exact commands without a terminal. Neither grants consent, runs
-//! project code, or changes the project beyond `dispatch.yml`.
+//! One terminal `dispatch setup` saves checks, grants exact check consent,
+//! installs observation hooks, and watches a project. Without a terminal,
+//! explicit check commands can still be saved but no consent is granted.
 #![cfg(unix)]
 
 use std::{
@@ -148,9 +147,12 @@ fn setup_without_a_terminal_saves_exact_checks_and_keeps_the_rest() {
         "execution:\n  timeout_secs: 123\nchecks:\n  verify: ['old']\n",
     )
     .unwrap();
+    let before = files(&project.root);
     let output = project.dispatch(&["setup", "--checks", "--verify", "a --x", "--verify", "b"]);
     let said = text(&output);
     assert!(output.status.success(), "{said}");
+    // Only the configuration is written: no lock or other file beside it.
+    assert_eq!(files(&project.root), before);
     assert!(
         said.contains("dispatch setup --checks in a terminal"),
         "{said}"
@@ -169,6 +171,25 @@ fn setup_without_a_terminal_saves_exact_checks_and_keeps_the_rest() {
     let output = project.dispatch(&["setup", "--checks"]);
     assert!(!output.status.success());
     assert!(text(&output).contains("--verify"), "{}", text(&output));
+}
+
+#[test]
+fn setup_without_a_terminal_cannot_grant_or_install_anything() {
+    let project = Project::new();
+    let output = project.dispatch(&["setup"]);
+    assert!(!output.status.success());
+    assert!(text(&output).contains("terminal"), "{}", text(&output));
+    assert!(!project.root.join("dispatch.yml").exists());
+    assert_eq!(project.consents(), 0);
+    assert!(
+        !project
+            .temp
+            .path()
+            .join("home/.claude/settings.json")
+            .exists()
+    );
+    assert!(!project.state.join("watchers").exists());
+    project.assert_nothing_ran();
 }
 
 #[test]
