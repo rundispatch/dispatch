@@ -1484,16 +1484,20 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(target_os = "macos")]
 const CLONE_NOFOLLOW: u32 = 0x0001;
 
+/// Copy one file. On macOS it is cloned by path with clonefile(2), never
+/// opened, because on-access scanning intercepts every `open()`; any failure
+/// falls back to `std::fs::copy`.
 fn copy_file_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
-        let source = CString::new(source.as_os_str().as_bytes())?;
-        let destination = CString::new(destination.as_os_str().as_bytes())?;
-        // Clone by path to avoid opening every file (and triggering on-access scans).
+        let c_source = CString::new(source.as_os_str().as_bytes())?;
+        let c_destination = CString::new(destination.as_os_str().as_bytes())?;
         // SAFETY: both paths are live, NUL-terminated strings for the duration of the call.
-        if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+        if unsafe { libc::clonefile(c_source.as_ptr(), c_destination.as_ptr(), CLONE_NOFOLLOW) }
+            == 0
+        {
             return Ok(());
         }
     }
@@ -2539,10 +2543,11 @@ mod tests {
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // A renamed test would run nothing in the child and still exit 0.
             assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stdout)
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "{stdout}"
             );
             return;
         }

@@ -2370,14 +2370,42 @@ fn workflow_hashfiles_mention_is_weak() -> Result<()> {
     )
 }
 
-struct WorkflowRun {
+const LIB_S0: &str = "pub fn work() -> u8 {\n    1\n}\n";
+/// This build's case: a unit test names a fixture file that is also a real one.
+const LIB_TEST_DELTA: &str = "pub fn work() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn names_a_fixture() {\n        let fixture = (\"src/main.rs\", include_str!(\"main.rs\"));\n        assert!(!fixture.1.is_empty());\n    }\n}\n";
+const LIB_CODE_DELTA: &str =
+    "pub fn work() -> u8 {\n    1\n}\n\npub fn entry() -> &'static str {\n    \"src/main.rs\"\n}\n";
+
+#[test]
+fn rust_test_module_naming_a_file_is_a_weak_mention() -> Result<()> {
+    assert_mention_case(
+        &[("src/main.rs", "fn main() {}\n"), ("src/lib.rs", LIB_S0)],
+        &[("src/lib.rs", LIB_TEST_DELTA)],
+        "src/main.rs",
+        Continue,
+        Some("mentioned"),
+    )
+}
+
+#[test]
+fn rust_library_string_naming_a_file_requires_refresh() -> Result<()> {
+    assert_mention_case(
+        &[("src/main.rs", "fn main() {}\n"), ("src/lib.rs", LIB_S0)],
+        &[("src/lib.rs", LIB_CODE_DELTA)],
+        "src/main.rs",
+        Refresh,
+        Some("file_fallback"),
+    )
+}
+
+struct MentionRun {
     _root: TempDir,
     source: PathBuf,
     state: PathBuf,
     run_id: String,
 }
 
-impl WorkflowRun {
+impl MentionRun {
     fn dispatch(&self, args: &[&str]) -> Result<std::process::Output> {
         Ok(cargo_bin_cmd!("dispatch")
             .arg("--state-dir")
@@ -2388,16 +2416,35 @@ impl WorkflowRun {
     }
 }
 
-fn workflow_run(checks: &str) -> Result<WorkflowRun> {
+fn workflow_run(checks: &str) -> Result<MentionRun> {
+    mention_run(
+        &[
+            (".github/workflows/ci.yml", WORKFLOW_S0),
+            ("Cargo.lock", "original lock\n"),
+        ],
+        (".github/workflows/ci.yml", WORKFLOW_DELTA),
+        "Cargo.lock",
+        checks,
+    )
+}
+
+/// A run whose agent writes `delta` over `s0`, after which `changed` changes
+/// underneath it.
+fn mention_run(
+    s0: Files<'_>,
+    (path, delta): (&str, &str),
+    changed: &str,
+    checks: &str,
+) -> Result<MentionRun> {
     let root = TempDir::new()?;
     let source = root.path().join("source");
     let state = root.path().join("state");
-    let workflow = source.join(".github/workflows/ci.yml");
-    write_file(&workflow, WORKFLOW_S0)?;
-    write_file(&source.join("Cargo.lock"), "original lock\n")?;
+    for (file, contents) in s0 {
+        write_file(&source.join(file), contents)?;
+    }
     let agent = root.path().join("agent");
     let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fixture 1.0\\n'; exit 0; fi\nmkdir -p .github/workflows\ncat > .github/workflows/ci.yml <<'YAML'\n{WORKFLOW_DELTA}YAML\nprintf '{{\"type\":\"result\",\"model\":\"fixture\"}}\\n'\n"
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fixture 1.0\\n'; exit 0; fi\nmkdir -p \"$(dirname {path})\"\ncat > {path} <<'DELTA'\n{delta}DELTA\nprintf '{{\"type\":\"result\",\"model\":\"fixture\"}}\\n'\n"
     );
     fs::write(&agent, script)?;
     fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
@@ -2429,8 +2476,8 @@ fn workflow_run(checks: &str) -> Result<WorkflowRun> {
     );
     let run: Value = serde_json::from_slice(&run.stdout)?;
     let run_id = run["run_id"].as_str().context("run has no ID")?;
-    fs::write(source.join("Cargo.lock"), "changed underneath\n")?;
-    Ok(WorkflowRun {
+    fs::write(source.join(changed), "changed underneath\n")?;
+    Ok(MentionRun {
         _root: root,
         source,
         state,
@@ -2449,10 +2496,18 @@ fn workflow_mention_without_checks_requires_refresh() -> Result<()> {
     );
     let check: Value = serde_json::from_slice(&check.stdout)?;
     assert_eq!(check["validity"]["decision"], "refresh", "{check}");
-    assert!(
-        check["validity"]["reasons"]
-            .as_array()
-            .is_some_and(|reasons| reasons.iter().any(|reason| reason["path"] == "Cargo.lock")),
+    // One reason of its own says why, first; the mention keeps its plain fact.
+    let reasons = &check["validity"]["reasons"];
+    assert_eq!(reasons[0]["code"], "analysis_uncertain", "{check}");
+    assert_eq!(
+        reasons[0]["detail"],
+        "merged checks cannot run — no checks are configured (checks.verify is empty)",
+        "{check}"
+    );
+    assert_eq!(reasons[1]["code"], "mention_changed", "{check}");
+    assert_eq!(reasons[1]["path"], "Cargo.lock", "{check}");
+    assert_eq!(
+        reasons[1]["detail"], "mentioned file Cargo.lock changed since the work started",
         "{check}"
     );
     Ok(())
@@ -2477,8 +2532,7 @@ fn workflow_mention_continues_pending_merged_checks() -> Result<()> {
                 reason["code"] == "mention_changed"
                     && reason["path"] == "Cargo.lock"
                     && reason["detail"]
-                        .as_str()
-                        .is_some_and(|detail| detail.contains("merged checks"))
+                        == "mentioned file Cargo.lock changed since the work started"
             })),
         "{check}"
     );
@@ -2515,9 +2569,73 @@ fn workflow_mention_continues_pending_merged_checks() -> Result<()> {
     let explain = fixture.dispatch(&["explain", &fixture.run_id])?;
     ensure!(explain.status.success(), "explain failed");
     let explain = String::from_utf8_lossy(&explain.stdout);
+    // The merged checks decided: the analysis says so, and the reason stays the fact.
     assert!(
-        explain.contains("mention_changed") && explain.contains("merged checks"),
+        explain.contains("analysis: integration")
+            && explain.contains(
+                "mention_changed: mentioned file Cargo.lock changed since the work started"
+            ),
         "{explain}"
+    );
+    Ok(())
+}
+
+fn lib_run(delta: &str) -> Result<MentionRun> {
+    mention_run(
+        &[("src/main.rs", "fn main() {}\n"), ("src/lib.rs", LIB_S0)],
+        ("src/lib.rs", delta),
+        "src/main.rs",
+        "checks:\n  verify:\n    - 'test -f src/main.rs'\n",
+    )
+}
+
+fn check_json(fixture: &MentionRun) -> Result<Value> {
+    let check = fixture.dispatch(&["check", &fixture.run_id, "--json"])?;
+    ensure!(
+        check.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    Ok(serde_json::from_slice(&check.stdout)?)
+}
+
+#[test]
+fn rust_test_fixture_path_continues_pending_merged_checks() -> Result<()> {
+    let fixture = lib_run(LIB_TEST_DELTA)?;
+    let check = check_json(&fixture)?;
+    assert_eq!(check["validity"]["decision"], "continue", "{check}");
+    assert_eq!(
+        check["validity"]["reasons"],
+        json!([{
+            "code": "mention_changed",
+            "fact_id": check["validity"]["reasons"][0]["fact_id"],
+            "path": "src/main.rs",
+            "detail": "mentioned file src/main.rs changed since the work started",
+        }]),
+        "{check}"
+    );
+    let accept = fixture.dispatch(&["accept", &fixture.run_id])?;
+    let stdout = String::from_utf8_lossy(&accept.stdout);
+    assert!(
+        accept.status.success()
+            && stdout.contains("Merged checks: passed on the current source with this patch"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_library_path_requires_refresh_with_merged_checks() -> Result<()> {
+    let check = check_json(&lib_run(LIB_CODE_DELTA)?)?;
+    assert_eq!(check["validity"]["decision"], "refresh", "{check}");
+    assert_eq!(
+        check["validity"]["reasons"][0]["code"], "fact_broken",
+        "{check}"
+    );
+    assert_eq!(
+        check["validity"]["reasons"][0]["path"], "src/main.rs",
+        "{check}"
     );
     Ok(())
 }

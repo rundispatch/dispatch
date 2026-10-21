@@ -97,40 +97,23 @@ fn evaluate_run_in(
     let kept = keep.map(|run_dir| run_dir.join(CONFLICT_OUTPUT));
     let (mut validity, conflict) =
         assess(&world, &WorkView::of(run, candidate), kept.as_deref(), memo)?;
-    if validity.decision == Decision::Continue
-        && validity
-            .reasons
-            .iter()
-            .any(|reason| reason.code == ReasonCode::MentionChanged)
-    {
-        let skipped = run.baseline_path.parent().map(|run_dir| {
-            integration::checks_skipped(run, candidate_label, run_dir, Some(validity.world_changed))
-        });
+    if rests_on_merged_checks(&validity) {
+        let skipped = run
+            .baseline_path
+            .parent()
+            .context("the run has no directory")
+            .and_then(|run_dir| {
+                integration::checks_skipped(
+                    run,
+                    candidate_label,
+                    run_dir,
+                    Some(validity.world_changed),
+                )
+            });
         match skipped {
-            Some(Ok(None)) => {
-                for reason in &mut validity.reasons {
-                    reason
-                        .detail
-                        .push_str("; merged checks will decide at accept");
-                }
-            }
-            Some(Ok(Some(why))) => {
-                validity.decision = Decision::Refresh;
-                for reason in &mut validity.reasons {
-                    reason
-                        .detail
-                        .push_str(&format!("; merged checks cannot run — {why}"));
-                }
-            }
-            Some(Err(error)) => {
-                validity.decision = Decision::Refresh;
-                for reason in &mut validity.reasons {
-                    reason
-                        .detail
-                        .push_str(&format!("; merged checks are unavailable — {error:#}"));
-                }
-            }
-            None => validity.decision = Decision::Refresh,
+            Ok(None) => {}
+            Ok(Some(why)) => cannot_rest_on_merged_checks(&mut validity, why),
+            Err(error) => cannot_rest_on_merged_checks(&mut validity, format!("{error:#}")),
         }
     }
     if let (Some(path), Some(output)) = (&kept, conflict) {
@@ -428,6 +411,31 @@ pub fn overridable(validity: &Validity) -> bool {
         })
 }
 
+/// Whether `validity` is a CONTINUE that the merged checks decide at accept:
+/// one carrying weak mentions that changed.
+pub fn rests_on_merged_checks(validity: &Validity) -> bool {
+    validity.decision == Decision::Continue
+        && validity
+            .reasons
+            .iter()
+            .any(|reason| reason.code == ReasonCode::MentionChanged)
+}
+
+/// Such a CONTINUE when the merged checks cannot run: REFRESH, saying why first.
+fn cannot_rest_on_merged_checks(validity: &mut Validity, why: impl fmt::Display) {
+    validity.decision = Decision::Refresh;
+    validity.reasons.insert(
+        0,
+        Reason {
+            code: ReasonCode::AnalysisUncertain,
+            fact_id: None,
+            path: None,
+            detail: format!("merged checks cannot run — {why}"),
+        },
+    );
+    validity.reasons.truncate(MAX_REASONS);
+}
+
 /// The configuration frozen with the run, or `None` when the snapshot cannot be
 /// read. Callers treat `None` as strict accept so that a missing file can only
 /// make acceptance more conservative.
@@ -475,23 +483,9 @@ pub(crate) fn gate(
             source_lock,
         ))??;
         if let MergedChecks::Skipped(why) = &checks
-            && validity
-                .reasons
-                .iter()
-                .any(|reason| reason.code == ReasonCode::MentionChanged)
+            && rests_on_merged_checks(&validity)
         {
-            validity.decision = Decision::Refresh;
-            for reason in &mut validity.reasons {
-                let detail = reason
-                    .detail
-                    .strip_suffix("; merged checks will decide at accept")
-                    .unwrap_or(&reason.detail);
-                reason.detail = format!("{detail}; merged checks cannot run — {why}");
-            }
-            return Ok(AcceptGate::Blocked {
-                validity,
-                checks: Some(checks),
-            });
+            cannot_rest_on_merged_checks(&mut validity, why);
         }
         return Ok(match validity.decision {
             Decision::Continue => AcceptGate::Compatible { validity, checks },

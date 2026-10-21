@@ -126,30 +126,46 @@ pub fn identifiers_in(
     }
 }
 
-/// Keep byte and line positions while hiding comments and Python docstrings
-/// from path-token detection in a candidate's post-image.
-pub fn without_comments_and_docstrings(lang: Lang, source: &[u8]) -> Result<Vec<u8>> {
+/// A post-image as path mentions see it, each copy keeping every byte and line
+/// position: its code, and its test code (Rust items under `#[cfg(test)]`).
+/// Comments and Python docstrings are in neither.
+pub fn code_and_tests(lang: Lang, source: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let tree = parse(lang, source)?;
-    let mut masked = source.to_vec();
+    let mut code = source.to_vec();
+    let mut in_test = vec![false; source.len()];
     let mut cur = tree.root_node().walk();
-    loop {
+    'walk: loop {
         let node = cur.node();
         if node.kind().ends_with("comment") {
-            mask(&mut masked, node);
+            mask(&mut code, node);
         } else if lang == Lang::Python
             && let Some(docstring) = docstring_statement(node)
         {
-            mask(&mut masked, docstring);
+            mask(&mut code, docstring);
+        } else if let Some(item) = cfg_test_item(node, source) {
+            in_test[node.start_byte()..item.end_byte()].fill(true);
         }
         if cur.goto_first_child() {
             continue;
         }
         while !cur.goto_next_sibling() {
             if !cur.goto_parent() {
-                return Ok(masked);
+                break 'walk;
             }
         }
     }
+    let mut tests = code.clone();
+    for (index, test) in in_test.into_iter().enumerate() {
+        let byte = if test {
+            &mut code[index]
+        } else {
+            &mut tests[index]
+        };
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+    Ok((code, tests))
 }
 
 fn mask(source: &mut [u8], node: Node) {
@@ -158,6 +174,23 @@ fn mask(source: &mut [u8], node: Node) {
             *byte = b' ';
         }
     }
+}
+
+/// The item a Rust `#[cfg(test)]` attribute applies to.
+fn cfg_test_item<'a>(attribute: Node<'a>, source: &[u8]) -> Option<Node<'a>> {
+    if attribute.kind() != "attribute_item"
+        || !source[attribute.byte_range()]
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .eq(b"#[cfg(test)]")
+    {
+        return None;
+    }
+    let mut item = attribute.next_named_sibling()?;
+    while item.kind() == "attribute_item" || item.kind().ends_with("comment") {
+        item = item.next_named_sibling()?;
+    }
+    Some(item)
 }
 
 fn docstring_statement(scope: Node) -> Option<Node> {
