@@ -3,8 +3,8 @@
 This page describes what `src/orchestrator/attach.rs` and `src/orchestrator/serve.rs`
 do: `dispatch attach`, `dispatch finish` and `dispatch serve`, the three commands that
 let Dispatch observe, judge and — only if you ask — apply work done by an agent it did
-not launch. For the short version and the commands, see the
-[README](../README.md#attach-your-own-agent) and the
+not launch. For the short version, see the [README](../README.md); the commands are in
+the [reference](reference.md) and the
 [product guide](product-guide.md#using-your-own-agent). Coherence itself (the model,
 the verdicts, the fixture matrix) is documented in [coherence.md](coherence.md); this
 page is about how attached work is fed into that same model. Attach and `serve` are
@@ -686,7 +686,7 @@ the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
   - "Nothing to clean" adds that Dispatch removes only the workspaces it made.
   - The run's record and Δ stay.
   - **Check workspaces** (`<state>/check-workspaces/<sha256 of the source path>`, one per
-    project, see [coherence.md](coherence.md#integration-checks-l2)) are listed after
+    project, see [coherence.md](coherence.md#l2-integration-checks-integrationrs)) are listed after
     them, one line each: `<path> · internal check workspace`. The confirmation then says
     that check workspaces hold temporary verification and build files and that Work
     records are kept separately. Each is removed under its project's source lock; one in

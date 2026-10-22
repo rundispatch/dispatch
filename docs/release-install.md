@@ -10,7 +10,8 @@ Each archive is built and smoke-tested (`dispatch version`, and an install with
 interactively. Windows, SSH/tmux and native GUI terminals are not certified. Packages are
 unsigned and not notarized. The archive contains only `dispatch`, `LICENSE`, `INSTALL.md`
 (this page) and `BUILD.json`, which records source and binary identities. No account state,
-logs, grants, credentials or fonts are bundled.
+logs, grants, credentials or fonts are bundled. Dispatch needs Git and the tools your
+project's checks use, and installs no agent or provider tool.
 
 ## Install
 

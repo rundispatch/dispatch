@@ -1,9 +1,9 @@
 # Work coherence: technical reference
 
 This page describes what the code in `src/coherence.rs` and `src/coherence/` does.
-For the short version and the commands, see the [README](../README.md#work-coherence-keeping-results-valid-while-the-code-moves)
-and the [product guide](product-guide.md). Coherence is part of the experimental
-developer preview.
+For the short version, see the [README](../README.md); the commands are in the
+[reference](reference.md) and the [product guide](product-guide.md). Coherence is part
+of the experimental developer preview.
 
 ## The problem and the approach
 
@@ -50,6 +50,33 @@ Facts are derived only from S0 and Δ, so they can be recomputed at any time.
 | `integration_check_failed` | L2: a configured check failed or timed out on the merged tree | `Refresh` |
 
 At most 20 reasons are kept in a `Validity`; result projections keep 5.
+
+### A worked example
+
+A run adds a call to `auth::validate(&token)` in `src/handler.rs`.
+While it waited for review:
+
+```text
+# You edit README.md and an unrelated function in src/util.rs.
+$ dispatch check
+Run <id>
+Coherence: CONTINUE
+Analysis: files_only
+World changed files: 2
+At accept: merged checks will run (checks.verify on the source as it is then, with this patch) and must pass before anything is applied
+Next: dispatch accept <id>  (or dispatch reject <id>)
+$ dispatch accept <id>     # runs your checks on the merged tree, then applies onto the edited tree
+
+# Instead, someone changes validate's signature in src/auth.rs.
+$ dispatch check
+Run <id>
+Coherence: REFRESH
+Analysis: symbols
+World changed files: 1
+  fact_broken: pub fn validate(token: &Token) -> Result<User, AuthError> => pub fn validate(ctx: &AuthContext, token: &Token) -> Result<User, AuthError>
+At accept: accept would refuse it now (REFRESH), before any merged checks
+Next: dispatch refresh <id>  (or dispatch reject <id>)
+```
 
 ## The pipeline
 
