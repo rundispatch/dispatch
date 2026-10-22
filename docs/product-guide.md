@@ -210,7 +210,7 @@ Coherence section when the source moved or the run is a refresh.
 `check`, `refresh` and the `Coherence:` line act only on a finished, ready result
 that is not yet applied (`check` and the line also need exactly one candidate,
 which any single-agent run has). The verdict rules, limits and events
-are in the [coherence reference](coherence.md); the README has the short version.
+are in the [coherence reference](coherence.md), with a worked example.
 
 ### Auto-apply
 

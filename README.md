@@ -10,503 +10,32 @@
 <p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
 
 A coding agent works from a snapshot of your source while the real source keeps
-changing: you edit files, another run is accepted, a teammate merges. Dispatch
-runs the agent in an isolated copy of that snapshot, keeps the patch it produced,
-and before applying it checks whether the work still holds against the source as
+changing: you edit files, another result is accepted, a teammate merges. Dispatch
+keeps the snapshot the work began from (S0) and the patch it produced (Δ), and
+before anything lands it checks whether the work still holds against the source as
 it is now. The answer is a verdict with reasons, not a merge conflict:
-
-```text
-task
-  ↓
-S0: frozen baseline + isolated candidate workspace
-  ↓
-one selected coding agent + configured verification
-  ↓
-Δ: the patch, kept with its evidence
-  ↓
-validate(facts the work relied on, source now)
-  ↓
-CONTINUE / REFRESH / STOP, with reasons
-  ↓
-review → accept or reject
-```
-
-Dispatch runs the coding agent you configured in an isolated workspace,
-verifies the result when checks are configured, and lets you review and accept
-it. Those are how Dispatch carries the work. Coherence is what it adds: the
-verdict is always recomputed from the snapshot, the patch and the source now,
-and a stale result is never applied.
+**CONTINUE**, **REFRESH** or **STOP**. A stale result is never applied.
 
 Everything Dispatch does is local. Provider execution requires the provider’s
 service; Dispatch itself needs no account, no network service and no upload.
 
-## Quick start
-
-```sh
-curl -fsSL https://rundispatch.sh/install | sh
-cd your-project
-dispatch setup       # on a terminal: checks, consent, hooks, watching
-claude --worktree    # work: your agent in its own worktree, or dispatch attach -- <agent>
-dispatch accept      # once the result is ready for review
-```
-
-- **Install** puts `dispatch` in `~/.local/bin` for macOS (Apple silicon or Intel) or Linux
-  (x86_64 or aarch64), after checking it against the release's `SHA256SUMS`. Until the
-  website redirects `rundispatch.sh/install`, use
-  `https://github.com/rundispatch/dispatch/releases/latest/download/install.sh`. See
-  [Install](#install).
-- **`dispatch setup`** is one pass, and each step can be skipped: pick the checks it
-  detected (or type your own), allow them to run by themselves for this project, install
-  Claude Code's and Hermes's hooks if they are on `PATH`, and start watching.
-- **Work.** A Claude Code or Hermes session in its own worktree becomes Work by itself. When
-  the session ends and its process is gone, Dispatch freezes the change and runs the checks
-  you allowed; it never applies anything. Any other agent works through `dispatch attach --
-  <agent>`, which finishes when the agent exits.
-- **`dispatch accept`** checks the result against the source as it is now and applies it.
-  `dispatch watch` shows what is ready, and what waits on you.
-
-## Two ways to use Dispatch
-
-- **Let Dispatch launch the agent.** `dispatch run "<task>"` runs your coding
-  agent from a frozen snapshot in an isolated workspace. This needs a resource
-  set up with `dispatch setup`, or an explicit `--agent`.
-- **Protect work you run yourself.** Run `dispatch attach -- <agent command>`
-  from your checkout and Dispatch makes the agent its own workspace, so any
-  agent CLI works isolated, with or without worktree support of its own.
-  `dispatch attach --workspace <dir>` observes an agent already working in a
-  worktree, and `dispatch finish` freezes the result. No resource setup is
-  needed.
-
-Either way, the result is judged the same way: `dispatch check`, `accept` and
-`reject` work on it against the source as it is now.
-
-**Watching a project.** `dispatch start` watches the project in the
-background and gives you your shell back. While it runs, Dispatch keeps the
-verdict of every Work item it knows about current as the code moves:
-- results waiting for your review, native or attached;
-- attached work still in progress;
-- attached work it may apply.
-
-`dispatch watch` shows that state live. On a terminal it is a table of Work,
-named by its worktree folder or its task, with Work that needs you first; the
-selected Work's details say why its verdict is what it is and what to do next.
-You act on the selected Work without typing its ID: `f` finishes, `a` accepts,
-`r` rejects (after asking, naming the Work), `c` closes it without a review
-(after asking why, then confirming), `d` reviews. Below 90 columns
-each Work is a two-line card. Leaving it does not stop watching. `dispatch stop` ends watching for
-this project. No agent needs to be set up
-for any of this.
-
-```text
-$ dispatch start
-✓ Watching ~/src/project
-  Dispatch is running in the background. See it: dispatch watch · Stop: dispatch stop
-  No checks are configured, so Work here is not verified. Add them: dispatch setup --checks, or dispatch setup --checks --verify '<command>'
-```
-
-`dispatch setup` starts watching at the end of its pass, so `start` is needed only
-on its own. The first `dispatch start` on a terminal, in a project without checks,
-first shows the checks it detected, with "Continue without checks" focused, so
-Enter alone writes nothing. Without a terminal it starts watching at once, as above.
-`dispatch setup --checks --verify '<command>'` saves exact commands without a
-terminal. Letting Work run them by itself is never granted without a terminal.
-
-A project watched with `dispatch start` is watched again by the next Dispatch command
-or hook there, after a reboot, a crash or an upgrade in place, until `dispatch stop`.
-After a reboot or a crash, that command says `Watching <root> again: its owner had
-stopped.`; a Claude Code or Hermes session starting there does the same. After an
-upgrade in place it says `Restarted watching <root> with Dispatch <new> (was
-<old>).`. The owner stops by itself when the project or Dispatch's state directory is
-deleted.
-
-**Work that appears without hooks.** In a watched project, a Claude Code
-worktree that appears after watching began (`claude --worktree` or `claude -p
---worktree`) becomes Work by itself, with no hooks installed.
-- Dispatch lists the project's Git worktrees about once a second and never walks
-  your directories; `dispatch start` returns once it has taken that list. A
-  worktree counts when Claude Code made it under `.claude/worktrees/` and a
-  `claude session` holds its lock.
-- S0 is its merge base with the project, with full confidence: everything in a
-  worktree that appeared while you watched is its session's.
-- While the session's process runs, the Work shows `agent running`. When it is
-  gone, or its lock is released, the Work says the session ended, `claude -p`
-  included. With the project's check consent, the owner then finishes it, as
-  below; otherwise it records only what it observed.
-- Claude worktrees that were already there when watching began, or that have no
-  session lock, are listed as "found, not tracked", with `dispatch attach
-  --workspace <path>`.
-- Codex and Cursor Agent worktrees are recognized the same way, each by the one
-  reliable sign it leaves: for Codex (`codex exec --worktree`), wherever the
-  worktree is, `codex-thread.json` in its Git metadata; for Cursor Agent
-  (`cursor-agent --worktree <name>`), exactly
-  `~/.cursor/worktrees/<project folder, lowercased>/<name>` on branch `<name>`.
-  Neither records anything that names its running agent, so Dispatch cannot see
-  their sessions end. Their Work never reads `agent running` and never turns
-  idle by itself; when the agent is done, `dispatch finish <id>`, or `dispatch
-  close <id> --reason unfinished`.
-- Hermes Agent worktrees (`hermes chat --worktree`) are recognized by place and
-  branch: `.worktrees/hermes-<8 hex>` in the project, on branch
-  `hermes/hermes-<same 8 hex>`. While the Hermes process that locked the worktree
-  runs, the Work shows `agent running`. Once that process is gone, its session
-  is recorded as ended, also after Hermes removed the worktree: Dispatch follows
-  the process it recorded by its exact identity, not only by the lock.
-- Hermes removes its worktree when the session ends, with the agent's
-  uncommitted changes, unless the worktree holds commits on no remote-tracking
-  ref. So Dispatch rewrites the Work's patch so far whenever its tree changes,
-  about once a second. When the worktree is gone, `status` and `watch` say when
-  the kept changes were last seen; anything after that is not included. You can
-  still finish them (`dispatch finish <id>`), review them and accept them, or
-  close the Work; only you can finish them, never your check consent.
-- With Hermes's hook installed (`dispatch setup` offers it when `hermes` is on
-  `PATH`), Dispatch keeps the exact changes before Hermes
-  removes the worktree, at the end of a CLI `hermes chat` session. `/new` and
-  the TUI fall back to the changes last seen. Setup appends one block to
-  `~/.hermes/config.yaml`, keeps every other byte, and removes exactly that
-  block again; Hermes asks you to allow the hook the first time it runs it.
-- Other agents' worktrees are not recognized: `dispatch attach -- <agent>`
-  gives any agent its own workspace.
-
-**Work that appears with hooks.** With Claude Code's hooks installed (`dispatch
-setup` offers them when `claude` is on `PATH`, shown and approved first), a Claude Code session
-in its own worktree of a watched project (`claude --worktree`) becomes Work by
-itself the moment it starts. Whichever sees a worktree first, hook or discovery,
-creates its Work, and the other joins it.
-- S0 is the worktree as the session found it, before its first edit.
-- Later sessions in the same worktree join the same Work.
-- When Claude Code removes the worktree, Dispatch first keeps its exact
-  changes, then waits for you to `finish` them, or `close` the Work.
-- Dispatch compares the source with the worktree's start once, after the Work
-  is recorded. If they differed, for example because accepted changes were not
-  committed when the worktree was made from HEAD, `status`, `explain` and
-  `watch` say so, and recommend `dispatch attach -- <agent>`, which begins from
-  the current source, uncommitted changes included. It is advisory, and
-  `claude --worktree` still starts from what Claude Code chooses.
-- If you have let this project's checks run by themselves (`dispatch setup`),
-  Dispatch runs them on the kept changes instead, and the Work waits for your
-  review. That permission names the exact commands: when `checks.verify` changes,
-  it no longer holds until you approve the new ones. It never lets anything apply.
-- **When the session ends.** With that permission, once a Claude Code or Hermes
-  session has ended and its process is gone, the owner finishes its Work the same
-  way: Δ frozen, checks run, the result waits for your review. `/clear` and
-  `/resume` keep the process running and finish nothing. A session resumed in that
-  worktree goes on from the same S0, so its Work holds both sessions' changes, and
-  the earlier result closes as superseded by it.
-- **Waiting on you.** Claude Code's `Notification` and `Stop` hooks mark the Work
-  `waiting on you: permission`, `input` or `turn ended`. `dispatch watch` lists it
-  under "needs you", and `status` says the same, until the session moves again.
-- A session running directly in your checkout is told that Dispatch cannot
-  tell its edits from yours, and nothing is tracked.
-- No session in its own worktree is lost silently, even on a busy machine. It
-  ends one of three ways, and the session is told which:
-  - **tracked:** its Work is created before the hook returns;
-  - **pending:** its starting state is saved, and the watching owner finishes
-    creating the Work moments later;
-  - **not tracked:** its starting state could not be captured in time, or the
-    worktree kept changing while it was being captured. Discovery may still
-    track the worktree when it finds it later.
-
-  Work is never left half-created.
-
-To build Dispatch with Dispatch, as its own releases are built, see
-[docs/self-hosting.md](docs/self-hosting.md).
-
-**Work that notices Work.** While a project is watched, Dispatch also compares
-the Work that is not yet integrated, and says where two pieces already touch:
-- both change the same declaration or whole file, or edit overlapping lines;
-- one changes the signature of, or removes, a declaration the other uses;
-- one changes or deletes a file the other relies on.
-
-A row in `dispatch watch` then names the other Work under TOUCHES (piped, it
-ends with `interacts with <id>`). The selected Work's details, and `dispatch
-status`, say how, apart from the verdict: Work can be
-`CONTINUE` and still interact. This is exact to the declaration for Rust and
-Python, and to the file elsewhere. It is advisory: nothing is blocked,
-reordered or refreshed, and once one piece lands the other is judged by the
-coherence check as before.
-
-**How often interactions are right is measured.** When Work lands, Dispatch
-records the interactions it had with the other Work in progress
-(`interaction.landed`). The watching owner then records its next verdict on
-each of those other pieces (`interaction.outcome`), whether or not an
-interaction was reported. Documented queries in
-`docs/queries/interactions-measured.sql` read the precision and misses from
-your own state directory. Nothing leaves your machine. "Invalidated" there
-means Dispatch's own later verdict, not a confirmed conflict.
-
-Watching covers Work Dispatch launched, that you attached, sessions whose
-runtime reports them, and Claude Code, Codex and Cursor Agent worktrees it
-finds. Working Work shows the files it has changed so far and how long it has
-been tracked; until the owner has counted, files read `unknown`, never 0. It
-does not scan for agent processes. `dispatch serve` does the same watching in the
-foreground, and `check` and `status` answer on demand.
-
-## Work coherence: keeping results valid while the code moves
-
-Before 0.2.0 any difference anywhere in the tree refused `dispatch accept`, even
-an edited README, and Dispatch could not tell a harmless change from one that
-invalidates the work.
-
-Dispatch treats a run like an optimistic transaction. **S0** is the snapshot
-the run started from and **Δ** is the patch the agent produced. From S0 and Δ,
-Dispatch derives the *facts the work relied on*: the declarations the patch edits,
-the declarations its new code uses, and, for files it cannot parse, the files
-themselves. When you accept, Dispatch observes the current source (ignoring what
-`.gitignore` excludes), checks that Δ still applies, and checks that those facts
-still hold. The answer is a verdict, always recomputed from S0, Δ and the source as
-it is now. Nothing about it is trusted from an earlier moment.
-
-| Verdict | Meaning | At accept time | Mid-run |
-|---|---|---|---|
-| `CONTINUE` | The source did not move, or nothing the work relied on changed. | Applies against the current source, after your `checks.verify` pass on the merged result if the source moved. | Nothing, unless it follows an earlier invalid verdict (`coherence.checked`). |
-| `REFRESH` | Δ no longer applies, a relied-on fact changed, or a check failed on the merged tree. | Nothing is applied and the source is left unchanged; the message says whether the merged checks ran and names `dispatch refresh` (for attached Work: run the agent again, then close the old Work as superseded) or `dispatch reject`. | `coherence.invalidated` is recorded and the agent continues. Only with `mid_run: stop` and `stop_on_refresh: true` is it stopped. |
-| `STOP` | Δ is already present in the source. | Nothing is applied; the message points to `dispatch close <id> --reason already-present`, which records no review. | `coherence.invalidated` is recorded. With `mid_run: stop` the agent is stopped. |
-
-### Accept-time flow
-
-- `dispatch check [run]` evaluates the finished result now and prints the verdict,
-  analysis level, number of changed files, reasons, what accept would verify
-  (`At accept:`) and the next command. It is read-only, stores nothing, and exits 0
-  for any verdict (1 if it cannot evaluate). It runs the file, patch and symbol
-  layers only; integration checks run at accept. The summary at the end of a run or
-  a `finish` shows the same verdict and `At accept` line, and its heading follows the
-  verdict: `Ready for review`, `Finished, but stale (REFRESH)` or
-  `Finished, already in the source (STOP)`.
-- `dispatch check <id> --merged` also runs your `checks.verify` on the source as it
-  is now with the Work's change applied, in the project's check workspace, exactly as
-  accept would, and prints one line per command (PASS/FAIL, exit code, duration, logs).
-  For unfinished attached Work, the change is taken from the workspace now, new
-  untracked files included, as `finish` would take it; the live patch is not
-  touched. Nothing is applied and no verdict changes; one `coherence.merged_checks`
-  event records the source state (Git HEAD and whether it had uncommitted changes,
-  or a plain directory), the Δ digest, the checked tree and each command's result and
-  duration. It exits 1 if a check fails. It needs the same authority as `finish`: the
-  Work's own `--allow-unsafe-local`, standing consent for exactly these checks
-  (`dispatch setup`), or `--allow-unsafe-local` for this check alone, which
-  is not recorded on the Work. For finished Work whose source has not moved since the
-  Work began it runs nothing, as accept does. Accept checks again only a tree that has
-  no recorded pass, because the source can move after.
-- **A tree that passed is not checked again.** A pass of `checks.verify` is recorded
-  for 24 hours, keyed by the exact tree that was checked (ignored files left out), the
-  ordered commands, and the environment they ran in (backend and image, `PATH`,
-  `HOME`, `TMPDIR`, `LANG`, where each program resolves, and the Dispatch version).
-  `finish`, `check --merged` and accept then run nothing for that tree, record
-  `checks.reused`, and say `passed, reused from <run> at <time>; logs: …`. Failures are
-  never recorded. Plain directories, sources where Git converts file contents
-  (`core.autocrlf`, `core.eol`, or a `text`, `eol`, `filter`, `ident`, `crlf` or
-  `working-tree-encoding` attribute) and trees holding an untracked nested repository
-  get no record, and their checks run every time. A reused result is counted as
-  reused, never as time saved.
-- `finish`, `check` and `diff --stat` print `Δ <12 hex>`, the start of the SHA-256
-  of the patch bytes. `dispatch accept <id> --expect <digest>` (12 or more hex
-  characters) refuses before anything else, naming both digests, if the frozen Δ
-  is not the one you reviewed. The accepted digest is recorded with the review
-  (`review.accepted.delta_digest`).
-- `dispatch accept [run]` applies the result and then records your acceptance. It
-  first prints `Merged checks:`, whether your checks ran on the merged result and
-  passed, or why they did not run, then one line per command when they ran. If
-  the tree is byte-identical to the snapshot, behavior is unchanged. If it moved, the verdict gates the apply. A `REFRESH` or
-  `STOP` leaves the source untouched, shows the application as blocked by source
-  drift, and records no acceptance: the result stays pending until you refresh,
-  reject or close it.
-- `dispatch accept [run] --despite-refresh --explanation "<why>"` applies a `REFRESH`
-  that comes only from the file and symbol analysis, when you have checked that the
-  work still holds. Your checks must still run and pass on the merged tree, and the
-  overridden verdict is recorded with your explanation. It never overrides `STOP`, a
-  patch that no longer applies, or a failing check, and auto-apply never uses it.
-- `dispatch refresh [run]` starts a **new** run of the same task against the current
-  source. The task gets a fixed note naming the earlier run and up to ten reasons it
-  went stale. The old run is not modified. It needs the same authority as `run`
-  (`--allow-unsafe-local`, or the project's native consent) and repeats the original launch choices,
-  such as a fixed agent, model or effort. Dispatch never relaunches automatically.
-
-Worked example. A run adds a call to `auth::validate(&token)` in `src/handler.rs`.
-While it waited for review:
-
-```text
-# You edit README.md and an unrelated function in src/util.rs.
-$ dispatch check
-Run <id>
-Coherence: CONTINUE
-Analysis: files_only
-World changed files: 2
-At accept: merged checks will run (checks.verify on the source as it is then, with this patch) and must pass before anything is applied
-Next: dispatch accept <id>  (or dispatch reject <id>)
-$ dispatch accept <id>     # runs your checks on the merged tree, then applies onto the edited tree
-
-# Instead, someone changes validate's signature in src/auth.rs.
-$ dispatch check
-Run <id>
-Coherence: REFRESH
-Analysis: symbols
-World changed files: 1
-  fact_broken: pub fn validate(token: &Token) -> Result<User, AuthError> => pub fn validate(ctx: &AuthContext, token: &Token) -> Result<User, AuthError>
-At accept: accept would refuse it now (REFRESH), before any merged checks
-Next: dispatch refresh <id>  (or dispatch reject <id>)
-```
-
-All keys are optional and live in `dispatch.yml`; the values shown are the defaults.
-The block is read from the configuration frozen with each run.
-
-```yaml
-coherence:
-  accept: validate        # validate: check the moved tree; strict: refuse on any drift (0.1.x behavior)
-  mid_run: observe        # observe: record verdicts while the agent works; stop: cancel it on STOP
-  stop_on_refresh: false  # with mid_run: stop, also cancel on REFRESH
-  poll_secs: 10           # how often the watchers look for source changes (must be > 0); worktree discovery runs about once a second regardless
-  integration_checks: true  # when the source moved, run checks.verify on the merged tree before applying
-```
-
-### What it checks and what it does not
-
-- Symbol facts exist for **Rust and Python** only. Other languages use file-level
-  facts: any change to a file the patch edits, or that its code uses by path, is a
-  `REFRESH`. A path named only in a Rust or Python comment or docstring is no
-  dependency at all. A path named in test code, or in a file without symbol
-  support (YAML, Markdown, TOML, shell), is weak: when that file changes, the
-  verdict stays `CONTINUE` and the merged checks decide at accept, or it is
-  `REFRESH` when no checks can run.
-- A referenced symbol is bound by *unique name* in the baseline, not by full name
-  resolution. Ambiguous or very common names are skipped, so some breakage is missed.
-- A Python function that only gains optional parameters (defaults, `*args`,
-  `**kwargs`) keeps code that calls it valid. Any other signature change to a
-  function the work calls is a `REFRESH`; Rust signatures compare exactly.
-- Integration checks run your configured `checks.verify` on the merged tree in the
-  project's check workspace: one internal Git repository per project under the state
-  directory, never a worktree of yours, holding the source's non-ignored files with
-  the change applied. Ignored build output stays there between runs, so builds are
-  incremental after the first; `dispatch clean` removes it. They hold the project's
-  source lock while running, so one project's merged checks run one at a time. On the
-  local backend they are skipped for a run that was not itself approved for local
-  execution. A check that fails, times out or cannot run produces `REFRESH`.
-- Two edits to the same symbol are reported as `REFRESH`. Python appends at the very
-  end of a function are not seen as same-symbol edits by the symbol layer; the patch
-  check and your checks still apply.
-- Transitive behavior changes (a callee's callee) are caught only if your checks
-  cover them.
-- Nested repositories and submodules are not analysed.
-- Mid-run verdicts are advisory by default.
-
-### Auto-apply
-
-A session mode (Shift+Tab, or `/auto-apply on`) and a CLI flag (`dispatch run
---auto-apply`, `dispatch refresh --auto-apply`) apply an eligible result
-automatically instead of waiting for review. Auto-apply is never auto-accept: it
-applies only a verdict whose evidence is complete for the exact world it names — an
-unmoved world with passed verification, or a moved world whose merged tree passed
-your own checks — and it never records human acceptance, so review stays `pending`.
-See the [product guide](docs/product-guide.md#auto-apply) for the mode and
-[coherence reference](docs/coherence.md#automatic-application-auto-apply) for the
-full eligibility and authorization rules.
-
-### Attach your own agent
-
-`dispatch attach` puts work from an agent Dispatch did not launch — Claude Code, Codex, Cursor, a script — under the same coherence checking, in its own worktree. After `dispatch setup` saves this project's checks and you allow those exact checks, the first example can auto-apply an eligible result:
-
-```sh
-dispatch attach --auto-apply -- claude -p "add input validation"   # from your checkout, with standing consent for its checks
-dispatch attach --workspace ../scratch --agent codex --auto-apply  # or observe one already running
-dispatch finish <run-id>                                           # you say when it's done
-dispatch start                                                     # keeps a foreign attachment observed and applies it
-```
-
-Dispatch is honest about what it saw: full confidence when S0 is the workspace as the work began (a workspace Dispatch made, or a session's start) or a real Git merge-base commit; partial confidence when it had to snapshot a directory at attach time, or when a session resumed in a worktree it had not seen, since earlier edits are then invisible to the patch. Attached Work that did not begin from the current source, such as a worktree made from HEAD while accepted changes were still uncommitted, says so once in `attach`, `status` and `watch`. A workspace Dispatch made is removed once its work is applied, and kept otherwise until you run `dispatch clean`, which lists what it would remove, project check workspaces and the record of passed checks included, and asks first. It never removes a workspace that unfinished Work, or Work waiting for review, still uses, and it lists worktrees you or an agent's runtime made without removing them. `dispatch close <id> --reason <reason>` retires Work nobody will finish, or a result that is already in the source or replaced, without recording a review. See [attach.md](docs/attach.md).
-
-See the [coherence reference](docs/coherence.md) for the model, rules, events and
-the fixture matrix, and [coherence validation](docs/coherence-validation.md) for
-what is claimed today, what is measured during real use, and what would show the
-thesis to be wrong.
-
-## Interactive loop
-
-From a source directory, open Dispatch. Missing resources lead to guided setup
-and preserve your goal. You can also configure resources first:
-
-```bash
-dispatch setup                 # checks, consent, hooks and watching; then "Agents Dispatch launches…" for provider login and funding consent
-dispatch setup --checks        # approve a known project check
-dispatch setup --checks --verify 'cargo test'   # or save an exact one, no terminal needed; grants nothing
-dispatch                      # direct goal → work → verification → review
-```
-
-Enter the outcome, then approve local execution for that goal. Dispatch displays
-the chosen resource, work and verification. A durable clarification
-appears directly in the session; submitting its answer continues automatically.
-At review, enter `d` for the diff, `a` to accept and safely apply, `r` to reject,
-`i` for artifact details, or `n` to leave the result pending and start another goal.
-These actions retain the displayed run, question, and candidate identities.
-Verification and human acceptance remain separate.
-
-The compact inline view preserves scrollback and uses the terminal's background.
-Enter submits, Alt+Enter inserts a newline, bracketed paste inserts without
-submitting, Ctrl+C cancels, and Ctrl+D exits an empty editor. During work,
-Ctrl+C waits for process cleanup; EOF/hangup also requests controlled cancellation.
-Input entered while work is active is discarded rather than queued as another goal.
-
-Use `dispatch --plain` for ordinary line input, `--ascii` for ASCII graph marks,
-and `--no-color` (or `NO_COLOR`) for native colors. `TERM=dumb` selects plain mode.
-Plain input is line-oriented; the integrated editor supports multiline paste.
-Bare invocation without terminal input and output prints help and exits 2.
-
-Use `/resources` for Accounts / Resources and `/checks` for project checks.
-`dispatch resources` prints cached configuration status without a prompt or model
-call. Discovery never authorizes spending. Codex and Claude use their own supported
-CLI login; no Dispatch account is required. Confirm the exact model, effort and
-included funding. Claude assertions expire after at most 24 hours and have an
-explicit refresh path. Changed/rejected funding epochs need fresh owner consent.
-No paid fallback, credits or account switch is automatic.
-See [setup and review](docs/product-guide.md), [visual system](docs/design-system.md)
-and [candidate validation](docs/product-rc-validation.md).
-
-## One-shot CLI
-
-From a repository or plain directory:
-
-```bash
-cd my-project
-dispatch run "Fix the retry race"
-```
-
-Local agents run with your operating-system permissions. On a terminal Dispatch asks first: `[1] This run only  [2] Allow for this project  [Enter] Cancel`. Allowing the project covers later runs and refreshes with exactly the same agent command and checks; any change asks again. A piped `y` allows one run; scripts can also use `--allow-unsafe-local` after accepting that risk.
-
-Review and apply the result. Without an ID, `diff` shows the latest result and
-names it, and `accept` acts only when exactly one result waits for review for this
-source; with several it changes nothing and lists them with their IDs:
-
-```bash
-dispatch diff
-dispatch accept
-```
-
-Or reject it without changing the source tree:
-
-```bash
-dispatch reject
-```
-
-The summary at the end of the run prints these commands with the run's ID.
-
-To run a specific agent:
-
-```bash
-dispatch run "Fix the retry race" --agent claude
-```
-
-`dispatch explain` shows which agent and resource the last task used.
-
-## How Dispatch chooses an agent
-
-Each run uses exactly one agent:
-
-- With profiles in `resources.yml` (written by `dispatch setup`), Dispatch uses
-  the first eligible profile in file order. `--agent`, `--model` and `--effort`
-  only narrow the choice. If no eligible profile matches, the run is refused
-  with each profile's reason; it never falls back to an unchecked agent.
-- With no profiles configured (no `resources.yml`, or `allocation_enabled:
-  false`), `--agent claude|codex|cursor|hermes` runs that agent with its own
-  login and no funding contract is checked.
-- With neither, `dispatch run` refuses: run `dispatch setup`, or pass `--agent`.
-
-There is no ranking, benchmark data or automatic fallback to another agent.
+- **Your agents, as they are.** In a watched project, a Claude Code or Hermes session
+  in its own worktree becomes Work by itself, Codex and Cursor Agent worktrees are
+  found too, and any other agent works through `dispatch attach -- <agent>`.
+  [Attach and watching →](docs/attach.md)
+- **A verdict with reasons.** From S0 and Δ, Dispatch derives the facts the work relied
+  on, declaration by declaration for Rust and Python and file by file elsewhere, and
+  checks them against the source now. [Coherence →](docs/coherence.md)
+- **Nothing lands unless it still holds.** When the source moved, `dispatch accept`
+  runs your checks on the merged result first. A REFRESH or STOP is refused, and the
+  source is left unchanged. [Review and accept →](docs/product-guide.md#decisions-and-review)
+- **Checks you allow run by themselves.** Your consent names the exact commands. When
+  a Claude Code or Hermes session ends, Dispatch freezes its change and runs them, and
+  that finish never applies anything. A tree that passed is not checked again.
+- **It shows what needs you.** While a project is watched, every Work's verdict stays
+  current as the code moves. `dispatch watch` shows them, lists Claude Code sessions
+  waiting for a permission or your next prompt first, and says, as advice, where two
+  pieces of Work already touch.
 
 ## Install
 
@@ -514,225 +43,55 @@ There is no ranking, benchmark data or automatic fallback to another agent.
 curl -fsSL https://rundispatch.sh/install | sh
 ```
 
-Until the website redirects that address, use the release asset itself:
-`curl -fsSL https://github.com/rundispatch/dispatch/releases/latest/download/install.sh | sh`.
-It downloads this machine's archive (`dispatch-macos-arm64.tar.gz`,
-`dispatch-macos-x86_64.tar.gz`, `dispatch-linux-x86_64.tar.gz` or
-`dispatch-linux-aarch64.tar.gz`), verifies it against the release's `SHA256SUMS`, and
-puts `dispatch` in `~/.local/bin` (`DISPATCH_INSTALL_DIR` for another directory,
-`DISPATCH_VERSION=0.4.17` for a particular release). Run it again to upgrade; the
-owner of a watched project restarts with the next command. If the directory is not on
-your `PATH`, it prints the line to add; it never edits your shell's files. Manual
-download and verification, upgrades and uninstalling are in
-[install / upgrade / uninstall](docs/release-install.md). Dispatch sends nothing:
-installs are counted by GitHub's own download counts of the release assets.
+It installs `dispatch` into `~/.local/bin` for macOS (Apple silicon or Intel) or Linux
+(x86_64 or aarch64), checked against the release's `SHA256SUMS`. Until the website
+redirects that address, use
+`https://github.com/rundispatch/dispatch/releases/latest/download/install.sh`. Manual
+download, upgrades and uninstalling: [install, upgrade, uninstall](docs/release-install.md).
 
-Each archive is built and smoke-tested by CI on its own architecture; interactive
-testing for this release was on macOS arm64. The packages are unsigned and not
-notarized.
-Source builds use `cargo build --release --locked`; Git and the project’s actual
-check tools must be installed. No provider tool or font is installed by Dispatch.
+## Quick start
 
-## Safety and source behavior
+```sh
+cd your-project
+dispatch setup       # on a terminal: checks, consent, hooks, watching
+claude --worktree    # work: your agent in its own worktree, or dispatch attach -- <agent>
+dispatch accept      # once the result is ready for review
+```
+
+`dispatch setup` is one pass, and each step can be skipped. To let Dispatch launch the
+agent instead, `dispatch run "<task>"` runs it from a frozen snapshot in a workspace of
+its own. [Quick start →](https://rundispatch.sh/docs/quick-start)
+
+## Safety
 
 > **Local execution is not a security sandbox.**
 
-Real agents and project checks run with the permissions of the Dispatch process and receive `HOME` so installed harnesses can use local authentication. Dispatch clears most other child environment variables. Configured extra variables require the separate `--allow-forwarded-env` acknowledgement and their values are redacted from persisted logs.
+Agents and project checks run with your user's permissions. Dispatch tracks an agent
+only in a workspace of its own, never in your checkout, and applies only a result that
+still holds against your source. [Safety and source behavior →](docs/reference.md#safety-and-source-behavior)
 
-Dispatch freezes the source into an internal Git baseline and gives the selected agent an independent candidate workspace. It does not run the agent directly in the original tree. `dispatch accept` uses the existing safe apply path. If the source moved since the snapshot, [work coherence](#work-coherence-keeping-results-valid-while-the-code-moves) decides whether the patch is still valid; a stale result is refused and the source is left unchanged. With `coherence.accept: strict`, any source drift is refused. `dispatch reject` never applies candidate changes.
+## Docs
 
-If verification is configured, the same commands run against the candidate and their output is retained. Without configured checks, Dispatch reports `Verification: Not configured`. Verification is mechanical evidence, not a universal code-quality judgment. A completed harness invocation is reported as `Ready for review` when its patch still holds against the source now, `Finished, but stale (REFRESH)` or `Finished, already in the source (STOP)` when it does not; failed checks are reported as `Verification failed`, never as completed or verified work. The summary shows the patch, the verdict and what accept would verify; a `CONTINUE` there does not mean merged checks have passed.
+- [rundispatch.sh/docs](https://rundispatch.sh/docs): quick start, concepts, guides,
+  commands, configuration and verdicts.
+- In this repository, versioned with the code:
+  - [reference](docs/reference.md): commands, configuration and current boundaries;
+  - [attach and watching](docs/attach.md): sessions, worktrees, hooks and the
+    background owner;
+  - [coherence](docs/coherence.md): facts, verdicts, merged checks and the fixture
+    matrix;
+  - [product guide](docs/product-guide.md): setup, checks, review and auto-apply;
+  - [install, upgrade, uninstall](docs/release-install.md);
+  - [coherence validation](docs/coherence-validation.md): what is claimed and measured,
+    and what would show it wrong;
+  - [building Dispatch with Dispatch](docs/self-hosting.md).
 
-The local backend is the supported real-agent path in this candidate. Docker execution is advanced and experimental: users must provide a suitable image containing the agent and project toolchain.
+## For coding agents
 
-## Core commands
-
-```text
-dispatch setup [codex|claude | --checks [--verify command]...]
-dispatch resources
-dispatch run "<task>" [--source path] [--agent claude|codex|cursor|hermes]
-dispatch run "<task>" --json|--jsonl
-dispatch status [run-id] [--json|--jsonl]
-dispatch diff [run-id]
-dispatch accept [run-id] [--expect <Δ digest>]
-dispatch reject [run-id]
-dispatch close <run-id> --reason unfinished|workspace-removed|already-present|superseded [--replacement run-id]
-dispatch explain [run-id]
-dispatch check [run-id] [--json] [--merged [--allow-unsafe-local]]
-dispatch refresh [run-id] [--allow-unsafe-local] [--json|--jsonl]
-dispatch answer <run-id> <question-id> --revision n --answer text [--json]
-dispatch cancel <run-id> <question-id> --revision n [--json]
-dispatch attach [--workspace path] [--auto-apply] [-- command...]
-dispatch finish <run-id> [--allow-unsafe-local]
-dispatch start [--root path]
-dispatch watch [--root path] [--json]
-dispatch stop [--root path]
-dispatch clean [--dry-run] [--yes]
-dispatch serve [--root path] [--json]
-dispatch history [--limit count]
-dispatch version
-```
-
-Without a run ID, `status`, `diff`, `explain`, `check`, and `refresh` resolve the latest relevant single-result run for the current source tree; `status`, `diff`, `explain` and `check` print which run they describe. `accept` and `reject` without an ID act only when exactly one result waits for review for the source; with none or several they change nothing and list the explicit commands. `close` and `finish` always need an ID. An explicit ID may be a unique, case-insensitive prefix; an ambiguous one is refused. `--task-file path|-` reads a task from a file or stdin, and `--source path` overrides the current directory.
-
-`run --json` writes one versioned result object to stdout. `run --jsonl` writes each committed, sequenced event followed by a final result object; `status --jsonl` replays that committed journal. Machine modes require non-interactive authorization flags when local execution needs acknowledgement, keeping stdout parseable.
-
-Advanced automation can follow committed events without controlling execution:
-
-```bash
-dispatch events <run-id> --after 0 --until attention --timeout 30
-dispatch events <run-id> --after <cursor> --until finished --timeout 30
-```
-
-Output is JSON Lines with a final committed cursor. `attention` includes human
-waiting or a finished outcome; `finished` waits for the core lifecycle to finish
-(including a result awaiting review). Timeout exits 124 without answering,
-launching, or repairing anything. Omit `--until` to replay through the current
-journal. Events now include their committed `payload.outcome`, so a transient
-question cannot disappear merely because it was answered before the next poll.
-A cursor ahead of the journal is rejected. Historical events written before
-Phase 4 remain readable, but cannot reconstruct transient states they did not
-record; current state is still available.
-
-One-shot exit codes are:
-
-- `0`: a result is ready for review and verification passed or was not configured;
-- `3`: a result is ready for review, but configured verification failed;
-- `4`: the goal is waiting on a human (a durable clarification);
-- `124`: the goal-wide deadline expired;
-- `1`: execution or orchestration failed (including work stopped by the mid-run coherence watcher);
-- `2`: command-line usage error.
-
-The result keeps execution, verification, review, and application as separate fields. Attempt records also keep requested, resolved, and harness-observed model/effort values separate; an unknown or mismatched observed identity is not replaced by configuration.
-
-### Resource profiles
-
-`dispatch setup codex` or `dispatch setup claude` writes a profile to the
-user-level `$DISPATCH_HOME/resources.yml` (normally `~/.dispatch/resources.yml`);
-project configuration cannot enable one. A profile names the exact model, effort
-and included funding you confirmed, and the account it was confirmed for:
-
-```yaml
-version: 1
-allocation_enabled: true
-profiles:
-  - provider: openai
-    funding_source: chatgpt-plus
-    harness: codex
-    model: your-included-model-id
-    effort: low
-    service_mode: standard
-    runtime: local
-    pool: chatgpt-codex
-    tier: standard        # written for older versions; nothing selects on it
-    included: true
-    no_overage_verified: true
-    authorization_revision: 1
-    codex_account: {account_sha256: "…", checked_at: "…"}   # recorded by setup
-```
-
-`no_overage_verified` is an explicit assertion that the account cannot fall
-through to paid overage; an included model name or visible credits are not
-enough. Profiles without it are shown in `dispatch explain` but are ineligible.
-
-Immediately before each launch, the adapter checks the funding identity it can
-observe. Codex: authentication must be ChatGPT, no paid credits available, the
-standard service tier, the configured plan, and the account setup recorded; an
-identity that cannot be observed is refused. Claude: the subscription evidence
-must be current, and the executable, CLI version, account and settings must
-match it. A refusal names the reason and is sticky: that
-`authorization_revision` stays refused, even if the account switches back,
-until `dispatch setup` re-authorizes the profile with a new revision.
-
-Claude assertions expire after at most 24 hours; revalidate the profile with
-`dispatch setup`. A bounded live run passed with Claude Code 2.1.274, personal
-Pro, `claude-sonnet-5` at medium effort and usage credits disabled; this is
-specific to that account state and configuration. See
-[provider support](docs/provider-support.md).
-
-### Clarification
-
-A goal is one agent invocation. Codex may ask one essential clarification
-question with this exact JSON envelope in its final `agent_message` event,
-followed by a successful process exit:
-
-```json
-{"dispatch_checkpoint":{"version":1,"question":"Which behavior is required?","choices":["A","B"]}}
-```
-
-Dispatch validates the report after the agent's process has been cleaned up,
-then persists a question with `lifecycle=waiting` and `waiting_on=human`. It
-never pauses a live model process, and it never asks while an agent it launched
-may still be running. Malformed, non-final or unsuccessful reports do not create
-a question. Answer or cancel the specific question with its current revision
-(available in `dispatch status <run-id> --json`):
-
-```bash
-dispatch answer <run-id> <question-id> --revision 1 --answer "A" --json
-dispatch cancel <run-id> <question-id> --revision 1 --json
-```
-
-Answers are authorized by the local run owner's OS identity and accepted once.
-The answer command runs one continuation from the original baseline with the
-answer; a second question cannot start a third invocation. `--timeout` is one
-goal-wide deadline covering baseline checks, the invocations, verification and
-human waiting. There is no automatic retry, crash replay or separate `resume`
-command, and the background watcher (`dispatch start`) never answers a question
-or continues a goal. Pending questions and all attempt evidence survive process
-exit and reload, and every launch is recorded durably, so a run is never closed
-while an agent it launched may still be alive.
-
-## Configuration and verification
-
-Configuration is optional. Dispatch discovers `dispatch.yml`, `dispatch.yaml`, `.dispatch.yml`, or `.dispatch.yaml` at the source root. `dispatch init` can create a starting file for advanced setup.
-
-```yaml
-execution:
-  backend: local
-  timeout_secs: 1800
-  forwarded_env: []
-
-checks:
-  baseline: []
-  verify:
-    - cargo test
-
-harnesses:
-  claude:
-    model: null
-    extra_args: []
-  codex:
-    model: null
-    extra_args: []
-  cursor:
-    model: null
-    extra_args: []
-  hermes:
-    model: null
-    provider: null
-    extra_args: []
-```
-
-Use the command that actually verifies the project, such as `pytest`, `npm test`, or `go test ./...`. Repository configuration cannot grant itself local-execution or environment-forwarding permission.
-
-Before a native run's agent starts, Dispatch makes sure each program in `checks.baseline` and `checks.verify` can be found, and runs the `checks.baseline` commands, if you listed any, on the run's snapshot (S0). With an empty `checks.baseline` nothing runs before the agent: afterwards, only the `checks.verify` commands that failed are run again on S0, to tell work that broke them from a project that was already broken.
-
-## Local state and artifacts
-
-Normalized state lives in `~/.dispatch/dispatch.db`; `--state-dir` or `DISPATCH_HOME` overrides that location. Per-run evidence lives under `~/.dispatch/runs/<run-id>/`, including the frozen baseline, candidate workspace, bounded stdout/stderr, structured agent output, checks, patch, events, and inspectable metadata.
-
-No network service is required to create, execute, inspect, accept, or reject a task, and Dispatch uploads nothing.
-
-## Current boundaries
-
-- Experimental developer preview, not a stable 1.0 service.
-- Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent and Hermes Agent remain available as an explicit `--agent cursor` or `--agent hermes` choice without a funding contract. Hermes passed attach and native runs in the 0.4.14 conformance trials; its own worktree mode, which 0.4.14 did not recognize, passed with 0.4.15 on 2026-10-16, in one trial without the hook (the last-seen path). Agent installation, authentication, quotas, and provider availability remain external prerequisites.
-- Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current, finishes Work whose session ended when you allowed the project's checks, and applies only attached work you allowed to integrate; it never launches, refreshes or signals agents. It recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's worktrees by itself, sees only Claude Code's and Hermes's sessions end, and scans no processes.
+Read [AGENTS.md](AGENTS.md) before changing this repository. To operate Dispatch for
+someone, see the [agent guide](https://rundispatch.sh/docs/agents).
 
 ## Development
-
-Rust owns execution, persistence, coherence and review. There is no server component.
 
 ```bash
 cargo fmt --check
@@ -740,28 +99,10 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-The tests need only Rust, `git`, `python3` and `sh`; no `docker` CLI.
-`scripts/test-in-docker.sh` runs the same validation in `ci/test.Dockerfile`, a
-pinned Rust 1.97.1 Linux image, as an ordinary user with your uid. Your checkout
-is mounted read-only, `target/` lives in a Docker volume, and the container runs
-with `--init`, so orphaned processes are reaped as on a real system. Give it a
-command to run that instead, for example `scripts/test-in-docker.sh cargo test
---locked some_test`. `DISPATCH_DOCKER_STRESS=1 scripts/test-in-docker.sh cargo
-test --locked` runs the suite on a loaded machine (2 CPUs, 16 busy loops, 8 test
-threads), as CI's `tests under load` job does on every pull request. Build first
-without it: `scripts/test-in-docker.sh cargo test --locked --no-run`.
+The tests need only Rust, `git`, `python3` and `sh`. `scripts/test-in-docker.sh` runs
+them in CI's Linux image, and with `DISPATCH_DOCKER_STRESS=1` on a loaded machine, as CI
+does on every pull request. [Testing and CI →](docs/reference.md#testing-and-ci)
 
-CI runs the suite on every pull request and push to `main`, on Linux (in the test
-image) and macOS. A release runs the same suite on its tag before it builds any
-asset. `stability.yml` runs the suite 20 times a night on both platforms and lists
-every failing test with its count. `harness-trials.yml` runs real agents through
-`scripts/harness-trial.sh`, only by hand or weekly, never on pull requests, with
-keys from a protected environment. Only the fixture reaches the model providers,
-sent by the agents; Dispatch uploads nothing.
+## License
 
-Dispatch's promise is tested per agent: `scripts/harness-trial.sh <harness>
-<path>` runs one shared scenario through each path Dispatch offers an agent and
-records pass or fail against Dispatch's own contract. It never compares the
-agents. Results: [docs/harness-conformance.md](docs/harness-conformance.md).
-
-Detailed contributor guardrails live in [AGENTS.md](AGENTS.md).
+[MIT](LICENSE).
