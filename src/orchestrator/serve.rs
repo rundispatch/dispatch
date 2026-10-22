@@ -3,10 +3,13 @@
 //! `dispatch serve` in the foreground: every tick it observes the root's
 //! world, adopts attached Work whose owner has gone, follows unowned attached
 //! Work, keeps Ready results' verdicts what `check` would show, and
-//! auto-applies attached Work whose `capabilities.integrate` is true. It never
-//! finishes, launches, kills or refreshes anything; wrapped attach and human
-//! review remain the only things that do. `dispatch watch` renders the same
-//! view from canonical state and owns nothing.
+//! auto-applies attached Work whose `capabilities.integrate` is true. It
+//! finishes Work only by the person's consent to the project's checks, once
+//! its session is over or its workspace removed, each finish a task of its
+//! own, and closes Work a resumed session went on from. It clears "waiting
+//! on you" once a waiting session moves again. It never launches,
+//! kills or refreshes an agent. `dispatch watch` renders the same view from
+//! canonical state and owns nothing.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -38,6 +41,7 @@ use crate::{
         world,
     },
     db::Database,
+    executor::CancellationToken,
     lock::{OperationLock, shutdown_signal},
     process::{IdentityState, ProcessIdentity, identity_state},
     source,
@@ -45,7 +49,8 @@ use crate::{
 };
 
 /// `dispatch serve [--root <path>] [--json]`. Loops until Ctrl+C, SIGTERM or
-/// SIGHUP; a second `serve` on the same root refuses to start. The owner
+/// SIGHUP, or until the root or the state directory no longer exists; a
+/// second `serve` on the same root refuses to start. The owner
 /// decides and records; this loop only renders what it did. `background`
 /// is `dispatch start`'s owner: it renders nothing, and its stderr is a log
 /// that names each distinct error once.
@@ -98,27 +103,39 @@ async fn run(
     let mut view = View::default();
     let errors = Arc::new(Mutex::new(HashSet::new()));
     let _fast = FastLoop::start(state, &owner.root, background, Arc::clone(&errors))?;
+    let places = [
+        ("project", owner.root.clone(), identity(&owner.root)),
+        ("state directory", state.root.clone(), identity(&state.root)),
+    ];
+    let mut finishes = Finishes::default();
 
-    loop {
+    let result = 'run: loop {
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = &mut shutdown => return Ok(()),
+            _ = &mut shutdown => break Ok(()),
         }
-        let mut tick = owner.tick(state);
-        // Work whose runtime removed its workspace, finished where the person
-        // consented to the project's checks running by themselves.
-        let waiting: Vec<String> = tick
-            .runs
-            .iter()
-            .filter(|run| awaits_finish_by_consent(run))
-            .map(|run| run.id.clone())
-            .collect();
-        for id in waiting {
-            match super::attach::finish_by_consent(state, &id).await {
-                Ok(true) => tick.persisted = true,
-                Ok(false) => {}
-                Err(error) => tick.report(&error),
+        // Nothing is left to watch, or to record it in: `serve` removes the
+        // record on its way out.
+        for (what, path, at_start) in &places {
+            if identity(path) != *at_start {
+                log_error(
+                    background,
+                    &errors,
+                    &format!("stopping: the {what} {} no longer exists", path.display()),
+                );
+                break 'run Ok(());
             }
+        }
+        for error in finishes.reap().await {
+            log_error(background, &errors, &error);
+        }
+        let (reopened, failed) = finishes.reopen(state, &owner.root).await;
+        let mut tick = owner.tick(state);
+        if let Some(error) = &failed {
+            tick.report(error);
+        }
+        if let Err(error) = finishes.start(state, &tick.runs, &reopened) {
+            tick.report(&error);
         }
         if tick.cost.idle() && !tick.moved {
             tracing::debug!("tick: {}", tick.cost);
@@ -145,6 +162,142 @@ async fn run(
         // `render` prints only what differs from what is already shown.
         view.render(None, &tick.runs, json, owner.projection(), &[]);
         let _ = io::stdout().flush();
+    };
+    // A finish under way is stopped, its checks with it, and its Work stays
+    // as it was for the next owner.
+    finishes.stop().await;
+    result
+}
+
+/// The owner's finishes by consent (`attach::finish_by_consent`), one task
+/// per Work, so that no tick waits for a finish's checks.
+#[derive(Default)]
+struct Finishes {
+    running: HashMap<String, (CancellationToken, tokio::task::JoinHandle<Result<bool>>)>,
+    /// Work whose finish failed: left to a person rather than finished, and
+    /// its checks run, again every tick.
+    failed: HashSet<String>,
+}
+
+impl Finishes {
+    /// Start a finish for each of `runs` that the consent finishes now and
+    /// that has none, unless a session reopened it. The first error is
+    /// returned; the other runs are still looked at.
+    fn start(
+        &mut self,
+        state: &State,
+        runs: &[RunRecord],
+        reopened: &HashSet<String>,
+    ) -> Result<()> {
+        let mut failed = Ok(());
+        for run in runs {
+            if self.running.contains_key(&run.id)
+                || self.failed.contains(&run.id)
+                || reopened.contains(&run.id)
+            {
+                continue;
+            }
+            match super::attach::finishes_by_consent(state, run) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    failed = failed.and(Err(error));
+                    continue;
+                }
+            }
+            let cancel = CancellationToken::new();
+            let (state, id, token) = (state.clone(), run.id.clone(), cancel.clone());
+            let task =
+                tokio::spawn(
+                    async move { super::attach::finish_by_consent(&state, &id, token).await },
+                );
+            self.running.insert(run.id.clone(), (cancel, task));
+        }
+        failed
+    }
+
+    /// Collect the finishes that ended, and what went wrong in them.
+    async fn reap(&mut self) -> Vec<String> {
+        let ended: Vec<String> = self
+            .running
+            .iter()
+            .filter(|(_, (_, task))| task.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut errors = Vec::new();
+        for id in ended {
+            let Some((_, task)) = self.running.remove(&id) else {
+                continue;
+            };
+            let error = match task.await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => format!("{error:#}"),
+                Err(error) => error.to_string(),
+            };
+            self.failed.insert(id.clone());
+            errors.push(format!("could not finish {id}: {error}"));
+        }
+        errors
+    }
+
+    /// Close the Work that sessions reopened (`attach::reopen_noted`) in the
+    /// project at `root`, each once its finish, if one runs, was cancelled
+    /// and has ended. Returns the Work still waiting to close, and the first
+    /// error.
+    async fn reopen(
+        &mut self,
+        state: &State,
+        root: &Path,
+    ) -> (HashSet<String>, Option<anyhow::Error>) {
+        let mut waiting = HashSet::new();
+        let noted = match super::attach::reopen_noted(state, root) {
+            Ok(noted) => noted,
+            Err(error) => return (waiting, Some(error)),
+        };
+        let mut failed = None;
+        for (old, new) in noted {
+            self.stop_one(&old).await;
+            match super::attach::supersede_reopened(state, &old, &new) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
+            }
+            waiting.insert(old);
+        }
+        (waiting, failed)
+    }
+
+    async fn stop_one(&mut self, id: &str) {
+        if let Some((cancel, task)) = self.running.remove(id) {
+            cancel.cancel();
+            let _ = task.await;
+        }
+    }
+
+    async fn stop(&mut self) {
+        let ids: Vec<String> = self.running.keys().cloned().collect();
+        for id in ids {
+            self.stop_one(&id).await;
+        }
+    }
+}
+
+/// Which directory is at `path`, by one `stat`: its device and inode, so one
+/// made again in its place is another. The owner's own writes make the state
+/// directory again after it was removed.
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Some((0, 0))
     }
 }
 
@@ -633,6 +786,7 @@ impl Owner {
         if let Err(error) = super::liveness::observe(state, &self.root, &runs) {
             tick.report(&error);
         }
+        clear_needs_you(state, &runs, &mut tick);
         let moved = tick.moved || tick.adopted;
         self.reevaluate(state, &runs, &mut tick, moved);
         let started = Instant::now();
@@ -764,6 +918,26 @@ impl Owner {
             tick.report(&error);
             Vec::new()
         })
+    }
+}
+
+/// Clear "waiting on you" on Work whose session moved again
+/// (`attach::needs_you_cleared`): one `stat` per waiting Work.
+fn clear_needs_you(state: &State, runs: &[RunRecord], tick: &mut Tick) {
+    for run in runs {
+        let Some(by) = super::attach::needs_you_cleared(run) else {
+            continue;
+        };
+        let at = run
+            .attachment
+            .as_ref()
+            .and_then(|a| a.needs_you.as_ref())
+            .map(|m| m.at);
+        match at.map(|at| super::attach::clear_needs_you(state, &run.id, at, by)) {
+            Some(Ok(true)) => tick.persisted = true,
+            Some(Err(error)) => tick.report(&error),
+            _ => {}
+        }
     }
 }
 
@@ -1428,19 +1602,6 @@ impl Owner {
     }
 }
 
-/// Active attached Work whose workspace was removed with its exact changes
-/// kept and that carries the authority to run checks: a candidate for
-/// `attach::finish_by_consent`, which checks the consent itself.
-fn awaits_finish_by_consent(run: &RunRecord) -> bool {
-    run.outcome.lifecycle == LifecycleState::Working
-        && run.environment.unsafe_local
-        && run
-            .attachment
-            .as_ref()
-            .and_then(|attachment| attachment.workspace_removed.as_ref())
-            .is_some_and(|removal| removal.exact)
-}
-
 /// Whether the owner stores `validity` over `stored`: when it says something
 /// new (`worth_recording`), the first time the Work is checked at all, and
 /// when the world first moves under it, so the view never says "not checked"
@@ -1562,6 +1723,10 @@ fn short_ids<'a>(rows: &[&'a RunRecord]) -> HashMap<&'a str, &'a str> {
 /// kept apart from the verdict.
 fn row(run: &RunRecord, id: &str, interactions: Option<&Projection>) -> String {
     let mut line = format!("{id} · {}", describe(run).0);
+    if let Some(mark) = super::attach::waiting_on_you(run) {
+        line.push_str(" · ");
+        line.push_str(&super::attach::waiting_line(mark));
+    }
     if let Some(summary) = interactions.and_then(|p| p.summary(&run.id)) {
         line.push_str(" · ");
         line.push_str(&summary);
@@ -1621,7 +1786,14 @@ impl View {
                 let (line, decision) = describe(run);
                 // `null` while nothing watches the project: not known.
                 let concurrent = interactions.map(|p| p.json(&run.id));
-                let key = format!("{line} {concurrent:?}");
+                let needs_you = super::attach::waiting_on_you(run).map(|mark| {
+                    serde_json::json!({
+                        "kind": mark.kind,
+                        "message": mark.message,
+                        "since": mark.at,
+                    })
+                });
+                let key = format!("{line} {concurrent:?} {needs_you:?}");
                 if shown.get(&run.id) != Some(&key) {
                     println!(
                         "{}",
@@ -1639,6 +1811,7 @@ impl View {
                             "applied_by": line.applied_by,
                             "overridden": line.verdict == "overridden",
                             "interactions": concurrent,
+                            "needs_you": needs_you,
                         })
                     );
                     shown.insert(run.id.clone(), key);

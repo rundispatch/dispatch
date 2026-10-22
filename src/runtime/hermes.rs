@@ -26,7 +26,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 
 use super::{
-    EventKind, RuntimeEvent,
+    EventKind, Hook, RuntimeEvent,
     claude::{Liveness, Output},
 };
 use crate::{source, state::State};
@@ -306,18 +306,28 @@ pub fn addition(path: &Path, command: &str) -> Result<Addition> {
     Ok(Addition::Append(block(command)?))
 }
 
-/// Whether a hook running `dispatch … hook hermes` is in the configuration at
-/// `path`, as Dispatch added it or by hand.
-pub fn installed(path: &Path) -> Result<bool> {
-    let config = parse(read(path)?.as_deref().unwrap_or(""), path)?;
+/// Dispatch's hook in the configuration at `path`: exact for the block
+/// Dispatch appended, changed for any other `… hook hermes` hook.
+pub fn hook(path: &Path) -> Result<Hook> {
+    let text = read(path)?.unwrap_or_default();
+    let config = parse(&text, path)?;
+    if let Some((_, command)) = ours(&text) {
+        return Ok(Hook::Exact(command));
+    }
     let entries = config["hooks"]["on_session_finalize"].as_sequence();
-    Ok(entries.is_some_and(|entries| {
-        entries.iter().any(|entry| {
-            entry["command"]
-                .as_str()
-                .is_some_and(|command| command.ends_with(" hook hermes"))
-        })
-    }))
+    Ok(
+        if entries.is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["command"]
+                    .as_str()
+                    .is_some_and(|command| command.ends_with(" hook hermes"))
+            })
+        }) {
+            Hook::Changed
+        } else {
+            Hook::Absent
+        },
+    )
 }
 
 /// Append Dispatch's hook to the configuration at `path`, every byte of it
@@ -342,11 +352,32 @@ pub fn install(path: &Path, command: &str) -> Result<Option<PathBuf>> {
     write(path, existing.as_deref(), &text)
 }
 
+/// Change only the command in a hook block Dispatch previously appended.
+/// Edited blocks and hooks the person added by hand remain theirs to update.
+pub fn update(path: &Path, command: &str) -> Result<Option<PathBuf>> {
+    let existing = read(path)?.unwrap_or_default();
+    let (range, _) = ours(&existing).with_context(|| {
+        format!(
+            "Dispatch's hook in {} is not as Dispatch added it; update it there yourself",
+            path.display()
+        )
+    })?;
+    let mut text = existing.clone();
+    text.replace_range(range, &block(command)?);
+    let config = parse(&text, path)?;
+    anyhow::ensure!(
+        config["hooks"]["on_session_finalize"][0]["command"].as_str() == Some(command),
+        "the hook would not read back as written; {} was left untouched",
+        path.display()
+    );
+    write(path, Some(&existing), &text)
+}
+
 /// Remove exactly the block Dispatch appended from the configuration at
 /// `path`, refusing if it was edited. Returns the backup.
 pub fn uninstall(path: &Path) -> Result<Option<PathBuf>> {
     let existing = read(path)?.unwrap_or_default();
-    let range = ours(&existing).with_context(|| {
+    let (range, _) = ours(&existing).with_context(|| {
         format!(
             "Dispatch's hook in {} is not as Dispatch added it; it was edited or added by \
              hand, so remove it there yourself",
@@ -359,8 +390,9 @@ pub fn uninstall(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Where in `text` the block Dispatch appended is, exactly as Dispatch wrote
-/// it for some `… hook hermes` command, with nothing nested under it since.
-fn ours(text: &str) -> Option<std::ops::Range<usize>> {
+/// it for some `… hook hermes` command, with nothing nested under it since;
+/// and that command.
+fn ours(text: &str) -> Option<(std::ops::Range<usize>, String)> {
     let header = format!("\n{MARKER}\nhooks:\n  on_session_finalize:\n    - command: ");
     let start = text.find(&header)?;
     let line = text[start + header.len()..].lines().next()?;
@@ -371,7 +403,7 @@ fn ours(text: &str) -> Option<std::ops::Range<usize>> {
     (command.ends_with(" hook hermes")
         && text[start..].starts_with(&block)
         && !after.starts_with([' ', '\t', '-']))
-    .then_some(start..end)
+    .then_some((start..end, command))
 }
 
 /// The configuration's text, `None` when there is no file.
@@ -521,13 +553,13 @@ mod tests {
         let path = temp.path().join("config.yaml");
         for original in [THEIRS, "model:\n  default: x\n", ""] {
             fs::write(&path, original).unwrap();
-            assert!(!installed(&path).unwrap());
+            assert_eq!(hook(&path).unwrap(), Hook::Absent);
             let backup = install(&path, COMMAND).unwrap().unwrap();
             assert_eq!(fs::read_to_string(&backup).unwrap(), original);
             fs::remove_file(backup).unwrap();
             let text = fs::read_to_string(&path).unwrap();
             assert!(text.starts_with(original), "{text}");
-            assert!(installed(&path).unwrap());
+            assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
             // As Hermes reads it: one `on_session_finalize` hook, whose
             // command splits into this Dispatch's arguments.
             let config: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
@@ -572,7 +604,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
         // Added by hand as shown: installed, but not Dispatch's to remove.
         fs::write(&path, format!("{theirs}{lines}")).unwrap();
-        assert!(installed(&path).unwrap());
+        assert_eq!(hook(&path).unwrap(), Hook::Changed);
         assert!(uninstall(&path).is_err());
         // Not YAML: untouched.
         fs::write(&path, "model: [\n").unwrap();
@@ -599,6 +631,7 @@ mod tests {
             format!("{installed_text}    - command: echo hi\n"),
         ] {
             fs::write(&path, &edited).unwrap();
+            assert_eq!(hook(&path).unwrap(), Hook::Changed, "{edited}");
             assert!(uninstall(&path).is_err(), "{edited}");
             assert_eq!(fs::read_to_string(&path).unwrap(), edited);
         }
@@ -616,7 +649,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.yaml");
         assert!(install(&path, COMMAND).unwrap().is_none());
-        assert!(installed(&path).unwrap());
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
         let names: Vec<_> = fs::read_dir(temp.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())

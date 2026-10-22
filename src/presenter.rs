@@ -196,6 +196,15 @@ pub fn coherence_text(validity: &Validity) -> String {
         Decision::Continue if !validity.world_changed => {
             "Coherence: CONTINUE — world unchanged".into()
         }
+        Decision::Continue if crate::coherence::rests_on_merged_checks(validity) => format!(
+            "Coherence: CONTINUE — {}; the merged checks {}",
+            validity.reasons[0].detail,
+            if validity.analysis == AnalysisLevel::Integration {
+                "passed"
+            } else {
+                "decide at accept"
+            }
+        ),
         Decision::Continue => format!(
             "Coherence: CONTINUE — {} file{} changed underneath, none affect this work",
             validity.changed_files,
@@ -2176,6 +2185,7 @@ mod tests {
             sessions: Vec::new(),
             workspace_removed: None,
             source_at_start: None,
+            needs_you: None,
         }
     }
 
@@ -2383,6 +2393,25 @@ mod tests {
             assert!(ascii.contains(&expected.replace('—', "-")), "{ascii}");
             assert!(!ascii.contains('—'));
         }
+    }
+
+    #[test]
+    fn a_continue_on_changed_mentions_says_the_merged_checks_decide() {
+        let detail = "mentioned file Cargo.lock changed since the work started";
+        let mut validity = with_validity(Decision::Continue, true, 1, Some(detail))
+            .coherence
+            .and_then(|record| record.validity)
+            .unwrap();
+        validity.reasons[0].code = ReasonCode::MentionChanged;
+        assert_eq!(
+            coherence_text(&validity),
+            format!("Coherence: CONTINUE — {detail}; the merged checks decide at accept")
+        );
+        validity.analysis = AnalysisLevel::Integration;
+        assert_eq!(
+            coherence_text(&validity),
+            format!("Coherence: CONTINUE — {detail}; the merged checks passed")
+        );
     }
 
     #[test]

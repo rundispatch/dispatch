@@ -1,0 +1,60 @@
+name: Stats
+
+# Every night, GitHub's own counts for this repository go to CSV files on the
+# `stats` branch: release downloads always, and traffic (views, clones,
+# referrers, paths) when the STATS_TOKEN secret exists, since GitHub keeps
+# traffic for 14 days only. scripts/stats.py says what each file holds.
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stats
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      # The script as the default branch has it, then this checkout moves to
+      # the stats branch, or, on the first run, to a new orphan branch. A
+      # push never forces: if the branch was missed, the push is refused
+      # rather than replacing it.
+      - name: Check out the stats branch, or start it
+        run: |
+          cp scripts/stats.py "$RUNNER_TEMP/stats.py"
+          if git ls-remote --exit-code --heads origin stats >/dev/null; then
+            git fetch --depth=1 origin stats
+            git switch -C stats FETCH_HEAD
+          else
+            git switch --orphan stats
+          fi
+      - name: Record downloads and traffic
+        id: record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATS_TOKEN: ${{ secrets.STATS_TOKEN }}
+        run: |
+          if [ -z "$STATS_TOKEN" ]; then
+            echo "::notice::No STATS_TOKEN secret: downloads recorded, traffic (views, clones, referrers, paths) not."
+          fi
+          python3 "$RUNNER_TEMP/stats.py" --out .
+      # Also after a failed traffic read, so that downloads are still kept.
+      - name: Commit and push if anything changed
+        if: ${{ !cancelled() && steps.record.outcome != 'skipped' }}
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing changed."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Stats for $(date -u +%F)"
+          git push origin stats

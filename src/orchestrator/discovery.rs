@@ -12,7 +12,9 @@
 //!
 //! A worktree that has Work is the Work's: it is neither listed nor
 //! registered again, unless that Work finished after its worktree was
-//! removed, so a worktree at that path now is another one.
+//! removed, so a worktree at that path now is another one. A new session's
+//! lock on it reopens its Work when that Work awaits review or is being
+//! finished: the session goes on from the same S0.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -225,8 +227,33 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
     });
     let mut changed = inventory.entries.len() != before;
     for found in &found {
-        if has_work(&found.path) || inventory.entries.iter().any(|e| e.path == found.path) {
+        if has_work(&found.path) {
+            // A known worktree that a new session locked: a resume goes on
+            // from its Work if that Work is a result awaiting review or being
+            // finished (`registration::discovered` decides, under the lock).
+            if let (Some(run), Made::Claude(signals)) =
+                (latest.get(found.path.as_path()), &found.made)
+                && let Some(lock) = &signals.lock
+                && relocked(run, lock)
+            {
+                let session = session(lock, false);
+                register(
+                    state,
+                    root,
+                    &found.path,
+                    "Claude Code",
+                    session,
+                    lock_pid(lock),
+                );
+            }
             continue;
+        }
+        if let Some(at) = inventory.entries.iter().position(|e| e.path == found.path) {
+            if !locked_by_its_maker(&inventory.entries[at], found) {
+                continue;
+            }
+            inventory.entries.remove(at);
+            changed = true;
         }
         // The process a session's lock names, and whether it runs.
         let (name, locked) = match &found.made {
@@ -290,6 +317,48 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
         write(state, root, &inventory)?;
     }
     Ok(())
+}
+
+/// Whether `lock` names a running Claude session that `run`, the latest Work
+/// of its worktree, has not seen, while that Work awaits review or its
+/// sessions have all ended: then a session started there again.
+fn relocked(run: &RunRecord, lock: &Lock) -> bool {
+    let Some(attachment) = run.attachment.as_ref() else {
+        return false;
+    };
+    let Lock::Session { name, pid, .. } = lock else {
+        return false;
+    };
+    let over = super::awaits_review(run)
+        || (run.outcome.lifecycle == LifecycleState::Working
+            && attachment.sessions.iter().all(|s| s.ended_at.is_some()));
+    let seen = attachment.agent_process.as_ref().map(|agent| agent.pid) == Some(*pid)
+        || attachment
+            .sessions
+            .iter()
+            .any(|s| s.session_id == format!("lock:{name}@{pid}"));
+    over && run.outcome.closed.is_none() && !seen && claude::liveness(lock) == Liveness::Running
+}
+
+/// Whether a worktree `listed` without a lock is now locked by the Hermes
+/// process that made it. Hermes makes its worktree and then locks it, two
+/// Git commands that a busy machine can hold apart for longer than `GRACE`:
+/// it was listed while Hermes was still making it.
+fn locked_by_its_maker(listed: &InventoryEntry, found: &Found) -> bool {
+    listed.lock.is_none()
+        && matches!(found.made, Made::Hermes(_))
+        && found
+            .lock
+            .as_deref()
+            .and_then(hermes::lock_pid)
+            .is_some_and(|pid| hermes::liveness(pid, &found.path) == Liveness::Running)
+}
+
+fn lock_pid(lock: &Lock) -> Option<u32> {
+    match lock {
+        Lock::Session { pid, .. } => Some(*pid),
+        Lock::Other(_) => None,
+    }
 }
 
 /// Register `session` of the runtime a person knows as `name` as Work in

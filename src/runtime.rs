@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::{
-    AttachmentRecord, RuntimeSession, WorkspaceOwner,
+    AttachmentRecord, NeedsYou, NeedsYouKind, RuntimeSession, WorkspaceOwner,
     orchestrator::{
         attach,
         background::{self, Watcher},
@@ -58,6 +58,27 @@ pub enum EventKind {
     },
     /// The runtime is about to delete the workspace at `cwd`.
     WorkspaceRemoved,
+    /// The session waits on a person (`NeedsYou`). Never replied to.
+    NeedsYou {
+        kind: NeedsYouKind,
+        message: String,
+        transcript: Option<PathBuf>,
+    },
+}
+
+/// Dispatch's hook in a runtime's own configuration, as that runtime's
+/// module recognises it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Hook {
+    Absent,
+    /// Exactly as Dispatch writes it, running this command.
+    Exact(String),
+    /// Exactly as an earlier Dispatch wrote it, running this command: hooks
+    /// this Dispatch updates.
+    Earlier(String),
+    /// A `… hook <provider>` hook not as any Dispatch wrote it: edited, or
+    /// added by hand.
+    Changed,
 }
 
 /// What the runtime should be told.
@@ -91,6 +112,23 @@ pub fn validate(event: &RuntimeEvent) -> Result<()> {
         EventKind::Start { source, .. } => source.as_str(),
         EventKind::End { reason } => reason.as_str(),
         EventKind::WorkspaceRemoved => "removed",
+        EventKind::NeedsYou {
+            message,
+            transcript,
+            ..
+        } => {
+            anyhow::ensure!(
+                message.len() <= 512 && !message.chars().any(char::is_control),
+                "invalid message"
+            );
+            anyhow::ensure!(
+                transcript
+                    .as_ref()
+                    .is_none_or(|path| path.is_absolute() && path.as_os_str().len() <= 4096),
+                "the transcript must be an absolute path"
+            );
+            "needs_you"
+        }
     };
     anyhow::ensure!(
         word.len() <= 32
@@ -128,7 +166,11 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
     let root = source::repo_identity(&workspace)?
         .context("the checkout lost its repository")?
         .main_worktree;
-    if !matches!(background::watcher(state, &root)?, Watcher::Watched(_)) {
+    // A project whose owner stopped without `dispatch stop` is still watched:
+    // its owner comes back while this session is registered.
+    if !matches!(background::watcher(state, &root)?, Watcher::Watched(_))
+        && !background::revive_in_background(state, &root)
+    {
         return Ok(Reply::Silent);
     }
     match event.kind {
@@ -151,25 +193,28 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
         }
         EventKind::Start { .. } => Ok(Reply::Silent),
         EventKind::End { reason } => {
-            // Within the 5 s `SessionEnd` timeout setup installs.
-            let wait = Duration::from_secs(3);
-            registration::publish_first(state, &workspace, wait)?;
-            let mut run_id = attach::find_active_attachment(state, &workspace)?;
-            if run_id.is_none() {
-                // Claude Code reports a worktree session's end from the main
-                // checkout: match it by session instead.
-                let (provider, session) = (event.provider, event.session_id.as_str());
-                registration::publish_session_first(state, &root, provider, session, wait)?;
-                run_id = attach::find_session_attachment(state, &root, provider, session)?;
+            let (provider, session) = (event.provider, event.session_id.as_str());
+            if let Some(run_id) = session_work(state, &root, &workspace, provider, session)? {
+                attach::record_session_end(state, &run_id, provider, session, &reason)?;
             }
-            if let Some(run_id) = run_id {
-                attach::record_session_end(
-                    state,
-                    &run_id,
-                    event.provider,
-                    &event.session_id,
-                    &reason,
-                )?;
+            Ok(Reply::Silent)
+        }
+        EventKind::NeedsYou {
+            kind,
+            message,
+            transcript,
+        } => {
+            let (provider, session) = (event.provider, event.session_id.as_str());
+            if let Some(run_id) = session_work(state, &root, &workspace, provider, session)? {
+                let mark = NeedsYou {
+                    kind,
+                    message,
+                    at: Utc::now(),
+                    transcript,
+                    provider: provider.into(),
+                    session_id: event.session_id,
+                };
+                attach::record_needs_you(state, &run_id, mark)?;
             }
             Ok(Reply::Silent)
         }
@@ -177,17 +222,41 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
     }
 }
 
+/// The active Work of `session` in `workspace`, found by its workspace or,
+/// failing that, by the session: Claude Code reports a worktree session's end
+/// from the main checkout. A registration still pending is published first,
+/// within the 5 s timeout setup installs for these hooks.
+fn session_work(
+    state: &State,
+    root: &Path,
+    workspace: &Path,
+    provider: &str,
+    session: &str,
+) -> Result<Option<String>> {
+    let wait = Duration::from_secs(3);
+    registration::publish_first(state, workspace, wait)?;
+    if let Some(run_id) = attach::find_active_attachment(state, workspace)? {
+        return Ok(Some(run_id));
+    }
+    registration::publish_session_first(state, root, provider, session, wait)?;
+    attach::find_session_attachment(state, root, provider, session)
+}
+
 /// Whether a session in `cwd` is outside every watched project, decided from
 /// the files alone, without Git or the database: there is no repository
-/// there, or the serve lock of the one there is free. Anything it cannot
-/// read for certain is left to Git.
+/// there, or the serve lock of the one there is free and no owner stopped
+/// without `dispatch stop`. Anything it cannot read for certain is left to
+/// Git.
 fn unwatched(state: &State, cwd: &Path) -> bool {
     let Ok(cwd) = std::fs::canonicalize(cwd) else {
         return false;
     };
     match main_worktree(&cwd) {
         Some(None) => true,
-        Some(Some(root)) => matches!(background::watcher(state, &root), Ok(Watcher::NotWatched)),
+        Some(Some(root)) => {
+            matches!(background::watcher(state, &root), Ok(Watcher::NotWatched))
+                && !background::stopped_owner(state, &root)
+        }
         None => false,
     }
 }
@@ -197,7 +266,7 @@ fn unwatched(state: &State, cwd: &Path) -> bool {
 /// shape this does not read: a `.git` that is not a repository, a separate
 /// Git directory or submodule, or a configuration that may move the work
 /// tree.
-fn main_worktree(cwd: &Path) -> Option<Option<PathBuf>> {
+pub(crate) fn main_worktree(cwd: &Path) -> Option<Option<PathBuf>> {
     for directory in cwd.ancestors() {
         let dot_git = directory.join(".git");
         let Ok(metadata) = std::fs::symlink_metadata(&dot_git) else {
@@ -251,10 +320,7 @@ fn removed(state: &State, workspace: &Path) -> Result<Reply> {
     // changes are already kept, so nothing here may fail the hook.
     let consented = state
         .load_run(&run_id)
-        .is_ok_and(|run| run.environment.unsafe_local)
-        && crate::consent::project_root(workspace)
-            .and_then(|project| crate::consent::consent(state, &project))
-            .is_ok_and(|consent| consent.is_valid());
+        .is_ok_and(|run| attach::finishes_by_consent(state, &run).unwrap_or(false));
     Ok(Reply::Notice(if files_changed == 0 {
         format!("Dispatch closed Work {id}: the worktree held no changes.")
     } else if consented {
@@ -291,6 +357,8 @@ fn start(
         resumed,
         consented: false,
         started_at: began.1,
+        reopens: None,
+        not_reopened: None,
     };
     // The full id: sessions started together share their first characters.
     Ok(
@@ -433,6 +501,18 @@ mod tests {
             },
         };
         assert_eq!(ingest(&state, event).unwrap(), Reply::Silent);
+        let waiting = RuntimeEvent {
+            provider: "claude",
+            session_id: "s1".into(),
+            cwd: worktree.clone(),
+            model: None,
+            kind: EventKind::NeedsYou {
+                kind: NeedsYouKind::Permission,
+                message: "Claude needs your permission".into(),
+                transcript: Some(temp.path().join("s1.jsonl")),
+            },
+        };
+        assert_eq!(ingest(&state, waiting).unwrap(), Reply::Silent);
         assert!(!state.db_path().exists(), "nothing opened the database");
     }
 }

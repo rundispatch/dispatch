@@ -9,6 +9,14 @@ on:
         description: Existing version tag to release
         required: true
         type: string
+  # A pull request that changes how releases are built builds, packages and
+  # smoke-tests all four targets, and publishes nothing. ci.yml runs the
+  # suite on it already.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/package-local.py
+      - scripts/install.sh
 
 permissions:
   contents: read
@@ -19,13 +27,17 @@ env:
 jobs:
   # The suite on both platforms, on the tag being released, before any asset.
   checks:
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ inputs.tag || github.ref_name }}
 
+  # Each target natively on its own architecture, named by what `uname -m`
+  # says there. macos-15-intel is GitHub's Intel macOS runner.
   build:
     name: Build ${{ matrix.asset }}
     needs: checks
+    if: ${{ !cancelled() && (needs.checks.result == 'success' || (github.event_name == 'pull_request' && needs.checks.result == 'skipped')) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -34,21 +46,29 @@ jobs:
         include:
           - runner: macos-15
             asset: dispatch-macos-arm64.tar.gz
+          - runner: macos-15-intel
+            asset: dispatch-macos-x86_64.tar.gz
+          # The older glibc: the binary runs on more Linux systems.
           - runner: ubuntu-22.04
             asset: dispatch-linux-x86_64.tar.gz
+          - runner: ubuntu-22.04-arm
+            asset: dispatch-linux-aarch64.tar.gz
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ github.event_name != 'pull_request' && env.RELEASE_TAG || github.sha }}
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - name: Verify tag matches crate version
+      - name: Read the crate version, and on a release check the tag
         run: |
           crate_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
-          test "$RELEASE_TAG" = "v$crate_version"
+          echo "VERSION=$crate_version" >> "$GITHUB_ENV"
+          [ "$GITHUB_EVENT_NAME" = pull_request ] || test "$RELEASE_TAG" = "v$crate_version"
       - run: cargo build --release --locked
+      # The archive is named by this runner's machine, so the copy fails on
+      # a runner of another architecture than its asset says.
       - name: Package and smoke test
         run: |
           mkdir smoke
@@ -56,7 +76,14 @@ jobs:
           cp "package/${{ matrix.asset }}" .
           test "$(tar -tzf "${{ matrix.asset }}" | LC_ALL=C sort | tr '\n' ' ')" = "BUILD.json INSTALL.md LICENSE dispatch "
           tar -xzf "${{ matrix.asset }}" -C smoke
-          "./smoke/dispatch" version | grep -Fx "dispatch ${RELEASE_TAG#v}"
+          "./smoke/dispatch" version | grep -Fx "dispatch $VERSION"
+      - name: Install with scripts/install.sh on this machine
+        run: |
+          DISPATCH_RELEASE_URL="file://$PWD/package" DISPATCH_INSTALL_DIR="$RUNNER_TEMP/bin" \
+            sh scripts/install.sh > install.log || { cat install.log; exit 1; }
+          cat install.log
+          grep -Fx "Downloading ${{ matrix.asset }} from file://$PWD/package" install.log
+          "$RUNNER_TEMP/bin/dispatch" version | grep -Fx "dispatch $VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -65,6 +92,7 @@ jobs:
 
   release:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -82,20 +110,28 @@ jobs:
         run: |
           sha256sum dispatch-*.tar.gz > SHA256SUMS
           sha256sum -c SHA256SUMS
+          test "$(awk '{ print $2 }' SHA256SUMS | tr '\n' ' ')" = \
+            "dispatch-linux-aarch64.tar.gz dispatch-linux-x86_64.tar.gz dispatch-macos-arm64.tar.gz dispatch-macos-x86_64.tar.gz "
+      # The one-line installer, uploaded beside the archives, installs these.
+      - name: Install with scripts/install.sh from these assets
+        run: |
+          DISPATCH_RELEASE_URL="file://$PWD/dist" DISPATCH_INSTALL_DIR="$RUNNER_TEMP/bin" \
+            sh scripts/install.sh
+          "$RUNNER_TEMP/bin/dispatch" version | grep -Fx "dispatch ${RELEASE_TAG#v}"
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
-              dist/dispatch-*.tar.gz dist/SHA256SUMS \
+              dist/dispatch-*.tar.gz dist/SHA256SUMS scripts/install.sh \
               --clobber
           else
             # A tag with a hyphen (v0.2.0-rc.1) is a prerelease, never "latest".
             prerelease=""
             case "$RELEASE_TAG" in *-*) prerelease="--prerelease" ;; esac
             gh release create "$RELEASE_TAG" \
-              dist/dispatch-*.tar.gz dist/SHA256SUMS \
+              dist/dispatch-*.tar.gz dist/SHA256SUMS scripts/install.sh \
               --verify-tag \
               --title "Dispatch $RELEASE_TAG" \
               --notes-file .github/release-notes.md \

@@ -14,6 +14,8 @@
 //! worktree gone, usually before it sees the process gone. The lock went with
 //! the worktree, so the recorded process is followed by its exact identity
 //! alone: once it is gone, its sessions end as for any other gone process.
+//! Hermes's hook records the removal before Hermes releases the lock, so a
+//! released lock is judged on the Work's record as read after the lock.
 //!
 //! Codex's and Cursor Agent's worktrees name no process (`discovery::
 //! UNOBSERVED`): their liveness is `Unknown` for good, so their Work never
@@ -65,19 +67,8 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
     {
         return Ok(());
     }
-    // A removed workspace has no lock left: only the recorded process is
-    // followed, until that exact process is gone.
     if attachment.workspace_removed.is_some() {
-        let Some(old) = attachment.agent_process.as_ref() else {
-            return Ok(());
-        };
-        return match process::identity_state(old) {
-            IdentityState::Gone | IdentityState::Reused => {
-                end_sessions(state, run, None, "process_gone")?;
-                set_agent_process(state, &run.id, Some(old), None)
-            }
-            IdentityState::ExactLive | IdentityState::Unknown => Ok(()),
-        };
+        return follow_removed(state, run);
     }
     let workspace = attachment.workspace.as_path();
     let signals = claude::worktree_signals(workspace);
@@ -93,6 +84,27 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
         return Ok(());
     };
     let recorded = attachment.agent_process.as_ref();
+    // `run` was loaded before the lock was read, and Hermes's hook records
+    // the worktree's removal before Hermes releases the lock: a lock that no
+    // longer names the recorded process is judged on the record as it is now.
+    let released =
+        recorded.is_some_and(|old| session.as_ref().is_none_or(|(pid, _)| *pid != old.pid));
+    if released {
+        let now = state.load_run(&run.id)?;
+        if now
+            .attachment
+            .as_ref()
+            .is_some_and(|attachment| attachment.workspace_removed.is_some())
+        {
+            return follow_removed(state, &now);
+        }
+        // A worktree being deleted reads as unlocked. Git deletes the
+        // worktree before its metadata, so only one still there was released;
+        // a removal is noted when the worktree is gone.
+        if !workspace.join(".git").exists() {
+            return Ok(());
+        }
+    }
     match (recorded, session) {
         (None, None) => Ok(()),
         // Running: record it. Gone or Unknown, never seen running: nothing.
@@ -125,6 +137,59 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
             set_agent_process(state, &run.id, Some(old), None)
         }
     }
+}
+
+/// A removed workspace has no lock left: only the recorded process is
+/// followed, until that exact process is gone.
+fn follow_removed(state: &State, run: &RunRecord) -> Result<()> {
+    let Some(old) = run
+        .attachment
+        .as_ref()
+        .and_then(|a| a.agent_process.as_ref())
+    else {
+        return Ok(());
+    };
+    match process::identity_state(old) {
+        IdentityState::Gone | IdentityState::Reused => {
+            end_sessions(state, run, None, "process_gone")?;
+            set_agent_process(state, &run.id, Some(old), None)
+        }
+        IdentityState::ExactLive | IdentityState::Unknown => Ok(()),
+    }
+}
+
+/// Whether the process that ran `run`'s sessions is gone, by its worktree's
+/// lock, for a worktree Claude Code or Hermes made in the project at `root`:
+/// the lock names a process that no longer runs (a closed terminal leaves
+/// the lock behind), or there is no lock, as the runtime releases it when it
+/// exits. Either way, the process Dispatch recorded as the agent must not
+/// run either. Anything that cannot be told, including a worktree no
+/// runtime made, which has no lock to judge by, is not gone.
+pub(crate) fn session_process_gone(root: &Path, run: &RunRecord) -> bool {
+    let Some(attachment) = run.attachment.as_ref() else {
+        return false;
+    };
+    let recorded_runs = attachment
+        .agent_process
+        .as_ref()
+        .is_some_and(|agent| process::identity_state(agent) == IdentityState::ExactLive);
+    let workspace = attachment.workspace.as_path();
+    let signals = claude::worktree_signals(workspace);
+    let lock_gone = if claude::made_by_claude(root, workspace, &signals) {
+        match &signals.lock {
+            None => true,
+            Some(lock @ Lock::Session { .. }) => claude::liveness(lock) == Liveness::Gone,
+            Some(Lock::Other(_)) => false,
+        }
+    } else if hermes::made(root, workspace) {
+        match hermes::locked_pid(workspace) {
+            Some(pid) => hermes::liveness(pid, workspace) == Liveness::Gone,
+            None => signals.lock.is_none(),
+        }
+    } else {
+        false
+    };
+    lock_gone && !recorded_runs
 }
 
 /// The exact identity of the process a session lock names, if it runs.
@@ -271,6 +336,16 @@ mod tests {
     /// Attached Work in a worktree laid out as `claude --worktree` makes it,
     /// with one open session; its `locked` file is the test's to write.
     fn project() -> Project {
+        let project = attached(".claude/worktrees/w", "w", "claude", |gitdir| {
+            std::fs::write(gitdir.join("CLAUDE_BASE"), "base\n").unwrap();
+        });
+        project.start_session("s1", Utc::now() - Duration::minutes(1));
+        project
+    }
+
+    /// Attached Work for `agent` in a new worktree at `path` on `branch`,
+    /// as a hook or discovery registers it, its Git metadata made by `made`.
+    fn attached(path: &str, branch: &str, agent: &str, made: impl FnOnce(&Path)) -> Project {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("project");
         std::fs::create_dir_all(&root).unwrap();
@@ -278,29 +353,20 @@ mod tests {
         git(&root, &["init", "--quiet"]);
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "--quiet", "-m", "initial"]);
-        git(
-            &root,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
-                "w",
-                ".claude/worktrees/w",
-            ],
-        );
+        git(&root, &["worktree", "add", "--quiet", "-b", branch, path]);
         let root = std::fs::canonicalize(&root).unwrap();
-        let gitdir = root.join(".git/worktrees/w");
-        std::fs::write(gitdir.join("CLAUDE_BASE"), "base\n").unwrap();
+        let name = Path::new(path).file_name().unwrap();
+        let gitdir = root.join(".git/worktrees").join(name);
+        made(&gitdir);
         let state = State::discover(Some(temp.path().join("state"))).unwrap();
         state.initialize().unwrap();
         let run = attach::create(
             &state,
             AttachRequest {
-                workspace: root.join(".claude/worktrees/w"),
+                workspace: root.join(path),
                 root: None,
                 task: Some("t".into()),
-                agent: Some("claude".into()),
+                agent: Some(agent.into()),
                 pid: None,
                 command: None,
                 allow_unsafe_local: false,
@@ -318,7 +384,6 @@ mod tests {
         };
         // As a hook or discovery registers it: the runtime made the workspace.
         project.edit(|attachment| attachment.workspace_owner = WorkspaceOwner::Runtime);
-        project.start_session("s1", Utc::now() - Duration::minutes(1));
         project
     }
 
@@ -333,7 +398,13 @@ mod tests {
                 end_reason: None,
                 model: None,
             };
-            record_session_start(&self.state, &self.run_id, session).unwrap();
+            record_session_start(
+                &self.state,
+                &self.run_id,
+                session,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
         }
 
         fn lock(&self, pid: u32, start: &str) {
@@ -632,6 +703,130 @@ mod tests {
         assert_eq!(p.events("runtime.agent_running"), 1);
         stop(first);
         stop(second);
+    }
+
+    const HERMES: &str = ".worktrees/hermes-0a1b2c3d";
+
+    /// Work in a worktree laid out as `hermes chat --worktree` makes it, with
+    /// its open session, locked by `agent`, which discovery recorded as the
+    /// Work's process when it registered it, and with a change in it. `None`
+    /// where a process has no exact identity.
+    fn hermes_project(agent: &Child) -> Option<Project> {
+        let name = HERMES.rsplit('/').next().unwrap();
+        // Hermes runs before it makes its worktree, and locks it at once.
+        let p = attached(HERMES, &format!("hermes/{name}"), "hermes", |gitdir| {
+            let lock = format!("hermes pid={}", agent.id());
+            std::fs::write(gitdir.join("locked"), lock).unwrap();
+        });
+        let session = RuntimeSession {
+            provider: "hermes".into(),
+            session_id: name.into(),
+            source: "discovered".into(),
+            started_at: Utc::now() - Duration::minutes(1),
+            ended_at: None,
+            end_reason: None,
+            model: None,
+        };
+        record_session_start(
+            &p.state,
+            &p.run_id,
+            session,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let identity = process::process_identity(agent.id());
+        if identity.start.is_none() || identity.boot.is_none() {
+            return None;
+        }
+        p.edit(|attachment| attachment.agent_process = Some(identity));
+        std::fs::write(p.root.join(HERMES).join("notes.txt"), "two\n").unwrap();
+        Some(p)
+    }
+
+    fn hermes_session(ended: Option<&str>) -> [(String, Option<String>); 1] {
+        [("hermes-0a1b2c3d".into(), ended.map(str::to_owned))]
+    }
+
+    /// Found under load in CI: Hermes's hook records its worktree's removal,
+    /// then Hermes releases the lock and removes the worktree. A tick that
+    /// loaded the Work before the hook and read the lock after the release
+    /// ended the session as `lock_released` while Hermes still ran, and let
+    /// its process go. That process is followed instead, until it is gone.
+    #[test]
+    fn a_removal_recorded_before_the_unlock_follows_the_process_to_its_end() {
+        let agent = sleeper();
+        let Some(p) = hermes_project(&agent) else {
+            return stop(agent);
+        };
+        // The tick loads the Work; the hook keeps the exact Δ and Hermes
+        // releases its lock before the tick reads it.
+        let runs = load_source_runs(&p.state, &p.root).unwrap();
+        attach::freeze_removed_workspace(&p.state, &p.run_id).unwrap();
+        std::fs::remove_file(&p.locked).unwrap();
+        observe(&p.state, &p.root, &runs).unwrap();
+        assert_eq!(p.sessions(), hermes_session(None));
+        assert_eq!(p.agent().map(|agent| agent.pid), Some(agent.id()));
+
+        // Hermes removes the worktree and exits.
+        git(&p.root, &["worktree", "remove", "--force", HERMES]);
+        stop(agent);
+        p.tick();
+        assert_eq!(p.sessions(), hermes_session(Some("process_gone")));
+        assert_eq!(p.agent(), None);
+        assert_eq!(p.events("runtime.session_ended"), 1);
+    }
+
+    /// Found under load in CI: Hermes's worktree removed while still locked,
+    /// between liveness reading that Hermes made it and reading its lock,
+    /// read as a released lock, and the session ended while Hermes ran.
+    #[test]
+    fn a_worktree_deleted_while_its_lock_is_read_is_not_a_release() {
+        use std::{
+            ffi::CString,
+            io::Write,
+            os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        };
+
+        let agent = sleeper();
+        let Some(p) = hermes_project(&agent) else {
+            return stop(agent);
+        };
+        let worktree = p.root.join(HERMES);
+        // HEAD as a FIFO: reading whether Hermes made the worktree waits for
+        // the test, which deletes the worktree, as Git does first, before it
+        // answers. The lock is read after that.
+        let head = p.locked.with_file_name("HEAD");
+        let text = std::fs::read(&head).unwrap();
+        std::fs::remove_file(&head).unwrap();
+        let fifo = CString::new(head.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C path; mkfifo only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let gate = std::thread::spawn({
+            let (head, worktree) = (head.clone(), worktree.clone());
+            move || {
+                let mut writer = std::fs::OpenOptions::new().write(true).open(head).unwrap();
+                std::fs::remove_dir_all(worktree).unwrap();
+                writer.write_all(&text).unwrap();
+            }
+        });
+        p.tick();
+        // A tick that never read HEAD lets the gate through.
+        drop(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&head),
+        );
+        gate.join().unwrap();
+        assert!(!worktree.exists());
+        assert_eq!(p.sessions(), hermes_session(None));
+        assert_eq!(p.agent().map(|agent| agent.pid), Some(agent.id()));
+
+        // The removal noted, the process is followed to its end.
+        attach::note_workspace_gone(&p.state, &p.run_id, None).unwrap();
+        stop(agent);
+        p.tick();
+        assert_eq!(p.sessions(), hermes_session(Some("process_gone")));
     }
 
     #[test]

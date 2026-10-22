@@ -1,55 +1,182 @@
-# Dispatch 0.4.0: install, upgrade, uninstall
+# Dispatch: install, upgrade, uninstall
 
-Dispatch 0.4.0 is an experimental developer preview. It adds
-[attached work and `dispatch serve`](attach.md): observing and, if you ask, applying
-work an external agent (Claude Code, Codex, Cursor or anything else) produced in its
-own worktree, under the same [work coherence](coherence.md) model as work Dispatch
-launched itself, on top of [auto-apply](product-guide.md#auto-apply) from 0.3.0.
+Dispatch is an experimental developer preview. It runs a coding agent from a frozen snapshot,
+or watches one you run yourself ([attached work](attach.md)), and judges the result against
+the source as it is now ([work coherence](coherence.md)).
 
-Runtime scope: macOS arm64 is the platform exercised interactively for this
-release. Linux x86_64 is built and smoke-tested by CI (build, package, `dispatch
-version`) but was not exercised interactively. Windows, SSH/tmux and native GUI
-terminals are not certified. Packages are unsigned and not notarized.
+Releases are built for macOS on Apple silicon and Intel, and Linux on x86_64 and aarch64.
+Each archive is built and smoke-tested (`dispatch version`, and an install with
+`install.sh`) on its own architecture by CI; macOS arm64 is the platform exercised
+interactively. Windows, SSH/tmux and native GUI terminals are not certified. Packages are
+unsigned and not notarized. The archive contains only `dispatch`, `LICENSE`, `INSTALL.md`
+(this page) and `BUILD.json`, which records source and binary identities. No account state,
+logs, grants, credentials or fonts are bundled.
 
-## Try without replacing an installation
-
-Download `dispatch-macos-arm64.tar.gz` (or `dispatch-linux-x86_64.tar.gz`) and
-`SHA256SUMS` from the GitHub release, or build a local archive (see the end of this
-page). Extract the archive into a new directory, then run the executable by its
-absolute path. `BUILD.json` records source and binary identities. From the output
-directory, `shasum -a 256 -c SHA256SUMS` checks the archive and adjacent executable.
-The archive contains only `dispatch`, `LICENSE`, `INSTALL.md`, and `BUILD.json`.
-No account state, logs, grants, credentials or fonts are bundled.
+## Install
 
 ```sh
-shasum -a 256 -c SHA256SUMS --ignore-missing
-mkdir -p /tmp/dispatch-install
-tar -xzf dispatch-macos-arm64.tar.gz -C /tmp/dispatch-install
-/tmp/dispatch-install/dispatch version
-cd /path/to/your/project
-/tmp/dispatch-install/dispatch --state-dir /path/to/private/dispatch-state setup
-/tmp/dispatch-install/dispatch --state-dir /path/to/private/dispatch-state setup --checks
-/tmp/dispatch-install/dispatch --state-dir /path/to/private/dispatch-state
+curl -fsSL https://rundispatch.sh/install | sh
 ```
 
-The expected version is `dispatch 0.4.0`. Use `command -v dispatch` and
-`type -a dispatch` to locate older PATH installations. An explicit path is the
-reliable way to select this build. Do not replace a working binary just to try
-it. Ordinary work uses the provider's account; test-only setup must use fixture
-homes and fake executables, as the acceptance scripts do.
+`rundispatch.sh/install` redirects to the latest release's `install.sh`. Until the website
+does, use the release asset itself:
+
+```sh
+curl -fsSL https://github.com/rundispatch/dispatch/releases/latest/download/install.sh | sh
+```
+
+The script:
+- picks this machine's archive: `dispatch-macos-arm64.tar.gz`,
+  `dispatch-macos-x86_64.tar.gz`, `dispatch-linux-x86_64.tar.gz` or
+  `dispatch-linux-aarch64.tar.gz`. A shell running under Rosetta on Apple silicon gets the
+  arm64 build. Any other system is refused, saying so;
+- downloads it and `SHA256SUMS` from the latest release, or from the release named by
+  `DISPATCH_VERSION` (`DISPATCH_VERSION=0.4.17`, a leading `v` is accepted). A release that
+  has no archive for this machine installs nothing and says so;
+- verifies the archive's checksum (`shasum -a 256`, or `sha256sum`), and installs nothing on a
+  mismatch;
+- puts `dispatch` in `~/.local/bin`, or `DISPATCH_INSTALL_DIR`, made if missing. It copies the
+  binary there under a temporary name and renames it into place, so an existing binary, even a
+  running one, is never written into;
+- prints `Installed dispatch <version> at <path>`, from the installed binary itself;
+- never edits a dotfile. When the directory is not on `PATH`, it prints the line to add and the
+  file it belongs in (`~/.zshrc`, `~/.bash_profile` on macOS or `~/.bashrc` elsewhere,
+  `fish_add_path` in `~/.config/fish/config.fish`, otherwise `~/.profile`):
+
+  ```text
+  Installed dispatch 0.4.17 at /Users/you/.local/bin/dispatch
+
+  /Users/you/.local/bin is not on your PATH. Add this line to ~/.zshrc, then open a new terminal:
+
+    export PATH="/Users/you/.local/bin:$PATH"
+  ```
+
+Run it again to upgrade. A project owner started from that path is restarted by the next
+Dispatch command there (see "Upgrading to 0.4.17").
+
+Files fetched with `curl` carry no quarantine attribute, so the unsigned binary runs. Only a
+browser download needs `xattr -d com.apple.quarantine dispatch` on macOS.
+
+Downloads are counted by GitHub, not by Dispatch: each install downloads `install.sh`, the
+archive and `SHA256SUMS` once, and the repository's nightly job copies GitHub's counts to its
+`stats` branch. Dispatch itself sends nothing.
+
+### Manual download and verification
+
+Download the archive for your machine and `SHA256SUMS` from the
+[GitHub release](https://github.com/rundispatch/dispatch/releases), into one directory:
+
+| Machine | Archive |
+|---|---|
+| macOS, Apple silicon | `dispatch-macos-arm64.tar.gz` |
+| macOS, Intel | `dispatch-macos-x86_64.tar.gz` |
+| Linux, x86_64 | `dispatch-linux-x86_64.tar.gz` |
+| Linux, aarch64 | `dispatch-linux-aarch64.tar.gz` |
+
+Verify it, extract it into a new directory, and run the executable by its path:
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing     # Linux: sha256sum -c SHA256SUMS --ignore-missing
+mkdir -p ~/dispatch-0.4.17
+tar -xzf dispatch-macos-arm64.tar.gz -C ~/dispatch-0.4.17
+~/dispatch-0.4.17/dispatch version
+```
+
+The expected version is `dispatch 0.4.17`. Use `command -v dispatch` and `type -a dispatch`
+to find other installations on `PATH`. To try a build without replacing a working one, run it
+by its path with its own state: `~/dispatch-0.4.17/dispatch --state-dir
+/path/to/private/dispatch-state setup`. Ordinary work uses the provider's account; test-only
+setup must use fixture homes and fake executables, as the acceptance scripts do.
+
+## First use
+
+In a project, on a terminal:
+
+```sh
+dispatch setup
+```
+
+One pass: choose the checks, allow them to run by themselves (or not), install Claude Code's
+and Hermes's hooks if they are on `PATH`, and start watching. Then run your agent in its own
+worktree (`claude --worktree`, `hermes chat --worktree`), or `dispatch attach -- <agent>`,
+and `dispatch accept` once the result is ready. See the [README](../README.md#quick-start).
 
 ## Upgrade, restore, uninstall
 
-Stop all Dispatch sessions before upgrading. Back up the complete private state
-directory and keep the matching binary. SQLite migrations now preserve a consistent
-600-permission `dispatch.schema-N-*.db` backup beside the database before upgrading
-historical schemas. These backups preserve database state, not artifact files; keep
-a full state-directory copy as well. Schema is 24 as of 0.4.1. Newer schemas are
-refused.
+Back up the complete private state directory before upgrading, and keep the matching binary.
+SQLite migrations preserve a consistent 600-permission `dispatch.schema-N-*.db` backup beside
+the database before upgrading historical schemas. These backups preserve database state, not
+artifact files; keep a full state-directory copy as well. Schema is 24 as of 0.4.1. Newer
+schemas are refused.
 
-To roll back, stop every session and restore a complete matching backup into a
-separate directory; point the matching old binary at it with `--state-dir`. Never
-point an old binary at current state or restore only a DB over newer artifacts.
+To roll back, stop every session and restore a complete matching backup into a separate
+directory; point the matching old binary at it with `--state-dir`. Never point an old binary
+at current state or restore only a DB over newer artifacts.
+
+### Upgrading to 0.4.17
+
+No migration; the schema stays at 24. Existing records are not rewritten.
+- An empty `dispatch.setup-lock` next to `dispatch.yml`, left by an earlier Dispatch, can be
+  deleted; Dispatch no longer makes it.
+- **Rollback.** Back up the whole state directory before upgrading, and roll back only by
+  restoring it. 0.4.16 cannot read a run whose stored verdict has the new reason
+  `mention_changed`: its `history` then fails with ``unknown variant `mention_changed` ``.
+- **No restart by hand.** After an upgrade in place (the same executable path, as
+  `install.sh` does), the next Dispatch command in a watched project (`status`, `watch`,
+  `attach`, `finish`, `check`, `accept` or `start`) replaces the owner and says `Restarted
+  watching <root> with Dispatch 0.4.17 (was 0.4.16).`. There is no `dispatch stop && dispatch
+  start`. An owner started from another path keeps running, and `status` names its version.
+- **Watcher record version 2.** `watchers/<key>.json` gains `exe`, the canonical path of the
+  binary that started the owner, and `environment`, the `PATH`, `HOME`, `TMPDIR` and `LANG`
+  it was started with, which a revived owner is given again. Version 1 records are still read:
+  an owner they name is replaced only by a newer version, and is revived with the caller's
+  environment.
+- **Check consent version 2.** `projects/<key>.json` records now have `version: 2`, whose
+  scope adds typed `attach` and `finish`, and Work the owner finishes when its session ends.
+  A version 1 consent no longer holds: `status` and `watch` say `check consent no longer
+  holds: it did not cover typed attach, finish, or session end`, and `dispatch setup` asks
+  once more, saying why. Until then, Work registered by a hook gets no authority from it.
+- **Native standing consent.** "Allow for this project" on a native `run` or `refresh`
+  writes `projects/native-<key>.json`, one per project and harness: the agent's resolved
+  executable, its configured model, effort, provider, arguments and service mode, and
+  `checks.baseline` and `checks.verify`. A later launch with exactly those needs no prompt and
+  no flag; any change asks again. Nothing is stored in the repository.
+- **Hooks.** Claude Code's hooks are now six: `Notification` (matcher
+  `permission_prompt|idle_prompt|agent_needs_input`, 5 s) and `Stop` (5 s) join
+  `SessionStart`, `SessionEnd`, `WorktreeRemove` and `PreToolUse`/`ExitWorktree`. A settings
+  file from 0.4.6 to 0.4.16 holds the earlier four: `dispatch setup` offers to update them,
+  showing the hooks they become, and keeps every hook of yours. Hooks edited by hand are left
+  alone and reported as changed by hand; remove and install them from "Agents Dispatch
+  launches…" → Runtime integrations. Until the update, nothing says when an agent waits on
+  you. The Hermes hook is unchanged.
+- **Additive JSON and events.**
+  - `runtime.needs_you`: `{kind (permission | input | turn_ended), message, at, transcript,
+    session_id}`, when Claude Code's `Notification` or `Stop` hook marks the Work.
+    `runtime.needs_you_cleared`: `{by: transcript | session_end | work_finished}`.
+  - The attachment gains `needs_you` (`{kind, message, at, transcript, provider,
+    session_id}`), absent when nothing waits. `watch --json` work lines gain `needs_you`:
+    `{kind, message, since}` or `null`; their `state` stays `working`.
+  - `work.reopened {reopens, provenance}` on Work a resumed session started from an earlier
+    Work's S0, and `work.closed {reason: "superseded", by: "reopen", replacement}` on the
+    earlier one. `work.not_reopened {reopens, reason}` when that S0 could no longer be read.
+  - Facts gain the origin `mentioned` (a weak fact), and reasons the code
+    `mention_changed`. A weak-only CONTINUE whose merged checks cannot run becomes REFRESH
+    with an `analysis_uncertain` reason first, `merged checks cannot run — <why>`.
+  - `attach.authorized {by: "project consent"}` is now also recorded by a typed `attach` or
+    `finish` that ran on standing consent.
+  - `status --json` with no Work prints `null`, and `status --jsonl` prints nothing; both exit
+    0.
+  - `runs/<id>/finishing-by-consent` exists, holding the owner's pid, while the owner finishes
+    that Work by consent; `reopen/<id>` notes a reopen until the earlier Work is closed.
+- **Changed behaviour.**
+  - **Session end.** With consent, the owner finishes Work a Claude Code or Hermes session
+    registered once its session ended and its process is gone.
+  - **Mentions.** Paths in Rust and Python comments make no fact any more, and paths in test
+    code or in files without symbol support are weak. A Work whose verdict was REFRESH only
+    for such a path can read CONTINUE now.
+  - **The wrapped exit** prints finish's verdict and next steps; its first line still begins
+    `Attached work <id> finished`.
+  - **The owner exits** when its project or the state directory is deleted.
 
 ### Upgrading to 0.4.16
 
@@ -509,8 +636,11 @@ going forward; no existing run's stored record, outcome or events are rewritten 
 this migration beyond the table rebuild itself. See [attach.md](attach.md) for what
 the new commands do.
 
-Uninstall by removing only the executable you installed and its archive/extraction
-directory. Keep `~/.dispatch` (or your explicit state directory), project files and
+Uninstall by running `dispatch stop` in each watched project, removing Dispatch's hooks
+(`dispatch setup` → "Agents Dispatch launches…" → Runtime integrations), then removing only
+the executable you installed (`~/.local/bin/dispatch` for `install.sh`) and any
+archive/extraction directory. An owner left running keeps running after its binary is
+removed, so stop it first. Keep `~/.dispatch` (or your explicit state directory), project files and
 provider accounts. State deletion and provider logout are separate owner actions.
 
 ## Build a local archive
@@ -520,7 +650,8 @@ cargo build --release --locked --target-dir /tmp/dispatch-rc/current/target
 python3 scripts/package-local.py /tmp/dispatch-rc/current/target/release/dispatch /tmp/dispatch-rc/release
 ```
 
-The package metadata, ordering and compression are deterministic for the same
+The archive is named for this machine (`dispatch-<macos|linux>-<uname -m>.tar.gz`), or for
+`--target macos-arm64|macos-x86_64|linux-x86_64|linux-aarch64` after a cross build. The package metadata, ordering and compression are deterministic for the same
 binary and declared source manifest. This does not claim bit-identical Rust builds
 across different machines or toolchains. No signing keys, tags, pushes or uploads
 are involved. Publication is a separate owner decision.

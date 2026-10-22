@@ -1442,7 +1442,7 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
                 "snapshot destination unexpectedly contains {}",
                 target.display()
             );
-            fs::copy(entry.path(), &target).with_context(|| {
+            copy_file_contents(entry.path(), &target).with_context(|| {
                 format!(
                     "failed to copy {} to {}",
                     entry.path().display(),
@@ -1478,6 +1478,30 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
             .with_context(|| format!("failed to preserve permissions on {}", path.display()))?;
     }
     Ok(())
+}
+
+// From <sys/clonefile.h>; libc exposes clonefile but not its flags.
+#[cfg(target_os = "macos")]
+const CLONE_NOFOLLOW: u32 = 0x0001;
+
+/// Copy one file. On macOS it is cloned by path with clonefile(2), never
+/// opened, because on-access scanning intercepts every `open()`; any failure
+/// falls back to `std::fs::copy`.
+fn copy_file_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let c_source = CString::new(source.as_os_str().as_bytes())?;
+        let c_destination = CString::new(destination.as_os_str().as_bytes())?;
+        // SAFETY: both paths are live, NUL-terminated strings for the duration of the call.
+        if unsafe { libc::clonefile(c_source.as_ptr(), c_destination.as_ptr(), CLONE_NOFOLLOW) }
+            == 0
+        {
+            return Ok(());
+        }
+    }
+    fs::copy(source, destination).map(|_| ())
 }
 
 fn ensure_symlink_stays_within(root: &Path, link: &Path, target: &Path) -> Result<()> {
@@ -2438,6 +2462,168 @@ mod tests {
             run_git_within(command, None, "the stand-in", Duration::from_millis(300)).unwrap_err();
         assert!(format!("{error:#}").contains("safety timeout"), "{error:#}");
         assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    fn copy_fixture(source: &Path) {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        write(&source.join("large"), vec![0x5a; 8 * 1024 * 1024]);
+        write(&source.join("executable"), "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(source.join("executable"), fs::Permissions::from_mode(0o751)).unwrap();
+        write(&source.join("read-only"), "read only\n");
+        fs::set_permissions(source.join("read-only"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::create_dir(source.join("empty")).unwrap();
+        fs::set_permissions(source.join("empty"), fs::Permissions::from_mode(0o550)).unwrap();
+        symlink("large", source.join("link")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_copy_fixture(source: &Path, destination: &Path) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        assert_eq!(
+            fingerprint_tree(source).unwrap(),
+            fingerprint_tree(destination).unwrap()
+        );
+        for name in ["large", "executable", "read-only", "empty"] {
+            let original = fs::metadata(source.join(name)).unwrap();
+            let copied = fs::metadata(destination.join(name)).unwrap();
+            assert_eq!(original.permissions().mode(), copied.permissions().mode());
+            assert_ne!(original.ino(), copied.ino());
+            if original.is_file() {
+                assert_eq!(
+                    fs::read(source.join(name)).unwrap(),
+                    fs::read(destination.join(name)).unwrap()
+                );
+            }
+        }
+        assert!(
+            fs::symlink_metadata(destination.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            Path::new("large")
+        );
+        assert_eq!(fs::read_dir(destination.join("empty")).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_preserves_contents_modes_links_and_empty_directories() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        copy_fixture(&source);
+        copy_tree_contents(&source, &destination).unwrap();
+        assert_copy_fixture(&source, &destination);
+        write(&destination.join("large"), "private edit");
+        assert_eq!(
+            fs::metadata(source.join("large")).unwrap().len(),
+            8 * 1024 * 1024
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_file_clones_without_opening_files() {
+        const CHILD: &str = "DISPATCH_TEST_EXHAUST_DESCRIPTORS";
+        if std::env::var_os(CHILD).is_none() {
+            // Descriptor limits are process-wide: never exhaust the test runner's.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "source::tests::copy_file_clones_without_opening_files",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // A renamed test would run nothing in the child and still exit 0.
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "{stdout}"
+            );
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        write(&source, "clone without open\n");
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: the pointer addresses an initialized rlimit. Only this isolated
+        // subprocess changes its soft descriptor limit, leaving the hard limit intact.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let reduced = libc::rlimit {
+            rlim_cur: limit.rlim_cur.min(64),
+            rlim_max: limit.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &reduced) }, 0);
+        let mut files = Vec::new();
+        loop {
+            match File::open("/dev/null") {
+                Ok(file) => files.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        let result = copy_file_contents(&source, &destination);
+        drop(files);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        result.unwrap();
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_file_falls_back_after_real_clone_failure() {
+        use std::{
+            ffi::CString,
+            os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+        };
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        copy_fixture(&source);
+        copy_tree_contents(&source, &destination).unwrap();
+        for name in ["large", "executable", "read-only"] {
+            let from = source.join(name);
+            let to = destination.join(name);
+            fs::set_permissions(&to, fs::Permissions::from_mode(0o600)).unwrap();
+            write(&to, "stale destination");
+            let from_c = CString::new(from.as_os_str().as_bytes()).unwrap();
+            let to_c = CString::new(to.as_os_str().as_bytes()).unwrap();
+            // SAFETY: both C strings remain live through the call.
+            assert_eq!(
+                unsafe { libc::clonefile(from_c.as_ptr(), to_c.as_ptr(), CLONE_NOFOLLOW) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EEXIST)
+            );
+            copy_file_contents(&from, &to).unwrap();
+            fs::set_permissions(&to, fs::metadata(&from).unwrap().permissions()).unwrap();
+        }
+        assert_copy_fixture(&source, &destination);
+        // Existing files must still be refused by the tree walker, not overwritten.
+        assert!(copy_tree_contents(&source, &destination).is_err());
     }
 
     #[test]

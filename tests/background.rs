@@ -433,3 +433,273 @@ fn a_lock_that_cannot_be_probed_is_an_error_not_a_watcher() {
     }
     assert!(project.record().is_none());
 }
+
+impl Project {
+    /// The record, changed by `edit`, written back over the owner's.
+    fn edit_record(&self, edit: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+        let mut record = self.record().expect("a watcher record");
+        edit(record.as_object_mut().unwrap());
+        fs::write(self.record_path(), record.to_string()).unwrap();
+    }
+
+    fn started(&self) -> i32 {
+        let output = self.dispatch(&["start"]);
+        assert!(output.status.success(), "{}", text(&output));
+        self.owner_pid()
+    }
+}
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// An owner killed without `dispatch stop` leaves its record and frees the
+/// lock: the next `status` there starts it again, and says so on stderr only.
+#[test]
+fn status_brings_back_an_owner_that_was_killed() {
+    let project = Project::new();
+    let pid = project.started();
+    let record = project.record().unwrap();
+    assert_eq!(record["version"], 2);
+    let exe = fs::canonicalize(assert_cmd::cargo_bin!("dispatch")).unwrap();
+    assert_eq!(record["exe"], exe.to_str().unwrap());
+    assert_eq!(
+        record["environment"]["PATH"],
+        std::env::var("PATH").unwrap().as_str()
+    );
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    wait_until("the lock to be released", || !project.lock_is_held());
+
+    let status = project.dispatch(&["status"]);
+    assert!(status.status.success(), "{}", text(&status));
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert_eq!(
+        stderr.trim(),
+        format!(
+            "Watching {} again: its owner had stopped.",
+            project.root.display()
+        )
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("Project: watched in the background"),
+        "{stdout}"
+    );
+    assert!(project.lock_is_held());
+    assert_ne!(project.owner_pid(), pid);
+    assert!(alive(project.owner_pid()));
+
+    // Watching again, nothing more is said.
+    let again = project.dispatch(&["status", "--json"]);
+    assert!(again.status.success(), "{}", text(&again));
+    assert!(again.stderr.is_empty(), "{}", text(&again));
+
+    // `dispatch stop` removes the record: nothing comes back.
+    assert!(project.dispatch(&["stop"]).status.success());
+    let stopped = project.dispatch(&["status"]);
+    assert!(stopped.stderr.is_empty(), "{}", text(&stopped));
+    assert!(!project.lock_is_held());
+}
+
+/// A dead owner is not brought back while the project's configuration does
+/// not read: `status` says why in one line and spawns nothing (its log, which
+/// a spawned owner writes to, is untouched), and the record stays, so it
+/// comes back once the configuration is fixed.
+#[test]
+fn a_broken_configuration_brings_back_no_owner() {
+    let project = Project::new();
+    let pid = project.started();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    wait_until("the lock to be released", || !project.lock_is_held());
+    fs::write(project.root.join("dispatch.yml"), "coherence: [\n").unwrap();
+    let log = project
+        .state
+        .join("watchers")
+        .join(format!("{}.log", project.key()));
+    let before = fs::read(&log).unwrap();
+
+    for _ in 0..2 {
+        let status = project.dispatch(&["status"]);
+        assert!(status.status.success(), "{}", text(&status));
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(
+            stderr.starts_with(&format!(
+                "Could not watch {} again: ",
+                project.root.display()
+            )),
+            "{stderr}"
+        );
+        assert!(stderr.contains("dispatch.yml"), "{stderr}");
+        assert!(!project.lock_is_held());
+        assert_eq!(project.owner_pid(), pid, "the record stays");
+        assert_eq!(fs::read(&log).unwrap(), before, "nothing was spawned");
+    }
+
+    fs::write(
+        project.root.join("dispatch.yml"),
+        "coherence:\n  poll_secs: 1\n",
+    )
+    .unwrap();
+    let status = project.dispatch(&["status"]);
+    assert!(
+        String::from_utf8_lossy(&status.stderr).contains("again: its owner had stopped."),
+        "{}",
+        text(&status)
+    );
+    assert!(project.lock_is_held());
+    assert!(project.dispatch(&["stop"]).status.success());
+}
+
+/// An owner on another version is replaced only by the binary that started
+/// it (upgraded in place) or, when its record does not name one, by a newer
+/// Dispatch.
+#[test]
+fn an_owner_on_another_version_is_replaced_only_from_its_own_executable() {
+    let project = Project::new();
+    let restarted = |old: &str| {
+        let pid = project.owner_pid();
+        let status = project.dispatch(&["status"]);
+        assert!(status.status.success(), "{}", text(&status));
+        assert_eq!(
+            String::from_utf8_lossy(&status.stderr).trim(),
+            format!(
+                "Restarted watching {} with Dispatch {VERSION} (was {old}).",
+                project.root.display()
+            )
+        );
+        wait_until("the old owner to exit", || !alive(pid));
+        let record = project.record().unwrap();
+        assert_eq!(record["dispatch_version"], VERSION);
+        assert_eq!(record["version"], 2);
+        assert_ne!(project.owner_pid(), pid);
+        assert!(project.lock_is_held());
+    };
+    let left_alone = |old: &str| {
+        let pid = project.owner_pid();
+        let status = project.dispatch(&["status"]);
+        assert!(status.status.success(), "{}", text(&status));
+        assert!(status.stderr.is_empty(), "{}", text(&status));
+        let stdout = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            stdout.contains(&format!("it runs Dispatch {old}, this is {VERSION}")),
+            "{stdout}"
+        );
+        assert_eq!(project.owner_pid(), pid);
+        assert!(alive(pid));
+    };
+
+    // Upgraded in place: this executable started it. The new owner keeps
+    // the environment the old one recorded.
+    project.started();
+    let recorded = format!("/nonexistent/recorded:{}", std::env::var("PATH").unwrap());
+    project.edit_record(|record| {
+        record.insert("dispatch_version".into(), "0.0.1".into());
+        record["environment"]["PATH"] = recorded.as_str().into();
+    });
+    restarted("0.0.1");
+    assert_eq!(
+        project.record().unwrap()["environment"]["PATH"],
+        recorded.as_str()
+    );
+
+    // Another install path.
+    project.edit_record(|record| {
+        record.insert("dispatch_version".into(), "0.0.1".into());
+        record.insert("exe".into(), "/elsewhere/bin/dispatch".into());
+    });
+    left_alone("0.0.1");
+
+    // A version 1 record of a newer Dispatch.
+    project.edit_record(|record| {
+        record.insert("version".into(), 1.into());
+        record.remove("exe");
+        record.insert("dispatch_version".into(), "99.0.0".into());
+    });
+    left_alone("99.0.0");
+
+    // A version 1 record of an older Dispatch: it keeps no environment, so
+    // the new owner runs with this one's.
+    project.edit_record(|record| {
+        record.insert("dispatch_version".into(), "0.0.1".into());
+        record.remove("environment");
+    });
+    restarted("0.0.1");
+    assert_eq!(
+        project.record().unwrap()["environment"]["PATH"],
+        std::env::var("PATH").unwrap().as_str()
+    );
+
+    // `start` replaces the version half of "Already watching".
+    project.edit_record(|record| {
+        record.insert("dispatch_version".into(), "0.0.2".into());
+    });
+    let pid = project.owner_pid();
+    let start = project.dispatch(&["start"]);
+    assert!(start.status.success(), "{}", text(&start));
+    assert!(
+        String::from_utf8_lossy(&start.stderr).contains("(was 0.0.2)"),
+        "{}",
+        text(&start)
+    );
+    let stdout = String::from_utf8_lossy(&start.stdout);
+    assert!(stdout.contains("Already watching"), "{stdout}");
+    assert!(
+        !stdout.contains("dispatch stop && dispatch start"),
+        "{stdout}"
+    );
+    wait_until("the old owner to exit", || !alive(pid));
+    assert!(project.dispatch(&["stop"]).status.success());
+}
+
+/// The owner notices its project, or the state directory it records in, is
+/// gone, and exits within a few ticks instead of running on for days.
+#[test]
+fn an_owner_exits_when_its_project_is_deleted() {
+    let project = Project::new();
+    let pid = project.started();
+    fs::remove_dir_all(&project.root).unwrap();
+    wait_until("the owner to exit", || !alive(pid));
+    assert!(!project.lock_is_held());
+    assert!(project.record().is_none(), "the owner removed its record");
+    let log = fs::read_to_string(project.record_path().with_extension("log")).unwrap();
+    assert!(log.contains("no longer exists"), "{log}");
+}
+
+#[test]
+fn an_owner_exits_when_its_state_directory_is_deleted() {
+    let project = Project::new();
+    let pid = project.started();
+    // The owner may be writing there while it goes.
+    wait_until("the state directory to be removed", || {
+        fs::remove_dir_all(&project.state).is_ok()
+    });
+    wait_until("the owner to exit", || !alive(pid));
+}
+
+/// `status` where no Work was ever made: the project line, no error.
+#[test]
+fn status_without_work_shows_the_project() {
+    let project = Project::new();
+    let status = project.dispatch(&["status"]);
+    assert!(status.status.success(), "{}", text(&status));
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout),
+        format!(
+            "No Work in {} yet.\n\nProject: not watched · dispatch start\n",
+            project.root.display()
+        )
+    );
+    let json = project.dispatch(&["status", "--json"]);
+    assert!(json.status.success(), "{}", text(&json));
+    assert_eq!(String::from_utf8_lossy(&json.stdout), "null\n");
+    let jsonl = project.dispatch(&["status", "--jsonl"]);
+    assert!(jsonl.status.success(), "{}", text(&jsonl));
+    assert!(jsonl.stdout.is_empty(), "{}", text(&jsonl));
+
+    project.started();
+    let watched = text(&project.dispatch(&["status"]));
+    assert!(
+        watched.contains("Project: watched in the background"),
+        "{watched}"
+    );
+    assert!(project.dispatch(&["stop"]).status.success());
+}

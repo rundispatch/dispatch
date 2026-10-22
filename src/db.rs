@@ -2719,6 +2719,7 @@ mod tests {
             sessions: Vec::new(),
             workspace_removed: None,
             source_at_start: None,
+            needs_you: None,
         });
         migrated.sync_run(&attached)?;
         assert_eq!(

@@ -590,6 +590,53 @@ fn accept_records_review_and_applies() {
     assert_eq!(metadata["outcome"]["applied_by"], "human");
 }
 
+/// A person's accept waits for the result while another process holds it,
+/// as the project owner does a while to record a verdict on a busy machine,
+/// says so, then applies it.
+#[test]
+fn accept_waits_while_another_process_holds_the_result() {
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new(true);
+    let id = f.attach(&[]);
+    edit_workspace(&f.workspace);
+    f.dispatch(&["finish", &id]).success();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(f.state.join("runs").join(&id).join(".operation.lock"))
+        .unwrap();
+    // SAFETY: an exclusive lock on a descriptor this test owns; dropping it
+    // releases the lock.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let accept = Command::new(assert_cmd::cargo_bin!("dispatch"))
+        .arg("--state-dir")
+        .arg(&f.state)
+        .args(["accept", &id])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held longer than a person's command once waited.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    drop(lock);
+    let output = accept.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Waiting for Work {id}: another process is using it."
+        )),
+        "{stderr}"
+    );
+    assert_eq!(f.event_count(&id, "review.accepted"), 1);
+    assert_eq!(
+        fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    2\n}\n"
+    );
+}
+
 #[test]
 fn reject_records_review_only() {
     let f = Fixture::new(true);

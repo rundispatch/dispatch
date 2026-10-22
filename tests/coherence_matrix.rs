@@ -25,12 +25,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use assert_cmd::cargo_bin_cmd;
 use dispatch::{
     Decision, DiffStats, SourceKind,
     coherence::{self, WorkView, world},
     source::{self, SourceSnapshot},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 type Files<'a> = &'a [(&'a str, &'a str)];
@@ -2261,6 +2262,400 @@ fn run_matrix() -> Vec<Row> {
         }
     }
     rows
+}
+
+fn assert_mention_case(
+    s0: Files<'_>,
+    delta: Files<'_>,
+    changed_path: &str,
+    expected: Decision,
+    expected_origin: Option<&str>,
+) -> Result<()> {
+    for git_source in [true, false] {
+        let ctx = build(
+            git_source,
+            s0,
+            &[],
+            delta,
+            &[Op::Write(changed_path, "changed underneath\n")],
+        )?;
+        let verdict = verdict(&ctx)?;
+        assert_eq!(
+            verdict.decision,
+            expected,
+            "{} source: {}",
+            if git_source { "Git" } else { "directory" },
+            verdict.reason
+        );
+        if expected_origin == Some("mentioned") {
+            assert!(
+                !verdict.reason.is_empty(),
+                "a changed weak mention must keep a visible reason"
+            );
+        }
+        let patch = fs::read(&ctx.diff)?;
+        let facts = coherence::facts::derive_facts(
+            &WorkView {
+                source: &ctx.source,
+                delta_patch: &ctx.diff,
+                baseline: &ctx.snapshot.baseline_path,
+                baseline_commit: &ctx.snapshot.baseline_commit,
+            },
+            &coherence::facts::parse_patch(&patch),
+        )?;
+        let origin = facts
+            .facts
+            .iter()
+            .find(|fact| fact.path == changed_path)
+            .map(|fact| serde_json::to_value(fact.origin))
+            .transpose()?;
+        assert_eq!(
+            origin,
+            expected_origin.map(|origin| json!(origin)),
+            "{} source, {changed_path}",
+            if git_source { "Git" } else { "directory" }
+        );
+    }
+    Ok(())
+}
+
+const WORKFLOW_S0: &str = "name: CI\njobs:\n  test:\n    runs-on: ubuntu-latest\n";
+const WORKFLOW_DELTA: &str = "name: CI\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${{ hashFiles('Cargo.lock') }}\"\n";
+
+#[test]
+fn rust_comment_naming_an_old_plan_is_not_a_dependency() -> Result<()> {
+    assert_mention_case(
+        &[
+            ("docs/plan-0.4.14.md", "original plan\n"),
+            ("src/lib.rs", "pub fn work() -> u8 {\n    1\n}\n"),
+        ],
+        &[(
+            "src/lib.rs",
+            "pub fn work() -> u8 {\n    // See docs/plan-0.4.14.md.\n    1\n}\n",
+        )],
+        "docs/plan-0.4.14.md",
+        Continue,
+        None,
+    )
+}
+
+#[test]
+fn rust_doc_comment_naming_an_old_plan_is_not_a_dependency() -> Result<()> {
+    assert_mention_case(
+        &[
+            ("docs/plan-0.4.14.md", "original plan\n"),
+            ("src/lib.rs", "pub fn work() -> u8 {\n    1\n}\n"),
+        ],
+        &[(
+            "src/lib.rs",
+            "/// See docs/plan-0.4.14.md.\npub fn work() -> u8 {\n    1\n}\n",
+        )],
+        "docs/plan-0.4.14.md",
+        Continue,
+        None,
+    )
+}
+
+#[test]
+fn workflow_hashfiles_mention_is_weak() -> Result<()> {
+    assert_mention_case(
+        &[
+            ("Cargo.lock", "original lock\n"),
+            (".github/workflows/ci.yml", WORKFLOW_S0),
+        ],
+        &[(".github/workflows/ci.yml", WORKFLOW_DELTA)],
+        "Cargo.lock",
+        Continue,
+        Some("mentioned"),
+    )
+}
+
+const LIB_S0: &str = "pub fn work() -> u8 {\n    1\n}\n";
+/// This build's case: a unit test names a fixture file that is also a real one.
+const LIB_TEST_DELTA: &str = "pub fn work() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn names_a_fixture() {\n        let fixture = (\"src/main.rs\", include_str!(\"main.rs\"));\n        assert!(!fixture.1.is_empty());\n    }\n}\n";
+const LIB_CODE_DELTA: &str =
+    "pub fn work() -> u8 {\n    1\n}\n\npub fn entry() -> &'static str {\n    \"src/main.rs\"\n}\n";
+
+#[test]
+fn rust_test_module_naming_a_file_is_a_weak_mention() -> Result<()> {
+    assert_mention_case(
+        &[("src/main.rs", "fn main() {}\n"), ("src/lib.rs", LIB_S0)],
+        &[("src/lib.rs", LIB_TEST_DELTA)],
+        "src/main.rs",
+        Continue,
+        Some("mentioned"),
+    )
+}
+
+#[test]
+fn rust_library_string_naming_a_file_requires_refresh() -> Result<()> {
+    assert_mention_case(
+        &[("src/main.rs", "fn main() {}\n"), ("src/lib.rs", LIB_S0)],
+        &[("src/lib.rs", LIB_CODE_DELTA)],
+        "src/main.rs",
+        Refresh,
+        Some("file_fallback"),
+    )
+}
+
+struct MentionRun {
+    _root: TempDir,
+    source: PathBuf,
+    state: PathBuf,
+    run_id: String,
+}
+
+impl MentionRun {
+    fn dispatch(&self, args: &[&str]) -> Result<std::process::Output> {
+        Ok(cargo_bin_cmd!("dispatch")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .current_dir(&self.source)
+            .args(args)
+            .output()?)
+    }
+}
+
+fn workflow_run(checks: &str) -> Result<MentionRun> {
+    mention_run(
+        &[
+            (".github/workflows/ci.yml", WORKFLOW_S0),
+            ("Cargo.lock", "original lock\n"),
+        ],
+        (".github/workflows/ci.yml", WORKFLOW_DELTA),
+        "Cargo.lock",
+        checks,
+    )
+}
+
+/// A run whose agent writes `delta` over `s0`, after which `changed` changes
+/// underneath it.
+fn mention_run(
+    s0: Files<'_>,
+    (path, delta): (&str, &str),
+    changed: &str,
+    checks: &str,
+) -> Result<MentionRun> {
+    let root = TempDir::new()?;
+    let source = root.path().join("source");
+    let state = root.path().join("state");
+    for (file, contents) in s0 {
+        write_file(&source.join(file), contents)?;
+    }
+    let agent = root.path().join("agent");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fixture 1.0\\n'; exit 0; fi\nmkdir -p \"$(dirname {path})\"\ncat > {path} <<'DELTA'\n{delta}DELTA\nprintf '{{\"type\":\"result\",\"model\":\"fixture\"}}\\n'\n"
+    );
+    fs::write(&agent, script)?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+    write_file(
+        &source.join("dispatch.yml"),
+        &format!(
+            "execution:\n  timeout_secs: 600\n{checks}harnesses:\n  cursor:\n    executable: \"{}\"\n",
+            agent.display()
+        ),
+    )?;
+    let run = cargo_bin_cmd!("dispatch")
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("run")
+        .arg(&source)
+        .args([
+            "--task",
+            "Update the workflow.",
+            "--agent",
+            "cursor",
+            "--allow-unsafe-local",
+            "--json",
+        ])
+        .output()?;
+    ensure!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let run: Value = serde_json::from_slice(&run.stdout)?;
+    let run_id = run["run_id"].as_str().context("run has no ID")?;
+    fs::write(source.join(changed), "changed underneath\n")?;
+    Ok(MentionRun {
+        _root: root,
+        source,
+        state,
+        run_id: run_id.to_owned(),
+    })
+}
+
+#[test]
+fn workflow_mention_without_checks_requires_refresh() -> Result<()> {
+    let fixture = workflow_run("")?;
+    let check = fixture.dispatch(&["check", &fixture.run_id, "--json"])?;
+    ensure!(
+        check.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let check: Value = serde_json::from_slice(&check.stdout)?;
+    assert_eq!(check["validity"]["decision"], "refresh", "{check}");
+    // One reason of its own says why, first; the mention keeps its plain fact.
+    let reasons = &check["validity"]["reasons"];
+    assert_eq!(reasons[0]["code"], "analysis_uncertain", "{check}");
+    assert_eq!(
+        reasons[0]["detail"],
+        "merged checks cannot run — no checks are configured (checks.verify is empty)",
+        "{check}"
+    );
+    assert_eq!(reasons[1]["code"], "mention_changed", "{check}");
+    assert_eq!(reasons[1]["path"], "Cargo.lock", "{check}");
+    assert_eq!(
+        reasons[1]["detail"], "mentioned file Cargo.lock changed since the work started",
+        "{check}"
+    );
+    Ok(())
+}
+
+#[test]
+fn workflow_mention_continues_pending_merged_checks() -> Result<()> {
+    let fixture = workflow_run("checks:\n  verify:\n    - 'test -f Cargo.lock'\n")?;
+    let check = fixture.dispatch(&["check", &fixture.run_id, "--json"])?;
+    ensure!(
+        check.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let check: Value = serde_json::from_slice(&check.stdout)?;
+    let validity = &check["validity"];
+    assert_eq!(validity["decision"], "continue", "{check}");
+    assert!(
+        validity["reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.iter().any(|reason| {
+                reason["code"] == "mention_changed"
+                    && reason["path"] == "Cargo.lock"
+                    && reason["detail"]
+                        == "mentioned file Cargo.lock changed since the work started"
+            })),
+        "{check}"
+    );
+    let check_text = fixture.dispatch(&["check", &fixture.run_id])?;
+    ensure!(check_text.status.success(), "text check failed");
+    let check_text = String::from_utf8_lossy(&check_text.stdout);
+    assert!(
+        check_text.contains("mention_changed") && check_text.contains("merged checks"),
+        "{check_text}"
+    );
+    let accept = fixture.dispatch(&["accept", &fixture.run_id])?;
+    ensure!(
+        accept.status.success(),
+        "accept failed: {}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&accept.stdout);
+    assert!(
+        stdout.contains("Merged checks: passed on the current source with this patch"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.source.join(".github/workflows/ci.yml"))?,
+        WORKFLOW_DELTA
+    );
+    let metadata: Value = serde_json::from_slice(&fs::read(
+        fixture
+            .state
+            .join("runs")
+            .join(&fixture.run_id)
+            .join("metadata.json"),
+    )?)?;
+    assert_eq!(metadata["coherence"]["validity"]["analysis"], "integration");
+    let explain = fixture.dispatch(&["explain", &fixture.run_id])?;
+    ensure!(explain.status.success(), "explain failed");
+    let explain = String::from_utf8_lossy(&explain.stdout);
+    // The merged checks decided: the analysis says so, and the reason stays the fact.
+    assert!(
+        explain.contains("analysis: integration")
+            && explain.contains(
+                "mention_changed: mentioned file Cargo.lock changed since the work started"
+            ),
+        "{explain}"
+    );
+    Ok(())
+}
+
+fn lib_run(delta: &str) -> Result<MentionRun> {
+    mention_run(
+        &[("src/main.rs", "fn main() {}\n"), ("src/lib.rs", LIB_S0)],
+        ("src/lib.rs", delta),
+        "src/main.rs",
+        "checks:\n  verify:\n    - 'test -f src/main.rs'\n",
+    )
+}
+
+fn check_json(fixture: &MentionRun) -> Result<Value> {
+    let check = fixture.dispatch(&["check", &fixture.run_id, "--json"])?;
+    ensure!(
+        check.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    Ok(serde_json::from_slice(&check.stdout)?)
+}
+
+#[test]
+fn rust_test_fixture_path_continues_pending_merged_checks() -> Result<()> {
+    let fixture = lib_run(LIB_TEST_DELTA)?;
+    let check = check_json(&fixture)?;
+    assert_eq!(check["validity"]["decision"], "continue", "{check}");
+    assert_eq!(
+        check["validity"]["reasons"],
+        json!([{
+            "code": "mention_changed",
+            "fact_id": check["validity"]["reasons"][0]["fact_id"],
+            "path": "src/main.rs",
+            "detail": "mentioned file src/main.rs changed since the work started",
+        }]),
+        "{check}"
+    );
+    let accept = fixture.dispatch(&["accept", &fixture.run_id])?;
+    let stdout = String::from_utf8_lossy(&accept.stdout);
+    assert!(
+        accept.status.success()
+            && stdout.contains("Merged checks: passed on the current source with this patch"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_library_path_requires_refresh_with_merged_checks() -> Result<()> {
+    let check = check_json(&lib_run(LIB_CODE_DELTA)?)?;
+    assert_eq!(check["validity"]["decision"], "refresh", "{check}");
+    assert_eq!(
+        check["validity"]["reasons"][0]["code"], "fact_broken",
+        "{check}"
+    );
+    assert_eq!(
+        check["validity"]["reasons"][0]["path"], "src/main.rs",
+        "{check}"
+    );
+    Ok(())
+}
+
+#[test]
+fn schema_file_used_by_code_still_requires_refresh() {
+    let scenario = scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == "08 contract file (json schema)")
+        .expect("scenario 08 exists");
+    for git_source in [true, false] {
+        let row = run_scenario(&scenario, git_source);
+        assert_eq!(
+            row.coherence,
+            Some(Refresh),
+            "{}: {:?}",
+            row.source,
+            row.error
+        );
+    }
 }
 
 #[test]

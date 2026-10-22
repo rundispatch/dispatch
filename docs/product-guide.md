@@ -6,7 +6,25 @@ an essential clarification question.
 
 ## Setup and resources
 
-`dispatch setup` and the session's `/resources` action share the same handlers.
+**In a project, on a terminal, `dispatch setup` is one pass**, and each step can be
+skipped; nothing is granted without a deliberate choice:
+1. **Checks:** the commands Dispatch detected, as a multi-select, plus *Other
+   command…*; *Save selected checks* writes them to `dispatch.yml`. Focus starts on
+   *Continue without checks* (or *Keep current checks*).
+2. **Consent:** *Allow checks for this project?* with the exact commands and what
+   they may do; *Allow* or *Cancel*, focus on *Cancel* (see below).
+3. **Hooks:** for `claude` and `hermes` found on `PATH`, the exact hooks Dispatch
+   adds, or an update of an earlier Dispatch's hooks showing what they become;
+   *Install* (or *Update*) or *Skip*, focus on *Skip*. Hooks edited by hand are left
+   alone.
+4. **Watching** starts, unless it already runs.
+
+It ends with *Done*, or *Agents Dispatch launches…* for the provider accounts below
+and Runtime integrations (removing hooks). Without a terminal it refuses and names
+`dispatch setup --checks --verify '<command>'`.
+
+`dispatch setup` and the session's `/resources` action share the same handlers for
+agents Dispatch launches.
 Every step is a menu: ↑/↓ (or j/k) move, a digit moves to that row, Enter chooses,
 Esc goes back. `dispatch setup codex` or `dispatch setup claude` starts a new
 resource; choosing an existing profile's row revalidates it without retyping
@@ -80,13 +98,15 @@ itself.
 **Saving checks without a terminal.** `dispatch setup --checks --verify 'cargo test'
 --verify 'cargo clippy -- -D warnings'` writes exactly those commands, in that order,
 to `checks.verify`, and keeps the rest of `dispatch.yml`. It never lets Work run them
-by itself; that needs `dispatch setup --checks` in a terminal, or
+by itself; that needs `dispatch setup` (or `dispatch setup --checks`) in a terminal, or
 `--allow-unsafe-local` on a single `finish`. On a terminal, `--verify` pre-fills the
 same menu.
 
-`dispatch setup --checks` can also let Work in the project run its checks by
-themselves: Work that a runtime reports, or that Dispatch finds, then has them run
-when its worktree is removed, and accept runs them on the merged tree.
+`dispatch setup` (or `dispatch setup --checks`) can also let Work in the project run
+its checks by themselves: Work that a runtime reports, or that Dispatch finds, then has
+them run when its worktree is removed or its session ends; a typed `dispatch attach` or
+`dispatch finish` runs them without `--allow-unsafe-local`; and accept runs them on the
+merged tree.
 - Checks run project code, including code an agent wrote, on your machine with
   your permissions, not in a sandbox. They run in the Work's workspace and, on the
   source as it is then with the Work's change, in the project's check workspace at
@@ -97,6 +117,16 @@ when its worktree is removed, and accept runs them on the merged tree.
   approve the new commands; `dispatch status` and `dispatch watch` say which.
 - It runs checks only. Applying still needs your review.
 - Stop it on the same screen.
+- A consent given before 0.4.17 covered less, so it no longer holds; `status` and
+  `watch` say so, and `dispatch setup` asks once more.
+
+**Native runs.** On a terminal, `dispatch run` and `dispatch refresh` ask `[1] This run
+only  [2] Allow for this project  [Enter] Cancel`. *Allow for this project* lets later
+native runs and refreshes in this project launch exactly the same agent command (the
+resolved executable, model, effort, provider, arguments and service mode) and the same
+checks without asking; any change asks again. It is kept in Dispatch's state, and is
+given only on a terminal: a piped `1`, `y` or `yes` allows that one run, a piped `2` is
+refused. `--allow-unsafe-local` still works.
 
 Work shows the actual selected resource, committed phase, elapsed time and launch
 accounting. Recorded launches, uncertain spawn and configured limits are distinct;
@@ -160,7 +190,10 @@ Coherence section when the source moved or the run is a refresh.
   nothing ran; or not run and why (the source has not moved, no checks are
   configured, and so on). `--expect <digest>` accepts only
   the Δ you reviewed: if the frozen Δ's digest does not start with it, nothing
-  happens and both digests are named. Without an ID it acts only when exactly
+  happens and both digests are named. If another process holds the Work (the
+  project owner recording a verdict, another accept running the merged checks),
+  `accept` waits, saying `Waiting for Work <id>: another process is using it.`
+  Without an ID it acts only when exactly
   one result waits for review for the source, and so does `dispatch reject`;
   with several they change nothing and list each one's command.
 - `dispatch close <id> --reason <reason>` retires a result without judging it:
@@ -501,17 +534,19 @@ itself, and `status` says so: when the agent is done, `dispatch finish <id>`, or
 its session. While that exact process runs, the Work shows `agent running (pid
 N)`; a reused pid never counts. When the process is gone, or the lock is
 released, Dispatch records the end of the session, `claude -p` included. The
-Work then reads `idle`, with "session ended — finish, resume or close". It is
-never finished, applied or closed by this. A process Dispatch never saw running
+Work then reads `idle`, with "session ended — finish, resume or close". If you
+allowed the project's checks to run by themselves, the watching owner then finishes
+it: its changes are frozen, the checks run, and it waits for your review. It is
+never applied or closed by this. A process Dispatch never saw running
 proves nothing, and nothing is recorded. The end is recorded even when you
 `finish` the Work first. Other agents' worktrees are not recognized:
 `dispatch attach -- <agent>` gives any agent a workspace of its own.
 
-**Work that appears with hooks.** `dispatch setup` → **Runtime integrations…** installs
-Claude Code's hooks into `~/.claude/settings.json`: `SessionStart`, `SessionEnd`,
-`WorktreeRemove`, and `PreToolUse` for the `ExitWorktree` tool only. Discovery
-needs none of them; they add an S0 taken before the session's first edit, and the
-exact changes kept when Claude Code removes a worktree.
+**Work that appears with hooks.** `dispatch setup` installs Claude Code's hooks into
+`~/.claude/settings.json`: `SessionStart`, `SessionEnd`, `WorktreeRemove`,
+`PreToolUse` for the `ExitWorktree` tool only, `Notification` and `Stop`. Discovery
+needs none of them; they add an S0 taken before the session's first edit, the exact
+changes kept when Claude Code removes a worktree, and "waiting on you".
 - **Consent:** the screen shows exactly what is added, and focus starts on Cancel.
   A backup of the previous settings is kept, and **Remove** takes out exactly what
   was added. These hooks observe; they involve no account, model or funding.
@@ -520,9 +555,15 @@ exact changes kept when Claude Code removes a worktree.
   first edit. When Claude Code removes the worktree, its exact changes are kept
   first. If you allowed the project's checks to run by themselves, Dispatch then
   runs them and the Work waits for your review. Otherwise it waits for you to
-  `finish` or `close` it. When the session ends, `status` and `watch` say so:
-  finish it, resume it, or close it. The watching owner also compares the
+  `finish` or `close` it. When the session ends and its process is gone, Dispatch
+  finishes it the same way if you allowed the checks; otherwise `status` and `watch`
+  say so: finish it, resume it, or close it. `/clear` and `/resume` finish nothing. A
+  session resumed in that worktree goes on from the same S0, and the earlier result
+  closes as superseded by the new Work. The watching owner also compares the
   source with the worktree's start once, and says so if they differed (above).
+- **Waiting on you:** when Claude Code asks for a permission, waits for input, or ends
+  its turn, the Work shows `waiting on you: permission` (or `input`, `turn ended`) in
+  `watch`, under "needs you", and in `status`, until the session moves again.
 - **Sessions in your checkout:** a fresh one is told that Dispatch cannot follow it.
 - **Other agents:** `dispatch attach -- <agent>` from your checkout gives any agent
   CLI a workspace of its own. It begins from the current source, uncommitted

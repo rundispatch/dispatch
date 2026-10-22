@@ -610,6 +610,13 @@ class Project:
         validity = (self.run(name).get("coherence") or {}).get("validity") or {}
         return validity.get("decision"), validity.get("world_changed")
 
+    def checked(self):
+        """Wait until the owner has checked every Work but the applied: then
+        no row changes by itself, so `visit` reads each Work once."""
+        for name in self.ids:
+            self.wait_run(name, "checked", lambda run: run["outcome"]["application"] == "applied"
+                          or (run.get("coherence") or {}).get("validity") is not None)
+
     def age_out(self, name):
         """Finished more than an hour ago: the view's filter drops it, as it
         would an hour from now. The committed projection and its file agree."""
@@ -886,6 +893,7 @@ def names(binary, base):
     project.attach("認証コンテキスト")  # 8 characters, 16 cells
     project.attach("plain", task=None)
     project.start()
+    project.checked()
     for width in (200, 120, 80, 60):
         with project.watch(width) as watch:
             watch.until("drawn", lambda: watch.table() or watch.cards())
@@ -1240,6 +1248,7 @@ def ascii_mode(binary, base):
     project.attach("feature", parent="two")
     board(project)
     project.attach("a-really-long-workspace-name-for-the-alpha-variant")
+    project.checked()
     for width in (120, 60):
         with project.watch(width, flags=("--ascii",)) as watch:
             watch.until("drawn", lambda: listed_order(watch, ["me-endpoint"]) == ["me-endpoint"])
@@ -1525,10 +1534,12 @@ def plain(binary, base):
     assert HEADER.match(watcher["watcher"]), watcher
     for raw, (_, want) in zip(records[1:], expected):
         record = json.loads(raw)
-        keys = sorted(want) + ["interactions"]
+        keys = sorted(want) + ["interactions", "needs_you"]
         assert list(record) == sorted(keys), ("0.4.10 key order (sorted)", list(record))
         assert record["interactions"] in (None, []) or isinstance(record["interactions"], list), record
         record.pop("interactions")
+        # No session here waits on anyone (contract D).
+        assert record.pop("needs_you") is None, record
         assert record == want, (record, want)
     # `--plain` on a terminal is the same report, not the interactive view.
     session = Session([binary, "--state-dir", str(project.state), "--plain", "watch"], project.root,

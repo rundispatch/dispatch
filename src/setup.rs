@@ -361,15 +361,10 @@ fn read_config(path: &Path) -> Result<Option<Vec<u8>>> {
 /// Unknown advanced YAML fields survive project-check updates (via Value below).
 fn atomic_config(path: &Path, expected: Option<&[u8]>, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("configuration parent missing")?;
-    let lock_path = path.with_extension("setup-lock");
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let lock = options.open(lock_path)?;
+    // The lock is the configuration's directory itself, so setup leaves no
+    // file in a project but the configuration it was asked to save, and
+    // writers with different state directories still take turns.
+    let lock = fs::File::open(parent)?;
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
@@ -393,7 +388,7 @@ fn atomic_config(path: &Path, expected: Option<&[u8]>, bytes: &[u8]) -> Result<(
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
     temp.persist(path)?;
-    fs::File::open(parent)?.sync_all()?;
+    lock.sync_all()?;
     drop(lock);
     Ok(())
 }
@@ -498,13 +493,15 @@ mod tests {
         let path = temp.path().join("resources.yml");
         // Held a little longer than at once, as by a process forked while a
         // writer held it, not yet exec'd on a loaded machine.
-        let held = fs::File::create(path.with_extension("setup-lock"))?;
+        let held = fs::File::open(temp.path())?;
         assert_eq!(
             unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
+        let written = path.clone();
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(1));
+            assert!(!written.exists(), "written while the lock was held");
             drop(held);
         });
         atomic_config(&path, None, b"version: 1\n")?;

@@ -212,8 +212,8 @@ watched becomes Work without the hooks, from its merge base with the clone; the
 hooks add an S0 taken at the session's start and the exact changes kept when
 Claude Code removes the worktree.
 
-`dispatch setup` → **Runtime integrations…** installs four Claude Code hooks
-user-wide, in `~/.claude/settings.json`. They point at the binary that ran
+`dispatch setup` installs Claude Code's hooks (four up to 0.4.16, six from 0.4.17,
+which adds `Notification` and `Stop`) user-wide, in `~/.claude/settings.json`. They point at the binary that ran
 setup and at its state. To build Dispatch with Dispatch, you want them in this
 clone only, pointing at the pinned release and the state above. Write the same
 four entries to `~/dispatch-dev/integration/.claude/settings.local.json`, with

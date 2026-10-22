@@ -1,0 +1,12 @@
+[
+  {
+    "id": 1,
+    "tag_name": "v0.4.0-rc.1",
+    "name": "Dispatch v0.4.0-rc.1",
+    "draft": false,
+    "prerelease": true,
+    "assets": [
+      {"id": 11, "name": "dispatch-macos-arm64.tar.gz", "content_type": "application/gzip", "state": "uploaded", "size": 4123456, "download_count": 3}
+    ]
+  }
+]

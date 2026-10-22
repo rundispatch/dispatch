@@ -95,8 +95,27 @@ fn evaluate_run_in(
         &run.source_kind,
     )?;
     let kept = keep.map(|run_dir| run_dir.join(CONFLICT_OUTPUT));
-    let (validity, conflict) =
+    let (mut validity, conflict) =
         assess(&world, &WorkView::of(run, candidate), kept.as_deref(), memo)?;
+    if rests_on_merged_checks(&validity) {
+        let skipped = run
+            .baseline_path
+            .parent()
+            .context("the run has no directory")
+            .and_then(|run_dir| {
+                integration::checks_skipped(
+                    run,
+                    candidate_label,
+                    run_dir,
+                    Some(validity.world_changed),
+                )
+            });
+        match skipped {
+            Ok(None) => {}
+            Ok(Some(why)) => cannot_rest_on_merged_checks(&mut validity, why),
+            Err(error) => cannot_rest_on_merged_checks(&mut validity, format!("{error:#}")),
+        }
+    }
     if let (Some(path), Some(output)) = (&kept, conflict) {
         fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))?;
     }
@@ -385,10 +404,36 @@ pub fn overridable(validity: &Validity) -> bool {
                 reason.code,
                 ReasonCode::FactBroken
                     | ReasonCode::FactMissing
+                    | ReasonCode::MentionChanged
                     | ReasonCode::SameSymbolEdited
                     | ReasonCode::AnalysisUncertain
             ) && !integration::is_integration_reason(reason)
         })
+}
+
+/// Whether `validity` is a CONTINUE that the merged checks decide at accept:
+/// one carrying weak mentions that changed.
+pub fn rests_on_merged_checks(validity: &Validity) -> bool {
+    validity.decision == Decision::Continue
+        && validity
+            .reasons
+            .iter()
+            .any(|reason| reason.code == ReasonCode::MentionChanged)
+}
+
+/// Such a CONTINUE when the merged checks cannot run: REFRESH, saying why first.
+fn cannot_rest_on_merged_checks(validity: &mut Validity, why: impl fmt::Display) {
+    validity.decision = Decision::Refresh;
+    validity.reasons.insert(
+        0,
+        Reason {
+            code: ReasonCode::AnalysisUncertain,
+            fact_id: None,
+            path: None,
+            detail: format!("merged checks cannot run — {why}"),
+        },
+    );
+    validity.reasons.truncate(MAX_REASONS);
 }
 
 /// The configuration frozen with the run, or `None` when the snapshot cannot be
@@ -430,13 +475,18 @@ pub(crate) fn gate(
     }
     let mut validity = evaluate_run(run, candidate_label, Some(run_dir))?;
     if validity.decision == Decision::Continue {
-        let (validity, checks) = block_on(integration::verify_integration(
+        let (mut validity, checks) = block_on(integration::verify_integration(
             run,
             candidate_label,
             validity,
             run_dir,
             source_lock,
         ))??;
+        if let MergedChecks::Skipped(why) = &checks
+            && rests_on_merged_checks(&validity)
+        {
+            cannot_rest_on_merged_checks(&mut validity, why);
+        }
         return Ok(match validity.decision {
             Decision::Continue => AcceptGate::Compatible { validity, checks },
             Decision::Refresh | Decision::Stop => AcceptGate::Blocked {
@@ -520,7 +570,8 @@ fn block_on<T: Send>(future: impl Future<Output = T> + Send) -> Result<T> {
 /// conflict, a patch that already reverses cleanly is present in the source,
 /// and a patch that does not apply cleanly needs a refresh. Only when L0
 /// continues and the world moved does L1 check the symbols and files the patch
-/// assumes; any reason it finds means refresh.
+/// assumes. A broken weak mention stays CONTINUE pending merged checks; strong
+/// failures require REFRESH.
 pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
     evaluate_with(world, work, &facts::Memo::default())
 }
@@ -572,7 +623,11 @@ fn assess(
         let (found, level) = facts::check(work, world, memo)?;
         analysis = level;
         (
-            if found.is_empty() {
+            if found.is_empty()
+                || found
+                    .iter()
+                    .all(|reason| reason.code == ReasonCode::MentionChanged)
+            {
                 Decision::Continue
             } else {
                 Decision::Refresh

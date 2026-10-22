@@ -129,16 +129,42 @@ impl Project {
             .collect()
     }
 
+    /// Whether the watch's inventory lists `worktree`.
+    fn listed(&self, worktree: &Path) -> bool {
+        let Ok(entries) = fs::read_dir(self.state.join("watchers")) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".inventory.json")
+                && fs::read(entry.path())
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|inventory| {
+                        inventory["entries"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|entry| entry["path"].as_str() == worktree.to_str())
+                    })
+        })
+    }
+
     /// The one Work in `worktree`.
     fn run(&self, worktree: &Path) -> Value {
         let [run] = self.runs_in(worktree).try_into().unwrap();
         run
     }
 
+    /// The kinds of the events written in full: the owner may be appending
+    /// one as this reads, and a line is whole once its newline is.
     fn events(&self, id: &str) -> Vec<String> {
-        fs::read_to_string(self.state.join("runs").join(id).join("events.jsonl"))
-            .unwrap()
-            .lines()
+        let text =
+            fs::read_to_string(self.state.join("runs").join(id).join("events.jsonl")).unwrap();
+        text.split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
             .map(|line| serde_json::from_str::<Value>(line).unwrap()["event_type"].to_string())
             .collect()
     }
@@ -382,13 +408,23 @@ fn a_session_outliving_its_removed_worktree_still_ends() {
     assert_eq!(p.run(&worktree)["outcome"]["lifecycle"], "working");
 }
 
-/// Liveness records the session's end, then lets go of the agent: wait for both.
+/// Liveness records the session's end, then lets go of the agent: wait for
+/// both, and say what was recorded instead if they never come.
 fn session_ended(p: &Project) {
-    wait_until("the session's end", || {
-        let run = p.run(&p.worktree());
-        run["attachment"]["sessions"][0]["end_reason"] == "process_gone"
-            && run["attachment"]["agent_process"].is_null()
-    });
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let attachment = p.run(&p.worktree())["attachment"].clone();
+        if attachment["sessions"][0]["end_reason"] == "process_gone"
+            && attachment["agent_process"].is_null()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the session's end: {attachment}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// With no remote-tracking refs Hermes counts no commit as unpushed, so it
@@ -574,18 +610,36 @@ fn a_hermes_worktree_without_its_lock_is_listed_not_tracked() {
         .unwrap()
         .set_modified(made)
         .unwrap();
-    let watchers = p.state.join("watchers");
-    wait_until("the worktree listed", || {
-        fs::read_dir(&watchers).unwrap().flatten().any(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".inventory.json")
-                && fs::read_to_string(entry.path())
-                    .unwrap_or_default()
-                    .contains(&format!("hermes-{ID}"))
-        })
-    });
+    wait_until("the worktree listed", || p.listed(&worktree));
     assert!(p.runs_in(&worktree).is_empty());
     hermes.exit();
+}
+
+/// Hermes makes its worktree, then locks it: two Git commands, which a busy
+/// machine can hold apart for longer than a worktree without a lock is given
+/// before it is listed. Listed meanwhile, it becomes Work once Hermes's lock
+/// is on it.
+#[test]
+fn a_worktree_listed_before_hermes_locked_it_becomes_work() {
+    let p = Project::new();
+    p.watch();
+    let mut hermes = Hermes::new(&p, &p.root);
+    hermes.ok(&format!(
+        "git worktree add --quiet .worktrees/hermes-{ID} -b hermes/hermes-{ID}"
+    ));
+    let worktree = p.worktree();
+    wait_until("the worktree listed", || p.listed(&worktree));
+    hermes.ok(&format!(
+        "git worktree lock --reason \"hermes pid=$$\" .worktrees/hermes-{ID}"
+    ));
+    let id = discovered(&p, &hermes);
+    wait_until("the worktree no longer listed", || !p.listed(&worktree));
+    let run = p.run(&worktree);
+    assert_eq!(
+        run["attachment"]["sessions"][0]["session_id"],
+        format!("hermes-{ID}")
+    );
+    hermes.exit();
+    session_ended(&p);
+    assert_eq!(p.runs_in(&worktree).len(), 1, "{id}");
 }

@@ -495,9 +495,11 @@ fn a_worktree_that_vanishes_unannounced_can_be_finished_from_last_seen_changes()
             .unwrap()
             .contains("    2")
     );
+    // Lines written in full: the owner may be appending one as this reads.
     let events = fs::read_to_string(p.run_dir(&id).join("events.jsonl")).unwrap();
     let events: Vec<Value> = events
-        .lines()
+        .split_inclusive('\n')
+        .filter_map(|line| line.strip_suffix('\n'))
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(
@@ -1048,4 +1050,157 @@ fn an_end_for_an_ended_session_or_finished_work_changes_nothing() {
     assert_eq!(p.claude_exit(WORKTREE_SESSION), "");
     assert_eq!(sessions_and_lifecycle(&p.only_run()), finished);
     assert_eq!(p.session_ends(&id), 1);
+}
+
+impl Project {
+    fn watcher_file(&self, suffix: &str) -> PathBuf {
+        use sha2::Digest;
+        let key = hex::encode(sha2::Sha256::digest(self.root.to_string_lossy().as_bytes()));
+        self.state.join("watchers").join(format!("{key}.{suffix}"))
+    }
+
+    fn record(&self) -> Option<Value> {
+        serde_json::from_slice(&fs::read(self.watcher_file("json")).ok()?).ok()
+    }
+
+    fn owner_pid(&self) -> Option<i32> {
+        Some(self.record()?["identity"]["pid"].as_i64()? as i32)
+    }
+
+    /// A `SessionStart` in the worktree from a hook whose `PATH` is not the
+    /// one `dispatch start` had, as Claude Code's or Hermes's would be.
+    fn session_start_elsewhere(&self) -> Output {
+        let mut child = Command::new(assert_cmd::cargo_bin!("dispatch"))
+            .arg("--state-dir")
+            .arg(&self.state)
+            .args(["hook", "claude"])
+            .env("DISPATCH_REGISTRATION_BUDGET_MS", "600000")
+            .env("PATH", hook_path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = serde_json::json!({
+            "hook_event_name": "SessionStart", "session_id": "s1", "source": "startup",
+            "cwd": self.worktree, "transcript_path": "/dev/null", "model": "claude-sonnet-5",
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn kill_owner(&self) -> i32 {
+        let pid = self.owner_pid().unwrap();
+        // SAFETY: the owner this test started.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        wait_until("the owner to exit", || !alive(pid));
+        pid
+    }
+}
+
+/// The hook's `PATH`: this one, behind a directory of its own.
+fn hook_path() -> String {
+    format!("/nonexistent/hook-bin:{}", std::env::var("PATH").unwrap())
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only probes.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A session starting while the project's owner is dead (killed, or the
+/// machine rebooted) brings it back and is still registered. The hook says
+/// only what it says in any watched project: the line about the owner goes
+/// to the owner's log, since Claude adds `SessionStart` stdout to the model's
+/// context. The owner runs with the environment `dispatch start` had, which
+/// it records itself, not the hook's.
+#[test]
+fn a_session_start_brings_back_a_dead_owner_and_is_registered() {
+    let p = Project::new("");
+    p.watch();
+    let path = std::env::var("PATH").unwrap();
+    assert_eq!(p.record().unwrap()["environment"]["PATH"], path.as_str());
+    let pid = p.kill_owner();
+
+    let output = p.session_start_elsewhere();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(output.stderr.is_empty(), "{}", text(&output));
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        reply,
+        serde_json::json!({"systemMessage": format!(
+            "Dispatch is tracking this worktree as Work {id}; see it with dispatch watch."
+        )})
+    );
+
+    wait_until("the owner to come back", || {
+        p.owner_pid().is_some_and(|new| new != pid && alive(new))
+    });
+    assert_eq!(p.record().unwrap()["environment"]["PATH"], path.as_str());
+    let log = fs::read_to_string(p.watcher_file("log")).unwrap();
+    assert!(
+        log.contains(&format!(
+            "Watching {} again: its owner had stopped.",
+            p.root.display()
+        )),
+        "{log}"
+    );
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(
+        status.contains("Project: watched in the background"),
+        "{status}"
+    );
+}
+
+/// After `dispatch stop` nothing comes back: the project is not watched.
+#[test]
+fn a_stopped_project_stays_unwatched() {
+    let p = Project::new("");
+    p.watch();
+    assert!(p.dispatch(&["stop"]).status.success());
+    assert_eq!(p.start("s1", "startup", &p.worktree), "");
+    assert!(p.runs().is_empty());
+    assert!(p.owner_pid().is_none());
+}
+
+/// A dead owner whose project's configuration no longer reads is not brought
+/// back: the hook spawns nothing, says why in the owner's log, and replies as
+/// in any project nobody watches. The record stays.
+#[test]
+fn a_session_start_spawns_no_owner_for_a_broken_configuration() {
+    let p = Project::new("");
+    p.watch();
+    let pid = p.kill_owner();
+    fs::write(p.root.join("dispatch.yml"), "coherence: [\n").unwrap();
+
+    let output = p.session_start_elsewhere();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    assert!(output.stderr.is_empty(), "{}", text(&output));
+    assert!(p.runs().is_empty());
+    assert_eq!(p.owner_pid(), Some(pid), "the record stays");
+    let log = fs::read_to_string(p.watcher_file("log")).unwrap();
+    let reason = log.lines().last().unwrap();
+    assert!(
+        reason.contains(&format!("Could not watch {} again: ", p.root.display())),
+        "{log}"
+    );
+    assert!(reason.contains("dispatch.yml"), "{log}");
 }

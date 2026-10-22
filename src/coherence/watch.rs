@@ -48,6 +48,8 @@ pub struct WatchSpec {
     /// Overwritten at each evaluation; must live outside `workspace`.
     pub delta_patch: PathBuf,
     pub poll: Duration,
+    /// The verdicts that stop this attempt (`CoherenceConfig::stopping`).
+    pub stopping: Vec<Decision>,
 }
 
 /// A running watcher. It stops when `finish` is awaited or when it is dropped,
@@ -82,7 +84,10 @@ impl Drop for Watcher {
 }
 
 async fn watch(spec: WatchSpec, tx: mpsc::UnboundedSender<WatchMsg>, stop: CancellationToken) {
-    let mut policy = Policy::default();
+    let mut policy = Policy {
+        stopping: spec.stopping.clone(),
+        ..Policy::default()
+    };
     let mut last: Option<Signals> = None;
     // The work's index, kept between checks so Git re-reads only what
     // changed; without one, every check stages the whole workspace.
@@ -208,9 +213,12 @@ pub(crate) fn worth_recording(last: Option<&Validity>, validity: &Validity) -> b
 /// Decides which verdicts become messages to a running agent: those
 /// `worth_recording` against the last message sent. At most one message goes
 /// out per `MIN_MESSAGE_GAP`; a verdict held back by that limit is sent later
-/// unless a newer evaluation supersedes it.
+/// unless a newer evaluation supersedes it. A verdict that stops the attempt
+/// is never held back: it ends the attempt, so it cannot churn the run.
 #[derive(Default)]
 pub(crate) struct Policy {
+    /// The decisions that stop the attempt.
+    stopping: Vec<Decision>,
     sent: Option<Validity>,
     sent_at: Option<Instant>,
     pending: Option<Validity>,
@@ -224,10 +232,11 @@ impl Policy {
             let validity = settle(validity);
             self.pending = self.worth_sending(&validity).then_some(validity);
         }
-        if self.pending.is_some()
-            && self
-                .sent_at
-                .is_none_or(|at| now.saturating_duration_since(at) >= MIN_MESSAGE_GAP)
+        if let Some(pending) = &self.pending
+            && (self.stopping.contains(&pending.decision)
+                || self
+                    .sent_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= MIN_MESSAGE_GAP))
         {
             self.sent_at = Some(now);
             self.sent = self.pending.clone();
@@ -270,6 +279,7 @@ mod tests {
             workspace: workspace.clone(),
             delta_patch: temp.path().join("delta-live.patch"),
             poll: Duration::from_secs(1),
+            stopping: Vec::new(),
         };
         let index = temp.path().join("index");
         fs::write(workspace.join("a.txt"), "two\n").unwrap();
@@ -420,6 +430,7 @@ mod tests {
             workspace: root.join("missing-workspace"),
             delta_patch: root.join("delta-live.patch"),
             poll: Duration::from_millis(20),
+            stopping: Vec::new(),
         }
     }
 
@@ -455,5 +466,24 @@ mod tests {
         assert!(policy.step(at(base, 30), Some(stop.clone())).is_none());
         let sent = policy.step(at(base, 60), None).unwrap();
         assert_eq!(sent.decision, Decision::Stop);
+    }
+
+    /// A source file read while it is being written can give a refresh that
+    /// does not stop the attempt; the stop that follows once the write ends
+    /// is sent at once, not a minute later.
+    #[test]
+    fn a_verdict_that_stops_the_attempt_is_never_held_back() {
+        let base = Instant::now();
+        let mut policy = Policy {
+            stopping: vec![Decision::Stop],
+            ..Policy::default()
+        };
+        assert!(policy.step(at(base, 0), Some(refresh("w1"))).is_some());
+        let stop = verdict(Decision::Stop, "w2", &[ReasonCode::AlreadyApplied]);
+        let sent = policy.step(at(base, 1), Some(stop)).unwrap();
+        assert_eq!(sent.decision, Decision::Stop);
+        // What does not stop it still waits for the gap.
+        assert!(policy.step(at(base, 2), Some(cont("w3"))).is_none());
+        assert!(policy.step(at(base, 61), None).is_some());
     }
 }

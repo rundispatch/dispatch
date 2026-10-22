@@ -3,13 +3,15 @@
 //!
 //! Facts come from the patch alone. `Modified` facts are the S0 declarations a
 //! changed line falls in (context lines never count; a class or trait counts
-//! only for changes outside its members); `Referenced` facts are declarations the added lines use and
-//! that bind by the unique-name rule (exactly one declaration of that base name
-//! in the baseline, and not a name the work itself declares); `File` facts cover files without symbol support and files
-//! the new code mentions by path. Work is proportional to the delta: only the
-//! delta's files and the few files `git grep` finds for its identifiers are
-//! read or parsed, all from the baseline commit through the hardened Git
-//! wrappers.
+//! only for changes outside its members); `Referenced` facts are declarations
+//! the added lines use and that bind by the unique-name rule (exactly one
+//! declaration of that base name in the baseline, and not a name the work
+//! itself declares); `File` facts cover files without symbol support and files
+//! the new code names by path. A name in a comment or docstring makes no fact;
+//! one in test code or in a file without symbol support is a weak `Mentioned`
+//! fact. Work is proportional to the delta: only the delta's files and the few
+//! files `git grep` finds for its identifiers are read or parsed, all from the
+//! baseline commit through the hardened Git wrappers.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -26,8 +28,8 @@ use crate::{
     coherence::{
         WorkView,
         symbols::{
-            FileSymbols, Lang, SymbolDecl, SymbolKind, extract, identifiers_in, lang_for_path,
-            python_call_compatible,
+            FileSymbols, Lang, SymbolDecl, SymbolKind, code_and_tests, extract, identifiers_in,
+            lang_for_path, python_call_compatible,
         },
         world::WorldObservation,
     },
@@ -567,11 +569,15 @@ fn make_fact(
 }
 
 fn file_fact(path: &str, bytes: &[u8]) -> MustHold {
+    file_fact_with_origin(path, bytes, FactOrigin::FileFallback)
+}
+
+fn file_fact_with_origin(path: &str, bytes: &[u8], origin: FactOrigin) -> MustHold {
     make_fact(
         FactKind::File,
         path,
         "",
-        FactOrigin::FileFallback,
+        origin,
         hex::encode(Sha256::digest(bytes)),
         None,
         path.to_owned(),
@@ -619,6 +625,7 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
     let mut file_facts = Vec::new();
     let mut names = BTreeSet::new();
     let mut introduced = BTreeSet::new();
+    let mut posts = HashMap::new();
     for file in delta {
         let lang = lang_for_path(&file.path);
         let s0 = match file.status {
@@ -683,6 +690,9 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
             if after.is_none() && before.as_ref().is_some_and(|b| !b.has_error) {
                 derived.unparsed.push(file.path.clone());
             }
+            if let Some(post) = post {
+                posts.insert(file.path.as_str(), post);
+            }
         }
         if file.status != DeltaStatus::Modified {
             continue;
@@ -737,7 +747,7 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
         .collect();
     let (referenced, unbound) = bind_names(work, &names, &skip, None)?;
     derived.unbound = unbound;
-    file_facts.extend(mentioned_files(work, delta)?);
+    file_facts.extend(mentioned_files(work, delta, &posts)?);
 
     let mut seen = HashSet::new();
     derived.facts = modified
@@ -1031,22 +1041,73 @@ fn path_tokens(line: &str) -> impl Iterator<Item = &str> {
         })
 }
 
+/// Test code by path: a Rust or Python file under a `tests/` directory, or a
+/// Python file named `test_*.py` or `*_test.py`.
+fn is_test_file(path: &str, lang: Lang) -> bool {
+    let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+    dirs.split('/').any(|dir| dir == "tests")
+        || (lang == Lang::Python && (name.starts_with("test_") || name.ends_with("_test.py")))
+}
+
+/// Record `origin` for `key`; a strong origin replaces a weak one.
+fn keep_strongest(origins: &mut BTreeMap<String, FactOrigin>, key: &str, origin: FactOrigin) {
+    let known = origins.entry(key.to_owned()).or_insert(origin);
+    if origin == FactOrigin::FileFallback {
+        *known = origin;
+    }
+}
+
 /// File facts for baseline files the added lines mention by path: an exact
 /// tracked path, or a bare or partial path matching exactly one tracked file.
-fn mentioned_files(work: &WorkView, delta: &[DeltaFile]) -> Result<Vec<MustHold>> {
-    let mut tokens = BTreeSet::new();
+/// In Rust and Python, a name in a comment or docstring is no mention and one
+/// in test code is weak; any mention in a file without symbol support is weak.
+/// `posts` are the post-images the derivation built.
+fn mentioned_files(
+    work: &WorkView,
+    delta: &[DeltaFile],
+    posts: &HashMap<&str, Vec<u8>>,
+) -> Result<Vec<MustHold>> {
+    let mut tokens = BTreeMap::new();
+    let mut add_line = |line: &[u8], origin| {
+        let text = String::from_utf8_lossy(line);
+        for mut token in path_tokens(&text) {
+            while let Some(rest) = token
+                .strip_prefix("./")
+                .or_else(|| token.strip_prefix("../"))
+            {
+                token = rest;
+            }
+            keep_strongest(&mut tokens, token, origin);
+        }
+    };
     for file in delta {
-        for hunk in &file.hunks {
-            for line in hunk.lines.iter().filter(|line| line.tag == b'+') {
-                let text = String::from_utf8_lossy(&line.text);
-                for mut token in path_tokens(&text) {
-                    while let Some(rest) = token
-                        .strip_prefix("./")
-                        .or_else(|| token.strip_prefix("../"))
-                    {
-                        token = rest;
-                    }
-                    tokens.insert(token.to_owned());
+        let lang = lang_for_path(&file.path);
+        // Test code names fixtures, and the merged checks run it.
+        let origin = match lang {
+            Some(lang) if !is_test_file(&file.path, lang) => FactOrigin::FileFallback,
+            _ => FactOrigin::Mentioned,
+        };
+        let split = lang
+            .zip(posts.get(file.path.as_str()))
+            .and_then(|(lang, post)| code_and_tests(lang, post).ok());
+        let Some((code, tests)) = split else {
+            // A file without a post-image we can parse must not silently drop a code fact.
+            for hunk in &file.hunks {
+                for line in hunk.lines.iter().filter(|line| line.tag == b'+') {
+                    add_line(&line.text, origin);
+                }
+            }
+            continue;
+        };
+        for (image, origin) in [(code, origin), (tests, FactOrigin::Mentioned)] {
+            for (index, line) in image.split(|byte| *byte == b'\n').enumerate() {
+                let number = index as u32 + 1;
+                if file
+                    .new_ranges
+                    .iter()
+                    .any(|&(start, end)| start <= number && number <= end)
+                {
+                    add_line(line, origin);
                 }
             }
         }
@@ -1062,8 +1123,8 @@ fn mentioned_files(work: &WorkView, delta: &[DeltaFile]) -> Result<Vec<MustHold>
     }
     let known: HashSet<&str> = paths.iter().map(String::as_str).collect();
     let delta_paths: HashSet<&str> = delta.iter().map(|file| file.path.as_str()).collect();
-    let mut matched = BTreeSet::new();
-    for token in &tokens {
+    let mut matched = BTreeMap::new();
+    for (token, origin) in &tokens {
         let name = token.rsplit('/').next().unwrap_or(token);
         let candidates = by_name.get(name).map(Vec::as_slice).unwrap_or_default();
         let hit = if known.contains(token.as_str()) {
@@ -1080,14 +1141,17 @@ fn mentioned_files(work: &WorkView, delta: &[DeltaFile]) -> Result<Vec<MustHold>
             (ends.len() == 1).then(|| ends[0])
         };
         if let Some(path) = hit.filter(|path| !delta_paths.contains(path)) {
-            matched.insert(path.to_owned());
+            keep_strongest(&mut matched, path, *origin);
         }
     }
-    let matched: Vec<String> = matched.into_iter().collect();
+    let mut matched: Vec<(String, FactOrigin)> = matched.into_iter().collect();
+    // A large set of weak mentions must not evict a code dependency at the cap.
+    matched.sort_by_key(|(_, origin)| *origin == FactOrigin::Mentioned);
+    let paths: Vec<String> = matched.iter().map(|(path, _)| path.clone()).collect();
     Ok(matched
         .iter()
-        .zip(read_s0_many(work, &matched)?)
-        .filter_map(|(path, blob)| Some(file_fact(path, &blob?)))
+        .zip(read_s0_many(work, &paths)?)
+        .filter_map(|((path, origin), blob)| Some(file_fact_with_origin(path, &blob?, *origin)))
         .collect())
 }
 
@@ -1116,6 +1180,7 @@ pub fn evaluate_facts(
         FactOrigin::Modified => 0,
         FactOrigin::Referenced => 1,
         FactOrigin::FileFallback => 2,
+        FactOrigin::Mentioned => 3,
     });
     let mut reasons = Vec::new();
     let mut parsed: HashMap<&str, Option<FileSymbols>> = HashMap::new();
@@ -1131,15 +1196,21 @@ pub fn evaluate_facts(
             detail,
         };
         if fact.kind == FactKind::File {
+            let (missing, broken, prefix) = if fact.origin == FactOrigin::Mentioned {
+                let code = ReasonCode::MentionChanged;
+                (code, code, "mentioned file ")
+            } else {
+                (ReasonCode::FactMissing, ReasonCode::FactBroken, "")
+            };
             match &bytes {
                 None => reasons.push(reason(
-                    ReasonCode::FactMissing,
-                    format!("{} no longer exists", fact.path),
+                    missing,
+                    format!("{prefix}{} no longer exists", fact.path),
                 )),
                 Some(bytes) if hex::encode(Sha256::digest(bytes)) != fact.sig_fp => {
                     reasons.push(reason(
-                        ReasonCode::FactBroken,
-                        format!("{} changed since the work started", fact.path),
+                        broken,
+                        format!("{prefix}{} changed since the work started", fact.path),
                     ));
                 }
                 Some(_) => {}
@@ -1754,9 +1825,9 @@ diff --git a/y.rs b/y.rs\nindex 1..2 100644\n--- a/y.rs\n+++ b/y.rs\n\
             .filter(|fact| fact.kind == FactKind::File)
             .map(|fact| fact.path.as_str())
             .collect();
-        // Exact path (after dropping ../), unique basename; the ambiguous
-        // schema.json and the unknown missing.json are not files we can bind.
-        assert_eq!(files, ["docs/limits.md", "schema/user.json"]);
+        // The comment is ignored. The exact path in include_str! survives;
+        // the ambiguous schema.json and unknown missing.json do not bind.
+        assert_eq!(files, ["schema/user.json"]);
         for fact in derived.facts.iter().filter(|f| f.kind == FactKind::File) {
             assert_eq!(fact.origin, FactOrigin::FileFallback);
         }
@@ -1764,6 +1835,179 @@ diff --git a/y.rs b/y.rs\nindex 1..2 100644\n--- a/y.rs\n+++ b/y.rs\n\
         let own = "pub fn load() -> u8 {\n    // src/loader.rs\n    1\n}\n";
         let derived = repo.derive(&[("src/loader.rs", Some(own))]);
         assert!(derived.facts.iter().all(|f| f.kind != FactKind::File));
+    }
+
+    #[test]
+    fn rust_comments_and_doc_comments_do_not_mention_files() {
+        let repo = Repo::new(&[
+            ("docs/plan.md", "before\n"),
+            ("src/main.rs", "pub fn run() {}\n"),
+        ]);
+        for delta in [
+            "// see docs/plan.md\npub fn run() {}\n",
+            "/// see docs/plan.md\npub fn run() {}\n",
+        ] {
+            let derived = repo.derive(&[("src/main.rs", Some(delta))]);
+            assert!(
+                derived.facts.iter().all(|fact| fact.kind != FactKind::File),
+                "{delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_rust_comment_drops_only_its_token() {
+        let repo = Repo::new(&[
+            ("schema/user.json", "{}\n"),
+            ("docs/plan.md", "before\n"),
+            ("src/main.rs", "pub fn run() {}\n"),
+        ]);
+        let delta =
+            "pub fn run() { let _ = include_str!(\"schema/user.json\"); // docs/plan.md\n}\n";
+        let derived = repo.derive(&[("src/main.rs", Some(delta))]);
+        let files: Vec<_> = derived
+            .facts
+            .iter()
+            .filter(|fact| fact.kind == FactKind::File)
+            .map(|fact| fact.path.as_str())
+            .collect();
+        assert_eq!(files, ["schema/user.json"]);
+    }
+
+    #[test]
+    fn python_docstrings_are_not_mentions_but_code_strings_are() {
+        let repo = Repo::new(&[
+            ("docs/module.md", "before\n"),
+            ("docs/class.md", "before\n"),
+            ("docs/function.md", "before\n"),
+            ("data.json", "{}\n"),
+            (
+                "loader.py",
+                "class Loader:\n    def read(self):\n        return 1\n",
+            ),
+        ]);
+        let delta = "\"\"\"docs/module.md\"\"\"\nclass Loader:\n    \"\"\"docs/class.md\"\"\"\n    def read(self):\n        \"\"\"docs/function.md\"\"\"\n        return open(\"data.json\")\n";
+        let derived = repo.derive(&[("loader.py", Some(delta))]);
+        let files: Vec<_> = derived
+            .facts
+            .iter()
+            .filter(|fact| fact.kind == FactKind::File)
+            .map(|fact| fact.path.as_str())
+            .collect();
+        assert_eq!(files, ["data.json"]);
+    }
+
+    #[test]
+    fn paths_in_test_code_are_weak_mentions() {
+        let repo = Repo::new(&[
+            ("src/main.rs", "fn main() {}\n"),
+            ("data.json", "{}\n"),
+            ("src/lib.rs", "pub fn run() {}\n"),
+        ]);
+        let rust = "const FIXTURE: &str = \"src/main.rs\";\nconst DATA: &str = include_str!(\"../data.json\");\n";
+        let python = "FIXTURE = \"src/main.rs\"\nDATA = open(\"data.json\")\n";
+        let module = format!(
+            "pub fn run() {{}}\n\n#[cfg(test)]\n#[allow(unused)]\nmod tests {{\n{rust}}}\n"
+        );
+        for (path, delta) in [
+            ("src/lib.rs", module.as_str()),
+            ("tests/cli.rs", rust),
+            ("test_cli.py", python),
+            ("pkg/cli_test.py", python),
+            ("tests/helpers.py", python),
+        ] {
+            let derived = repo.derive(&[(path, Some(delta))]);
+            for mentioned in ["src/main.rs", "data.json"] {
+                let fact = find(&derived.facts, mentioned, "");
+                assert_eq!(
+                    fact.map(|fact| fact.origin),
+                    Some(FactOrigin::Mentioned),
+                    "{path}: {mentioned}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paths_in_library_code_stay_strong_beside_test_code() {
+        let repo = Repo::new(&[
+            ("src/main.rs", "fn main() {}\n"),
+            ("data.json", "{}\n"),
+            ("src/lib.rs", "pub fn run() {}\n"),
+            ("loader.py", "def run():\n    pass\n"),
+        ]);
+        let rust = "pub fn run() -> &'static str {\n    \"src/main.rs\"\n}\n\n#[cfg(test)]\nmod tests {\n    const DATA: &str = \"data.json\";\n    const MAIN: &str = \"src/main.rs\";\n}\n";
+        let derived = repo.derive(&[("src/lib.rs", Some(rust))]);
+        let origin = |path| find(&derived.facts, path, "").map(|fact| fact.origin);
+        assert_eq!(origin("src/main.rs"), Some(FactOrigin::FileFallback));
+        assert_eq!(origin("data.json"), Some(FactOrigin::Mentioned));
+        let python = "def run():\n    return open(\"data.json\")\n";
+        let derived = repo.derive(&[("loader.py", Some(python))]);
+        assert_eq!(
+            find(&derived.facts, "data.json", "").map(|fact| fact.origin),
+            Some(FactOrigin::FileFallback)
+        );
+    }
+
+    #[test]
+    fn test_files_are_known_by_path() {
+        for (path, lang) in [
+            ("tests/cli.rs", Lang::Rust),
+            ("crates/core/tests/cli.rs", Lang::Rust),
+            ("test_cli.py", Lang::Python),
+            ("pkg/cli_test.py", Lang::Python),
+            ("tests/conftest.py", Lang::Python),
+        ] {
+            assert!(is_test_file(path, lang), "{path}");
+        }
+        for (path, lang) in [
+            ("src/tests.rs", Lang::Rust),
+            ("src/test_cli.rs", Lang::Rust),
+            ("pkg/contest.py", Lang::Python),
+            ("pkg/latest.py", Lang::Python),
+            ("tests.py", Lang::Python),
+        ] {
+            assert!(!is_test_file(path, lang), "{path}");
+        }
+    }
+
+    #[test]
+    fn yaml_mentions_make_weak_facts() {
+        let repo = Repo::new(&[
+            ("Cargo.lock", "before\n"),
+            (".github/workflows/ci.yml", "name: CI\n"),
+        ]);
+        let delta = "name: CI\nkey: ${{ hashFiles('Cargo.lock') }}\n";
+        let derived = repo.derive(&[(".github/workflows/ci.yml", Some(delta))]);
+        let fact = find(&derived.facts, "Cargo.lock", "").unwrap();
+        assert_eq!(fact.kind, FactKind::File);
+        assert_eq!(serde_json::to_value(fact.origin).unwrap(), "mentioned");
+    }
+
+    #[test]
+    fn weak_mentions_cannot_evict_a_code_dependency_at_the_fact_cap() {
+        let mut files = vec![
+            ("workflow.yml".to_owned(), "name: CI\n".to_owned()),
+            ("src/main.rs".to_owned(), "pub fn load() {}\n".to_owned()),
+            ("zz.json".to_owned(), "{}\n".to_owned()),
+        ];
+        let weak: Vec<String> = (0..MAX_FACTS + 5)
+            .map(|index| format!("a{index:03}.md"))
+            .collect();
+        files.extend(weak.iter().map(|path| (path.clone(), "text\n".to_owned())));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let repo = Repo::new(&refs);
+        let yaml = format!("name: CI\nmentions: {}\n", weak.join(" "));
+        let rust = "pub fn load() { let _ = include_str!(\"zz.json\"); }\n";
+        let derived = repo.derive(&[("workflow.yml", Some(&yaml)), ("src/main.rs", Some(rust))]);
+        assert_eq!(derived.facts.len(), MAX_FACTS);
+        assert_eq!(
+            find(&derived.facts, "zz.json", "").unwrap().origin,
+            FactOrigin::FileFallback
+        );
     }
 
     #[test]

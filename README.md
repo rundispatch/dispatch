@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.16 — experimental developer preview**
+**Dispatch 0.4.17 — experimental developer preview**
 
 <p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch; once one lands, the other no longer fits, and dispatch accept refuses it as REFRESH, leaving the source unchanged."></a></p>
 <p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
@@ -39,6 +39,31 @@ and a stale result is never applied.
 
 Everything Dispatch does is local. Provider execution requires the provider’s
 service; Dispatch itself needs no account, no network service and no upload.
+
+## Quick start
+
+```sh
+curl -fsSL https://rundispatch.sh/install | sh
+cd your-project
+dispatch setup       # on a terminal: checks, consent, hooks, watching
+claude --worktree    # work: your agent in its own worktree, or dispatch attach -- <agent>
+dispatch accept      # once the result is ready for review
+```
+
+- **Install** puts `dispatch` in `~/.local/bin` for macOS (Apple silicon or Intel) or Linux
+  (x86_64 or aarch64), after checking it against the release's `SHA256SUMS`. Until the
+  website redirects `rundispatch.sh/install`, use
+  `https://github.com/rundispatch/dispatch/releases/latest/download/install.sh`. See
+  [Install](#install).
+- **`dispatch setup`** is one pass, and each step can be skipped: pick the checks it
+  detected (or type your own), allow them to run by themselves for this project, install
+  Claude Code's and Hermes's hooks if they are on `PATH`, and start watching.
+- **Work.** A Claude Code or Hermes session in its own worktree becomes Work by itself. When
+  the session ends and its process is gone, Dispatch freezes the change and runs the checks
+  you allowed; it never applies anything. Any other agent works through `dispatch attach --
+  <agent>`, which finishes when the agent exits.
+- **`dispatch accept`** checks the result against the source as it is now and applies it.
+  `dispatch watch` shows what is ready, and what waits on you.
 
 ## Two ways to use Dispatch
 
@@ -79,11 +104,20 @@ $ dispatch start
   No checks are configured, so Work here is not verified. Add them: dispatch setup --checks, or dispatch setup --checks --verify '<command>'
 ```
 
-The first `dispatch start` on a terminal, in a project without checks, first
-shows the checks it detected, with "Continue without checks" focused, so Enter
-alone writes nothing. Without a terminal it starts watching at once, as above.
+`dispatch setup` starts watching at the end of its pass, so `start` is needed only
+on its own. The first `dispatch start` on a terminal, in a project without checks,
+first shows the checks it detected, with "Continue without checks" focused, so
+Enter alone writes nothing. Without a terminal it starts watching at once, as above.
 `dispatch setup --checks --verify '<command>'` saves exact commands without a
 terminal. Letting Work run them by itself is never granted without a terminal.
+
+A project watched with `dispatch start` is watched again by the next Dispatch command
+or hook there, after a reboot, a crash or an upgrade in place, until `dispatch stop`.
+After a reboot or a crash, that command says `Watching <root> again: its owner had
+stopped.`; a Claude Code or Hermes session starting there does the same. After an
+upgrade in place it says `Restarted watching <root> with Dispatch <new> (was
+<old>).`. The owner stops by itself when the project or Dispatch's state directory is
+deleted.
 
 **Work that appears without hooks.** In a watched project, a Claude Code
 worktree that appears after watching began (`claude --worktree` or `claude -p
@@ -96,7 +130,8 @@ worktree that appears after watching began (`claude --worktree` or `claude -p
   worktree that appeared while you watched is its session's.
 - While the session's process runs, the Work shows `agent running`. When it is
   gone, or its lock is released, the Work says the session ended, `claude -p`
-  included. Dispatch records only what it observed, and finishes nothing.
+  included. With the project's check consent, the owner then finishes it, as
+  below; otherwise it records only what it observed.
 - Claude worktrees that were already there when watching began, or that have no
   session lock, are listed as "found, not tracked", with `dispatch attach
   --workspace <path>`.
@@ -122,8 +157,8 @@ worktree that appears after watching began (`claude --worktree` or `claude -p
   the kept changes were last seen; anything after that is not included. You can
   still finish them (`dispatch finish <id>`), review them and accept them, or
   close the Work; only you can finish them, never your check consent.
-- With Hermes's hook installed (`dispatch setup` → Runtime integrations →
-  Install the Hermes hook), Dispatch keeps the exact changes before Hermes
+- With Hermes's hook installed (`dispatch setup` offers it when `hermes` is on
+  `PATH`), Dispatch keeps the exact changes before Hermes
   removes the worktree, at the end of a CLI `hermes chat` session. `/new` and
   the TUI fall back to the changes last seen. Setup appends one block to
   `~/.hermes/config.yaml`, keeps every other byte, and removes exactly that
@@ -132,7 +167,7 @@ worktree that appears after watching began (`claude --worktree` or `claude -p
   gives any agent its own workspace.
 
 **Work that appears with hooks.** With Claude Code's hooks installed (`dispatch
-setup` → Runtime integrations, shown and approved first), a Claude Code session
+setup` offers them when `claude` is on `PATH`, shown and approved first), a Claude Code session
 in its own worktree of a watched project (`claude --worktree`) becomes Work by
 itself the moment it starts. Whichever sees a worktree first, hook or discovery,
 creates its Work, and the other joins it.
@@ -146,11 +181,19 @@ creates its Work, and the other joins it.
   `watch` say so, and recommend `dispatch attach -- <agent>`, which begins from
   the current source, uncommitted changes included. It is advisory, and
   `claude --worktree` still starts from what Claude Code chooses.
-- If you have let this project's checks run by themselves (`dispatch setup
-  --checks`), Dispatch runs them on the kept changes instead, and the Work waits
-  for your review. That permission names the exact commands: when
-  `checks.verify` changes, it no longer holds until you approve the new ones. It
-  never lets anything apply.
+- If you have let this project's checks run by themselves (`dispatch setup`),
+  Dispatch runs them on the kept changes instead, and the Work waits for your
+  review. That permission names the exact commands: when `checks.verify` changes,
+  it no longer holds until you approve the new ones. It never lets anything apply.
+- **When the session ends.** With that permission, once a Claude Code or Hermes
+  session has ended and its process is gone, the owner finishes its Work the same
+  way: Δ frozen, checks run, the result waits for your review. `/clear` and
+  `/resume` keep the process running and finish nothing. A session resumed in that
+  worktree goes on from the same S0, so its Work holds both sessions' changes, and
+  the earlier result closes as superseded by it.
+- **Waiting on you.** Claude Code's `Notification` and `Stop` hooks mark the Work
+  `waiting on you: permission`, `input` or `turn ended`. `dispatch watch` lists it
+  under "needs you", and `status` says the same, until the session moves again.
 - A session running directly in your checkout is told that Dispatch cannot
   tell its edits from yours, and nothing is tracked.
 - No session in its own worktree is lost silently, even on a busy machine. It
@@ -194,8 +237,7 @@ Watching covers Work Dispatch launched, that you attached, sessions whose
 runtime reports them, and Claude Code, Codex and Cursor Agent worktrees it
 finds. Working Work shows the files it has changed so far and how long it has
 been tracked; until the owner has counted, files read `unknown`, never 0. It
-does not scan for agent processes. After a reboot, run
-`dispatch start` again. `dispatch serve` does the same watching in the
+does not scan for agent processes. `dispatch serve` does the same watching in the
 foreground, and `check` and `status` answer on demand.
 
 ## Work coherence: keeping results valid while the code moves
@@ -239,7 +281,7 @@ it is now. Nothing about it is trusted from an earlier moment.
   or a plain directory), the Δ digest, the checked tree and each command's result and
   duration. It exits 1 if a check fails. It needs the same authority as `finish`: the
   Work's own `--allow-unsafe-local`, standing consent for exactly these checks
-  (`dispatch setup --checks`), or `--allow-unsafe-local` for this check alone, which
+  (`dispatch setup`), or `--allow-unsafe-local` for this check alone, which
   is not recorded on the Work. For finished Work whose source has not moved since the
   Work began it runs nothing, as accept does. Accept checks again only a tree that has
   no recorded pass, because the source can move after.
@@ -273,8 +315,8 @@ it is now. Nothing about it is trusted from an earlier moment.
   patch that no longer applies, or a failing check, and auto-apply never uses it.
 - `dispatch refresh [run]` starts a **new** run of the same task against the current
   source. The task gets a fixed note naming the earlier run and up to ten reasons it
-  went stale. The old run is not modified. It needs the same explicit flags as `run`
-  (for example `--allow-unsafe-local`) and repeats the original launch choices,
+  went stale. The old run is not modified. It needs the same authority as `run`
+  (`--allow-unsafe-local`, or the project's native consent) and repeats the original launch choices,
   such as a fixed agent, model or effort. Dispatch never relaunches automatically.
 
 Worked example. A run adds a call to `auth::validate(&token)` in `src/handler.rs`.
@@ -317,7 +359,12 @@ coherence:
 ### What it checks and what it does not
 
 - Symbol facts exist for **Rust and Python** only. Other languages use file-level
-  facts: any change to a file the patch edits, or mentions by path, is a `REFRESH`.
+  facts: any change to a file the patch edits, or that its code uses by path, is a
+  `REFRESH`. A path named only in a Rust or Python comment or docstring is no
+  dependency at all. A path named in test code, or in a file without symbol
+  support (YAML, Markdown, TOML, shell), is weak: when that file changes, the
+  verdict stays `CONTINUE` and the merged checks decide at accept, or it is
+  `REFRESH` when no checks can run.
 - A referenced symbol is bound by *unique name* in the baseline, not by full name
   resolution. Ambiguous or very common names are skipped, so some breakage is missed.
 - A Python function that only gains optional parameters (defaults, `*args`,
@@ -353,10 +400,10 @@ full eligibility and authorization rules.
 
 ### Attach your own agent
 
-`dispatch attach` puts work from an agent Dispatch did not launch — Claude Code, Codex, Cursor, a script — under the same coherence checking, in its own worktree:
+`dispatch attach` puts work from an agent Dispatch did not launch — Claude Code, Codex, Cursor, a script — under the same coherence checking, in its own worktree. After `dispatch setup` saves this project's checks and you allow those exact checks, the first example can auto-apply an eligible result:
 
 ```sh
-dispatch attach --auto-apply -- claude -p "add input validation"   # from your checkout: Dispatch makes the workspace
+dispatch attach --auto-apply -- claude -p "add input validation"   # from your checkout, with standing consent for its checks
 dispatch attach --workspace ../scratch --agent codex --auto-apply  # or observe one already running
 dispatch finish <run-id>                                           # you say when it's done
 dispatch start                                                     # keeps a foreign attachment observed and applies it
@@ -375,7 +422,7 @@ From a source directory, open Dispatch. Missing resources lead to guided setup
 and preserve your goal. You can also configure resources first:
 
 ```bash
-dispatch setup                 # provider login guidance and explicit funding consent
+dispatch setup                 # checks, consent, hooks and watching; then "Agents Dispatch launches…" for provider login and funding consent
 dispatch setup --checks        # approve a known project check
 dispatch setup --checks --verify 'cargo test'   # or save an exact one, no terminal needed; grants nothing
 dispatch                      # direct goal → work → verification → review
@@ -419,7 +466,7 @@ cd my-project
 dispatch run "Fix the retry race"
 ```
 
-Local agents run with your operating-system permissions. Dispatch asks for confirmation before execution; scripts can use `--allow-unsafe-local` after accepting that risk.
+Local agents run with your operating-system permissions. On a terminal Dispatch asks first: `[1] This run only  [2] Allow for this project  [Enter] Cancel`. Allowing the project covers later runs and refreshes with exactly the same agent command and checks; any change asks again. A piped `y` allows one run; scripts can also use `--allow-unsafe-local` after accepting that risk.
 
 Review and apply the result. Without an ID, `diff` shows the latest result and
 names it, and `accept` acts only when exactly one result waits for review for this
@@ -463,14 +510,26 @@ There is no ranking, benchmark data or automatic fallback to another agent.
 
 ## Install
 
-Download the archive for your platform and `SHA256SUMS` from the
-[latest GitHub release](https://github.com/rundispatch/dispatch/releases), verify
-the checksum, and run the executable by its explicit path; see
-[install / upgrade / uninstall](docs/release-install.md).
+```sh
+curl -fsSL https://rundispatch.sh/install | sh
+```
 
-Interactive testing for this release was on macOS arm64. Linux x86_64 is built and
-smoke-tested by CI but not exercised interactively. The macOS package is unsigned and
-not notarized.
+Until the website redirects that address, use the release asset itself:
+`curl -fsSL https://github.com/rundispatch/dispatch/releases/latest/download/install.sh | sh`.
+It downloads this machine's archive (`dispatch-macos-arm64.tar.gz`,
+`dispatch-macos-x86_64.tar.gz`, `dispatch-linux-x86_64.tar.gz` or
+`dispatch-linux-aarch64.tar.gz`), verifies it against the release's `SHA256SUMS`, and
+puts `dispatch` in `~/.local/bin` (`DISPATCH_INSTALL_DIR` for another directory,
+`DISPATCH_VERSION=0.4.17` for a particular release). Run it again to upgrade; the
+owner of a watched project restarts with the next command. If the directory is not on
+your `PATH`, it prints the line to add; it never edits your shell's files. Manual
+download and verification, upgrades and uninstalling are in
+[install / upgrade / uninstall](docs/release-install.md). Dispatch sends nothing:
+installs are counted by GitHub's own download counts of the release assets.
+
+Each archive is built and smoke-tested by CI on its own architecture; interactive
+testing for this release was on macOS arm64. The packages are unsigned and not
+notarized.
 Source builds use `cargo build --release --locked`; Git and the project’s actual
 check tools must be installed. No provider tool or font is installed by Dispatch.
 
@@ -669,7 +728,7 @@ No network service is required to create, execute, inspect, accept, or reject a 
 - Experimental developer preview, not a stable 1.0 service.
 - Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent and Hermes Agent remain available as an explicit `--agent cursor` or `--agent hermes` choice without a funding contract. Hermes passed attach and native runs in the 0.4.14 conformance trials; its own worktree mode, which 0.4.14 did not recognize, passed with 0.4.15 on 2026-10-16, in one trial without the hook (the last-seen path). Agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current and applies only attached work you allowed to integrate; it never launches, refreshes, finishes on a session's end or signals agents. It recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's worktrees by itself, sees only Claude Code's and Hermes's sessions end, and scans no processes.
+- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current, finishes Work whose session ended when you allowed the project's checks, and applies only attached work you allowed to integrate; it never launches, refreshes or signals agents. It recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's worktrees by itself, sees only Claude Code's and Hermes's sessions end, and scans no processes.
 
 ## Development
 
