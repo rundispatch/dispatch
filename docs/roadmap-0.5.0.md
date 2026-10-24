@@ -66,3 +66,27 @@ their denominators. The baselines are 0.4.15's:
 - **A hook with nothing to do:** 202 ms (median).
 
 A reused result is counted as reused, never as time saved.
+
+## After 0.5.0: candidates for 0.5.x
+
+Each needs its gate met before it is planned into a release.
+
+- **Warm, copy-on-write build output in the workspaces Dispatch makes.**
+  - **The problem:** every agent workspace starts with empty build directories (`target/`,
+    `node_modules`, `build/`, `.venv`). So each pays a cold build and holds its own copy on
+    disk. Rust shows it worst, but it is not Rust-specific. On 0.4.17's own build, four
+    leftover workspaces held 14 GB, the warm check workspace 6 GB, and every packet started
+    with a cold build.
+  - **What it would be:** seed a new workspace's ignored build directories from the checkout
+    by cloning (`clonefile(2)` on APFS, reflinks on Linux), as native runs already do. Copies
+    then share blocks until they diverge. This is filesystem-level and language-neutral: no
+    index, no analysis.
+  - **Caveats:**
+    - Toolchains that fingerprint absolute paths (Cargo) may rebuild the project's own code
+      and keep only dependencies warm.
+    - Without clone support it falls back to a real copy, which saves no disk.
+    - Worktrees a runtime made (Claude Code, Hermes) are the runtime's own; seeding them is a
+      separate decision.
+  - **Gate:** a measurement during 0.4.18's build, at no feature cost. Cold versus seeded
+    first-build time, and disk per workspace, on Dispatch's repository and on one Node
+    project, with load averages. Reported as measured, never as time saved.
