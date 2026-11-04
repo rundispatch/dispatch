@@ -104,9 +104,15 @@ has failed in real use. The `ubuntu-22.04` runner remains a decision for the use
     tools, timeout 5 s);
   - the new set goes into `INSTALLED`, and `EARLIER` becomes a list of every earlier set, so
     installs from 0.4.16 and 0.4.17 are recognized and updated.
-- **Hermes:** a `pre_llm_call` shell hook returning `{"context"}`. The exact-match block in
-  `runtime/hermes.rs` extends to two hooks. Removal still recognizes 0.4.15's one-hook block, and
-  setup says the allowlist will ask once.
+- **Hermes:** a `pre_llm_call` shell hook returning `{"context"}`.
+  - The worktree comes from `TERMINAL_CWD`, as `on_session_finalize` already finds it. The
+    hook's own `cwd` is the repository root (P0).
+  - The payload carries the whole conversation and grows past `MAX_INPUT_BYTES` in a long
+    session. The delivery path never rejects a large payload, and is tested with 1 MB.
+  - The exact-match block in `runtime/hermes.rs` extends to two hooks. Removal still recognizes
+    0.4.15's one-hook block.
+  - Setup says that Hermes asks once per hook at its next start, on a terminal, and that its
+    hooks don't run until then (P0: approval is per event and command).
 - **Events:**
   - `note.written` is recorded by the owner when it writes an inbox.
   - `note.delivered` is recorded by the owner when it sees the delivered file, so the hook never
@@ -193,10 +199,18 @@ has failed in real use. The `ubuntu-22.04` runner remains a decision for the use
 
 ### P5 Native start, part 3 (Hermes; reviewed)
 
-- **The approach comes from P0.4.** The expected one: the copied fingerprint reuses the source
-  fingerprint's per-file identity (size, mtime, inode) for files cloned by path, instead of opening
-  them again. Fidelity stays proven by `snapshot_is_exact_private_and_excludes_state`.
-- **Target:** 10 s median at ordinary load on the 0.4.17 fixture.
+- **The approach (P0):** `copy_tree_contents` clones a directory whole with `clonefile(2)` on
+  macOS when nothing under it would be filtered.
+  - That is proven by a stat-only walk: no nested `.git`, no Dispatch state, nothing
+    `include_entry` skips.
+  - Otherwise, and on any error, it falls back to today's per-file clone for that directory.
+- **Why:** P0 timed one `clonefile` of the fixture's 3.6 GB `target/` at 0.11–0.19 s, against
+  2.6 s per file. A run clones it twice.
+- **Fidelity:** the fingerprints and `snapshot_is_exact_private_and_excludes_state` stay as they
+  are.
+- **Linux** is unchanged.
+- **Target:** at most 10 s median at ordinary load on the 0.4.17 fixture (today 10.3 s); about
+  5 s expected.
 
 ### M Warm-workspace measurement (integrator; no product code)
 
@@ -311,4 +325,31 @@ source record.
 
 ## Execution log
 
-To be written as the build runs.
+### P0 (2026-11-04; evidence in `~/dispatch-dev/p0-0418/`)
+
+- **The roadmap commit** (`5b52553`, the 0.5.x candidate that missed PR #28) is this branch's
+  first commit, `96d8f2d`.
+- **Claude Code delivery** (`claude-probe/FINDINGS.md`):
+  - SessionStart and PostToolUse `additionalContext` both reached the model: before the first
+    prompt, and right after the tool result, mid-turn. It quoted both markers.
+  - PostToolUse fires once per tool call.
+  - `cwd` follows `cd` into subdirectories, so delivery walks up to the worktree's top.
+- **Hermes delivery** (`hermes-probe/FINDINGS.md`):
+  - `pre_llm_call` `{"context"}` reached the model on each turn.
+  - The hook's `cwd` is the repository root; the worktree is in `TERMINAL_CWD`.
+  - The payload carries the whole conversation: 5.4 KB after three short turns, so a long
+    session exceeds the hook's 64 KiB input cap.
+  - Approval is per event and command, on a terminal, at Hermes's start. Declining records
+    nothing.
+  - The user's own Dispatch hook (installed 2026-10-23) is not yet approved, because Hermes
+    hasn't run since. The probe declined it, since it is the user's to approve.
+  - The config was restored byte for byte, and the probe's allowlist entries were revoked.
+- **Hook cost today** (`hook-cost/`, 300 runs each, load 2.1): a hook with nothing to do takes
+  3.54 ms p50 and 4.30 ms p95 (PostToolUse); 3.61 and 4.13 ms (SessionStart).
+- **Native start** (`native/FINDINGS.md`):
+  - pinned 0.4.17: 10.1, 10.3 and 11.1 s at load 6.5–8.1, a 10.3 s median;
+  - the two per-file clones of `target/` are about 3 s each, a fingerprint of new files 0.6 s,
+    and the baseline commit 0.9 s;
+  - one `clonefile` of `target/` as a directory takes 0.11–0.19 s. P5 is set accordingly.
+- **The second-SessionStart race** (0.4.17 P9's question 2) was never seen in real use. P1
+  writes the concurrent test first and fixes it only if it fails.
