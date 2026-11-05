@@ -30,6 +30,7 @@ pub mod integration;
 pub mod interactions;
 pub mod measure;
 pub mod memo;
+pub mod notes;
 pub mod symbols;
 pub mod watch;
 pub mod world;
