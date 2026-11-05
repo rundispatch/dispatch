@@ -779,6 +779,7 @@ impl Owner {
         let runs = self.load(state, &mut tick);
         tick.cost.load = started.elapsed();
         tick.cost.runs = runs.len();
+        hook_files(state, &self.root, &runs, &mut tick);
         tick.adopted = adopt_orphans(state, &runs, &mut tick);
         self.observe_starts(state, &runs, &mut tick);
         // Agent liveness remains at the coherence cadence; the separate fast
@@ -918,6 +919,17 @@ impl Owner {
             tick.report(&error);
             Vec::new()
         })
+    }
+}
+
+/// What hooks left as files (`inbox::settle`): the marks of sessions that
+/// ended or wait on the person, and the notes hooks delivered or that
+/// expired. Anything recorded is in this tick's runs once they are reloaded.
+fn hook_files(state: &State, root: &Path, runs: &[RunRecord], tick: &mut Tick) {
+    let mut errors = Vec::new();
+    tick.persisted |= super::inbox::settle(state, root, runs, &mut errors);
+    for error in errors {
+        tick.report(&error);
     }
 }
 

@@ -13,6 +13,11 @@
 //! and from the TUI with no reason, while the worktree lives on: only the
 //! `shutdown` of the process that locked the worktree, the hook's parent, is
 //! the end before removal.
+//!
+//! `pre_llm_call` runs once per turn, before the model is called: its
+//! `{"context": …}` reply is added to that turn's user message, which is how
+//! pending notes reach a Hermes agent. Its payload carries the whole
+//! conversation.
 
 use std::{
     ffi::OsStr,
@@ -110,6 +115,23 @@ struct Input {
 /// the hook does, so a failure is reported on stderr with a failing status,
 /// and the Δ the owner last saw is what remains.
 pub fn handle(state: &State, input: &[u8], terminal_cwd: Option<&OsStr>) -> Output {
+    // From the payload's head alone, which names the event before its
+    // conversation, however long that has grown.
+    if super::head(input)
+        .get("hook_event_name")
+        .map(String::as_str)
+        == Some("pre_llm_call")
+    {
+        let notes =
+            terminal_cwd.and_then(|cwd| super::deliver(state, Path::new(cwd), "pre_llm_call"));
+        return Output {
+            stdout: notes.map_or_else(String::new, |notes| {
+                serde_json::json!({"context": notes}).to_string()
+            }),
+            stderr: String::new(),
+            code: 0,
+        };
+    }
     let (stderr, code) = match finalize(state, input, terminal_cwd, parent_pid()) {
         Ok(()) => (String::new(), 0),
         Err(error) => (
@@ -259,27 +281,34 @@ pub fn hook_command(state: &State) -> Result<String> {
 /// The first line of the block Dispatch appends, which is how it finds it.
 const MARKER: &str = "# Added by dispatch setup, which removes it unless it is edited.";
 
-/// The hook's timeout: Hermes's most, which covers the minute keeping a
-/// removed worktree's Δ may wait for its registration and the minute it may
-/// wait for the Work's lock.
-const TIMEOUT: u64 = 300;
+/// The hooks Dispatch installs, each with its timeout. `on_session_finalize`
+/// has Hermes's most, which covers the minute keeping a removed worktree's Δ
+/// may wait for its registration and the minute it may wait for the Work's
+/// lock; `pre_llm_call` only renames a file.
+const INSTALLED: &[(&str, u64)] = &[("on_session_finalize", 300), ("pre_llm_call", 5)];
 
-/// The lines under `hooks:` that run `command` when a session ends.
-fn entry(command: &str) -> Result<String> {
+/// The one hook 0.4.15 to 0.4.17 installed.
+const EARLIER: &[(&str, u64)] = &[("on_session_finalize", 300)];
+
+/// The lines under `hooks:` that run `command` for each hook of `set`.
+fn entries(command: &str, set: &[(&str, u64)]) -> Result<String> {
     anyhow::ensure!(
         !command.chars().any(char::is_control),
         "the hook command has a control character"
     );
     let quoted = command.replace('\\', r"\\").replace('"', "\\\"");
-    Ok(format!(
-        "  on_session_finalize:\n    - command: \"{quoted}\"\n      timeout: {TIMEOUT}\n"
-    ))
+    Ok(set
+        .iter()
+        .map(|(event, timeout)| {
+            format!("  {event}:\n    - command: \"{quoted}\"\n      timeout: {timeout}\n")
+        })
+        .collect())
 }
 
 /// What Dispatch appends: a newline, so the file's last line ends whether it
 /// did or not, then its block.
-fn block(command: &str) -> Result<String> {
-    Ok(format!("\n{MARKER}\nhooks:\n{}", entry(command)?))
+fn block(command: &str, set: &[(&str, u64)]) -> Result<String> {
+    Ok(format!("\n{MARKER}\nhooks:\n{}", entries(command, set)?))
 }
 
 /// What installing does to the configuration.
@@ -291,119 +320,149 @@ pub enum Addition {
     ByHand(String),
 }
 
-/// What installing the hook running `command` would do to the configuration
+/// What installing the hooks running `command` would do to the configuration
 /// at `path`. It is read only to find a `hooks:` key, never rewritten.
 pub fn addition(path: &Path, command: &str) -> Result<Addition> {
     let config = parse(read(path)?.as_deref().unwrap_or(""), path)?;
     if config.get("hooks").is_some() {
-        return Ok(Addition::ByHand(entry(command)?));
+        return Ok(Addition::ByHand(entries(command, INSTALLED)?));
     }
     anyhow::ensure!(
         config.is_mapping() || config.is_null(),
         "{} is not a YAML mapping; it was left untouched",
         path.display()
     );
-    Ok(Addition::Append(block(command)?))
+    Ok(Addition::Append(block(command, INSTALLED)?))
 }
 
-/// Dispatch's hook in the configuration at `path`: exact for the block
-/// Dispatch appended, changed for any other `… hook hermes` hook.
+/// Dispatch's entries under `hooks:`, running `command`, as they should be.
+pub fn wanted(command: &str) -> Result<String> {
+    entries(command, INSTALLED)
+}
+
+/// Whether the block Dispatch appended to the configuration at `path` is
+/// there as some Dispatch wrote it, so that `update` and `uninstall` can
+/// change it. Hermes's own `hermes config set` rewrites the whole file, and
+/// then Dispatch's hooks are the person's to change.
+pub fn as_written(path: &Path) -> Result<bool> {
+    Ok(ours(&read(path)?.unwrap_or_default()).is_some())
+}
+
+/// Dispatch's hooks in the configuration at `path`, by what Hermes reads
+/// there: exact when they are just the hooks Dispatch installs, earlier when
+/// they are just the one an earlier Dispatch did, each running one command
+/// with nothing else in its entry, and changed for any other `… hook hermes`
+/// hook. Hermes rewriting the file in its own form changes none of that.
 pub fn hook(path: &Path) -> Result<Hook> {
-    let text = read(path)?.unwrap_or_default();
-    let config = parse(&text, path)?;
-    if let Some((_, command)) = ours(&text) {
-        return Ok(Hook::Exact(command));
-    }
-    let entries = config["hooks"]["on_session_finalize"].as_sequence();
-    Ok(
-        if entries.is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry["command"]
+    found(&read(path)?.unwrap_or_default(), path)
+}
+
+fn found(text: &str, path: &Path) -> Result<Hook> {
+    let config = parse(text, path)?;
+    let mut ours = serde_yaml::Mapping::new();
+    for (event, hooks) in config["hooks"].as_mapping().into_iter().flatten() {
+        let mine: Vec<serde_yaml::Value> = hooks
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .filter(|hook| {
+                hook["command"]
                     .as_str()
                     .is_some_and(|command| command.ends_with(" hook hermes"))
             })
-        }) {
-            Hook::Changed
-        } else {
-            Hook::Absent
-        },
-    )
+            .cloned()
+            .collect();
+        if !mine.is_empty() {
+            ours.insert(event.clone(), mine.into());
+        }
+    }
+    let Some(command) = ours
+        .values()
+        .next()
+        .map(|hooks| hooks[0]["command"].clone())
+    else {
+        return Ok(Hook::Absent);
+    };
+    let command = command.as_str().unwrap_or_default().to_owned();
+    let ours = serde_yaml::Value::Mapping(ours);
+    let written = |set| -> Result<bool> {
+        let hooks = parse(&format!("hooks:\n{}", entries(&command, set)?), path)?;
+        Ok(hooks["hooks"] == ours)
+    };
+    Ok(if written(INSTALLED)? {
+        Hook::Exact(command)
+    } else if written(EARLIER)? {
+        Hook::Earlier(command)
+    } else {
+        Hook::Changed
+    })
 }
 
-/// Append Dispatch's hook to the configuration at `path`, every byte of it
+/// Append Dispatch's hooks to the configuration at `path`, every byte of it
 /// kept. Returns the backup of the previous configuration, if there was one.
 pub fn install(path: &Path, command: &str) -> Result<Option<PathBuf>> {
     let Addition::Append(block) = addition(path, command)? else {
         anyhow::bail!(
-            "{} has a hooks: key of its own; add the hook there by hand",
+            "{} has a hooks: key of its own; add the hooks there by hand",
             path.display()
         );
     };
     let existing = read(path)?;
     let text = format!("{}{block}", existing.as_deref().unwrap_or(""));
-    // What Hermes will read: the one hook, running exactly this command.
-    let config = parse(&text, path)?;
-    let added = &config["hooks"]["on_session_finalize"][0];
-    anyhow::ensure!(
-        added["command"].as_str() == Some(command) && added["timeout"].as_u64() == Some(TIMEOUT),
-        "the hook would not read back as written; {} was left untouched",
-        path.display()
-    );
-    write(path, existing.as_deref(), &text)
+    write(path, existing.as_deref(), &text, command)
 }
 
-/// Change only the command in a hook block Dispatch previously appended.
-/// Edited blocks and hooks the person added by hand remain theirs to update.
+/// Make the block Dispatch previously appended, the current one or 0.4.15's,
+/// run `command` with the hooks Dispatch installs now. Edited blocks and
+/// hooks the person added by hand remain theirs to update.
 pub fn update(path: &Path, command: &str) -> Result<Option<PathBuf>> {
     let existing = read(path)?.unwrap_or_default();
     let (range, _) = ours(&existing).with_context(|| {
         format!(
-            "Dispatch's hook in {} is not as Dispatch added it; update it there yourself",
+            "Dispatch's hooks in {} are not as Dispatch added them; update them there yourself",
             path.display()
         )
     })?;
     let mut text = existing.clone();
-    text.replace_range(range, &block(command)?);
-    let config = parse(&text, path)?;
-    anyhow::ensure!(
-        config["hooks"]["on_session_finalize"][0]["command"].as_str() == Some(command),
-        "the hook would not read back as written; {} was left untouched",
-        path.display()
-    );
-    write(path, Some(&existing), &text)
+    text.replace_range(range, &block(command, INSTALLED)?);
+    write(path, Some(&existing), &text, command)
 }
 
-/// Remove exactly the block Dispatch appended from the configuration at
-/// `path`, refusing if it was edited. Returns the backup.
+/// Remove exactly the block Dispatch appended, the current one or 0.4.15's,
+/// from the configuration at `path`, refusing if it was edited. Returns the
+/// backup.
 pub fn uninstall(path: &Path) -> Result<Option<PathBuf>> {
     let existing = read(path)?.unwrap_or_default();
     let (range, _) = ours(&existing).with_context(|| {
         format!(
-            "Dispatch's hook in {} is not as Dispatch added it; it was edited or added by \
-             hand, so remove it there yourself",
+            "Dispatch's hooks in {} are not as Dispatch added them; they were edited or \
+             added by hand, so remove them there yourself",
             path.display()
         )
     })?;
     let mut text = existing.clone();
     text.replace_range(range, "");
-    write(path, Some(&existing), &text)
+    write(path, Some(&existing), &text, "")
 }
 
-/// Where in `text` the block Dispatch appended is, exactly as Dispatch wrote
-/// it for some `… hook hermes` command, with nothing nested under it since;
-/// and that command.
+/// Where in `text` the block Dispatch appended is, exactly as some Dispatch
+/// wrote it for some `… hook hermes` command, with nothing nested under it
+/// since; and that command.
 fn ours(text: &str) -> Option<(std::ops::Range<usize>, String)> {
     let header = format!("\n{MARKER}\nhooks:\n  on_session_finalize:\n    - command: ");
     let start = text.find(&header)?;
     let line = text[start + header.len()..].lines().next()?;
     let command: String = serde_yaml::from_str(line).ok()?;
-    let block = block(&command).ok()?;
-    let end = start + block.len();
-    let after = text.get(end..)?;
-    (command.ends_with(" hook hermes")
-        && text[start..].starts_with(&block)
-        && !after.starts_with([' ', '\t', '-']))
-    .then_some((start..end, command))
+    if !command.ends_with(" hook hermes") {
+        return None;
+    }
+    [INSTALLED, EARLIER].into_iter().find_map(|set| {
+        let block = block(&command, set).ok()?;
+        let end = start + block.len();
+        let after = text.get(end..)?;
+        (text[start..].starts_with(&block) && !after.starts_with([' ', '\t', '-']))
+            .then(|| (start..end, command.clone()))
+    })
 }
 
 /// The configuration's text, `None` when there is no file.
@@ -427,8 +486,24 @@ fn parse(text: &str, path: &Path) -> Result<serde_yaml::Value> {
 }
 
 /// Write `text` over the configuration at `path`, through a symbolic link if
-/// it is one, after keeping a backup of `existing` beside it.
-fn write(path: &Path, existing: Option<&str>, text: &str) -> Result<Option<PathBuf>> {
+/// it is one, after keeping a backup of `existing` beside it. Only if Hermes
+/// will read back exactly Dispatch's hooks running `command`, or none for an
+/// empty `command`.
+fn write(
+    path: &Path,
+    existing: Option<&str>,
+    text: &str,
+    command: &str,
+) -> Result<Option<PathBuf>> {
+    let wanted = match command {
+        "" => Hook::Absent,
+        command => Hook::Exact(command.to_owned()),
+    };
+    anyhow::ensure!(
+        found(text, path)? == wanted,
+        "the hooks would not read back as written; {} was left untouched",
+        path.display()
+    );
     let backup = match existing {
         Some(existing) => {
             let backup = path.with_extension(format!(
@@ -560,15 +635,16 @@ mod tests {
             let text = fs::read_to_string(&path).unwrap();
             assert!(text.starts_with(original), "{text}");
             assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
-            // As Hermes reads it: one `on_session_finalize` hook, whose
-            // command splits into this Dispatch's arguments.
+            // As Hermes reads it: one hook for each event, whose command
+            // splits into this Dispatch's arguments.
             let config: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
-            let hooks = config["hooks"]["on_session_finalize"]
-                .as_sequence()
-                .unwrap();
-            assert_eq!(hooks.len(), 1);
-            assert_eq!(hooks[0]["command"].as_str(), Some(COMMAND));
-            assert_eq!(hooks[0]["timeout"].as_u64(), Some(300));
+            for (event, timeout) in [("on_session_finalize", 300), ("pre_llm_call", 5)] {
+                let hooks = config["hooks"][event].as_sequence().unwrap();
+                assert_eq!(hooks.len(), 1);
+                assert_eq!(hooks[0]["command"].as_str(), Some(COMMAND));
+                assert_eq!(hooks[0]["timeout"].as_u64(), Some(timeout));
+            }
+            assert_eq!(config["hooks"].as_mapping().unwrap().len(), 2);
             assert_eq!(
                 shell_words::split(COMMAND).unwrap(),
                 [
@@ -599,13 +675,15 @@ mod tests {
         let Addition::ByHand(lines) = addition(&path, COMMAND).unwrap() else {
             panic!("a hooks: key is changed by hand");
         };
-        assert!(lines.contains("on_session_finalize:") && lines.contains("hook hermes"));
+        assert!(lines.contains("on_session_finalize:") && lines.contains("pre_llm_call:"));
         assert!(install(&path, COMMAND).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
-        // Added by hand as shown: installed, but not Dispatch's to remove.
+        // Added by hand as shown: Dispatch's hooks, but not its bytes to
+        // change.
         fs::write(&path, format!("{theirs}{lines}")).unwrap();
-        assert_eq!(hook(&path).unwrap(), Hook::Changed);
-        assert!(uninstall(&path).is_err());
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
+        assert!(!as_written(&path).unwrap());
+        assert!(uninstall(&path).is_err() && update(&path, COMMAND).is_err());
         // Not YAML: untouched.
         fs::write(&path, "model: [\n").unwrap();
         assert!(
@@ -625,14 +703,25 @@ mod tests {
         fs::write(&path, "model: x\n").unwrap();
         install(&path, COMMAND).unwrap();
         let installed_text = fs::read_to_string(&path).unwrap();
-        for edited in [
-            installed_text.replace("timeout: 300", "timeout: 30"),
-            format!("{installed_text}  on_session_start:\n    - command: echo hi\n"),
-            format!("{installed_text}    - command: echo hi\n"),
+        // A timeout of Dispatch's changed is changed. A hook of the person's
+        // under Dispatch's `hooks:` leaves Dispatch's hooks as written, but
+        // the block no longer Dispatch's alone to change.
+        let exact = || Hook::Exact(COMMAND.into());
+        for (edited, found) in [
+            (
+                installed_text.replace("timeout: 300", "timeout: 30"),
+                Hook::Changed,
+            ),
+            (
+                format!("{installed_text}  on_session_start:\n    - command: echo hi\n"),
+                exact(),
+            ),
+            (format!("{installed_text}    - command: echo hi\n"), exact()),
         ] {
             fs::write(&path, &edited).unwrap();
-            assert_eq!(hook(&path).unwrap(), Hook::Changed, "{edited}");
+            assert_eq!(hook(&path).unwrap(), found, "{edited}");
             assert!(uninstall(&path).is_err(), "{edited}");
+            assert!(update(&path, COMMAND).is_err(), "{edited}");
             assert_eq!(fs::read_to_string(&path).unwrap(), edited);
         }
         // Something added after it at the top level is kept.
@@ -655,5 +744,104 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, ["config.yaml"]);
+    }
+
+    #[test]
+    fn the_earlier_one_hook_block_is_updated_to_both_hooks_or_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.yaml");
+        let old = "'/old/dispatch' --state-dir '/s' hook hermes";
+        let earlier = format!("{THEIRS}{}", block(old, EARLIER).unwrap());
+        fs::write(&path, &earlier).unwrap();
+        assert_eq!(hook(&path).unwrap(), Hook::Earlier(old.into()));
+        assert!(as_written(&path).unwrap());
+        update(&path, COMMAND).unwrap().unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            format!("{THEIRS}{}", block(COMMAND, INSTALLED).unwrap())
+        );
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
+        fs::write(&path, &earlier).unwrap();
+        uninstall(&path).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), THEIRS);
+    }
+
+    /// The user's configuration after `hermes config set` (2026-11-04),
+    /// paths replaced: Hermes's dumper dropped Dispatch's marker and quoted
+    /// the command its own way, across two lines.
+    const REWRITTEN: &str = r"model:
+  default: gpt-6.1-sol
+agent:
+  reasoning_effort: xhigh
+hooks:
+  on_session_finalize:
+  - command: '''/Users/u/.local/bin/dispatch'' --state-dir ''/Users/u/.dispatch''
+      hook hermes'
+    timeout: 300
+";
+
+    const USERS: &str =
+        "'/Users/u/.local/bin/dispatch' --state-dir '/Users/u/.dispatch' hook hermes";
+
+    /// `pre_llm_call` as Hermes's dumper would write it, with `timeout`.
+    fn pre_llm_call(timeout: u64) -> String {
+        format!(
+            "  pre_llm_call:\n  - command: '{}'\n    timeout: {timeout}\n",
+            USERS.replace('\'', "''")
+        )
+    }
+
+    #[test]
+    fn hooks_hermes_rewrote_are_read_as_dispatchs_and_changed_only_by_hand() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.yaml");
+        fs::write(&path, REWRITTEN).unwrap();
+        // What Hermes runs is the command Dispatch wrote.
+        assert_eq!(hook(&path).unwrap(), Hook::Earlier(USERS.into()));
+        assert!(!as_written(&path).unwrap());
+        // Adding `pre_llm_call`, or removing them, is the person's to do,
+        // from the lines setup shows; the file is never written.
+        assert!(update(&path, USERS).is_err());
+        assert!(uninstall(&path).is_err());
+        assert!(install(&path, USERS).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), REWRITTEN);
+        let shown: serde_yaml::Value =
+            serde_yaml::from_str(&format!("hooks:\n{}", wanted(USERS).unwrap())).unwrap();
+        // Added by hand, in Hermes's form: exactly Dispatch's hooks.
+        let added = format!("{REWRITTEN}{}", pre_llm_call(5));
+        fs::write(&path, &added).unwrap();
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(USERS.into()));
+        let config: serde_yaml::Value = serde_yaml::from_str(&added).unwrap();
+        assert_eq!(config["hooks"], shown["hooks"]);
+        assert_eq!(config["agent"]["reasoning_effort"], "xhigh");
+        // Removed by hand.
+        let removed = &REWRITTEN[..REWRITTEN.find("hooks:").unwrap()];
+        fs::write(&path, removed).unwrap();
+        assert_eq!(hook(&path).unwrap(), Hook::Absent);
+    }
+
+    #[test]
+    fn an_edited_timeout_command_or_event_in_hermess_form_is_changed_and_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.yaml");
+        for edited in [
+            REWRITTEN.replace("timeout: 300", "timeout: 30"),
+            // One of the two run another command; both doing so would be an
+            // earlier install of another Dispatch, to update.
+            format!("{REWRITTEN}{}", pre_llm_call(5)).replacen(
+                "''/Users/u/.dispatch''",
+                "''/Users/u/elsewhere''",
+                1,
+            ),
+            REWRITTEN.replace("    timeout: 300\n", "    timeout: 300\n    matcher: x\n"),
+            REWRITTEN.replace("on_session_finalize", "on_session_end"),
+            format!("{REWRITTEN}{}", pre_llm_call(60)),
+        ] {
+            fs::write(&path, &edited).unwrap();
+            assert_eq!(hook(&path).unwrap(), Hook::Changed, "{edited}");
+            assert!(update(&path, USERS).is_err() && uninstall(&path).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        }
     }
 }

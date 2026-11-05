@@ -2,6 +2,7 @@ mod apply;
 pub mod attach;
 pub mod background;
 pub mod discovery;
+pub mod inbox;
 pub(crate) mod liveness;
 pub(crate) mod native;
 pub mod registration;

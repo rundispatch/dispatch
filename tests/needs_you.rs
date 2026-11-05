@@ -206,6 +206,12 @@ impl Project {
         self.run(id)["attachment"]["needs_you"].clone()
     }
 
+    /// The mark of `kind` once the owner recorded it from the hook's.
+    fn marked(&self, id: &str, kind: &str) -> Value {
+        wait_until("the mark recorded", || self.mark(id)["kind"] == kind);
+        self.mark(id)
+    }
+
     /// The events of `kind` written in full: the owner may be appending one
     /// as this reads, and a line is whole once its newline is.
     fn events(&self, id: &str, kind: &str) -> Vec<Value> {
@@ -247,8 +253,7 @@ fn each_hook_marks_its_kind_and_status_says_waiting_on_you() {
     assert!(!p.status(&id).contains("waiting on you"));
 
     p.notification("permission_prompt", "Claude needs your permission");
-    let mark = p.mark(&id);
-    assert_eq!(mark["kind"], "permission", "{mark}");
+    let mark = p.marked(&id, "permission");
     assert_eq!(mark["message"], "Claude needs your permission");
     assert_eq!(mark["transcript"], p.transcript.to_str().unwrap());
     let status = p.status(&id);
@@ -264,16 +269,23 @@ fn each_hook_marks_its_kind_and_status_says_waiting_on_you() {
     }
 
     p.notification("idle_prompt", "Claude is waiting for your input");
-    assert_eq!(p.mark(&id)["kind"], "input");
+    p.marked(&id, "input");
     assert!(p.status(&id).contains("waiting on you: input"));
 
     p.stop();
-    assert_eq!(p.mark(&id)["kind"], "turn_ended");
+    p.marked(&id, "turn_ended");
     assert!(p.status(&id).contains("waiting on you: turn ended"));
 
-    // Any other notification is not a wait, and leaves the mark as it was.
+    // Any other notification is not a wait, and leaves the mark as it was:
+    // it leaves none for the owner.
     let before = p.mark(&id);
     p.notification("auth_success", "Authenticated");
+    assert!(
+        fs::read_dir(p.state.join("marks"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert_eq!(p.mark(&id), before);
     assert_eq!(p.events(&id, "runtime.needs_you").len(), 3);
     // A new mark replaced the old each time; none was cleared.
@@ -286,6 +298,7 @@ fn a_write_to_the_transcript_clears_the_mark() {
     p.watch();
     let id = p.registered();
     p.notification("permission_prompt", "Claude needs your permission");
+    p.marked(&id, "permission");
     // The person answered: the tool runs and Claude writes its result.
     written_at(&p.transcript, SystemTime::now() + Duration::from_secs(3600));
     assert_eq!(p.cleared(&id), "transcript");
@@ -298,12 +311,13 @@ fn a_session_end_clears_the_mark() {
     p.watch();
     let id = p.registered();
     p.notification("idle_prompt", "Claude is waiting for your input");
+    p.marked(&id, "input");
     let mut end = p.common("SessionEnd");
     end["reason"] = "clear".into();
     assert_eq!(p.hook(end), "");
-    // Shown no more from the moment the session ended.
-    assert!(!p.status(&id).contains("waiting on you"));
+    // Shown no more once the owner recorded the end.
     assert_eq!(p.cleared(&id), "session_end");
+    assert!(!p.status(&id).contains("waiting on you"));
     assert_eq!(p.run(&id)["outcome"]["lifecycle"], "working");
 }
 

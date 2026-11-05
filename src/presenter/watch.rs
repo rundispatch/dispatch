@@ -1229,7 +1229,8 @@ async fn close(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Resu
 }
 
 /// `f`: `dispatch finish` for active attached Work. Running the project's
-/// checks needs the person's word, unless the Work already carries it.
+/// checks needs the person's word, unless the Work already carries it or
+/// their standing check consent covers exactly these checks.
 async fn finish(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Result<Notice> {
     if run.mode != crate::RunMode::Attached || run.outcome.lifecycle == LifecycleState::Finished {
         return Ok(Notice::new(
@@ -1239,8 +1240,8 @@ async fn finish(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Res
         ));
     }
     let checks = configured_checks(state, &run.id).0;
-    let mut allow = false;
-    if !checks.is_empty() && !run.environment.unsafe_local {
+    let allow = !checks.is_empty() && !run.environment.unsafe_local;
+    if allow && !crate::consent::consented(state, &run.source_path, &checks) {
         let question = format!(
             "Finish {} (Work {})? Finishing runs this project's checks on your machine, with your permissions:\n{}",
             item.name,
@@ -1258,7 +1259,6 @@ async fn finish(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Res
         if ui.select(&question, &rows, 1).await? != Some(0) {
             return Ok(Notice::new(Some(item), Kind::Info, "nothing changed."));
         }
-        allow = true;
     }
     Ok(
         match crate::orchestrator::attach::finish_quietly(state, &run.id, allow).await {

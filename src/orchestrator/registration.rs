@@ -344,13 +344,15 @@ pub(crate) fn register(
 }
 
 /// The worker: S0, `registration.json`, the run, the decision, publishing.
-/// Joining existing Work waits for its lock until `deadline`, the hook's.
+/// The workspace's lock, and joining existing Work its lock, are waited for
+/// until `deadline`, the hook's: another session starting there may hold the
+/// first while it waits for the second.
 fn work(state: &State, mut registration: Registration, deadline: Instant) -> Result<Started> {
     let workspace = registration.workspace.clone();
     let _lock = OperationLock::acquire_wait(
         &workspace_lock(state, &workspace),
         "another session is registering this workspace",
-        Duration::from_secs(10),
+        deadline.saturating_duration_since(Instant::now()),
     )?;
     fault("after_lock");
     publish_durable(state, &workspace)?;

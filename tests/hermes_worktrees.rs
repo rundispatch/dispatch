@@ -474,9 +474,12 @@ fn an_unpushed_commit_keeps_the_worktree_and_ends_only_the_session() {
 
     let payload = p.payload("on_session_finalize", "shutdown", &p.root);
     hermes.ok(&p.hook_line(&payload, &worktree));
+    // The hook leaves the end for the owner, which records it on its tick.
+    wait_until("the session's end", || {
+        p.run(&worktree)["attachment"]["sessions"][0]["end_reason"] == "shutdown"
+    });
     let run = p.run(&worktree);
     assert_eq!(run["attachment"]["workspace_removed"], Value::Null, "{run}");
-    assert_eq!(run["attachment"]["sessions"][0]["end_reason"], "shutdown");
     assert_eq!(run["outcome"]["lifecycle"], "working");
     assert!(
         p.events(&id)

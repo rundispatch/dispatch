@@ -1233,31 +1233,32 @@ pub(crate) fn record_session_start(
     Ok(true)
 }
 
-/// Record that a runtime session ended. Nothing else changes: an ended
-/// session does not end the Work.
+/// Record that a runtime session ended `at`. Nothing else changes: an ended
+/// session does not end the Work. Called by the project owner, waiting up
+/// to `wait` for the run's lock; `false`: still busy, nothing recorded.
 pub(crate) fn record_session_end(
     state: &State,
     run_id: &str,
     provider: &str,
     session_id: &str,
     reason: &str,
-) -> Result<()> {
-    let _lock = OperationLock::acquire_wait(
-        &state.run_dir(run_id).join(".operation.lock"),
-        "attached work has a foreground owner",
-        // Within the 5 s `SessionEnd` timeout setup installs; the project owner
-        // may hold the lock while it checks this Work.
-        Duration::from_secs(3),
-    )?;
+    at: DateTime<Utc>,
+    wait: Duration,
+) -> Result<bool> {
+    let Some(_lock) =
+        OperationLock::acquire_within(&state.run_dir(run_id).join(".operation.lock"), wait)?
+    else {
+        return Ok(false);
+    };
     let mut run = state.load_run(run_id)?;
     let Some(session) = run.attachment.as_mut().and_then(|attachment| {
         attachment.sessions.iter_mut().rev().find(|known| {
             known.provider == provider && known.session_id == session_id && known.ended_at.is_none()
         })
     }) else {
-        return Ok(());
+        return Ok(true);
     };
-    session.ended_at = Some(Utc::now());
+    session.ended_at = Some(at);
     session.end_reason = Some(reason.to_owned());
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1277,20 +1278,24 @@ pub(crate) fn record_session_end(
             ..EventRecord::default()
         },
         &mut run,
-    )
+    )?;
+    Ok(true)
 }
 
 /// Record that a session of Work `run_id` waits on a person; a later mark
-/// replaces it. Within the 5 s timeout setup installs for these hooks.
-pub(crate) fn record_needs_you(state: &State, run_id: &str, mark: NeedsYou) -> Result<()> {
-    let _lock = OperationLock::acquire_wait(
+/// replaces it. Called by the project owner, from a hook's mark, without
+/// waiting for the run's lock; `false`: busy, nothing recorded.
+pub(crate) fn record_needs_you(state: &State, run_id: &str, mark: NeedsYou) -> Result<bool> {
+    let Some(_lock) = OperationLock::acquire_within(
         &state.run_dir(run_id).join(".operation.lock"),
-        "attached work has a foreground owner",
-        Duration::from_secs(3),
-    )?;
+        Duration::ZERO,
+    )?
+    else {
+        return Ok(false);
+    };
     let mut run = state.load_run(run_id)?;
     let Some(attachment) = run.attachment.as_mut() else {
-        return Ok(());
+        return Ok(true);
     };
     attachment.needs_you = Some(mark.clone());
     let mut db = Database::open(state.db_path())?;
@@ -1313,7 +1318,8 @@ pub(crate) fn record_needs_you(state: &State, run_id: &str, mark: NeedsYou) -> R
             ..EventRecord::default()
         },
         &mut run,
-    )
+    )?;
+    Ok(true)
 }
 
 /// Why the mark on `run` no longer holds, judged with one `stat` of its

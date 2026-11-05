@@ -5,7 +5,7 @@ cancels); accept applies, and a stale accept is refused with what to do next;
 Work that appears while watching shows up without taking the selection; q
 leaves. Effects are checked in the recorded state, and what the person sees is
 checked on the screen as a terminal would show it."""
-import codecs, json, os, re, signal, subprocess, sys, tempfile, time
+import codecs, hashlib, json, os, re, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 sys.dont_write_bytecode=True
 from review_refinement import Session, WAIT, has_color
@@ -210,6 +210,35 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             assert (outcome['work_result'],outcome['review'])==('cancelled','not_requested'),outcome
             assert 'spare' in (state/'runs'/spare/'delta.patch').read_text(),'its changes were not kept'
             assert spare_tree.exists(),'closing deleted the worktree'
+            ui.send('q');ui.finish()
+        # Standing check consent for exactly the Work's checks is the person's
+        # word already: f finishes without asking. It is given after the Work
+        # registered, so the Work carries no authority of its own.
+        git('worktree','add','-q','-b','covered','.claude/worktrees/covered')
+        covered_tree=(repo/'.claude/worktrees/covered').resolve()
+        hook=json.dumps({'hook_event_name':'SessionStart','session_id':'s3','source':'startup','cwd':str(covered_tree)})
+        subprocess.run([binary,'--state-dir',str(state),'hook','claude'],input=hook.encode(),check=True,capture_output=True,env=no_deadline)
+        covered=[p.parent.name for p in (state/'runs').glob('*/metadata.json')
+                 if (json.loads(p.read_text()).get('attachment') or {}).get('workspace')==str(covered_tree)]
+        assert len(covered)==1,covered; covered=covered[0]
+        assert not meta(covered)['environment']['unsafe_local']
+        (covered_tree/'lib.txt').write_text('covered\n')
+        project=str(repo.resolve())
+        consent=state/'projects'/(hashlib.sha256(project.encode()).hexdigest()+'.json')
+        consent.parent.mkdir(exist_ok=True)
+        consent.write_text(json.dumps({'version':2,'root':project,'commands':['true'],'granted_at':'2026-11-04T00:00:00Z'}))
+        with Session([binary,'--state-dir',str(state),'watch','--root',str(repo)],repo,captures,'watch-finish-consented',width=160,height=30) as ui:
+            screen=Screen(ui)
+            screen.see('covered')
+            for _ in range(5):
+                if any(row.lstrip().startswith('› covered') for row in screen.rows()): break
+                ui.send('j');ui.pump(.3)
+            screen.see('› covered','f finish')
+            ui.send('f')
+            until(ui,lambda:meta(covered)['outcome']['work_result']=='ready','finished under consent')
+            screen.see('covered: finished; checks passed. It now waits for your review.')
+            # Redrawn cell by cell, the stream can split a question's words.
+            assert 'Finishcovered' not in ''.join(ui.clean.split()),'asked although consent covers the checks'
             ui.send('q');ui.finish()
     finally:
         subprocess.run([binary,'--state-dir',str(state),'stop','--root',str(repo)],capture_output=True)
