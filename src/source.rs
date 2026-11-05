@@ -1404,11 +1404,12 @@ pub(crate) fn parents_are_directories(
 
 fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
     let mut directory_permissions = Vec::new();
-    for entry in WalkDir::new(source)
+    let mut entries = WalkDir::new(source)
         .follow_links(false)
         .into_iter()
-        .filter_entry(include_entry)
-    {
+        .filter_entry(include_entry);
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::while_let_on_iterator))]
+    while let Some(entry) = entries.next() {
         let entry = entry.with_context(|| format!("failed to walk {}", source.display()))?;
         if entry.depth() == 0 {
             continue;
@@ -1429,6 +1430,11 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
                 ),
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    #[cfg(target_os = "macos")]
+                    if clone_clean_directory(entry.path(), &target) {
+                        entries.skip_current_dir();
+                        continue;
+                    }
                     fs::create_dir(&target).with_context(|| {
                         format!("failed to create directory {}", target.display())
                     })?;
@@ -1480,26 +1486,60 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Clone a directory whole when nothing under it would be filtered or refused,
+/// as its listings show without opening a file. A failed clone is undone, so the
+/// per-entry path starts again from a missing destination. A directory that is
+/// not clean has its subdirectories walked again; each walk stops at the first
+/// disqualifying entry, which keeps that cheap.
+#[cfg(target_os = "macos")]
+fn clone_clean_directory(source: &Path, destination: &Path) -> bool {
+    let clean = WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .all(|entry| {
+            entry.is_ok_and(|entry| {
+                let kind = entry.file_type();
+                include_entry(&entry) && (kind.is_dir() || kind.is_file() || kind.is_symlink())
+            })
+        });
+    if !clean {
+        return false;
+    }
+    match clonefile(source, destination) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!("cloning {} whole failed: {error}", source.display());
+            remove_created_directory(destination);
+            false
+        }
+    }
+}
+
 // From <sys/clonefile.h>; libc exposes clonefile but not its flags.
 #[cfg(target_os = "macos")]
 const CLONE_NOFOLLOW: u32 = 0x0001;
 
-/// Copy one file. On macOS it is cloned by path with clonefile(2), never
-/// opened, because on-access scanning intercepts every `open()`; any failure
-/// falls back to `std::fs::copy`.
+/// clonefile(2) by path, without following a final symlink. It never opens a
+/// file, because on-access scanning intercepts every `open()`.
+#[cfg(target_os = "macos")]
+fn clonefile(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    // SAFETY: both paths are live, NUL-terminated strings for the duration of the call.
+    if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Copy one file: on macOS a clone, and on any failure `std::fs::copy`.
 fn copy_file_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
-    {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-        let c_source = CString::new(source.as_os_str().as_bytes())?;
-        let c_destination = CString::new(destination.as_os_str().as_bytes())?;
-        // SAFETY: both paths are live, NUL-terminated strings for the duration of the call.
-        if unsafe { libc::clonefile(c_source.as_ptr(), c_destination.as_ptr(), CLONE_NOFOLLOW) }
-            == 0
-        {
-            return Ok(());
-        }
+    if clonefile(source, destination).is_ok() {
+        return Ok(());
     }
     fs::copy(source, destination).map(|_| ())
 }
@@ -2624,6 +2664,411 @@ mod tests {
         assert_copy_fixture(&source, &destination);
         // Existing files must still be refused by the tree walker, not overwritten.
         assert!(copy_tree_contents(&source, &destination).is_err());
+    }
+
+    /// Restores write access under a temporary directory on drop, so it can be
+    /// removed even when a test fails with read-only directories in it.
+    #[cfg(unix)]
+    struct Writable<'a>(&'a Path);
+
+    #[cfg(unix)]
+    impl Drop for Writable<'_> {
+        fn drop(&mut self) {
+            fn make_writable(path: &Path) {
+                use std::os::unix::fs::PermissionsExt;
+
+                if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+                    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+                    for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+                        make_writable(&entry.path());
+                    }
+                }
+            }
+            make_writable(self.0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const CLONE_MARK: &std::ffi::CStr = c"com.dispatch.test.clone-mark";
+
+    /// Marks a directory: a whole clone keeps its extended attributes, while a
+    /// directory the per-file path creates has none.
+    #[cfg(target_os = "macos")]
+    fn mark(directory: &Path) {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let path = CString::new(directory.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path, name and value are live for the call.
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                CLONE_MARK.as_ptr(),
+                b"1".as_ptr().cast(),
+                1,
+                0,
+                0,
+            )
+        };
+        assert_eq!(result, 0, "{}", directory.display());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cloned_whole(directory: &Path) -> bool {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let path = CString::new(directory.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path and name are live; a null buffer asks only for the size.
+        unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                CLONE_MARK.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            ) == 1
+        }
+    }
+
+    /// `copy_fixture` plus an absolute symlink, nested directories and a
+    /// read-only directory with a file in it, its directories marked on macOS.
+    #[cfg(unix)]
+    fn clean_fixture(root: &Path) {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        fs::create_dir_all(root).unwrap();
+        copy_fixture(root);
+        symlink("/nonexistent/absolute", root.join("absolute")).unwrap();
+        write(&root.join("nested/deep/file"), "deep\n");
+        write(&root.join("locked/file"), "locked\n");
+        #[cfg(target_os = "macos")]
+        for directory in ["", "nested", "nested/deep", "locked"] {
+            mark(&root.join(directory));
+        }
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    /// What `copy_tree_contents` must reproduce: every entry it copies, with
+    /// its type and mode, and its contents or link target.
+    #[cfg(unix)]
+    fn copied_entries(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+        WalkDir::new(root)
+            .min_depth(1)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(include_entry)
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                let contents = if metadata.is_file() {
+                    fs::read(entry.path()).unwrap()
+                } else if metadata.file_type().is_symlink() {
+                    fs::read_link(entry.path())
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec()
+                } else {
+                    Vec::new()
+                };
+                let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                (relative, metadata.mode(), contents)
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_tree_clones_a_clean_directory_whole_and_exactly() {
+        let temp = TempDir::new().unwrap();
+        let _writable = Writable(temp.path());
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        write(&source.join(".git/HEAD"), "ref: refs/heads/main\n");
+        clean_fixture(&source.join("target"));
+        fs::create_dir(&destination).unwrap();
+
+        copy_tree_contents(&source, &destination).unwrap();
+
+        assert_eq!(copied_entries(&source), copied_entries(&destination));
+        assert!(fs::symlink_metadata(destination.join(".git")).is_err());
+        for directory in ["target", "target/nested/deep", "target/locked"] {
+            assert!(cloned_whole(&destination.join(directory)), "{directory}");
+        }
+        write(&destination.join("target/large"), "private edit");
+        assert_eq!(
+            fs::metadata(source.join("target/large")).unwrap().len(),
+            8 * 1024 * 1024
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_never_copies_nested_git_or_state_but_copies_their_siblings() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let _writable = Writable(temp.path());
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        write(&source.join("vendor/.git/HEAD"), "ref: refs/heads/main\n");
+        write(&source.join("vendor/lib.rs"), "pub fn f() {}\n");
+        write(&source.join("a/b/c/.dispatch/state.json"), "{}\n");
+        write(&source.join("a/b/c/kept"), "kept\n");
+        // A linked worktree's or a submodule's `.git` is a file.
+        write(&source.join("a/b/.git"), "gitdir: /elsewhere\n");
+        write(&source.join("a/sibling"), "sibling\n");
+        fs::create_dir(source.join("links")).unwrap();
+        symlink("/elsewhere", source.join("links/.dispatch")).unwrap();
+        write(&source.join("links/kept"), "kept\n");
+        clean_fixture(&source.join("a/b/clean"));
+        fs::create_dir(&destination).unwrap();
+
+        copy_tree_contents(&source, &destination).unwrap();
+
+        for excluded in [
+            "vendor/.git",
+            "a/b/c/.dispatch",
+            "a/b/.git",
+            "links/.dispatch",
+        ] {
+            assert!(
+                fs::symlink_metadata(destination.join(excluded)).is_err(),
+                "{excluded}"
+            );
+        }
+        assert_eq!(copied_entries(&source), copied_entries(&destination));
+        #[cfg(target_os = "macos")]
+        assert!(
+            cloned_whole(&destination.join("a/b/clean")),
+            "a clean directory beside nested state is still cloned whole"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_refuses_a_special_file_at_any_depth() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        for fifo in ["fifo", "target/fifo", "target/nested/deep/fifo"] {
+            let temp = TempDir::new().unwrap();
+            let _writable = Writable(temp.path());
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            clean_fixture(&source.join("target"));
+            let path = CString::new(source.join(fifo).as_os_str().as_bytes()).unwrap();
+            // SAFETY: the path is a live, NUL-terminated string for the call.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+            fs::create_dir(&destination).unwrap();
+
+            let error = copy_tree_contents(&source, &destination).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("unsupported special file"),
+                "{fifo}: {error:#}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const SANDBOXED_COPY: [&str; 2] = [
+        "DISPATCH_TEST_SANDBOXED_SOURCE",
+        "DISPATCH_TEST_SANDBOXED_DESTINATION",
+    ];
+
+    /// Runs `copy_tree_contents` in a child of this test binary under a
+    /// sandbox profile, so the kernel refuses what the profile denies. The
+    /// child is the calling test again, which copies in `sandboxed_copy`.
+    #[cfg(target_os = "macos")]
+    fn copy_in_sandbox(test: &str, profile: &str, source: &Path, destination: &Path) {
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", profile])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env(SANDBOXED_COPY[0], source)
+            .env(SANDBOXED_COPY[1], destination)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // A renamed test would run nothing in the child and still exit 0.
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// In `copy_in_sandbox`'s child, copies and returns true.
+    #[cfg(target_os = "macos")]
+    fn sandboxed_copy() -> bool {
+        let [Some(source), Some(destination)] = SANDBOXED_COPY.map(std::env::var_os) else {
+            return false;
+        };
+        copy_tree_contents(Path::new(&source), Path::new(&destination)).unwrap();
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_tree_clones_whole_without_opening_a_file() {
+        if sandboxed_copy() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _writable = Writable(temp.path());
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        write(&source.join(".git/HEAD"), "ref: refs/heads/main\n");
+        clean_fixture(&source.join("target"));
+        fs::create_dir(&destination).unwrap();
+        // Opening a regular file under the source is refused; cloning a
+        // directory is not.
+        let profile = format!(
+            "(version 1)(allow default)(deny file-read-data (require-all \
+             (subpath \"{}\") (vnode-type REGULAR-FILE)))",
+            fs::canonicalize(&source).unwrap().display()
+        );
+
+        copy_in_sandbox(
+            "source::tests::copy_tree_clones_whole_without_opening_a_file",
+            &profile,
+            &source,
+            &destination,
+        );
+
+        assert_eq!(copied_entries(&source), copied_entries(&destination));
+        assert!(cloned_whole(&destination.join("target")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_tree_falls_back_to_an_identical_copy_when_a_directory_clone_fails() {
+        if sandboxed_copy() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _writable = Writable(temp.path());
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        clean_fixture(&source.join("target"));
+        fs::create_dir(&destination).unwrap();
+
+        // clonefile(2) of a directory fails with EPERM; of a file, it works.
+        copy_in_sandbox(
+            "source::tests::copy_tree_falls_back_to_an_identical_copy_when_a_directory_clone_fails",
+            "(version 1)(allow default)(deny file-clone (vnode-type DIRECTORY))",
+            &source,
+            &destination,
+        );
+
+        assert_eq!(copied_entries(&source), copied_entries(&destination));
+        assert!(!cloned_whole(&destination.join("target")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_still_fails_on_an_unreadable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let _writable = Writable(temp.path());
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        clean_fixture(&source.join("target"));
+        write(&source.join("target/nested/hidden/file"), "hidden\n");
+        fs::set_permissions(
+            source.join("target/nested/hidden"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        assert!(copy_tree_contents(&source, &destination).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_treats_existing_destination_entries_as_before() {
+        use std::os::unix::fs::symlink;
+
+        for case in [
+            "a file where a directory goes",
+            "a symlink where a directory goes",
+            "a file already there",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let _writable = Writable(temp.path());
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            let outside = temp.path().join("outside");
+            clean_fixture(&source.join("target"));
+            fs::create_dir(&destination).unwrap();
+            fs::create_dir(&outside).unwrap();
+            match case {
+                "a file where a directory goes" => {
+                    write(&destination.join("target"), "theirs\n");
+                }
+                "a symlink where a directory goes" => {
+                    symlink(&outside, destination.join("target")).unwrap();
+                }
+                _ => write(&destination.join("target/nested/deep/file"), "theirs\n"),
+            }
+            let before = copied_entries(&destination);
+
+            let error = copy_tree_contents(&source, &destination).unwrap_err();
+
+            assert!(
+                format!("{error:#}").contains("snapshot destination unexpectedly contains"),
+                "{case}: {error:#}"
+            );
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "{case}");
+            let after = copied_entries(&destination);
+            for entry in &before {
+                assert!(after.contains(entry), "{case}: {entry:?} changed");
+            }
+        }
+
+        // A directory already there is filled in, and what else it holds is kept.
+        let temp = TempDir::new().unwrap();
+        let _writable = Writable(temp.path());
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        clean_fixture(&source.join("target"));
+        write(&destination.join("target/nested/extra"), "theirs\n");
+
+        copy_tree_contents(&source, &destination).unwrap();
+
+        fs::remove_file(destination.join("target/nested/extra")).unwrap();
+        assert_eq!(copied_entries(&source), copied_entries(&destination));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_never_clones_the_root() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TempDir::new().unwrap();
+        let _writable = Writable(temp.path());
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        // Nothing under this root is filtered, so only the rule keeps it whole.
+        clean_fixture(&source);
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = fs::metadata(&destination).unwrap();
+
+        copy_tree_contents(&source, &destination).unwrap();
+
+        let after = fs::metadata(&destination).unwrap();
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(after.mode() & 0o7777, 0o700);
+        assert_eq!(copied_entries(&source), copied_entries(&destination));
+
+        // A destination that is missing is still an error, never a clone.
+        let missing = temp.path().join("missing");
+        assert!(copy_tree_contents(&source, &missing).is_err());
+        assert!(fs::symlink_metadata(&missing).is_err());
     }
 
     #[test]
