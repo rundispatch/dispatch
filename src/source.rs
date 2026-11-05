@@ -407,6 +407,26 @@ pub fn world_commit(checkout: &Path) -> Result<String> {
     capture_settled(&checkout, || capture_world(&checkout))
 }
 
+/// The ref naming the source as it was after its latest landing.
+pub const SOURCE_REF: &str = "refs/dispatch/source";
+
+/// Record `root`'s world now as a commit (`world_commit`), landed changes
+/// included though accept never commits them, and point `SOURCE_REF` at it
+/// with `message` in its reflog, so an agent can merge exactly what landed.
+/// Only that ref moves: the checkout's branches, HEAD, index and files don't.
+pub fn record_source(root: &Path, message: &str) -> Result<String> {
+    let root = resolve_source(Some(root))?;
+    let commit = world_commit(&root)?;
+    let mut update = git_command(&root);
+    update
+        .env("GIT_COMMITTER_NAME", "Dispatch")
+        .env("GIT_COMMITTER_EMAIL", "dispatch@localhost")
+        .args(["update-ref", "--create-reflog", "-m", message, SOURCE_REF])
+        .arg(&commit);
+    checked_output(update, "failed to point refs/dispatch/source at the source")?;
+    Ok(commit)
+}
+
 fn capture_settled(checkout: &Path, mut capture: impl FnMut() -> Result<String>) -> Result<String> {
     let signal = || crate::coherence::world::signal(checkout, &SourceKind::Git);
     let mut before = signal()?;
@@ -781,6 +801,16 @@ pub(crate) fn snapshot_delta_if_changed_indexed(
     index_path: &Path,
     retained_patch: &Path,
 ) -> Result<bool> {
+    // An index staged against one baseline says nothing of another, and a
+    // Work's S0 moves to a new baseline when it integrates the source.
+    let staged_for = index_path.with_extension("baseline");
+    let baseline = path_bytes(baseline_path);
+    if fs::read(&staged_for).ok().as_deref() != Some(baseline.as_slice()) {
+        match fs::remove_file(index_path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => write_atomically(&staged_for, &baseline)?,
+        }
+    }
     if index_path.exists() && retained_patch.exists() {
         let mut status = comparison_git_command(baseline_path, workspace);
         status.env("GIT_INDEX_FILE", index_path).args([
@@ -2377,6 +2407,7 @@ mod tests {
             source_fingerprint: snapshot.fingerprint.clone(),
             baseline_path: snapshot.baseline_path.clone(),
             baseline_commit: snapshot.baseline_commit.clone(),
+            baseline_history: Vec::new(),
             status: RunStatus::Evaluated,
             mode: crate::RunMode::Native,
             state_revision: 0,
@@ -4062,6 +4093,52 @@ mod tests {
         );
         let updated = fs::read_to_string(&patch).unwrap();
         assert!(updated.contains("+after the edit"), "{updated}");
+    }
+
+    /// S0 moves to a new baseline when the Work integrates the source: the
+    /// index kept against the old one must not make the workspace look
+    /// unchanged against the new one.
+    #[test]
+    fn a_kept_index_serves_only_the_baseline_it_was_staged_against() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("file.txt"), "first\n");
+        initialize_user_repository(&source);
+        let first = create_snapshot(&source, &temp.path().join("first")).unwrap();
+        write(&source.join("file.txt"), "second\n");
+        let second = create_snapshot(&source, &temp.path().join("second")).unwrap();
+        let workspace = temp.path().join("candidate");
+        create_candidate_workspace(&first.baseline_path, &workspace).unwrap();
+        write(&workspace.join("file.txt"), "second\n");
+        write(&workspace.join("own.txt"), "own\n");
+        // Old enough that Git trusts what it staged of them.
+        let written = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for name in ["file.txt", "own.txt"] {
+            fs::File::options()
+                .write(true)
+                .open(workspace.join(name))
+                .unwrap()
+                .set_modified(written)
+                .unwrap();
+        }
+        let index = temp.path().join("kept.index");
+        let patch = temp.path().join("delta-live.patch");
+        let follow = |baseline: &Path| {
+            snapshot_delta_if_changed_indexed(baseline, &workspace, &patch, &index, &patch).unwrap()
+        };
+        follow(&first.baseline_path);
+        assert!(fs::read_to_string(&patch).unwrap().contains("file.txt"));
+
+        follow(&second.baseline_path);
+        let expected = temp.path().join("expected.patch");
+        snapshot_delta(&second.baseline_path, &workspace, &expected).unwrap();
+        let followed = fs::read_to_string(&patch).unwrap();
+        assert_eq!(followed, fs::read_to_string(&expected).unwrap());
+        assert!(
+            followed.contains("own.txt") && !followed.contains("file.txt"),
+            "{followed}"
+        );
     }
 
     #[test]

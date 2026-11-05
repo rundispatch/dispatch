@@ -302,6 +302,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         &serde_yaml::to_string(&config).context("failed to serialize effective configuration")?,
     )?;
 
+    let mut history = Vec::new();
     let (snapshot, provenance, confidence, workspace, managed_workspace) = if *managed {
         let (snapshot, provenance, workspace, made) = make_workspace(state, root, run_id, &dir)
             .map_err(|error| error.context("could not make a workspace"))?;
@@ -318,11 +319,10 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         let commit = runtime.commit.clone();
         let (provenance, confidence) = if let Some(old) = &runtime.reopens {
             // It goes on from the Work it reopens: the same S0, attributed
-            // as that Work's was.
-            let old = state
-                .load_run(old)?
-                .attachment
-                .context("not attached Work")?;
+            // as that Work's was, and moved as that Work's was.
+            let old = state.load_run(old)?;
+            history = old.baseline_history;
+            let old = old.attachment.context("not attached Work")?;
             (old.provenance, old.confidence)
         } else if runtime.discovered {
             // The worktree appeared after watching began: every change in it
@@ -500,6 +500,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         source_fingerprint,
         baseline_path: published(snapshot.baseline_path),
         baseline_commit: snapshot.baseline_commit,
+        baseline_history: history,
         status: RunStatus::Running,
         mode: RunMode::Attached,
         state_revision: 0,

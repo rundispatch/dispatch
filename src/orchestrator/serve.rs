@@ -595,6 +595,8 @@ pub(crate) struct Owner {
     last_signal: Option<world::Signal>,
     /// Each followed run's work signal when it was last evaluated.
     work: HashMap<String, String>,
+    /// Each Work's workspace HEAD when its S0 was last looked at.
+    heads: HashMap<String, String>,
     /// Each Ready result's world signal when it was last checked.
     checked: HashMap<String, world::Signal>,
     /// Each unintegrated Work's footprint, with the digest of the Δ it was
@@ -732,6 +734,7 @@ impl Owner {
             kind,
             last_signal: None,
             work: HashMap::new(),
+            heads: HashMap::new(),
             checked: HashMap::new(),
             footprints: HashMap::new(),
             clean: HashMap::new(),
@@ -776,7 +779,7 @@ impl Owner {
         tick.cost.signal = started.elapsed();
 
         let started = Instant::now();
-        let runs = self.load(state, &mut tick);
+        let mut runs = self.load(state, &mut tick);
         tick.cost.load = started.elapsed();
         tick.cost.runs = runs.len();
         hook_files(state, &self.root, &runs, &mut tick);
@@ -788,6 +791,7 @@ impl Owner {
             tick.report(&error);
         }
         clear_needs_you(state, &runs, &mut tick);
+        self.follow_integration(state, &mut runs, &mut tick);
         let moved = tick.moved || tick.adopted;
         self.reevaluate(state, &runs, &mut tick, moved);
         let started = Instant::now();
@@ -881,6 +885,16 @@ impl Owner {
                 Ok(_) => tick.persisted = true,
                 Err(error) => tick.report(&error),
             }
+        }
+    }
+
+    /// Move the S0 of Work whose workspace integrated a newer source
+    /// (`s0::follow`), before anything evaluates it against the old one.
+    fn follow_integration(&mut self, state: &State, runs: &mut [RunRecord], tick: &mut Tick) {
+        let (moved, errors) = super::s0::follow(state, &self.root, runs, &mut self.heads);
+        tick.persisted |= moved;
+        for error in errors {
+            tick.report(&error);
         }
     }
 

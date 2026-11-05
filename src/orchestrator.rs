@@ -6,6 +6,7 @@ pub mod inbox;
 pub(crate) mod liveness;
 pub(crate) mod native;
 pub mod registration;
+pub(crate) mod s0;
 pub mod serve;
 pub(crate) use apply::source_lock_path;
 pub use apply::{ApplyAuthority, ApplyOutcome, auto_apply};
@@ -681,6 +682,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         source_fingerprint: snapshot.fingerprint,
         baseline_path: snapshot.baseline_path,
         baseline_commit: snapshot.baseline_commit,
+        baseline_history: Vec::new(),
         status: RunStatus::Preparing,
         mode: RunMode::Native,
         state_revision: 0,
@@ -3233,6 +3235,43 @@ pub(crate) fn source_at_start(attachment: &crate::AttachmentRecord) -> Vec<Strin
     lines
 }
 
+/// What `explain` says of S0: where it began and each move since.
+pub(crate) fn s0_lines(run: &RunRecord, attachment: &crate::AttachmentRecord) -> Vec<String> {
+    let began = match &attachment.provenance {
+        crate::BaselineProvenance::GitMergeBase { commit } => {
+            format!("commit {commit} (merge base with the root)")
+        }
+        crate::BaselineProvenance::SnapshotAtAttach => {
+            "snapshot of the workspace at attach; earlier edits are not attributed".into()
+        }
+        crate::BaselineProvenance::WorkspaceAtStart { commit } => {
+            format!("the workspace as it was when the work began ({commit})")
+        }
+        crate::BaselineProvenance::Discovered { commit } => format!(
+            "commit {commit} (merge base with the root; found by Dispatch, the worktree appeared while the project was watched)"
+        ),
+    };
+    // The current S0 first, then each it moved from.
+    let mut lines = Vec::new();
+    let mut label = "S0";
+    for moved in run.baseline_history.iter().rev() {
+        let why = match moved.landed_run {
+            _ if moved.back => "the workspace's HEAD no longer has it",
+            Some(_) => "the workspace merged the recorded source",
+            None => "the workspace merged the root's HEAD",
+        };
+        lines.push(format!(
+            "{label}: commit {} (moved from {} at {}: {why})",
+            moved.moved_to,
+            moved.commit,
+            moved.moved_at.format("%Y-%m-%d %H:%M UTC")
+        ));
+        label = "S0 before";
+    }
+    lines.push(format!("{label}: {began}"));
+    lines
+}
+
 fn print_attachment_details(run: &RunRecord) {
     let Some(attachment) = &run.attachment else {
         return;
@@ -3242,21 +3281,8 @@ fn print_attachment_details(run: &RunRecord) {
         println!("{line}");
     }
     println!("  root: {}", attachment.integration_root.display());
-    match &attachment.provenance {
-        crate::BaselineProvenance::GitMergeBase { commit } => {
-            println!("  S0: commit {commit} (merge base with the root)");
-        }
-        crate::BaselineProvenance::SnapshotAtAttach => {
-            println!("  S0: snapshot of the workspace at attach; earlier edits are not attributed");
-        }
-        crate::BaselineProvenance::WorkspaceAtStart { commit } => {
-            println!("  S0: the workspace as it was when the work began ({commit})");
-        }
-        crate::BaselineProvenance::Discovered { commit } => {
-            println!(
-                "  S0: commit {commit} (merge base with the root; found by Dispatch, the worktree appeared while the project was watched)"
-            );
-        }
+    for line in s0_lines(run, attachment) {
+        println!("  {line}");
     }
     println!("  confidence: {}", snake_case(&attachment.confidence));
     println!(
