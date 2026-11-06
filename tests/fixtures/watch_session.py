@@ -103,11 +103,14 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             '--agent','fake-good','--task',task,'--json'],capture_output=True,check=True)
         return json.loads(out.stdout)['run_id']
     def meta(run_id):return json.loads((state/'runs'/run_id/'metadata.json').read_text())
-    def until(ui,check,what):
-        for _ in range(300):
-            if check():return
-            ui.pump(.1)
-        raise AssertionError('never '+what)
+    def until(screen,check,what):
+        """Wait for `check`, as long as `Screen.see` waits; the last screen
+        says why it never came."""
+        deadline=time.monotonic()+WAIT
+        while not check():
+            if time.monotonic()>deadline:
+                raise AssertionError('never %s\n%s'%(what,'\n'.join(screen.rows())))
+            screen.ui.pump(.1)
     first=run('Create the fake artifact')
     captures=str(root/'captures')
     with Session([binary,'--state-dir',str(state),'watch','--root',str(source)],source,captures,'watch',width=160,height=30) as ui:
@@ -120,7 +123,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
         ui.send('\r');screen.see('Create the fake artifact: nothing changed.');ui.pump(.3)
         assert meta(first)['outcome']['review']=='pending','Enter alone rejected'
         ui.send('r');screen.see('Cancel');ui.send('\x1b[A');ui.pump(.3);ui.send('\r')
-        until(ui,lambda:meta(first)['outcome']['review']=='rejected','rejected')
+        until(screen,lambda:meta(first)['outcome']['review']=='rejected','rejected')
         screen.see('Create the fake artifact: rejected; nothing was applied.')
         # Work that appears while watching shows up first, since it needs a
         # decision; the selection stays on the Work it was on.
@@ -137,7 +140,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
         ui.send('\x1b');screen.see('› Write a second artifact','a accept')
         # Accept applies it.
         ui.send('a')
-        until(ui,lambda:meta(second)['outcome']['application']=='applied','applied')
+        until(screen,lambda:meta(second)['outcome']['application']=='applied','applied')
         # The notice says what accept verified: nothing moved, so no merged checks.
         screen.see('Write a second artifact: accepted and applied; merged checks not run')
         shown=' '.join(' '.join(screen.rows()).split())
@@ -170,7 +173,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             screen.see('auth-ctx: nothing changed.');ui.pump(.5)
             assert meta(work)['outcome']['lifecycle']=='working','Enter alone ran the checks'
             ui.send('f');screen.see('Cancel');ui.send('\x1b[A');ui.pump(.3);ui.send('\r')
-            until(ui,lambda:meta(work)['outcome']['work_result']=='ready','finished')
+            until(screen,lambda:meta(work)['outcome']['work_result']=='ready','finished')
             assert meta(work)['outcome']['verification']=='passed'
             screen.see('auth-ctx: finished; checks passed. It now waits for your review.')
             ui.send('q');ui.finish()
@@ -192,19 +195,19 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
             asking=lambda text:any(text in row for row in screen.rows())
             screen.see('› auth-ctx','spare');ui.send('j');screen.see('› spare','f finish')
             ui.send('r')
-            until(ui,lambda:'not rejected: Work %s is unfinished'%spare in flat()
+            until(screen,lambda:'not rejected: Work %s is unfinished'%spare in flat()
                   and 'dispatch close %s --reason unfinished'%spare in flat(),'reject refused')
             assert not asking('Reject spare'),'asked to reject unfinished Work'
             ui.send('c');screen.see('Why close spare (Work %s)?'%tag,'Unfinished: nobody will finish it','Cancel')
-            ui.send('\r');until(ui,lambda:not asking('Why close spare'),'reason cancelled')
+            ui.send('\r');until(screen,lambda:not asking('Why close spare'),'reason cancelled')
             ui.send('c');screen.see('Why close spare');ui.send('\x1b[A');ui.pump(.3);ui.send('\r')
             screen.see('Close spare (Work %s)? Unfinished: nobody will finish it.'%tag)
-            ui.send('\r');until(ui,lambda:not asking('Close spare (Work'),'confirmation cancelled');ui.pump(.3)
+            ui.send('\r');until(screen,lambda:not asking('Close spare (Work'),'confirmation cancelled');ui.pump(.3)
             assert meta(spare)['outcome']['lifecycle']=='working' and 'closed' not in meta(spare)['outcome'],\
                 'closed without a reason and a confirmation'
             ui.send('c');screen.see('Why close spare');ui.send('\x1b[A');ui.pump(.3);ui.send('\r')
             screen.see('Close spare (Work %s)?'%tag);ui.send('\x1b[A');ui.pump(.3);ui.send('\r')
-            until(ui,lambda:(meta(spare)['outcome'].get('closed') or {}).get('reason')=='unfinished','closed')
+            until(screen,lambda:(meta(spare)['outcome'].get('closed') or {}).get('reason')=='unfinished','closed')
             screen.see('spare: closed; no review was recorded and nothing was applied.')
             outcome=meta(spare)['outcome']
             assert (outcome['work_result'],outcome['review'])==('cancelled','not_requested'),outcome
@@ -229,13 +232,11 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
         consent.write_text(json.dumps({'version':2,'root':project,'commands':['true'],'granted_at':'2026-11-04T00:00:00Z'}))
         with Session([binary,'--state-dir',str(state),'watch','--root',str(repo)],repo,captures,'watch-finish-consented',width=160,height=30) as ui:
             screen=Screen(ui)
-            screen.see('covered')
-            for _ in range(5):
-                if any(row.lstrip().startswith('› covered') for row in screen.rows()): break
-                ui.send('j');ui.pump(.3)
-            screen.see('› covered','f finish')
+            # One key, then its redraw: a key sent before the view drew the
+            # last one moves the selection past the Work, onto closed spare.
+            screen.see('› auth-ctx','covered');ui.send('j');screen.see('› covered','f finish')
             ui.send('f')
-            until(ui,lambda:meta(covered)['outcome']['work_result']=='ready','finished under consent')
+            until(screen,lambda:meta(covered)['outcome']['work_result']=='ready','finished under consent')
             screen.see('covered: finished; checks passed. It now waits for your review.')
             # Redrawn cell by cell, the stream can split a question's words.
             assert 'Finishcovered' not in ''.join(ui.clean.split()),'asked although consent covers the checks'
