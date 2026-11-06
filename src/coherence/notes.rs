@@ -1,8 +1,8 @@
 //! What a note says: fixed text telling a live Work which other Work touches
 //! it, from the owner's projection and from landings. Each item is sent once
 //! per key, and a Work gets at most one note per ten minutes; items found in
-//! between wait and are merged into the next note. Pure: no I/O, no clock,
-//! no randomness.
+//! between, or past what one delivery takes, wait and are merged into the
+//! next note. Pure: no I/O, no clock, no randomness.
 
 use std::collections::BTreeMap;
 
@@ -11,8 +11,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::interactions::{self, Change, Interaction, Projection, Rule, Side, Target};
+use crate::orchestrator::inbox::MAX_TEXT;
 
 const WINDOW: Duration = Duration::minutes(10);
+/// Room kept for the line that says how many items wait.
+const MORE: usize = 40;
+/// The most characters of a signature a note shows, so that every item fits
+/// one delivery.
+const SIGNATURE: usize = 500;
 
 /// Other Work that landed while `work` was in progress.
 #[derive(Clone, Debug)]
@@ -31,7 +37,8 @@ pub struct Landing {
     pub signatures: BTreeMap<Target, (String, String)>,
 }
 
-/// One note for a Work: every item waiting when its window opened.
+/// One note for a Work: the items waiting when its window opened, as many
+/// as one delivery takes (`MAX_TEXT`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Note {
     /// A digest of `keys`: the same items give the same id.
@@ -99,7 +106,7 @@ pub fn compose(
             if interaction.change == Some(Change::Signature)
                 && let Some((old, new)) = landing.signatures.get(&interaction.target)
             {
-                item += &format!("\nSignature: {} → {}", one_line(old), one_line(new));
+                item += &format!("\nSignature: {} → {}", cap(old), cap(new));
             }
             item += &format!(
                 "\nThe source with this change is commit {} (refs/dispatch/source).",
@@ -126,15 +133,29 @@ pub fn compose(
     if items.is_empty() || next.last_note_at.is_some_and(|last| now - last < WINDOW) {
         return (Vec::new(), next);
     }
-    let keys: Vec<String> = items.keys().cloned().collect();
-    let id = hex::encode(Sha256::digest(keys.join("\n").as_bytes()))[..16].to_owned();
-    let text = format!(
-        "Dispatch: other Work touches this Work ({}), your changes in this workspace.\n{}",
-        short[work],
-        items.into_values().collect::<Vec<_>>().join("\n")
+    // A note fits one delivery; items past it are not sent yet, and wait
+    // for the next note.
+    let mut text = format!(
+        "Dispatch: other Work touches this Work ({}), your changes in this workspace.",
+        short[work]
     );
+    let mut length = text.chars().count() + MORE;
+    let mut keys = Vec::new();
+    for (key, item) in &items {
+        length += 1 + item.chars().count();
+        if length > MAX_TEXT && !keys.is_empty() {
+            break;
+        }
+        text += "\n";
+        text += item;
+        keys.push(key.clone());
+    }
+    if keys.len() < items.len() {
+        text += &format!("\nAnd {} more in the next note.", items.len() - keys.len());
+    }
+    let id = hex::encode(Sha256::digest(keys.join("\n").as_bytes()))[..16].to_owned();
     next.at.extend(keys.iter().map(|key| (key.clone(), now)));
-    next.pending.clear();
+    next.pending.retain(|key, _| !next.at.contains_key(key));
     next.last_note_at = Some(now);
     (vec![Note { id, keys, text }], next)
 }
@@ -159,6 +180,15 @@ fn item_key(kind: &str, other: &str, interaction: &Interaction) -> String {
 
 fn one_line(value: &str) -> String {
     value.replace(['\n', '\r'], " ")
+}
+
+/// A signature on one line, cut at `SIGNATURE` characters with "…".
+fn cap(value: &str) -> String {
+    let value = one_line(value);
+    match value.char_indices().nth(SIGNATURE) {
+        Some((end, _)) => format!("{}…", &value[..end]),
+        None => value,
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +347,24 @@ mod tests {
     }
 
     #[test]
+    fn a_signature_longer_than_a_delivery_is_cut_and_the_note_is_sent() {
+        let (old, new) = ("x".repeat(20_000), "y".repeat(20_000));
+        let landing = Landing {
+            signatures: BTreeMap::from([(symbol(), (old, new))]),
+            ..landed()
+        };
+        let (notes, sent) = compose_at(&projection(vec![]), &[landing], &Sent::default(), 0);
+        let text = &notes[0].text;
+        assert!(text.chars().count() <= MAX_TEXT, "{}", text.chars().count());
+        let shown = format!("Signature: {}… → {}…\n", "x".repeat(500), "y".repeat(500));
+        assert!(text.contains(&shown), "{text}");
+        assert!(
+            sent.pending.is_empty(),
+            "the item is sent, not left waiting"
+        );
+    }
+
+    #[test]
     fn whole_file_facts_do_not_make_notes() {
         let file = Target::File {
             path: "src/auth.rs".into(),
@@ -410,6 +458,47 @@ mod tests {
             notes[0]
                 .text
                 .contains("\nbbbbbbbb (Claude Code): both change")
+        );
+    }
+
+    #[test]
+    fn a_burst_past_one_delivery_is_sent_over_windows_and_nothing_is_lost() {
+        let overlap = |n: u32| Interaction {
+            lines: Some((n, n)),
+            ..interaction(
+                Rule::TextualOverlap,
+                Target::File {
+                    path: format!("src/{}file_{n}.rs", "nested/".repeat(10)),
+                },
+                None,
+            )
+        };
+        let view = projection((1..=200).map(overlap).collect());
+        let mut state = Sent::default();
+        let mut sent = Vec::new();
+        for window in 0..10 {
+            let (early, _) = compose_at(&view, &[landed()], &state, window * 10 - 1);
+            assert!(window == 0 || early.is_empty(), "one note per window");
+            let (notes, next) = compose_at(&view, &[landed()], &state, window * 10);
+            state = next;
+            let Some(note) = notes.first() else { break };
+            assert!(note.text.chars().count() <= MAX_TEXT, "{}", note.text.len());
+            assert_eq!(
+                note.text.lines().nth(1).unwrap().contains("landed"),
+                window == 0
+            );
+            sent.extend(note.keys.clone());
+        }
+        assert_eq!(sent.len(), 201, "every item, the landing first");
+        assert_eq!(state.at.len(), 201);
+        assert!(state.pending.is_empty());
+        let (first, _) = compose_at(&view, &[landed()], &Sent::default(), 0);
+        let waiting = 201 - first[0].keys.len();
+        assert!(waiting > 0);
+        assert!(
+            first[0]
+                .text
+                .ends_with(&format!("\nAnd {waiting} more in the next note."))
         );
     }
 

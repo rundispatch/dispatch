@@ -619,6 +619,8 @@ pub(crate) struct Owner {
     /// moves, and the facts each Work's (S0, Δ) was found to assume.
     worlds: world::Worlds,
     memo: facts::Memo,
+    /// What the notes step remembers between ticks.
+    told: super::notify::Told,
     scratch: tempfile::TempDir,
 }
 
@@ -684,6 +686,7 @@ pub(crate) struct Cost {
     pub apply: Duration,
     pub footprint: Duration,
     pub pairs: Duration,
+    pub notes: Duration,
     pub runs: usize,
     pub followed: usize,
     pub evaluated: usize,
@@ -702,7 +705,7 @@ impl std::fmt::Display for Cost {
         let ms = |d: Duration| d.as_millis();
         write!(
             f,
-            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted in {} ms · pairs in {} ms · total {} ms",
+            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted in {} ms · pairs in {} ms · notes {} ms · total {} ms",
             ms(self.signal),
             self.runs,
             ms(self.load),
@@ -716,6 +719,7 @@ impl std::fmt::Display for Cost {
             self.footprinted,
             ms(self.footprint),
             ms(self.pairs),
+            ms(self.notes),
             ms(self.total)
         )
     }
@@ -745,6 +749,7 @@ impl Owner {
             live: None,
             worlds: world::Worlds::default(),
             memo: facts::Memo::default(),
+            told: super::notify::Told::default(),
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -827,6 +832,7 @@ impl Owner {
         if tick.adopted || tick.persisted || tick.applied {
             self.interact(state, &runs, &mut tick);
         }
+        self.tell(state, &runs, &mut tick);
         self.measure(state, &runs, &mut tick);
         // Facts are kept only for each Work's (S0, Δ) as its footprint
         // stands now.
@@ -896,6 +902,26 @@ impl Owner {
         for error in errors {
             tick.report(&error);
         }
+    }
+
+    /// Leave live agents their notes (`notify::tell`), from the interaction
+    /// view as it stands after this tick's landings.
+    fn tell(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+        let started = Instant::now();
+        if let Some(projection) = &self.shown {
+            let errors = super::notify::tell(
+                state,
+                &self.root,
+                runs,
+                projection,
+                &mut self.told,
+                Utc::now(),
+            );
+            for error in errors {
+                tick.report(&error);
+            }
+        }
+        tick.cost.notes = started.elapsed();
     }
 
     /// Count the files changed in each patch followed this tick, the one

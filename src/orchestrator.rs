@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod inbox;
 pub(crate) mod liveness;
 pub(crate) mod native;
+mod notify;
 pub mod registration;
 pub(crate) mod s0;
 pub mod serve;

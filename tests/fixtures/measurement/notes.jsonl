@@ -1,0 +1,22 @@
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "note.written", "timestamp": "2026-11-05T10:00:00Z", "payload": {"note": "n1", "text": "t1"}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "note.delivered", "timestamp": "2026-11-05T10:01:00Z", "payload": {"note": "n1", "via": "PostToolUse"}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "note.touched", "timestamp": "2026-11-05T10:05:00Z", "payload": {"note": "n1", "key": "[\"work\",\"01J9NOTEW20000000000000000\",\"src/lib.rs\",\"f\",null]"}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "attach.s0_moved", "timestamp": "2026-11-05T10:06:00Z", "payload": {"from": "a", "to": "b"}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "coherence.checked", "timestamp": "2026-11-05T10:07:00Z", "payload": {"coherence": {"decision": "continue", "evaluated_at": "2026-11-05T00:00:00Z", "reasons": [], "analysis": "symbols"}}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "coherence.invalidated", "timestamp": "2026-11-05T10:20:00Z", "payload": {"coherence": {"decision": "refresh", "evaluated_at": "2026-11-05T00:00:00Z", "reasons": [], "analysis": "symbols"}}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "note.written", "timestamp": "2026-11-05T10:30:00Z", "payload": {"note": "n2", "text": "t2"}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "note.touched", "timestamp": "2026-11-05T10:30:10Z", "payload": {"note": "n2", "key": "[\"work\",\"01J9NOTEW20000000000000000\",\"src/lib.rs\",\"g\",null]"}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "coherence.invalidated", "timestamp": "2026-11-05T10:30:30Z", "payload": {"coherence": {"decision": "stop", "evaluated_at": "2026-11-05T00:00:00Z", "reasons": [], "analysis": "symbols"}}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "note.delivered", "timestamp": "2026-11-05T10:31:00Z", "payload": {"note": "n2", "via": "pre_llm_call"}}
+{"run_id": "01J9NOTEW10000000000000000", "event_type": "result.applied", "timestamp": "2026-11-05T10:40:00Z", "payload": {"coherence": {"decision": "refresh", "evaluated_at": "2026-11-05T00:00:00Z", "reasons": [], "analysis": "symbols"}}}
+{"run_id": "01J9NOTEW20000000000000000", "event_type": "note.written", "timestamp": "2026-11-05T11:00:00Z", "payload": {"note": "n3", "text": "t3"}}
+{"run_id": "01J9NOTEW20000000000000000", "event_type": "note.delivered", "timestamp": "2026-11-05T11:01:00Z", "payload": {"note": "n3", "via": "PostToolUse"}}
+{"run_id": "01J9NOTEW20000000000000000", "event_type": "note.touched", "timestamp": "2026-11-05T11:02:00Z", "payload": {"note": "n9", "key": "[\"work\",\"01J9NOTEW20000000000000000\",\"src/lib.rs\",\"f\",null]"}}
+{"run_id": "01J9NOTEW20000000000000000", "event_type": "run.finished", "timestamp": "2026-11-05T11:03:00Z", "payload": {"candidate_count": 1}}
+{"run_id": "01J9NOTEW20000000000000000", "event_type": "note.written", "timestamp": "2026-11-05T11:10:00Z", "payload": {"note": "n4", "text": "t4"}}
+{"run_id": "01J9NOTEW20000000000000000", "event_type": "note.expired", "timestamp": "2026-11-05T11:20:00Z", "payload": {"note": "n4", "lifecycle": "finished"}}
+{"run_id": "01J9NOTEW20000000000000000", "event_type": "note.written", "timestamp": "2026-11-05T11:30:00Z", "payload": {"note": "n5", "text": "t5"}}
+{"run_id": "01J9NOTEW30000000000000000", "event_type": "note.written", "timestamp": "2026-11-05T12:00:00Z", "payload": {"note": "n6", "text": "t6"}}
+{"run_id": "01J9NOTEW30000000000000000", "event_type": "note.written", "timestamp": "2026-11-05T12:04:00Z", "payload": {"note": "n7", "text": "t7"}}
+{"run_id": "01J9NOTEW30000000000000000", "event_type": "note.delivered", "timestamp": "2026-11-05T12:05:00Z", "payload": {"note": "n7", "via": "SessionStart"}}
+{"run_id": "01J9NOTEW30000000000000000", "event_type": "application.failed", "timestamp": "2026-11-05T12:10:00Z", "payload": {"application": "blocked_by_source_drift", "error": "x", "coherence": {"decision": "stop", "evaluated_at": "2026-11-05T00:00:00Z", "reasons": [], "analysis": "symbols"}}}
