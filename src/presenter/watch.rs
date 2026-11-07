@@ -778,7 +778,10 @@ struct Notice {
     name: Option<String>,
     kind: Kind,
     text: String,
-    at: Instant,
+    /// When it was first drawn. Its lifetime starts there, not when it was
+    /// made: on a loaded machine the reload before that draw can take longer
+    /// than the whole lifetime, and the answer to a key would never show.
+    drawn: Option<Instant>,
 }
 
 impl Notice {
@@ -788,8 +791,12 @@ impl Notice {
             name: work.map(|item| item.name.clone()),
             kind,
             text: text.into(),
-            at: Instant::now(),
+            drawn: None,
         }
+    }
+    fn expired(&self) -> bool {
+        self.drawn
+            .is_some_and(|drawn| drawn.elapsed() >= NOTICE_LIFETIME)
     }
     /// `<name>: <text>`, with the Work's name as it is listed now.
     fn shown(&self, items: &[Item]) -> String {
@@ -934,10 +941,7 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
             journal = now;
             loaded = Some(Instant::now());
         }
-        if notice
-            .as_ref()
-            .is_some_and(|notice| notice.at.elapsed() >= NOTICE_LIFETIME)
-        {
+        if notice.as_ref().is_some_and(Notice::expired) {
             notice = None;
         }
         let screen = Screen {
@@ -953,6 +957,9 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
         ui.draw_frame(&screen.key(), |frame, palette| {
             render(frame, &screen, palette)
         })?;
+        if let Some(notice) = &mut notice {
+            notice.drawn.get_or_insert_with(Instant::now);
+        }
         let Some(event) = ui.next().await? else {
             return Ok(());
         };
@@ -3084,6 +3091,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
         terminal.draw(|f| render(f, &screen, palette)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn a_notice_lives_from_its_first_draw_not_from_when_it_was_made() {
+        let listed = items(&demo());
+        let mut notice = Notice::new(Some(&listed[0]), Kind::Refused, "not rejected.");
+        // Not drawn yet, however long ago it was made: it stays.
+        assert!(!notice.expired());
+        notice.drawn = Instant::now().checked_sub(NOTICE_LIFETIME);
+        assert!(notice.expired());
     }
 
     #[test]

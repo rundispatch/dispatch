@@ -474,17 +474,16 @@ fn an_unpushed_commit_keeps_the_worktree_and_ends_only_the_session() {
 
     let payload = p.payload("on_session_finalize", "shutdown", &p.root);
     hermes.ok(&p.hook_line(&payload, &worktree));
-    // The hook leaves the end for the owner, which records it on its tick.
+    // The hook leaves the end for the owner, which records it on its tick:
+    // in `metadata.json` a moment before its event is in `events.jsonl`.
     wait_until("the session's end", || {
         p.run(&worktree)["attachment"]["sessions"][0]["end_reason"] == "shutdown"
+            && p.events(&id)
+                .contains(&"\"runtime.session_ended\"".to_owned())
     });
     let run = p.run(&worktree);
     assert_eq!(run["attachment"]["workspace_removed"], Value::Null, "{run}");
     assert_eq!(run["outcome"]["lifecycle"], "working");
-    assert!(
-        p.events(&id)
-            .contains(&"\"runtime.session_ended\"".to_owned())
-    );
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
     let listed = git(&p.root, &["worktree", "list", "--porcelain"]);

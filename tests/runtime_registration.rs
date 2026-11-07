@@ -295,18 +295,29 @@ impl Project {
         rusqlite::Connection::open(self.state.join("dispatch.db")).unwrap()
     }
 
-    /// How many records the database holds for `id`, or for every run.
+    /// How many records the database holds for `id`, or for every run. The
+    /// owner's first open makes the file a moment before the schema: none yet.
     fn recorded(&self, id: &str) -> i64 {
         if !self.state.join("dispatch.db").is_file() {
             return 0;
         }
-        self.db()
+        let db = self.db();
+        let schema: bool = db
             .query_row(
-                "SELECT COUNT(*) FROM runs WHERE id = ?1 OR ?1 = ''",
-                [id],
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs')",
+                [],
                 |row| row.get(0),
             )
-            .unwrap()
+            .unwrap();
+        if !schema {
+            return 0;
+        }
+        db.query_row(
+            "SELECT COUNT(*) FROM runs WHERE id = ?1 OR ?1 = ''",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     /// The payloads of `id`'s events of `kind`.

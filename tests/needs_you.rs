@@ -206,9 +206,17 @@ impl Project {
         self.run(id)["attachment"]["needs_you"].clone()
     }
 
-    /// The mark of `kind` once the owner recorded it from the hook's.
+    /// The mark of `kind` once the owner recorded it from the hook's, and its
+    /// event: the owner writes `metadata.json` a moment before `events.jsonl`.
     fn marked(&self, id: &str, kind: &str) -> Value {
-        wait_until("the mark recorded", || self.mark(id)["kind"] == kind);
+        wait_until("the mark recorded", || {
+            let mark = self.mark(id);
+            mark["kind"] == kind
+                && self
+                    .events(id, "runtime.needs_you")
+                    .last()
+                    .is_some_and(|event| event["payload"]["at"] == mark["at"])
+        });
         self.mark(id)
     }
 
@@ -230,9 +238,12 @@ impl Project {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    /// Wait for the owner to clear the mark, and say what cleared it.
+    /// Wait for the owner to clear the mark, and say what cleared it. The
+    /// cleared mark is in `metadata.json` a moment before its event is.
     fn cleared(&self, id: &str) -> String {
-        wait_until("the mark cleared", || self.mark(id).is_null());
+        wait_until("the mark cleared", || {
+            self.mark(id).is_null() && !self.events(id, "runtime.needs_you_cleared").is_empty()
+        });
         let cleared = self.events(id, "runtime.needs_you_cleared");
         assert_eq!(cleared.len(), 1, "{cleared:?}");
         cleared[0]["payload"]["by"].as_str().unwrap().to_owned()

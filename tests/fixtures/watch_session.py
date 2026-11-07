@@ -117,7 +117,8 @@ with tempfile.TemporaryDirectory(prefix='dispatch-watch-') as tmp:
         screen=Screen(ui)
         # Work is named by its task; its ID is in the details, its S0 nowhere.
         rows=screen.see('› Create the fake artifact','Work '+first[:8],'leave')
-        assert not any('S0' in row or 'Shift+Tab' in row for row in rows),rows
+        # As a word: a Work ID's time prefix spells S0 for minutes at a time.
+        assert not any(re.search(r'\bS0\b',row) or 'Shift+Tab' in row for row in rows),rows
         # Reject asks first, naming the Work; Enter alone cancels.
         ui.send('r');screen.see('Reject Create the fake artifact (Work %s)?'%first[:8],'Cancel')
         ui.send('\r');screen.see('Create the fake artifact: nothing changed.');ui.pump(.3)
