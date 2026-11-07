@@ -1851,12 +1851,15 @@ async fn finish_checks(
                 &run.baseline_commit,
                 &run.source_kind,
             )?;
-            integration::checks_skipped(
-                run,
-                &run.candidates[0].label,
-                &run_dir,
-                Some(!world.changes.is_empty()),
-            )? == Some(integration::ChecksSkipped::Unmoved)
+            matches!(
+                integration::checks_skipped(
+                    run,
+                    &run.candidates[0].label,
+                    &run_dir,
+                    Some(!world.changes.is_empty()),
+                )?,
+                Some(integration::ChecksSkipped::Unmoved { .. })
+            )
         }
         (None, Some(_)) => false,
     };

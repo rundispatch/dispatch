@@ -280,9 +280,25 @@ If verification is configured, the same commands run against the candidate and t
 
 The local backend is the supported real-agent path in this candidate. Docker execution is advanced and experimental: users must provide a suitable image containing the agent and project toolchain.
 
+## Events
+
+Each run's committed events are in the `events` table, and `dispatch events` and `status --jsonl` replay them. Every payload also carries the run's `outcome`. The coherence events are listed in [coherence.md](coherence.md#events), and those of attached Work in [attach.md](attach.md#events). New in 0.4.18:
+
+| Event | When | Payload |
+|---|---|---|
+| `attach.s0_moved` | the project owner moved attached Git Work's S0 to a recorded source or the root's HEAD that the workspace's HEAD descends from, or back when it no longer does | `{"from", "to", "workspace_head", "proof": "ancestor of workspace HEAD" \| "workspace HEAD no longer descends from S0", "recorded_at", "landed_run": <run id> \| null, "delta_before_sha256", "delta_after_sha256"}` |
+| `note.written` | the owner put a note in the Work's inbox | `{"note": <16 hex characters>, "text"}` |
+| `note.delivered` | the owner saw a hook take the note; the event's time is when the hook took it | `{"note", "via": "PostToolUse" \| "SessionStart" \| "pre_llm_call"}` |
+| `note.expired` | the Work stopped being in progress before a hook took the note | `{"note", "lifecycle"}` |
+| `note.touched` | the first change the Work's Δ made, after the note was written, at a target the note named: the declaration, compared by its full text, or the file for a textual overlap; once per target | `{"note", "key": [kind, other run, path, name, change]}` |
+
+`runtime.session_ended` (from a hook) and `runtime.needs_you` are now recorded by the project owner from a file the hook left, at the time the hook saw them; their payloads are unchanged.
+
 ## Local state and artifacts
 
 Normalized state lives in `~/.dispatch/dispatch.db`; `--state-dir` or `DISPATCH_HOME` overrides that location. Per-run evidence lives under `~/.dispatch/runs/<run-id>/`, including the frozen baseline, candidate workspace, bounded stdout/stderr, structured agent output, checks, patch, events, and inspectable metadata.
+
+After a landing on a Git project, Dispatch records the project's source as a commit and points `refs/dispatch/source` in that repository at it, with a reflog entry `dispatch: Work <id> landed`. No branch, HEAD, index or file of yours changes. Notes for live agents, and the marks hooks leave for the project owner, are files under `<state>/inbox/` and `<state>/marks/`.
 
 No network service is required to create, execute, inspect, accept, or reject a task, and Dispatch uploads nothing.
 
@@ -291,7 +307,7 @@ No network service is required to create, execute, inspect, accept, or reject a 
 - Experimental developer preview, not a stable 1.0 service.
 - Real-agent testing centers on Codex CLI and Claude Code (see [provider support](provider-support.md)); Cursor Agent and Hermes Agent remain available as an explicit `--agent cursor` or `--agent hermes` choice without a funding contract. Hermes passed attach and native runs in the 0.4.14 conformance trials; its own worktree mode, which 0.4.14 did not recognize, passed with 0.4.15 on 2026-10-16, in one trial without the hook (the last-seen path). Agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current, finishes Work whose session ended when you allowed the project's checks, and applies only attached work you allowed to integrate; it never launches, refreshes or signals agents. It recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's worktrees by itself, sees only Claude Code's and Hermes's sessions end, and scans no processes.
+- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current, finishes Work whose session ended when you allowed the project's checks, applies only attached work you allowed to integrate, leaves notes for live Claude Code and Hermes sessions that their hooks deliver, and moves the S0 of attached Git Work whose agent merged a recorded source; it never launches, refreshes or signals agents, and a note asks nothing of an agent. It recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's worktrees by itself, sees only Claude Code's and Hermes's sessions end, and scans no processes.
 
 ## Testing and CI
 

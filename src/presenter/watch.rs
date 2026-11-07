@@ -449,7 +449,7 @@ fn landed(run: &RunRecord, line: &orchestrator::WorkLine) -> String {
 /// What the Work began against, from `WorkLine`'s inputs.
 fn began(run: &RunRecord) -> String {
     let short = |commit: &str| commit.chars().take(8).collect::<String>();
-    match run.attachment.as_ref().map(|a| &a.provenance) {
+    let began = match run.attachment.as_ref().map(|a| &a.provenance) {
         Some(crate::BaselineProvenance::GitMergeBase { commit }) => format!(
             "the Git merge base {} of its worktree and the project",
             short(commit)
@@ -473,6 +473,13 @@ fn began(run: &RunRecord) -> String {
             ),
             None => "a Dispatch snapshot of the project folder".into(),
         },
+    };
+    match run.baseline_history.last() {
+        Some(moved) => format!(
+            "{began}; its S0 moved since, to commit {}",
+            short(&moved.moved_to)
+        ),
+        None => began,
     }
 }
 
@@ -2720,6 +2727,44 @@ mod tests {
         let text = rows(&buffer).join("\n");
         assert!(text.contains("No Work in the last hour."), "{text}");
         assert!(text.contains(want), "{text}");
+    }
+
+    /// `worktree`'s Work, after its workspace merged a recorded source.
+    fn moved(id: &str) -> RunRecord {
+        let mut run = working(worktree(id, "me-endpoint", 1));
+        run.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: PathBuf::from("/state/runs/w/baseline"),
+            baseline_commit: "b".into(),
+            commit: "e4a15cd9ffffffff".into(),
+            moved_to: "2216f677aaaaaaaa".into(),
+            moved_at: chrono::Utc::now(),
+            recorded_at: chrono::Utc::now(),
+            landed_run: Some("01M4DRXH00000000000000000A".into()),
+            back: false,
+        });
+        run
+    }
+
+    #[test]
+    fn a_work_line_names_the_s0_a_work_moved_to() {
+        let line = orchestrator::work_line(&moved("01M4DRXH00000000000000000B"), None);
+        assert_eq!(line.s0, "commit 2216f677 (moved from e4a15cd9)");
+        assert!(
+            line.to_string()
+                .starts_with("discovered claude · S0 commit 2216f677 (moved from e4a15cd9) · "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_began_detail_says_where_s0_moved_since() {
+        let item = items(&[moved("01M4DRXH00000000000000000B")]).remove(0);
+        assert_eq!(
+            lines(&item, "Began"),
+            [
+                "a Dispatch snapshot (e4a15cd9) of its worktree when its first session started, not a commit on any branch; its S0 moved since, to commit 2216f677"
+            ]
+        );
     }
 
     #[test]

@@ -35,14 +35,15 @@ use crate::{
 };
 
 /// Why accept does not run `checks.verify` on the merged tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksSkipped {
     /// The run's frozen configuration cannot be read, so accept is strict.
     ConfigUnreadable,
     /// `coherence.accept: strict`.
     Strict,
     /// The source has not moved since S0: the merged tree is the Work's own.
-    Unmoved,
+    /// `moved_to` names S0 when it moved after the Work began.
+    Unmoved { moved_to: Option<String> },
     /// `coherence.integration_checks: false`.
     Disabled,
     /// `checks.verify` is empty.
@@ -55,6 +56,15 @@ pub enum ChecksSkipped {
 
 impl fmt::Display for ChecksSkipped {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Unmoved {
+            moved_to: Some(commit),
+        } = self
+        {
+            return write!(
+                f,
+                "the source has not moved since the Work's S0 moved to {commit}, so the merged result is the Work's own tree"
+            );
+        }
         f.write_str(match self {
             Self::ConfigUnreadable => {
                 "the run's frozen configuration cannot be read, so accept is strict and applies only onto a source unchanged since the Work began"
@@ -62,7 +72,7 @@ impl fmt::Display for ChecksSkipped {
             Self::Strict => {
                 "accept is strict (coherence.accept: strict) and applies only onto a source unchanged since the Work began"
             }
-            Self::Unmoved => {
+            Self::Unmoved { .. } => {
                 "the source has not moved since the Work began, so the merged result is the Work's own tree"
             }
             Self::Disabled => "they are turned off (coherence.integration_checks: false)",
@@ -72,6 +82,16 @@ impl fmt::Display for ChecksSkipped {
             }
             Self::EmptyPatch => "the patch is empty",
         })
+    }
+}
+
+impl ChecksSkipped {
+    /// `Unmoved` for `run`, naming where its S0 moved, if it did.
+    pub fn unmoved(run: &RunRecord) -> Self {
+        let moved_to = run.baseline_history.last();
+        Self::Unmoved {
+            moved_to: moved_to.map(|moved| moved.moved_to.chars().take(8).collect()),
+        }
     }
 }
 
@@ -106,7 +126,7 @@ pub fn checks_skipped(
         }
     };
     let skipped = if unmoved {
-        ChecksSkipped::Unmoved
+        ChecksSkipped::unmoved(run)
     } else if !config.coherence.integration_checks {
         ChecksSkipped::Disabled
     } else if config.checks.verify.is_empty() {

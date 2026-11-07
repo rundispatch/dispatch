@@ -128,7 +128,8 @@ For an attached run, `explain` prints an **Attached work** section instead of a
 selection explanation (there is none): the workspace and root, the S0 line
 (`S0: commit <sha> (merge base with the root)`, `S0: commit <sha> (merge base with the
 root; found by Dispatch, the worktree appeared while the project was watched)` or
-`S0: snapshot of the workspace at attach; earlier edits are not attributed`),
+`S0: snapshot of the workspace at attach; earlier edits are not attributed`, and for
+Work whose S0 moved, the S0 it is now followed by each earlier one; see "When S0 moves"),
 `confidence`, `agent`, `owner`, the
 capability flags, and `finished: <reason>` once finished. It is followed by the
 ordinary **Coherence** section when the world moved or the verdict is not `CONTINUE`,
@@ -186,6 +187,74 @@ runtime's adapter and appears only for workspaces it made. For a Claude Code wor
 adds: "Claude Code: local commits reach a claude --worktree workspace only with
 worktree.baseRef: "head" in its settings; neither that setting nor a commit copies
 uncommitted changes." Dispatch never changes settings, commits or pushes in response.
+
+### When S0 moves
+
+Since 0.4.18, S0 follows an agent that integrates what landed, with proof.
+
+**The recorded source.** After each landing on a Git project, Dispatch records the project's
+source, landed changes included (accept never commits them), as a commit, and points
+`refs/dispatch/source` in the project's repository at it, with a reflog entry `dispatch:
+Work <id> landed`. Each record, with its commit, time and landed Work, is also kept in
+`<state>/projects/<sha256 of the root>/sources.json`. Nothing else of the person's checkout
+changes: not a branch, HEAD, the index or a file. A failure to record is printed (`Could not
+record the source after this landing: …`) and never fails the landing.
+
+The recorded source is the root's whole world, including the person's own uncommitted and
+untracked files. An agent that merges it takes those into its branch. They are then part of
+S0, not Δ, so they never land through that Work.
+
+**The move.** An agent may integrate what landed with `git merge refs/dispatch/source` or
+`git rebase refs/dispatch/source`. For attached Git Work still in progress, on the first
+tick after the workspace's HEAD moved, the project owner moves S0 to the newest of these
+that the HEAD descends from (`git merge-base --is-ancestor`):
+- a source recorded after the Work's S0, or recorded earlier but descending from S0's
+  commit (as when Work begun from the root's HEAD merges a landing that was still
+  uncommitted there);
+- the root's HEAD, when nothing is uncommitted at the root and S0 does not already contain
+  it.
+
+The new S0 is materialized in a new directory, `runs/<id>/s0/<n>/baseline`; the old one is
+kept. The run records the earlier S0 in `baseline_history`, and the event `attach.s0_moved
+{from, to, workspace_head, proof, recorded_at, landed_run, delta_before_sha256,
+delta_after_sha256}`, where `proof` is `ancestor of workspace HEAD`. Every earlier verdict's
+(S0, Δ) stays recomputable. Δ is then the agent's own change against what it merged, and a
+landed change it later reverts is in Δ as a revert.
+
+**No proof, no move.** S0 stays, and the verdict is what it would have been, while a merge,
+cherry-pick or rebase is in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `rebase-merge` or
+`rebase-apply`), while HEAD is detached, and for a pull of something never recorded, a
+cherry-pick or a squash of the landed change, or a merge of a source recorded before the
+Work began that does not descend from its S0. Native runs, plain directories, wrapped Work
+while its wrapper lives, and finished, closed or applied Work keep their S0. A resumed
+session goes on from the moved S0, with its history.
+
+**Moving back.** If the agent later undoes the merge (a `reset`, or a rebase that drops it),
+so its HEAD no longer descends from the moved S0, S0 moves back to the newest earlier S0 the
+HEAD descends from, or else to the one the Work began from, whose kept baseline is reused.
+The event is the same, with `proof` `workspace HEAD no longer descends from S0`, and the
+history entry has `back: true`. A `git revert` committed on top is not an undo: S0 stays and
+the revert is in Δ. The same happens when a rebase copies the recorded source's commit
+instead of keeping it as an ancestor (for example a rebase that flattens the merge): S0 goes
+back, the landed change is in Δ again, and the Work is REFRESH where it could have been
+CONTINUE. That is the verdict 0.4.17 gave, and never a revert landed. `git merge
+refs/dispatch/source`, or a rebase onto it, keeps the record as an ancestor.
+
+**Where it shows.** `explain` prints the S0 it is now, then each earlier one:
+
+```text
+  S0: commit b768cb1b9f76b262d153548f872a5cb6fdafc50b (moved from 47a3d33e4885c2f6835c99a6bf77dbbb0a5ce1ba at 2026-11-07 04:00 UTC: the workspace merged the recorded source)
+  S0 before: the workspace as it was when the work began (47a3d33e4885c2f6835c99a6bf77dbbb0a5ce1ba)
+```
+
+A move to the root's HEAD ends `the workspace merged the root's HEAD)`, and a move back
+`the workspace's HEAD no longer has it)`. Unmoved Work prints what it printed before.
+`watch`'s piped rows and the `s0` of `watch --json` name the S0 it is now, `S0 commit
+b768cb1b (moved from 47a3d33e)`, and the Began detail on a terminal adds `; its S0 moved
+since, to commit b768cb1b`. `status` prints no S0 line for attached Work. When the source has
+not moved since the move, `finish`, `check` and `accept` say so, naming the commit: `Merged
+checks: not run — the source has not moved since the Work's S0 moved to d1b75cdf, so the
+merged result is the Work's own tree`.
 
 ## Δ and "finished"
 
@@ -476,6 +545,10 @@ directory is gone. Nothing is applied or launched on start or exit. `dispatch se
      lifetime. Then read the session locks of the runtime-made Work it follows for
      liveness (see "Liveness from the session lock"), and clear the "waiting on you" mark
      of Work whose session moved (see "Waiting on you"): one `stat` per waiting Work.
+     Since 0.4.18 the tick also records the marks hooks left and the notes hooks took
+     ("Hooks never wait", "Notes to live agents"), right after loading the runs, and,
+     before evaluating, moves the S0 of Work whose workspace HEAD moved onto a recorded
+     source ("When S0 moves"): one `git rev-parse` per Work that can move.
   2. Follow every active attached run whose live owner state is not `Live` (a live
      wrapper is that wrapper's own business). For Work the fast loop follows, the
      tick still evaluates from its own scratch patch, but leaves `delta-live.patch` and
@@ -519,16 +592,18 @@ directory is gone. Nothing is applied or launched on start or exit. `dispatch se
      ignore the file unless an owner holds the project and its record names the pid
      that wrote it, so a count left by a killed owner reads as unknown. The owner
      removes it when it stops.
-  7. In the foreground, render the project view (below) every tick, because a run
+  7. Write notes (0.4.18): after the interactions are computed, compose each eligible
+     Work's note and put it in its inbox (see "Notes to live agents").
+  8. In the foreground, render the project view (below) every tick, because a run
      attached, finished or applied by *another* process changes the view without any
      verdict or apply of the owner's own.
 
   With `-v` the owner logs where each non-idle tick's time went (`-vv`: every tick):
   signal, loading runs, following work, evaluations, re-checks, auto-apply,
-  footprints and pairs, ending with the tick's `total`:
+  footprints and pairs, notes, ending with the tick's `total`:
 
   ```text
-  tick: signal 18 ms · 1 runs loaded in 2 ms · 1 followed in 9 ms · 1 evaluated in 37 ms · 0 rechecked in 0 ms · auto-apply 0 ms · 0 footprinted in 0 ms · pairs in 0 ms · total 99 ms
+  tick: signal 11 ms · 2 runs loaded in 0 ms · 2 followed in 36 ms · 2 evaluated in 24 ms · 0 rechecked in 0 ms · auto-apply 0 ms · 2 footprinted in 35 ms · pairs in 0 ms · notes 0 ms · total 151 ms
   ```
 - **`dispatch watch`** renders the same view from canonical state under a header
   naming who watches (`watched in the background since 10:02 (pid 812)`, or `not
@@ -540,8 +615,10 @@ directory is gone. Nothing is applied or launched on start or exit. `dispatch se
     Ctrl+C) never stops watching.
   - On a terminal, the rows can be selected (↑/↓ or j/k). A key runs exactly the
     command a person would type, as them, under the same locks and authority:
-    - `f` is `dispatch finish`; without the project's check consent it asks
-      before running checks, which is the same as `--allow-unsafe-local`;
+    - `f` is `dispatch finish`. When the Work's checks would run, the Work carries no
+      authority of its own, and the project's standing check consent does not cover
+      exactly those checks, it asks first, which is the same as `--allow-unsafe-local`.
+      Under that consent it finishes at once (0.4.18; 0.4.17 asked then too);
     - `a` is `dispatch accept`. A refusal is shown as accept prints it, and an accept
       names what became of the merged checks;
     - `r` is `dispatch reject`, after a confirmation with focus on Cancel. On unfinished
@@ -703,13 +780,13 @@ the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
 A runtime's session in its own worktree becomes Work in a watched project in two
 ways: through Claude Code's hooks, described here, or without any hook, when the
 owner finds the worktree ("Work that appears without hooks", below). Either way
-there is one Work per worktree. Hermes's hook registers nothing; it keeps the
-exact Δ of Work discovery found ("Hermes Agent", below).
+there is one Work per worktree. Hermes's hooks register nothing; they keep the
+exact Δ of Work discovery found and deliver notes ("Hermes Agent", below).
 
 With Claude Code's hooks installed, the runtime tells Dispatch about its sessions
 (`dispatch hook claude`, which reads the runtime's event on stdin). `dispatch setup`
 offers them when `claude` is on `PATH`, showing the exact additions, with focus on Skip.
-There are six, each a `command` hook running `'<dispatch>' --state-dir '<state>' hook
+There are seven, each a `command` hook running `'<dispatch>' --state-dir '<state>' hook
 claude`:
 
 | Event | Matcher | Timeout | Since |
@@ -720,9 +797,11 @@ claude`:
 | `PreToolUse` | `ExitWorktree` | 300 s | 0.4.6 |
 | `Notification` | `permission_prompt\|idle_prompt\|agent_needs_input` | 5 s | 0.4.17 |
 | `Stop` | | 5 s | 0.4.17 |
+| `PostToolUse` | | 5 s | 0.4.18 |
 
-A settings file holding exactly the four an earlier Dispatch installed is offered as an
-Update, showing the hooks it becomes, for the same executable (`Hook command, unchanged:
+`PostToolUse` runs after every tool call and only delivers notes ("Notes to live agents",
+below). A settings file holding exactly the hooks an earlier Dispatch installed, 0.4.6 to
+0.4.16's four or 0.4.17's six, is offered as an Update, showing the hooks it becomes, for the same executable (`Hook command, unchanged:
 …`) or another. Hooks of Dispatch's edited by hand are left alone and reported as `changed
 by hand`; the "Agents Dispatch launches…" → Runtime integrations menu removes them (`Only
 Dispatch's own hooks are removed, hook by hook`), then installs them again. A person's own
@@ -862,7 +941,8 @@ runtime registered (Claude Code or Hermes, by hook or discovery) once all of the
   start time, as a closed terminal leaves it, or no lock at all, as `/exit` leaves it.
 
 `/clear` and `/resume` end a session in a process that keeps running, so they finish
-nothing. `SessionEnd` itself only records the end, within its 5 s timeout. The finish is the
+nothing. `SessionEnd` itself only leaves the end for the owner to record ("Hooks never
+wait", below). The finish is the
 one above ("Δ and finished": Δ frozen, the memo first, checks in place when the source is
 unmoved, in the check workspace when it moved), recorded as `finish_reason: by_consent`
 with `attach.finished`'s `workspace_removed: null`. It runs as a task of its own, so the
@@ -913,7 +993,9 @@ reply, so they never keep Claude working:
   `Stop` is `turn ended`, "waiting for your next prompt". Any other notification changes
   nothing. A newer mark replaces the older one.
 - The mark is recorded on the Work (`attachment.needs_you`) and as `runtime.needs_you {kind,
-  message, at, transcript, session_id}`.
+  message, at, transcript, session_id}`. Since 0.4.18 the owner records it from the file the
+  hook left ("Hooks never wait", below), with the hook's time as `at`, so `watch` shows it
+  one tick later than before.
 - `dispatch status` prints `waiting on you: permission · Claude needs your permission · for
   2m`. `dispatch watch` lists the Work under "needs you", with state `waiting` and the next
   step `Its session asks for your permission: answer it there.` or `Its session waits for
@@ -930,6 +1012,93 @@ reply, so they never keep Claude working:
 SELECT run_id, json_extract(payload_json, '$.kind'), timestamp FROM events WHERE event_type = 'runtime.needs_you';
 SELECT run_id, json_extract(payload_json, '$.by'), timestamp FROM events WHERE event_type = 'runtime.needs_you_cleared';
 ```
+
+### Hooks never wait
+
+Since 0.4.18 a hook in a watched project opens no database and takes no lock of a Work's.
+A session's end (Claude Code's `SessionEnd`, Hermes's `on_session_finalize` when Hermes keeps
+its worktree) and a wait on the person (`Notification`, `Stop`) are left as a file,
+`<state>/marks/<ULID>.json`, written durably. The project owner records each one on its next
+tick, in the order they were made, with the time the hook saw it:
+- It finds the Work by workspace, else by session, publishing a pending registration first,
+  as the hook did before. A mark whose Work cannot be found is dropped, as before.
+- A Work another process holds (a typed `finish` running its checks) is skipped without
+  waiting, and its marks wait for a later tick, with the later marks of that workspace.
+- With no owner running, the marks stay until the next owner records them. An owner from
+  before 0.4.18 does not read them; any Dispatch command in the project replaces an owner
+  upgraded in place.
+
+In 0.4.17 these hooks waited up to 3 s for the Work's lock, then opened SQLite, inside a 5 s
+timeout, and under contention failed with `Dispatch could not track this session: attached
+work has a foreground owner: still busy after waiting 3s`. A `SessionStart` that finds
+another session registering the same worktree waits for it until the hook's own deadline,
+instead of failing after 10 s with `another session is registering this workspace`. The
+removal hooks (`WorktreeRemove`, `PreToolUse` on `ExitWorktree`, and Hermes's when Hermes
+removes its worktree) still wait, within their deadline, because they must keep the Δ before
+the worktree is deleted.
+
+### Notes to live agents
+
+While a project is watched, the owner may leave a note for a live agent about other Work.
+A note is information: fixed text, never written by a model, and it asks nothing of the
+agent. For example, with two Claude Code sessions in their own worktrees, one changing the
+signature of `validate` and the other calling it, each heard this after its next tool call:
+
+```text
+Dispatch: other Work touches this Work (01M6T2KV), your changes in this workspace.
+01M6T2KT (Claude Code): it changes the signature of validate (src/lib.rs), which this Work uses
+```
+
+After the first Work landed, the second heard:
+
+```text
+Dispatch: other Work touches this Work (01M6T2KV), your changes in this workspace.
+01M6T2KT (Claude Code), landed: it changes the signature of validate (src/lib.rs), which this Work uses
+Signature: pub fn validate(input: &str) -> bool → pub fn validate(input: &str, strict: bool) -> bool
+The source with this change is commit b768cb1b (refs/dispatch/source).
+```
+
+- **What gets a note** (`coherence::notes::compose`): an interaction with other Work in
+  progress under the rules `SameDeclaration`, `Uses` or `TextualOverlap` ("Work against
+  Work" in [coherence.md](coherence.md)), and a landing that had such an interaction with
+  this Work. A file-level interaction never makes a note.
+- **What it says.** One header line naming this Work by short ID, then one line per item:
+  the other Work by short ID and runtime, the target (declaration and path, or the lines for
+  a textual overlap), and the change, in the words of the interaction view. A landing item
+  adds the old and new signature for a changed signature (each cut at 500 characters), read
+  from that Work's S0 and Δ, and the recorded source commit that holds the landing ("When S0
+  moves", above). A landing without a recorded source (a plain directory, or a landing
+  before 0.4.18) makes no landing item.
+- **How often.** Each item is sent once, keyed by the other Work or landing, the target and
+  the change. A Work gets at most one note per ten minutes; anything found in between is
+  merged into the next note. Items about Work in progress are rebuilt each tick, so an item
+  whose Work or interaction is gone by then is not sent. A note is at most 8,000
+  characters; items past that wait for the next note, which the last line says: `And <n>
+  more in the next note.`
+- **Who gets notes:** Work in progress whose workspace had a Claude Code or Hermes session
+  recorded. Codex and Cursor Work gets none: Dispatch installs no hook in them that can
+  carry context. Neither does Work attached with `dispatch attach` and no session.
+- **The inbox.** The owner keeps at most one inbox per workspace in Dispatch's state,
+  `<state>/inbox/<sha256 of the workspace path>.json`, never in the repository, and what
+  each Work was sent in `<state>/inbox/sent/<run id>.json` until the Work finishes or is
+  closed, so a restarted owner sends nothing twice and loses no landing.
+- **Delivery.** Claude Code's `PostToolUse` hook (after every tool call) and `SessionStart`
+  hook give the notes as `hookSpecificOutput.additionalContext`, which Claude Code shows the
+  model beside the tool's result, or before the first prompt. Hermes's `pre_llm_call` hook
+  prints `{"context": …}`, which Hermes adds to that turn's message. The hook walks up from
+  its directory (Claude Code's `cwd`, Hermes's `TERMINAL_CWD`) to the first directory with a
+  `.git`, takes that workspace's inbox by renaming it, and prints it. A rename happens once,
+  so each note reaches the agent once. The hook runs no Git command, opens no database and
+  takes no lock. With no inbox, it prints nothing.
+- **Recorded:** `note.written {note, text}` when the owner puts a note in the inbox;
+  `note.delivered {note, via}` when the owner sees the hook took it, timed when the hook took
+  it; `note.expired {note, lifecycle}` when the Work stopped being in progress before a hook
+  took it. `note.touched {note, key}` records the first change the Work's Δ made, after a
+  note, at a target the note named ("Measuring notes" in
+  [coherence-validation.md](coherence-validation.md)).
+
+Claude Code's hooks and Hermes's need nothing else from the agent. Dispatch does not wake an
+idle session, block a turn or answer a `Stop` hook.
 
 ### Work that appears without hooks
 
@@ -1051,9 +1220,9 @@ its source:
   so even committed work goes. Hermes is the one entry of `VANISHING_WORKTREES`, so the
   fast loop keeps its Work's `delta-live.patch` fresh, and a removal Dispatch did not
   hear about leaves the last-seen Δ ("Workspace removal", above).
-- **The hook.** `dispatch setup` → Runtime integrations → `Install the Hermes hook`
-  appends one block to `~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml` when that is
-  set):
+- **The hooks.** `dispatch setup` (its Hooks step, or Runtime integrations → `Install
+  the Hermes hook`) appends one block to `~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml`
+  when that is set). Since 0.4.18 it holds two hooks; `pre_llm_call` delivers notes:
 
   ```yaml
   # Added by dispatch setup, which removes it unless it is edited.
@@ -1061,6 +1230,9 @@ its source:
     on_session_finalize:
       - command: "'<dispatch>' --state-dir '<state>' hook hermes"
         timeout: 300
+    pre_llm_call:
+      - command: "'<dispatch>' --state-dir '<state>' hook hermes"
+        timeout: 5
   ```
 
   - The consent screen shows that block and the path, with focus on Cancel. The file is
@@ -1068,24 +1240,38 @@ its source:
     written), never rewritten: the block is appended after a backup beside the file
     (`config.yaml.dispatch-backup-<time>`), and every other byte is kept. A config that
     already has `hooks:` is left alone, and setup shows the lines to add under it.
-  - `Remove the Hermes hook` takes out exactly that block, found by its marker line and
-    regenerated for comparison, and gives the file its bytes back. It refuses when the
-    block was edited, added by hand, or rewritten: *"Dispatch's hook in <path> is not as
-    Dispatch added it; it was edited or added by hand, so remove it there yourself"*.
-    `hermes config set` rewrites the file with PyYAML, which drops the marker, so after it
-    the hook must be removed by hand ("Upgrading to 0.4.15" in
-    [release-install.md](release-install.md)).
+  - Dispatch's hooks are recognized by value: every hook entry whose command ends in
+    ` hook hermes`, under any event. They are Dispatch's, unedited, when they equal
+    exactly the entries above for one command, or the one `on_session_finalize` entry
+    0.4.15 to 0.4.17 installed (offered as an Update). A different timeout or event, an
+    extra key, or the two hooks running different commands is `changed by hand`.
+  - Update and `Remove the Hermes hook` write only when Dispatch's marker block is there as
+    Dispatch wrote it: they replace or take out exactly that block and give the file its
+    other bytes back. `hermes config set` rewrites the file with PyYAML, which drops the
+    marker and re-quotes the lines. In a file Hermes rewrote, Dispatch still recognizes
+    its hooks, but writes nothing: setup shows the exact lines to set, or the entries to
+    remove, by hand. Dispatch does not re-serialize the file, because its YAML library
+    (YAML 1.2) and Hermes's (PyYAML, YAML 1.1) can read the same text differently.
   - Setup's status line is `Hermes hook: installed`, `not installed`, or `unknown, its
-    config.yaml is unreadable`; a hook added by hand counts as installed.
-  - Hermes asks the person to allow the hook the first time it runs it, and a run without
-    a terminal needs `hermes --accept-hooks`. Dispatch never writes Hermes's allowlist or
-    sets `hooks_auto_accept`. The allowlist is keyed by the command, so if the Dispatch
+    config.yaml is unreadable`; hooks added by hand count as installed.
+  - Hermes asks the person once for each hook, at its next start in a terminal, and the
+    hooks don't run until allowed (`hermes hooks list` shows which are). Setup says so: `Hermes
+    asks you once for each of these hooks, at its next start in a terminal, and they don't
+    run until you allow them (hermes hooks list shows which are allowed); a run without a
+    terminal needs hermes --accept-hooks.` Dispatch never writes Hermes's allowlist or sets
+    `hooks_auto_accept`. The allowlist is keyed by event and command, so if the Dispatch
     binary moves, Hermes asks again.
   - The timeout is Hermes's most, 300 s, which covers the minute keeping a removed
     worktree's Δ may wait for its registration and the minute it may wait for the Work's
     lock. Hermes waits for the hook before it removes the worktree.
-- **What the hook does** (`dispatch hook hermes`, reading Hermes's payload on stdin and
-  the worktree from `TERMINAL_CWD`, since the payload's `cwd` is the main checkout):
+- **`pre_llm_call`** runs before each model call. `dispatch hook hermes` reads the event's
+  name from the start of the payload, which carries the whole conversation and grows past
+  the hook's 64 KiB input limit in a long session, and takes the rest of stdin unread. It
+  delivers the inbox of the workspace `TERMINAL_CWD` is in as `{"context": …}`, or prints
+  nothing ("Notes to live agents", above).
+- **What `on_session_finalize` does** (`dispatch hook hermes`, reading Hermes's payload on
+  stdin and the worktree from `TERMINAL_CWD`, since the payload's `cwd` is the main
+  checkout):
   - It acts only on `on_session_finalize` with `reason: "shutdown"`, which is the CLI's
     process exit, right before the removal. `/new` fires it with `session_boundary`, and
     the TUI with no reason, while the worktree lives on; `on_session_end` ends every turn.
@@ -1096,8 +1282,9 @@ its source:
   - If Hermes will remove the worktree (by its own rule above), the hook keeps the exact Δ
     through the same path as Claude Code's `WorktreeRemove`: `workspace.removed` with
     `exact: true`, and the Work waits for `finish` or `close`, or is finished by the
-    project's check consent. If Hermes will keep it, the hook records only the session's
-    end (`runtime.session_ended`, reason `shutdown`).
+    project's check consent. If Hermes will keep it, the hook leaves only the session's
+    end, which the owner records (`runtime.session_ended`, reason `shutdown`; "Hooks never
+    wait", above).
   - It registers nothing. A worktree discovery never saw, in a project that is not watched
     or removed before a scan, is not kept.
   - It prints nothing. On an error it exits 1 with the reason on stderr; Hermes only logs
@@ -1248,13 +1435,18 @@ In addition to the existing coherence, application and review events (see
 | `attach.adopted` | `serve` takes over observation of an orphaned run | `{"owner_state": "adopted"}` |
 | `attach.authorized` | Work gains local authority: from the project's check consent (at registration, or a typed `attach` or `finish` that ran on it), or from a person's `finish --allow-unsafe-local` | `{"unsafe_local": true, "by": "project consent" \| "human"}` |
 | `runtime.session_started` | a hook records a new session on existing Work | `{"session": <RuntimeSession>}` |
-| `runtime.session_ended` | a hook's `SessionEnd`, Hermes's hook when Hermes keeps its worktree, or the owner from the session lock ("Liveness from the session lock") | `{"provider", "session_id", "reason"}`; Hermes's hook gives `shutdown`, the owner's reasons are `process_gone` and `lock_released` |
+| `runtime.session_ended` | a hook's `SessionEnd`, Hermes's hook when Hermes keeps its worktree (both recorded by the owner from the hook's mark since 0.4.18, at the hook's time), or the owner from the session lock ("Liveness from the session lock") | `{"provider", "session_id", "reason"}`; Hermes's hook gives `shutdown`, the owner's reasons are `process_gone` and `lock_released` |
 | `runtime.agent_running` | the owner records the process a session lock names, once it runs | `{"agent_process": <ProcessIdentity>, "previous"}` |
 | `runtime.agent_gone` | the owner clears it, once that process is gone or its lock released | `{"agent_process": null, "previous": <ProcessIdentity>}` |
-| `runtime.needs_you` | Claude Code's `Notification` or `Stop` hook marks the Work (0.4.17) | `{"kind": "permission" \| "input" \| "turn_ended", "message", "at", "transcript", "session_id"}` |
+| `runtime.needs_you` | Claude Code's `Notification` or `Stop` hook marks the Work (0.4.17; recorded by the owner from the hook's mark since 0.4.18) | `{"kind": "permission" \| "input" \| "turn_ended", "message", "at", "transcript", "session_id"}` |
 | `runtime.needs_you_cleared` | the owner clears that mark (0.4.17) | `{"by": "transcript" \| "session_end" \| "work_finished"}` |
 | `work.reopened` | a resumed session's Work begins from an earlier Work's S0 (0.4.17) | `{"reopens": <old id>, "provenance"}` |
 | `work.not_reopened` | it could not, because that S0 can no longer be read (0.4.17) | `{"reopens": <old id>, "reason"}` |
+| `attach.s0_moved` | the owner moved S0 to a recorded source or the root's HEAD the workspace's HEAD descends from, or back (0.4.18; see "When S0 moves") | `{"from", "to", "workspace_head", "proof": "ancestor of workspace HEAD" \| "workspace HEAD no longer descends from S0", "recorded_at", "landed_run": <id> \| null, "delta_before_sha256", "delta_after_sha256"}` |
+| `note.written` | the owner put a note in the Work's inbox (0.4.18; see "Notes to live agents") | `{"note": <16 hex>, "text"}` |
+| `note.delivered` | the owner saw a hook take it; timed when the hook took it | `{"note", "via": "PostToolUse" \| "SessionStart" \| "pre_llm_call"}` |
+| `note.expired` | the Work stopped being in progress before a hook took it | `{"note", "lifecycle"}` |
+| `note.touched` | the first change the Work's Δ made, after the note, at a target the note named | `{"note", "key": [kind, other run, path, name, change]}` |
 | `workspace.removed` | the workspace is gone: kept exactly by a hook (Claude Code's or Hermes's), or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes", "last_seen_at"}`; `last_seen_at` since 0.4.15 |
 | `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
 | `work.closed` | a person closed Work (`dispatch close`, or `c` in `watch`), or a resumed session superseded it (`by: "reopen"`, 0.4.17). Before 0.4.12, a person rejected unfinished Work whose workspace was gone | `{"reason": "unfinished" \| "workspace_removed" \| "already_present" \| "superseded", "by": "human" \| "reopen", "world_digest"?, "replacement"?}` |

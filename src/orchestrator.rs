@@ -2373,12 +2373,15 @@ pub async fn check(
         Some((config, logs, patch)) => {
             let run_dir = state.run_dir(&run.id);
             let unmoved = !unfinished
-                && integration::checks_skipped(
-                    &run,
-                    &candidate.label,
-                    &run_dir,
-                    Some(validity.world_changed),
-                )? == Some(ChecksSkipped::Unmoved);
+                && matches!(
+                    integration::checks_skipped(
+                        &run,
+                        &candidate.label,
+                        &run_dir,
+                        Some(validity.world_changed),
+                    )?,
+                    Some(ChecksSkipped::Unmoved { .. })
+                );
             let ran = if unmoved {
                 integration::reused(&run, patch, config, &run_dir)
             } else {
@@ -2396,7 +2399,7 @@ pub async fn check(
                     serde_json::json!({
                         "by": "check",
                         "delta_digest": digest,
-                        "skipped": ChecksSkipped::Unmoved.to_string(),
+                        "skipped": ChecksSkipped::unmoved(&run).to_string(),
                     }),
                 ),
                 Err(error) => (
@@ -2439,7 +2442,7 @@ pub async fn check(
         println!("{shown}");
     } else if let Some((ran, _)) = &ran {
         match ran {
-            Ok(None) => println!("Merged checks: not run — {}", ChecksSkipped::Unmoved),
+            Ok(None) => println!("Merged checks: not run — {}", ChecksSkipped::unmoved(&run)),
             Ok(Some(MergedRun {
                 source,
                 reused: Some(entry),
@@ -2792,6 +2795,15 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             || "directory snapshot".to_owned(),
             |head| format!("snapshot at {}", short(head)),
         ),
+    };
+    // Where S0 is now, once it moved, as `explain`'s S0 line says it.
+    let s0 = match run.baseline_history.last() {
+        Some(moved) => format!(
+            "commit {} (moved from {})",
+            short(&moved.moved_to),
+            short(&moved.commit)
+        ),
+        None => s0,
     };
     let overridden = run
         .coherence

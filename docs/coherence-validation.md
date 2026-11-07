@@ -29,6 +29,9 @@ of the product. The technical reference is [coherence.md](coherence.md).
 | While a project is watched, Codex and Cursor Agent worktrees that appear become Work with S0 at the merge base, recognized only by Codex's `codex-thread.json` marker or Cursor's documented location and branch | Shipped in 0.4.14; `tests/discovery.rs`; recognized from P0's real Codex 0.155.1 and Cursor Agent 2026.10.14 worktrees on macOS. Their sessions' end is not observable, so their liveness stays unknown |
 | `dispatch check --merged` runs the merged checks accept would run, before accept, and changes nothing; `accept --expect` lands only the reviewed Δ | Shipped in 0.4.14; `tests/merged_check.rs`. Used by the 0.4.14 integrator: `accept --expect` for every packet from P3 on, `check --merged` for P3, P2, P6, P6b and R |
 
+| While a project is watched, live Claude Code and Hermes sessions get notes in fixed text, through their hooks, about other Work that changes the same declaration, a declaration they use, or the same lines, and about such Work that landed, naming the recorded source commit. At most one note per Work per ten minutes; each item once | Shipped in 0.4.18; `tests/owner_notes.rs`, `tests/hook_delivery.rs`, `tests/notes_contract.rs`. Unmeasured on real work: what follows a note is counted by `docs/queries/notes-measured.sql`, and nothing is claimed about whether agents act on notes |
+| Attached Git Work's S0 follows the agent's merge or rebase of a recorded source, only with an ancestry proof, so Δ is the agent's own change; every earlier (S0, Δ) stays recomputable | Shipped in 0.4.18; the tests in `src/orchestrator/s0.rs` (merge, rebase, merge in progress, cherry-pick, revert, reset, detached HEAD) |
+
 Every public statement must fit this table. When a row changes, change the
 README and the website in the same release.
 
@@ -163,6 +166,39 @@ What these numbers can support, and what they cannot:
 - **Unknown stays unknown.** A counterpart without an outcome (result set 5) is
   neither a hit nor a miss, and a precision with no predicted outcome is NULL,
   not zero. No composite score is computed.
+
+## Measuring notes (0.4.18)
+
+Notes to live agents are recorded as `note.written`, then `note.delivered` or
+`note.expired`, and `note.touched` records the first change a Work's Δ made, after a
+note, at a target the note named (the declaration, compared by its full text, or the
+file for a textual overlap). The payloads are in [attach.md](attach.md#events). The
+documented query reads them, read-only, with the same rules as the interaction queries
+above:
+
+```bash
+sqlite3 -header -column <state>/dispatch.db < docs/queries/notes-measured.sql
+```
+
+`docs/queries/notes-measured.sql` lists each delivered note with whether the Work's Δ
+later changed its target, whether S0 moved after it, and the Work's next verdict. It
+counts them by that verdict; a note "agrees" when the verdict is REFRESH or STOP. Counts
+only: what followed a note, not what it caused. `notes_unsettled` must be 0 for
+finished Work.
+
+1. `notes_delivered`: one row per note delivered, with `touched`, `s0_moved` and
+   `next_verdict` (`none` when there is no later verdict yet).
+2. `notes_by_next_verdict`: counts by that verdict, with `agreed`, `touched` and
+   `s0_moved`.
+3. `notes_unsettled`: notes written and neither delivered nor expired, as `unsettled`
+   for Work no longer in progress and `pending` for Work still in progress.
+
+`tests/measurement_queries.rs` checks each result set against counts derived by hand
+from `tests/fixtures/measurement/notes.jsonl`. The same limits hold as for
+interactions: the verdict is Dispatch's own, not a human judgment; a touch or an S0
+move after a note is not shown to come from it; small samples are quoted as counts.
+For a `Uses` note, an agent that fixes its own call sites has not touched the target,
+so `touched` stays 0.
 
 ## What would falsify the positioning
 

@@ -737,6 +737,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_accept_would_verify_names_the_s0_the_work_moved_to() {
+        let project = Project::new();
+        let workspace = project.worktree("agent");
+        let work = project.attach(&workspace);
+        commit(&workspace, "a.txt", "agent\n");
+        let mut owner = project.owner();
+        owner.tick(&project.state);
+        // The line finish and check print under "At accept".
+        let scope = |run: &RunRecord| {
+            let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+            crate::orchestrator::accept_scope(&project.state, run, validity.unwrap())
+        };
+        let unmoved = "merged checks would not run now — the source has not moved since";
+        let own = "so the merged result is the Work's own tree";
+        assert_eq!(
+            scope(&project.run(&work.id)),
+            format!("{unmoved} the Work began, {own}")
+        );
+
+        project.land("landing", "b.txt", "landed\n").await;
+        git(
+            &workspace,
+            &["merge", "--quiet", "--no-edit", source::SOURCE_REF],
+        );
+        owner.tick(&project.state);
+
+        let run = project.run(&work.id);
+        let moved_to = &run.baseline_history[0].moved_to[..8];
+        assert_eq!(
+            scope(&run),
+            format!("{unmoved} the Work's S0 moved to {moved_to}, {own}")
+        );
+    }
+
+    #[tokio::test]
     async fn merging_the_recorded_source_moves_s0_so_the_delta_is_the_agents_own() {
         let project = Project::new();
         let workspace = project.worktree("agent");
