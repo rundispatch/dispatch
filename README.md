@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.17 — experimental developer preview**
+**Dispatch 0.4.18 — experimental developer preview**
 
 <p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch; once one lands, the other no longer fits, and dispatch accept refuses it as REFRESH, leaving the source unchanged."></a></p>
 <p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
@@ -36,6 +36,12 @@ service; Dispatch itself needs no account, no network service and no upload.
   current as the code moves. `dispatch watch` shows them, lists Claude Code sessions
   waiting for a permission or your next prompt first, and says, as advice, where two
   pieces of Work already touch.
+- **Live agents hear of each other.** A Claude Code or Hermes session in a watched
+  project gets a short note through its hooks when other Work changes the same
+  declaration, one it uses, or the same lines, and when such Work lands, naming the
+  recorded commit that holds it. A note is information and asks nothing. When the agent
+  merges that commit, its S0 follows, with proof, so its Δ is its own change again.
+  [Notes and S0 →](docs/attach.md#notes-to-live-agents)
 
 ## Install
 

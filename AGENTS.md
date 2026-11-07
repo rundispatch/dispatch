@@ -31,10 +31,14 @@ Public claims about coherence must match what is shipped and measured. Today tha
 an accept-time gate with symbol-level facts for Rust and Python, file-level facts
 elsewhere, weak facts for paths named only in test code or in files without symbol
 support (the merged checks decide those at accept), an advisory mid-run watcher on
-native runs, and advisory interactions between unintegrated Work while a project is
-watched. Claim precision for interactions only from recorded outcomes (the
+native runs, advisory interactions between unintegrated Work while a project is
+watched, notes in fixed text about those interactions and about landings, delivered
+to live Claude Code and Hermes sessions through their hooks, and an S0 for attached
+Git Work that follows the agent's merge or rebase of a recorded source, with an
+ancestry proof. Claim precision for interactions only from recorded outcomes (the
 documented queries), quoted as counts, and only as agreement with Dispatch's own
-later verdict. Do not claim tokens, minutes or money saved until a real run was
+later verdict. Notes are unmeasured on real work: say what a note says and when it
+arrives, not that an agent acted on it. Do not claim tokens, minutes or money saved until a real run was
 stopped and the attempt timestamps show it. The metrics that decide whether the
 thesis holds, and what would falsify it, are in `docs/coherence-validation.md`.
 
@@ -165,6 +169,10 @@ Each clause is recorded and bounded, and arrives with the release that ships it.
 - **Owner restart** (arrives with 0.4.17). A project watched with `dispatch start` and
   never stopped is watched again by the next Dispatch command or hook there, after a
   reboot or an in-place upgrade. One line says so; `dispatch stop` ends it.
+- **Notes to live agents** (approved 2026-11-04, arrives with 0.4.18). Dispatch speaks to
+  live agents only through their runtimes' hooks, with fixed text, and asks nothing of them.
+- **S0 follows integration** (approved 2026-11-04, arrives with 0.4.18). S0 moves only with
+  an ancestry proof against a recorded source; every earlier (S0, Δ) stays recomputable.
 
 ## Working method
 

@@ -225,6 +225,11 @@ fn persist_applied(
     {
         eprintln!("Could not record how this Work landed: {error:#}");
     }
+    // The source with this change, for Work that merges it (`s0`). Still
+    // under the source lock; like the measurement, it never fails the landing.
+    if let Err(error) = super::s0::record(state, &run) {
+        eprintln!("Could not record the source after this landing: {error:#}");
+    }
     // Applied, so a workspace Dispatch made for this Work holds nothing the
     // checkout lacks. Keeping it when removal fails loses nothing.
     if let Err(error) = super::attach::release_workspace(state, &mut run, "applied") {

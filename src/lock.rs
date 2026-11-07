@@ -51,16 +51,25 @@ impl OperationLock {
     /// finishing owner queue behind a human review or another applier instead
     /// of failing immediately.
     pub(crate) fn acquire_wait(path: &Path, busy_message: &str, timeout: Duration) -> Result<Self> {
+        match Self::acquire_within(path, timeout)? {
+            Some(lock) => Ok(lock),
+            None => bail!(
+                "{busy_message}: still busy after waiting {}s",
+                timeout.as_secs()
+            ),
+        }
+    }
+
+    /// `acquire_wait` for a caller that tries again later: `None` when the
+    /// lock is still held after `timeout`.
+    pub(crate) fn acquire_within(path: &Path, timeout: Duration) -> Result<Option<Self>> {
         let start = std::time::Instant::now();
         loop {
             if let TryAcquire::Acquired(lock) = Self::try_acquire(path)? {
-                return Ok(lock);
+                return Ok(Some(lock));
             }
             if start.elapsed() >= timeout {
-                bail!(
-                    "{busy_message}: still busy after waiting {}s",
-                    timeout.as_secs()
-                );
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(100));
         }

@@ -114,6 +114,53 @@ To roll back, stop every session and restore a complete matching backup into a s
 directory; point the matching old binary at it with `--state-dir`. Never point an old binary
 at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.18
+
+No migration; the schema stays at 24. Existing records are not rewritten.
+- **Rollback.** Back up the whole state directory before upgrading, and roll back only by
+  restoring it.
+- **The owner.** After an upgrade in place, the next Dispatch command in a watched project
+  restarts its owner with 0.4.18, as since 0.4.17. Until then, the marks hooks leave (a
+  session's end, a wait on you) wait for an owner that reads them, and no notes are
+  written. Nothing is lost.
+- **Claude Code hooks.** They are now seven: `PostToolUse` (every tool, 5 s) joins the six of
+  0.4.17. A settings file holding 0.4.16's four or 0.4.17's six is offered once as an
+  Update in `dispatch setup`, showing the hooks it becomes, and keeps every hook of yours.
+  Until the update, notes arrive only when a session starts. Hooks edited by hand are left
+  alone and reported as changed by hand.
+- **Hermes hooks.** The block in `config.yaml` gains `pre_llm_call` (5 s) beside
+  `on_session_finalize`. `dispatch setup` offers the one-hook block 0.4.15 to 0.4.17 wrote as
+  an Update. Hermes asks once for the new hook at its next start in a terminal, and it does
+  not run until you allow it; a run without a terminal needs `hermes --accept-hooks`. If
+  `hermes config set` rewrote the file, setup recognizes Dispatch's hook there but writes
+  nothing, and shows the exact lines to set by hand.
+- **One ref in your repository.** After each landing on a Git project Dispatch points
+  `refs/dispatch/source` at a commit of the project's source, with a reflog entry `dispatch:
+  Work <id> landed`. No branch, HEAD, index or file changes.
+- **New state files.** `<state>/inbox/` (notes not yet delivered, and `inbox/sent/<run
+  id>.json`, what each Work in progress was sent), `<state>/marks/` (marks hooks left for the
+  owner), `<state>/projects/<key>/sources.json` (the recorded sources), and
+  `runs/<id>/s0/<n>/baseline` for each S0 a Work moved to.
+- **Additive JSON and events.**
+  - Runs gain `baseline_history` (each earlier S0 and its move), absent when S0 never moved.
+  - New events: `attach.s0_moved`, `note.written`, `note.delivered`, `note.expired`,
+    `note.touched`. Their payloads are in [reference.md](reference.md#events).
+  - `runtime.session_ended` from a hook and `runtime.needs_you` are recorded by the owner,
+    with the hook's time.
+  - `watch --json` work lines keep `s0`; for Work whose S0 moved it reads `commit <sha>
+    (moved from <sha>)`.
+  - The `-v` tick line gains `notes N ms`.
+- **Changed behaviour.**
+  - **S0 follows integration.** Attached Git Work whose agent merges or rebases onto
+    `refs/dispatch/source` (or the root's HEAD, with nothing uncommitted there) has its S0
+    moved there, so its Δ shrinks to the agent's own change.
+  - **`f` in `watch`** finishes without asking when standing check consent covers exactly
+    the Work's checks.
+  - **The unmoved reason** of `finish`, `check` and `accept` (and `check --merged --json`'s
+    `merged_checks.skipped`), for Work whose S0 moved, reads `the source has not moved since
+    the Work's S0 moved to <sha>, …` instead of `…since the Work began…`. Other Work is
+    unchanged.
+
 ### Upgrading to 0.4.17
 
 No migration; the schema stays at 24. Existing records are not rewritten.

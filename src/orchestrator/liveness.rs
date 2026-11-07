@@ -22,9 +22,9 @@
 //! reads "agent running" and no end of their sessions is ever recorded. No
 //! process is guessed at: Cursor's lingering `worker-server` is not the agent.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
 
 use super::{attach::record_session_end, persist_event};
@@ -238,13 +238,18 @@ fn end_sessions(
     for session in sessions.filter(|session| {
         session.ended_at.is_none() && before.is_none_or(|before| session.started_at < before)
     }) {
-        record_session_end(
+        let recorded = record_session_end(
             state,
             &run.id,
             &session.provider,
             &session.session_id,
             reason,
+            Utc::now(),
+            Duration::from_secs(3),
         )?;
+        if !recorded {
+            bail!("attached work has a foreground owner: still busy after waiting 3s");
+        }
     }
     Ok(())
 }
@@ -608,7 +613,16 @@ mod tests {
         let child = sleeper();
         p.lock_child(&child);
         p.tick();
-        record_session_end(&p.state, &p.run_id, "claude", "s1", "prompt_input_exit").unwrap();
+        record_session_end(
+            &p.state,
+            &p.run_id,
+            "claude",
+            "s1",
+            "prompt_input_exit",
+            Utc::now(),
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
         stop(child);
         p.tick();
         assert_eq!(p.sessions(), [("s1".into(), ended("prompt_input_exit"))]);
@@ -621,7 +635,16 @@ mod tests {
         p.tick();
         stop(child);
         p.tick();
-        record_session_end(&p.state, &p.run_id, "claude", "s1", "other").unwrap();
+        record_session_end(
+            &p.state,
+            &p.run_id,
+            "claude",
+            "s1",
+            "other",
+            Utc::now(),
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
         assert_eq!(p.sessions(), [("s1".into(), ended("process_gone"))]);
         assert_eq!(p.events("runtime.session_ended"), 1);
     }

@@ -551,6 +551,12 @@ pub struct RunRecord {
     pub source_fingerprint: String,
     pub baseline_path: PathBuf,
     pub baseline_commit: String,
+    /// Each S0 this Work had before the current one, oldest first, with its
+    /// baseline kept so every verdict made against it stays recomputable. S0
+    /// moves only when the workspace integrated a newer source
+    /// (`orchestrator::s0`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baseline_history: Vec<EarlierBaseline>,
     pub status: RunStatus,
     #[serde(default)]
     pub mode: RunMode,
@@ -583,6 +589,43 @@ pub struct RunRecord {
     /// rewrite of an old run's metadata never loses what was recorded.
     #[serde(flatten)]
     pub historical: serde_json::Map<String, serde_json::Value>,
+}
+
+/// An S0 a Work moved away from, and the move.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EarlierBaseline {
+    pub baseline_path: PathBuf,
+    pub baseline_commit: String,
+    /// That S0 and the next one as commits in the project's repository.
+    pub commit: String,
+    pub moved_to: String,
+    pub moved_at: DateTime<Utc>,
+    /// When `moved_to` was recorded as the source: after `landed_run`
+    /// landed, or, without one, as the root's HEAD with nothing uncommitted.
+    pub recorded_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_run: Option<String>,
+    /// A move back: the workspace's HEAD no longer had `commit`, and
+    /// `moved_to` is an earlier S0 it has, with the times and Work of that S0.
+    #[serde(default)]
+    pub back: bool,
+}
+
+impl RunRecord {
+    /// S0 as a commit in the project's repository, and since when it has
+    /// been the source: the latest move's, or the one the Work began from.
+    /// `None` for a snapshot, which has no commit and never moves.
+    pub fn s0_commit(&self) -> Option<(&str, DateTime<Utc>)> {
+        if let Some(moved) = self.baseline_history.last() {
+            return Some((&moved.moved_to, moved.recorded_at));
+        }
+        match &self.attachment.as_ref()?.provenance {
+            BaselineProvenance::GitMergeBase { commit }
+            | BaselineProvenance::WorkspaceAtStart { commit }
+            | BaselineProvenance::Discovered { commit } => Some((commit, self.created_at)),
+            BaselineProvenance::SnapshotAtAttach => None,
+        }
+    }
 }
 
 /// Provenance, capabilities, process identities and timestamps for a

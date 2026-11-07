@@ -10,6 +10,10 @@
 //! Hook input is untrusted. It never chooses the integration root (Dispatch
 //! derives it from the workspace's own repository), and acts only in a
 //! project someone chose to watch with `dispatch start`.
+//!
+//! A hook never waits on Dispatch: a session's end or a wait on the person
+//! is left as a mark for the project owner, and notes for the agent are
+//! delivered from the files alone (`deliver`), before anything else.
 
 pub mod claude;
 pub mod codex;
@@ -29,6 +33,7 @@ use crate::{
     orchestrator::{
         attach,
         background::{self, Watcher},
+        inbox::{self, Mark, Marked},
         registration::{self, Outcome, Registration},
     },
     source,
@@ -192,54 +197,103 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
             Ok(Reply::Notice(SHARED_CHECKOUT.into()))
         }
         EventKind::Start { .. } => Ok(Reply::Silent),
+        // The owner records these on the session's Work (`inbox::settle`).
         EventKind::End { reason } => {
-            let (provider, session) = (event.provider, event.session_id.as_str());
-            if let Some(run_id) = session_work(state, &root, &workspace, provider, session)? {
-                attach::record_session_end(state, &run_id, provider, session, &reason)?;
-            }
-            Ok(Reply::Silent)
+            let what = Marked::SessionEnd { reason };
+            leave_mark(
+                state,
+                root,
+                workspace,
+                event.provider,
+                event.session_id,
+                what,
+            )
         }
         EventKind::NeedsYou {
             kind,
             message,
             transcript,
         } => {
-            let (provider, session) = (event.provider, event.session_id.as_str());
-            if let Some(run_id) = session_work(state, &root, &workspace, provider, session)? {
-                let mark = NeedsYou {
-                    kind,
-                    message,
-                    at: Utc::now(),
-                    transcript,
-                    provider: provider.into(),
-                    session_id: event.session_id,
-                };
-                attach::record_needs_you(state, &run_id, mark)?;
-            }
-            Ok(Reply::Silent)
+            let what = Marked::NeedsYou(NeedsYou {
+                kind,
+                message,
+                at: Utc::now(),
+                transcript,
+                provider: event.provider.into(),
+                session_id: event.session_id.clone(),
+            });
+            leave_mark(
+                state,
+                root,
+                workspace,
+                event.provider,
+                event.session_id,
+                what,
+            )
         }
         EventKind::WorkspaceRemoved => Ok(Reply::Silent),
     }
 }
 
-/// The active Work of `session` in `workspace`, found by its workspace or,
-/// failing that, by the session: Claude Code reports a worktree session's end
-/// from the main checkout. A registration still pending is published first,
-/// within the 5 s timeout setup installs for these hooks.
-fn session_work(
+fn leave_mark(
     state: &State,
-    root: &Path,
-    workspace: &Path,
+    root: PathBuf,
+    workspace: PathBuf,
     provider: &str,
-    session: &str,
-) -> Result<Option<String>> {
-    let wait = Duration::from_secs(3);
-    registration::publish_first(state, workspace, wait)?;
-    if let Some(run_id) = attach::find_active_attachment(state, workspace)? {
-        return Ok(Some(run_id));
+    session_id: String,
+    what: Marked,
+) -> Result<Reply> {
+    let mark = Mark {
+        root,
+        workspace,
+        provider: provider.into(),
+        session_id,
+        at: Utc::now(),
+        what,
+    };
+    inbox::mark(state, &mark)?;
+    Ok(Reply::Silent)
+}
+
+/// The notes pending for the workspace that holds `cwd`, claimed for
+/// delivery through `via`, the runtime's event. Found from the files alone:
+/// the workspace is the nearest directory above `cwd` with a `.git`, and no
+/// Git command, database, lock or network is involved.
+pub(crate) fn deliver(state: &State, cwd: &Path, via: &str) -> Option<String> {
+    if !cwd.is_absolute() {
+        return None;
     }
-    registration::publish_session_first(state, root, provider, session, wait)?;
-    attach::find_session_attachment(state, root, provider, session)
+    let cwd = std::fs::canonicalize(cwd).ok()?;
+    let workspace = cwd
+        .ancestors()
+        .find(|directory| std::fs::symlink_metadata(directory.join(".git")).is_ok())?;
+    inbox::claim(state, workspace, via)
+}
+
+/// The top-level string fields of the JSON object `input` begins with, read
+/// until `input` ends or stops being one: a payload's head says what the
+/// event is however large the rest, a tool's output or a whole conversation,
+/// may be.
+pub(crate) fn head(input: &[u8]) -> std::collections::HashMap<String, String> {
+    struct Fields<'a>(&'a mut std::collections::HashMap<String, String>);
+    impl<'de> serde::de::Visitor<'de> for Fields<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if let serde_json::Value::String(value) = map.next_value()? {
+                    self.0.insert(key, value);
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut fields = std::collections::HashMap::new();
+    let mut input = serde_json::Deserializer::from_slice(input);
+    let _ = serde::Deserializer::deserialize_map(&mut input, Fields(&mut fields));
+    fields
 }
 
 /// Whether a session in `cwd` is outside every watched project, decided from
@@ -514,5 +568,21 @@ mod tests {
         };
         assert_eq!(ingest(&state, waiting).unwrap(), Reply::Silent);
         assert!(!state.db_path().exists(), "nothing opened the database");
+    }
+
+    #[test]
+    fn a_payloads_head_is_read_however_the_rest_ends() {
+        let whole = br#"{"session_id": "s1", "effort": {"level": "high"}, "n": 3,
+            "hook_event_name": "PostToolUse", "tool_response": {"stdout": "a very long"}}"#;
+        let fields = head(whole);
+        assert_eq!(fields["hook_event_name"], "PostToolUse");
+        assert_eq!(fields["session_id"], "s1");
+        assert_eq!(fields.len(), 2, "only strings: {fields:?}");
+        // Cut inside the tool's output, as a bounded read cuts it.
+        let cut = &whole[..whole.len() - 12];
+        assert_eq!(head(cut)["hook_event_name"], "PostToolUse");
+        for other in [&b""[..], b"[1, 2]", b"not json", b"\"text\""] {
+            assert!(head(other).is_empty());
+        }
     }
 }

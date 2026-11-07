@@ -34,6 +34,24 @@ does not change how agents are launched or admitted. It never starts an agent by
 
 Facts are derived only from S0 and Δ, so they can be recomputed at any time.
 
+### S0 history
+
+S0 is fixed for native runs and plain directories. Since 0.4.18, attached Git Work in
+progress can move its S0 when its workspace's HEAD descends from a source Dispatch recorded
+after a landing (`refs/dispatch/source`), or from the root's HEAD with nothing uncommitted
+there, and never otherwise (`orchestrator::s0`, "When S0 moves" in [attach.md](attach.md)).
+
+- A move materializes the new S0 in a new baseline directory and keeps the old one.
+  `RunRecord.baseline_path` and `baseline_commit` then name the new S0, and
+  `RunRecord.baseline_history` keeps each earlier one (`EarlierBaseline`: its
+  `baseline_path` and `baseline_commit`, the project commit it was and the one it moved to,
+  `moved_at`, `recorded_at`, `landed_run`, and `back` for a move back).
+- `attach.s0_moved` records the move with its proof and the Δ digests before and after.
+- Every verdict was taken against the S0 of its time, and that baseline and its Δ are kept,
+  so each earlier (S0, Δ) stays recomputable. From the move on, facts are derived from the
+  new S0 and the Δ against it: the agent's own change, without what it merged.
+- Without the ancestry proof S0 stays, and the verdict is what it would have been.
+
 ### Verdicts
 
 `evaluate` (in `src/coherence.rs`) returns `Continue` unless a reason says otherwise:
@@ -232,7 +250,7 @@ through `integration::run_or_reuse`, which first asks the verification memo (bel
 needs a non-empty `checks.verify`, a non-empty Δ and authority: the Work's own
 `unsafe_local`, standing consent for exactly these commands, or
 `--allow-unsafe-local` on that check alone. For finished Work it applies accept's
-`Unmoved` rule: when the source has not moved since the Work began it runs nothing and
+`Unmoved` rule: when the source has not moved since S0 it runs nothing and
 prints `Merged checks: not run — …`, unless the memo holds a pass for that tree. It
 changes no verdict and applies nothing.
 
@@ -362,6 +380,10 @@ Merged checks: not run — the source has not moved since the Work began, so the
 Merged checks: passed on the current source with this patch; logs: <run dir>/coherence-checks/<id>
 Merged checks: not run — no checks are configured (checks.verify is empty)
 ```
+
+For Work whose S0 moved (see "S0 history"), the unmoved reason names it: `Merged checks: not
+run — the source has not moved since the Work's S0 moved to <8 hex>, so the merged result is
+the Work's own tree`, in `finish`, `check` and `accept` alike (0.4.18).
 
 `watch`'s accept notice and the review screen show the same outcome. `finish`, a
 native result's summary and `check` print the line that predicts it (`At accept: …`),
@@ -644,6 +666,12 @@ owner's view of it (`watchers/<key>.interactions.json`) is disposable: it is
 written only by the owner, trusted only while the owner holds the project, and
 removed when it exits.
 
+**Notes.** Since 0.4.18 the owner also turns `SameDeclaration`, `Uses` and
+`TextualOverlap` interactions, and landings that had one with a Work, into a note
+for that Work's live Claude Code or Hermes session, in fixed text
+(`coherence::notes`; "Notes to live agents" in [attach.md](attach.md)). A
+file-level interaction never makes a note. The note changes no verdict.
+
 ## Measuring interactions (`measure.rs`)
 
 Interactions are advisory, so whether they are right is measured from real use
@@ -759,6 +787,13 @@ facts are kept in its memory only, for as long as it runs.
 Kept outside the database: the verification memo (`<state>/memo/`), which records
 passes, never verdicts or facts, and the check workspaces (`<state>/check-workspaces/`).
 Both are disposable; `dispatch clean` removes them.
+
+Since 0.4.18 also kept outside the database: the recorded sources
+(`refs/dispatch/source` and its reflog in the project's repository, and
+`<state>/projects/<key>/sources.json`), each run's earlier baselines (`runs/<id>/s0/`), and
+the notes' inbox files (`<state>/inbox/`, `<state>/marks/`). Each S0 move is stored on the
+run as `baseline_history`. None of these is a symbol index: they hold commits, notes and
+what each Work was sent, and facts are still derived from (S0, Δ).
 
 Stored: `RunRecord.coherence` in the run projection JSON (`runs.run_projection_json`
 and `run.json`): `refreshed_from`, the latest stored `validity` (with its world

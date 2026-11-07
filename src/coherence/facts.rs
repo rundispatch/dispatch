@@ -89,6 +89,11 @@ impl DeltaFile {
             })
             .collect()
     }
+
+    /// `base`, the S0 text, with this file's hunks applied.
+    pub fn post_image(&self, base: &[u8]) -> Option<Vec<u8>> {
+        post_image(base, &self.hunks)
+    }
 }
 
 #[derive(Clone, Debug)]
