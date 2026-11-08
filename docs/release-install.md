@@ -19,8 +19,8 @@ project's checks use, and installs no agent or provider tool.
 curl -fsSL https://rundispatch.sh/install | sh
 ```
 
-`rundispatch.sh/install` redirects to the latest release's `install.sh`. Until the website
-does, use the release asset itself:
+`rundispatch.sh/install` redirects to the latest release's `install.sh`, which you can also
+fetch directly:
 
 ```sh
 curl -fsSL https://github.com/rundispatch/dispatch/releases/latest/download/install.sh | sh
