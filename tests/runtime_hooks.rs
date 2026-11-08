@@ -143,6 +143,20 @@ impl Project {
         self.hook_raw(event.to_string().as_bytes())
     }
 
+    /// Wait until the owner has taken every mark a hook left for it: a
+    /// session's end is recorded on its tick, not by the hook.
+    fn marks_taken(&self) {
+        let marks = self.state.join("marks");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while fs::read_dir(&marks).is_ok_and(|mut entries| entries.next().is_some()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the owner never took the marks"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     fn start(&self, session: &str, source: &str, cwd: &Path) -> String {
         self.hook(serde_json::json!({
             "hook_event_name": "SessionStart", "session_id": session, "source": source,
@@ -250,6 +264,7 @@ fn repeated_and_later_sessions_land_on_one_work() {
         "hook_event_name": "SessionEnd", "session_id": "s1", "reason": "clear",
         "cwd": p.worktree,
     }));
+    p.marks_taken();
 
     // The project view reads it as discovered work with no open session.
     let history = text(&p.dispatch(&["history"]));
@@ -907,7 +922,8 @@ fn an_ended_session_leaves_its_work_to_finish_resume_or_close() {
         p.hook(serde_json::json!({
             "hook_event_name": "SessionEnd", "session_id": "s1", "reason": reason,
             "cwd": p.worktree,
-        }))
+        }));
+        p.marks_taken();
     };
     end("prompt_input_exit");
     let status = text(&p.dispatch(&["status", &id]));
@@ -954,9 +970,10 @@ impl Project {
     }
 
     /// The `SessionEnd` Claude Code sends when `/exit` keeps the worktree:
-    /// `cwd` is the main checkout, not the worktree.
+    /// `cwd` is the main checkout, not the worktree. Returns the reply once
+    /// the owner has recorded the end.
     fn claude_exit(&self, session: &str) -> String {
-        self.hook(serde_json::json!({
+        let reply = self.hook(serde_json::json!({
             "session_id": session,
             "transcript_path": format!("/dev/null/{session}.jsonl"),
             "cwd": self.root,
@@ -964,7 +981,9 @@ impl Project {
             "prompt_id": "b5bbe6c2-793f-4d20-a19f-29ace51dc1ca",
             "hook_event_name": "SessionEnd",
             "reason": "prompt_input_exit",
-        }))
+        }));
+        self.marks_taken();
+        reply
     }
 
     fn session_ends(&self, id: &str) -> i64 {

@@ -295,18 +295,29 @@ impl Project {
         rusqlite::Connection::open(self.state.join("dispatch.db")).unwrap()
     }
 
-    /// How many records the database holds for `id`, or for every run.
+    /// How many records the database holds for `id`, or for every run. The
+    /// owner's first open makes the file a moment before the schema: none yet.
     fn recorded(&self, id: &str) -> i64 {
         if !self.state.join("dispatch.db").is_file() {
             return 0;
         }
-        self.db()
+        let db = self.db();
+        let schema: bool = db
             .query_row(
-                "SELECT COUNT(*) FROM runs WHERE id = ?1 OR ?1 = ''",
-                [id],
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs')",
+                [],
                 |row| row.get(0),
             )
-            .unwrap()
+            .unwrap();
+        if !schema {
+            return 0;
+        }
+        db.query_row(
+            "SELECT COUNT(*) FROM runs WHERE id = ?1 OR ?1 = ''",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     /// The payloads of `id`'s events of `kind`.
@@ -569,11 +580,12 @@ fn a_repeated_session_start_while_pending_lands_on_the_one_work() {
 }
 
 /// Claude Code reports a worktree session's end from the main checkout. Arriving
-/// while the registration is pending, the end publishes it first, matched by
-/// session, then records the end on it.
+/// while the registration is pending, the end is left for the owner, which
+/// publishes the registration first, matched by session, for the hook, then
+/// records the end on it.
 #[test]
 fn a_session_end_from_the_checkout_while_pending_publishes_then_records_it() {
-    let p = Project::new();
+    let mut p = Project::new();
     let id = p.pending();
     let notice = Project::notice(&p.hook(
         serde_json::json!({
@@ -583,6 +595,10 @@ fn a_session_end_from_the_checkout_while_pending_publishes_then_records_it() {
         &[],
     ));
     assert_eq!(notice, "");
+    assert!(p.runs().is_empty(), "the hook publishes nothing");
+    p.owner("recorded the end", |p| {
+        p.recorded(&id) == 1 && p.events(&id, "runtime.session_ended").len() == 1
+    });
     let run = published_once(&p, &id, "hook");
     assert_eq!(
         run["attachment"]["sessions"][0]["end_reason"],

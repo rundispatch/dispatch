@@ -2267,6 +2267,7 @@ mod tests {
             source_fingerprint: "sha256:abc".to_owned(),
             baseline_path: PathBuf::from(format!("/state/{id}/baseline")),
             baseline_commit: "0123456789abcdef".to_owned(),
+            baseline_history: Vec::new(),
             status: RunStatus::ReadyForEvaluation,
             mode: crate::RunMode::Native,
             state_revision: 0,

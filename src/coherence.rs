@@ -30,6 +30,7 @@ pub mod integration;
 pub mod interactions;
 pub mod measure;
 pub mod memo;
+pub mod notes;
 pub mod symbols;
 pub mod watch;
 pub mod world;
@@ -467,8 +468,9 @@ pub(crate) fn gate(
     // Strict accept, or a launched run's unmoved tree: the fingerprint rules
     // apply, and nothing is evaluated.
     if let Some(
-        skipped
-        @ (ChecksSkipped::ConfigUnreadable | ChecksSkipped::Strict | ChecksSkipped::Unmoved),
+        skipped @ (ChecksSkipped::ConfigUnreadable
+        | ChecksSkipped::Strict
+        | ChecksSkipped::Unmoved { .. }),
     ) = integration::checks_skipped(run, candidate_label, run_dir, None)?
     {
         return Ok(AcceptGate::Legacy(skipped));

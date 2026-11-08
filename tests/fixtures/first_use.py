@@ -353,9 +353,9 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         assert json.loads(case.settings.read_text()) == json.loads(theirs)
         assert_nothing_ran(case)
 
-    # 0.4.16 installed four hooks; this Dispatch installs six. Such a file,
+    # 0.4.16 installed four hooks; this Dispatch installs seven. Such a file,
     # upgraded in place, holds Dispatch's own hooks: setup offers Update, shows
-    # the change, and leaves exactly six beside the person's own Stop hook.
+    # the change, and leaves exactly seven beside the person's own Stop hook.
     # Runtime integrations writes the same bytes.
     with Case(parent, 'claude-upgrade') as case:
         command = f"'{binary}' --state-dir '{case.state}' hook claude"
@@ -392,7 +392,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         assert found == sorted([('SessionStart', '', 60), ('SessionEnd', '', 5),
                                 ('WorktreeRemove', '', 300), ('PreToolUse', 'ExitWorktree', 300),
                                 ('Notification', 'permission_prompt|idle_prompt|agent_needs_input', 5),
-                                ('Stop', '', 5)]), found
+                                ('Stop', '', 5), ('PostToolUse', '', 5)]), found
         assert settings['model'] == 'keep' and settings['hooks']['Stop'][0] == mine, settings
         case.settings.write_text(earlier)
         through_menu(case, 'claude-upgrade-menu', '1) Update Claude Code hooks',

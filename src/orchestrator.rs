@@ -2,9 +2,12 @@ mod apply;
 pub mod attach;
 pub mod background;
 pub mod discovery;
+pub mod inbox;
 pub(crate) mod liveness;
 pub(crate) mod native;
+mod notify;
 pub mod registration;
+pub(crate) mod s0;
 pub mod serve;
 pub(crate) use apply::source_lock_path;
 pub use apply::{ApplyAuthority, ApplyOutcome, auto_apply};
@@ -680,6 +683,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         source_fingerprint: snapshot.fingerprint,
         baseline_path: snapshot.baseline_path,
         baseline_commit: snapshot.baseline_commit,
+        baseline_history: Vec::new(),
         status: RunStatus::Preparing,
         mode: RunMode::Native,
         state_revision: 0,
@@ -2369,12 +2373,15 @@ pub async fn check(
         Some((config, logs, patch)) => {
             let run_dir = state.run_dir(&run.id);
             let unmoved = !unfinished
-                && integration::checks_skipped(
-                    &run,
-                    &candidate.label,
-                    &run_dir,
-                    Some(validity.world_changed),
-                )? == Some(ChecksSkipped::Unmoved);
+                && matches!(
+                    integration::checks_skipped(
+                        &run,
+                        &candidate.label,
+                        &run_dir,
+                        Some(validity.world_changed),
+                    )?,
+                    Some(ChecksSkipped::Unmoved { .. })
+                );
             let ran = if unmoved {
                 integration::reused(&run, patch, config, &run_dir)
             } else {
@@ -2392,7 +2399,7 @@ pub async fn check(
                     serde_json::json!({
                         "by": "check",
                         "delta_digest": digest,
-                        "skipped": ChecksSkipped::Unmoved.to_string(),
+                        "skipped": ChecksSkipped::unmoved(&run).to_string(),
                     }),
                 ),
                 Err(error) => (
@@ -2435,7 +2442,7 @@ pub async fn check(
         println!("{shown}");
     } else if let Some((ran, _)) = &ran {
         match ran {
-            Ok(None) => println!("Merged checks: not run — {}", ChecksSkipped::Unmoved),
+            Ok(None) => println!("Merged checks: not run — {}", ChecksSkipped::unmoved(&run)),
             Ok(Some(MergedRun {
                 source,
                 reused: Some(entry),
@@ -2788,6 +2795,15 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             || "directory snapshot".to_owned(),
             |head| format!("snapshot at {}", short(head)),
         ),
+    };
+    // Where S0 is now, once it moved, as `explain`'s S0 line says it.
+    let s0 = match run.baseline_history.last() {
+        Some(moved) => format!(
+            "commit {} (moved from {})",
+            short(&moved.moved_to),
+            short(&moved.commit)
+        ),
+        None => s0,
     };
     let overridden = run
         .coherence
@@ -3232,6 +3248,43 @@ pub(crate) fn source_at_start(attachment: &crate::AttachmentRecord) -> Vec<Strin
     lines
 }
 
+/// What `explain` says of S0: where it began and each move since.
+pub(crate) fn s0_lines(run: &RunRecord, attachment: &crate::AttachmentRecord) -> Vec<String> {
+    let began = match &attachment.provenance {
+        crate::BaselineProvenance::GitMergeBase { commit } => {
+            format!("commit {commit} (merge base with the root)")
+        }
+        crate::BaselineProvenance::SnapshotAtAttach => {
+            "snapshot of the workspace at attach; earlier edits are not attributed".into()
+        }
+        crate::BaselineProvenance::WorkspaceAtStart { commit } => {
+            format!("the workspace as it was when the work began ({commit})")
+        }
+        crate::BaselineProvenance::Discovered { commit } => format!(
+            "commit {commit} (merge base with the root; found by Dispatch, the worktree appeared while the project was watched)"
+        ),
+    };
+    // The current S0 first, then each it moved from.
+    let mut lines = Vec::new();
+    let mut label = "S0";
+    for moved in run.baseline_history.iter().rev() {
+        let why = match moved.landed_run {
+            _ if moved.back => "the workspace's HEAD no longer has it",
+            Some(_) => "the workspace merged the recorded source",
+            None => "the workspace merged the root's HEAD",
+        };
+        lines.push(format!(
+            "{label}: commit {} (moved from {} at {}: {why})",
+            moved.moved_to,
+            moved.commit,
+            moved.moved_at.format("%Y-%m-%d %H:%M UTC")
+        ));
+        label = "S0 before";
+    }
+    lines.push(format!("{label}: {began}"));
+    lines
+}
+
 fn print_attachment_details(run: &RunRecord) {
     let Some(attachment) = &run.attachment else {
         return;
@@ -3241,21 +3294,8 @@ fn print_attachment_details(run: &RunRecord) {
         println!("{line}");
     }
     println!("  root: {}", attachment.integration_root.display());
-    match &attachment.provenance {
-        crate::BaselineProvenance::GitMergeBase { commit } => {
-            println!("  S0: commit {commit} (merge base with the root)");
-        }
-        crate::BaselineProvenance::SnapshotAtAttach => {
-            println!("  S0: snapshot of the workspace at attach; earlier edits are not attributed");
-        }
-        crate::BaselineProvenance::WorkspaceAtStart { commit } => {
-            println!("  S0: the workspace as it was when the work began ({commit})");
-        }
-        crate::BaselineProvenance::Discovered { commit } => {
-            println!(
-                "  S0: commit {commit} (merge base with the root; found by Dispatch, the worktree appeared while the project was watched)"
-            );
-        }
+    for line in s0_lines(run, attachment) {
+        println!("  {line}");
     }
     println!("  confidence: {}", snake_case(&attachment.confidence));
     println!(

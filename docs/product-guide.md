@@ -397,7 +397,7 @@ dispatch finish <run-id>          # once you know the agent is done
 `finish` is the only thing that decides a foreign attachment is done — there is no
 timeout or idle heuristic. Until you run it, or until the agent's own driving script
 does, the work stays observed but not judged. Its checks run on what would land:
-in the workspace when the source has not moved since the Work began, otherwise on
+in the workspace when the source has not moved since its S0, otherwise on
 the source as it is now with the Work's change, as accept checks it, so accept can
 reuse that pass; only if that fails do they also run in the workspace, to show
 whose change broke it. Its summary shows the patch, the

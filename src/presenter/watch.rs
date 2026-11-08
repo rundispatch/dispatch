@@ -449,7 +449,7 @@ fn landed(run: &RunRecord, line: &orchestrator::WorkLine) -> String {
 /// What the Work began against, from `WorkLine`'s inputs.
 fn began(run: &RunRecord) -> String {
     let short = |commit: &str| commit.chars().take(8).collect::<String>();
-    match run.attachment.as_ref().map(|a| &a.provenance) {
+    let began = match run.attachment.as_ref().map(|a| &a.provenance) {
         Some(crate::BaselineProvenance::GitMergeBase { commit }) => format!(
             "the Git merge base {} of its worktree and the project",
             short(commit)
@@ -473,6 +473,13 @@ fn began(run: &RunRecord) -> String {
             ),
             None => "a Dispatch snapshot of the project folder".into(),
         },
+    };
+    match run.baseline_history.last() {
+        Some(moved) => format!(
+            "{began}; its S0 moved since, to commit {}",
+            short(&moved.moved_to)
+        ),
+        None => began,
     }
 }
 
@@ -778,7 +785,10 @@ struct Notice {
     name: Option<String>,
     kind: Kind,
     text: String,
-    at: Instant,
+    /// When it was first drawn. Its lifetime starts there, not when it was
+    /// made: on a loaded machine the reload before that draw can take longer
+    /// than the whole lifetime, and the answer to a key would never show.
+    drawn: Option<Instant>,
 }
 
 impl Notice {
@@ -788,8 +798,12 @@ impl Notice {
             name: work.map(|item| item.name.clone()),
             kind,
             text: text.into(),
-            at: Instant::now(),
+            drawn: None,
         }
+    }
+    fn expired(&self) -> bool {
+        self.drawn
+            .is_some_and(|drawn| drawn.elapsed() >= NOTICE_LIFETIME)
     }
     /// `<name>: <text>`, with the Work's name as it is listed now.
     fn shown(&self, items: &[Item]) -> String {
@@ -934,10 +948,7 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
             journal = now;
             loaded = Some(Instant::now());
         }
-        if notice
-            .as_ref()
-            .is_some_and(|notice| notice.at.elapsed() >= NOTICE_LIFETIME)
-        {
+        if notice.as_ref().is_some_and(Notice::expired) {
             notice = None;
         }
         let screen = Screen {
@@ -953,6 +964,9 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
         ui.draw_frame(&screen.key(), |frame, palette| {
             render(frame, &screen, palette)
         })?;
+        if let Some(notice) = &mut notice {
+            notice.drawn.get_or_insert_with(Instant::now);
+        }
         let Some(event) = ui.next().await? else {
             return Ok(());
         };
@@ -1229,7 +1243,8 @@ async fn close(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Resu
 }
 
 /// `f`: `dispatch finish` for active attached Work. Running the project's
-/// checks needs the person's word, unless the Work already carries it.
+/// checks needs the person's word, unless the Work already carries it or
+/// their standing check consent covers exactly these checks.
 async fn finish(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Result<Notice> {
     if run.mode != crate::RunMode::Attached || run.outcome.lifecycle == LifecycleState::Finished {
         return Ok(Notice::new(
@@ -1239,8 +1254,8 @@ async fn finish(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Res
         ));
     }
     let checks = configured_checks(state, &run.id).0;
-    let mut allow = false;
-    if !checks.is_empty() && !run.environment.unsafe_local {
+    let allow = !checks.is_empty() && !run.environment.unsafe_local;
+    if allow && !crate::consent::consented(state, &run.source_path, &checks) {
         let question = format!(
             "Finish {} (Work {})? Finishing runs this project's checks on your machine, with your permissions:\n{}",
             item.name,
@@ -1258,7 +1273,6 @@ async fn finish(ui: &mut Ui, state: &State, run: &RunRecord, item: &Item) -> Res
         if ui.select(&question, &rows, 1).await? != Some(0) {
             return Ok(Notice::new(Some(item), Kind::Info, "nothing changed."));
         }
-        allow = true;
     }
     Ok(
         match crate::orchestrator::attach::finish_quietly(state, &run.id, allow).await {
@@ -2715,6 +2729,44 @@ mod tests {
         assert!(text.contains(want), "{text}");
     }
 
+    /// `worktree`'s Work, after its workspace merged a recorded source.
+    fn moved(id: &str) -> RunRecord {
+        let mut run = working(worktree(id, "me-endpoint", 1));
+        run.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: PathBuf::from("/state/runs/w/baseline"),
+            baseline_commit: "b".into(),
+            commit: "e4a15cd9ffffffff".into(),
+            moved_to: "2216f677aaaaaaaa".into(),
+            moved_at: chrono::Utc::now(),
+            recorded_at: chrono::Utc::now(),
+            landed_run: Some("01M4DRXH00000000000000000A".into()),
+            back: false,
+        });
+        run
+    }
+
+    #[test]
+    fn a_work_line_names_the_s0_a_work_moved_to() {
+        let line = orchestrator::work_line(&moved("01M4DRXH00000000000000000B"), None);
+        assert_eq!(line.s0, "commit 2216f677 (moved from e4a15cd9)");
+        assert!(
+            line.to_string()
+                .starts_with("discovered claude · S0 commit 2216f677 (moved from e4a15cd9) · "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_began_detail_says_where_s0_moved_since() {
+        let item = items(&[moved("01M4DRXH00000000000000000B")]).remove(0);
+        assert_eq!(
+            lines(&item, "Began"),
+            [
+                "a Dispatch snapshot (e4a15cd9) of its worktree when its first session started, not a commit on any branch; its S0 moved since, to commit 2216f677"
+            ]
+        );
+    }
+
     #[test]
     fn details_say_the_verdict_how_it_landed_and_what_it_began_against() {
         let id = "01M4DRXH00000000000000000B";
@@ -3084,6 +3136,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
         terminal.draw(|f| render(f, &screen, palette)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn a_notice_lives_from_its_first_draw_not_from_when_it_was_made() {
+        let listed = items(&demo());
+        let mut notice = Notice::new(Some(&listed[0]), Kind::Refused, "not rejected.");
+        // Not drawn yet, however long ago it was made: it stays.
+        assert!(!notice.expired());
+        notice.drawn = Instant::now().checked_sub(NOTICE_LIFETIME);
+        assert!(notice.expired());
     }
 
     #[test]

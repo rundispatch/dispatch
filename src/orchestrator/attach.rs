@@ -302,6 +302,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         &serde_yaml::to_string(&config).context("failed to serialize effective configuration")?,
     )?;
 
+    let mut history = Vec::new();
     let (snapshot, provenance, confidence, workspace, managed_workspace) = if *managed {
         let (snapshot, provenance, workspace, made) = make_workspace(state, root, run_id, &dir)
             .map_err(|error| error.context("could not make a workspace"))?;
@@ -318,11 +319,10 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         let commit = runtime.commit.clone();
         let (provenance, confidence) = if let Some(old) = &runtime.reopens {
             // It goes on from the Work it reopens: the same S0, attributed
-            // as that Work's was.
-            let old = state
-                .load_run(old)?
-                .attachment
-                .context("not attached Work")?;
+            // as that Work's was, and moved as that Work's was.
+            let old = state.load_run(old)?;
+            history = old.baseline_history;
+            let old = old.attachment.context("not attached Work")?;
             (old.provenance, old.confidence)
         } else if runtime.discovered {
             // The worktree appeared after watching began: every change in it
@@ -500,6 +500,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         source_fingerprint,
         baseline_path: published(snapshot.baseline_path),
         baseline_commit: snapshot.baseline_commit,
+        baseline_history: history,
         status: RunStatus::Running,
         mode: RunMode::Attached,
         state_revision: 0,
@@ -1233,31 +1234,32 @@ pub(crate) fn record_session_start(
     Ok(true)
 }
 
-/// Record that a runtime session ended. Nothing else changes: an ended
-/// session does not end the Work.
+/// Record that a runtime session ended `at`. Nothing else changes: an ended
+/// session does not end the Work. Called by the project owner, waiting up
+/// to `wait` for the run's lock; `false`: still busy, nothing recorded.
 pub(crate) fn record_session_end(
     state: &State,
     run_id: &str,
     provider: &str,
     session_id: &str,
     reason: &str,
-) -> Result<()> {
-    let _lock = OperationLock::acquire_wait(
-        &state.run_dir(run_id).join(".operation.lock"),
-        "attached work has a foreground owner",
-        // Within the 5 s `SessionEnd` timeout setup installs; the project owner
-        // may hold the lock while it checks this Work.
-        Duration::from_secs(3),
-    )?;
+    at: DateTime<Utc>,
+    wait: Duration,
+) -> Result<bool> {
+    let Some(_lock) =
+        OperationLock::acquire_within(&state.run_dir(run_id).join(".operation.lock"), wait)?
+    else {
+        return Ok(false);
+    };
     let mut run = state.load_run(run_id)?;
     let Some(session) = run.attachment.as_mut().and_then(|attachment| {
         attachment.sessions.iter_mut().rev().find(|known| {
             known.provider == provider && known.session_id == session_id && known.ended_at.is_none()
         })
     }) else {
-        return Ok(());
+        return Ok(true);
     };
-    session.ended_at = Some(Utc::now());
+    session.ended_at = Some(at);
     session.end_reason = Some(reason.to_owned());
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
@@ -1277,20 +1279,24 @@ pub(crate) fn record_session_end(
             ..EventRecord::default()
         },
         &mut run,
-    )
+    )?;
+    Ok(true)
 }
 
 /// Record that a session of Work `run_id` waits on a person; a later mark
-/// replaces it. Within the 5 s timeout setup installs for these hooks.
-pub(crate) fn record_needs_you(state: &State, run_id: &str, mark: NeedsYou) -> Result<()> {
-    let _lock = OperationLock::acquire_wait(
+/// replaces it. Called by the project owner, from a hook's mark, without
+/// waiting for the run's lock; `false`: busy, nothing recorded.
+pub(crate) fn record_needs_you(state: &State, run_id: &str, mark: NeedsYou) -> Result<bool> {
+    let Some(_lock) = OperationLock::acquire_within(
         &state.run_dir(run_id).join(".operation.lock"),
-        "attached work has a foreground owner",
-        Duration::from_secs(3),
-    )?;
+        Duration::ZERO,
+    )?
+    else {
+        return Ok(false);
+    };
     let mut run = state.load_run(run_id)?;
     let Some(attachment) = run.attachment.as_mut() else {
-        return Ok(());
+        return Ok(true);
     };
     attachment.needs_you = Some(mark.clone());
     let mut db = Database::open(state.db_path())?;
@@ -1313,7 +1319,8 @@ pub(crate) fn record_needs_you(state: &State, run_id: &str, mark: NeedsYou) -> R
             ..EventRecord::default()
         },
         &mut run,
-    )
+    )?;
+    Ok(true)
 }
 
 /// Why the mark on `run` no longer holds, judged with one `stat` of its
@@ -1844,12 +1851,15 @@ async fn finish_checks(
                 &run.baseline_commit,
                 &run.source_kind,
             )?;
-            integration::checks_skipped(
-                run,
-                &run.candidates[0].label,
-                &run_dir,
-                Some(!world.changes.is_empty()),
-            )? == Some(integration::ChecksSkipped::Unmoved)
+            matches!(
+                integration::checks_skipped(
+                    run,
+                    &run.candidates[0].label,
+                    &run_dir,
+                    Some(!world.changes.is_empty()),
+                )?,
+                Some(integration::ChecksSkipped::Unmoved { .. })
+            )
         }
         (None, Some(_)) => false,
     };

@@ -388,7 +388,8 @@ async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
     let body = format!(
         "Runtime integrations\nClaude Code hooks: {} ({})\nHermes hook: {} ({})\nWith them, a Claude Code session in its own worktree of a project you watch \
          (dispatch start) appears as Work by itself; a session in the checkout itself is told Dispatch cannot follow it. \
-         Hermes's hook keeps a hermes --worktree session's exact changes before Hermes removes its worktree.",
+         Hermes's hooks keep a hermes --worktree session's exact changes before Hermes removes its worktree. \
+         Both deliver Dispatch's notes on other Work to the agent.",
         installed(&claude),
         path.display(),
         match &hermes {
@@ -487,9 +488,11 @@ impl Change {
     }
 }
 
-/// Hermes's consent stays Hermes's: Dispatch never writes its allowlist.
-const HERMES_CONSENT: &str = "Hermes asks you to allow the hook the first time it runs it; \
-     a run without a terminal needs hermes --accept-hooks.";
+/// Hermes's consent stays Hermes's: Dispatch never writes its allowlist,
+/// whose approvals are per hook (event and command).
+const HERMES_CONSENT: &str = "Hermes asks you once for each of these hooks, at its next start \
+     in a terminal, and they don't run until you allow them (hermes hooks list shows which are \
+     allowed); a run without a terminal needs hermes --accept-hooks.";
 
 /// One runtime's hook, the step both setup's pass and Runtime integrations
 /// take. It shows exactly what changes and where, with the existing and new
@@ -544,11 +547,25 @@ async fn hook_step(ui: &mut Ui, state: &State, runtime: Runtime, menu: bool) -> 
                 return Ok(true);
             }
         },
+        (Runtime::Hermes, Change::Update | Change::Remove) if !hermes::as_written(&path)? => {
+            let change = match change {
+                Change::Update => format!(
+                    "Under hooks:, make Dispatch's entries exactly these:\n{}{HERMES_CONSENT}",
+                    hermes::wanted(&command)?
+                ),
+                _ => "Remove the entries under hooks: that run hook hermes.".into(),
+            };
+            ui.commit(&format!(
+                "{shown} was rewritten or edited since Dispatch added its hooks (hermes config set rewrites it), so Dispatch leaves the file alone. {change}"
+            ))?;
+            return Ok(true);
+        }
         (Runtime::Hermes, Change::Update) => format!(
-            "Update Dispatch's hook in {shown}?\n{commands}\nOnly the command in Dispatch's block changes; a backup is kept beside the file. {HERMES_CONSENT}"
+            "Update Dispatch's hooks in {shown}?\n{commands}\nDispatch's block is replaced by exactly these:\n{}Nothing else in the file changes; a backup is kept beside the file. {HERMES_CONSENT}",
+            hermes::wanted(&command)?
         ),
         (Runtime::Hermes, Change::Remove) => format!(
-            "Remove Dispatch's hook from {shown}?\nOnly the block Dispatch added is removed, and only as Dispatch added it; a backup is kept beside the file."
+            "Remove Dispatch's hooks from {shown}?\nOnly the block Dispatch added is removed, and only as Dispatch added it; a backup is kept beside the file."
         ),
     };
     let rows = [

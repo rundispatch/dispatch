@@ -344,13 +344,15 @@ pub(crate) fn register(
 }
 
 /// The worker: S0, `registration.json`, the run, the decision, publishing.
-/// Joining existing Work waits for its lock until `deadline`, the hook's.
+/// The workspace's lock, and joining existing Work its lock, are waited for
+/// until `deadline`, the hook's: another session starting there may hold the
+/// first while it waits for the second.
 fn work(state: &State, mut registration: Registration, deadline: Instant) -> Result<Started> {
     let workspace = registration.workspace.clone();
     let _lock = OperationLock::acquire_wait(
         &workspace_lock(state, &workspace),
         "another session is registering this workspace",
-        Duration::from_secs(10),
+        deadline.saturating_duration_since(Instant::now()),
     )?;
     fault("after_lock");
     publish_durable(state, &workspace)?;
@@ -446,18 +448,17 @@ fn go_on_from(workspace: &Path, old: Option<RunRecord>) -> (Option<Reopen>, Opti
     }
 }
 
-/// The commit in the project's repository that is `run`'s S0, every object
-/// of its tree readable.
+/// The commit in the project's repository that is `run`'s S0, where it
+/// moved to if it did, every object of its tree readable.
 fn s0_commit(workspace: &Path, run: &RunRecord) -> Result<String> {
-    let Some(
-        BaselineProvenance::WorkspaceAtStart { commit } | BaselineProvenance::Discovered { commit },
-    ) = run
-        .attachment
-        .as_ref()
-        .map(|attachment| &attachment.provenance)
+    let Some(BaselineProvenance::WorkspaceAtStart { .. } | BaselineProvenance::Discovered { .. }) =
+        run.attachment
+            .as_ref()
+            .map(|attachment| &attachment.provenance)
     else {
         anyhow::bail!("Work {} records no S0 commit to go on from", run.id);
     };
+    let (commit, _) = run.s0_commit().context("S0 has no commit")?;
     let mut readable = source::git_command(workspace);
     readable.args([
         "rev-list",
@@ -472,7 +473,7 @@ fn s0_commit(workspace: &Path, run: &RunRecord) -> Result<String> {
         "its S0 commit {commit} can no longer be read: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    Ok(commit.clone())
+    Ok(commit.to_owned())
 }
 
 /// The deadline passed, or the worker gave up: decide pending or untracked,

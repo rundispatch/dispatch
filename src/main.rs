@@ -739,9 +739,13 @@ async fn run() -> Result<()> {
                 "unknown agent runtime: {provider}"
             );
             let mut input = Vec::new();
-            std::io::stdin()
+            let mut stdin = std::io::stdin().lock();
+            (&mut stdin)
                 .take(dispatch::runtime::MAX_INPUT_BYTES as u64 + 1)
                 .read_to_end(&mut input)?;
+            // The rest is read and dropped: a runtime writing a larger
+            // payload never meets a closed pipe.
+            std::io::copy(&mut stdin, &mut std::io::sink())?;
             let output = if provider == "hermes" {
                 // Hermes gives the worktree only in the hook's environment.
                 let worktree = std::env::var_os("TERMINAL_CWD");

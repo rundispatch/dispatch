@@ -39,26 +39,40 @@ fn clean_removes_only_listed_internal_check_workspaces_after_confirmation() {
 
     #[cfg(unix)]
     {
-        use std::{fs::OpenOptions, os::fd::AsRawFd};
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
 
         let lock_path = state
             .join("locks")
             .join(format!("source-{}.lock", "a".repeat(64)));
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        let lock = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path)
+        // A check in progress, in a process of its own. Held here, the lock
+        // would outlive its close in any child another test forked and has
+        // not yet exec'd.
+        let mut holder = Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl, sys\nf = open(sys.argv[1], 'a')\nfcntl.flock(f, fcntl.LOCK_EX)\nprint('held', flush=True)\nsys.stdin.read()",
+            ])
+            .arg(&lock_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
             .unwrap();
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let mut held = String::new();
+        BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut held)
+            .unwrap();
+        assert_eq!(held, "held\n");
         let busy = run(&["--yes"]);
         assert!(!busy.status.success());
         assert!(
             workspace.exists(),
             "clean must leave a check in progress alone"
         );
-        drop(lock);
+        // Reaped, the holder has closed everything it held.
+        holder.kill().unwrap();
+        holder.wait().unwrap();
     }
 
     let cleaned = run(&["--yes"]);

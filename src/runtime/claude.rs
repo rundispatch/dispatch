@@ -3,7 +3,10 @@
 //! the `ExitWorktree` tool with `action: remove`, which does not run
 //! `WorktreeRemove`; and `Notification` and `Stop`, when the session waits on
 //! the person) as `RuntimeEvent`s, and the reply Claude Code shows the
-//! person. Everything Claude-specific ends here.
+//! person. `SessionStart` and `PostToolUse` also deliver pending notes to the
+//! agent, as `additionalContext`: Claude Code shows it to the model before
+//! the first prompt, or right after the tool's result. Everything
+//! Claude-specific ends here.
 
 use std::{sync::mpsc, time::Duration};
 
@@ -131,18 +134,31 @@ const REMOVAL_DEADLINE: Duration = Duration::from_secs(240);
 /// be deleted whose Δ Dispatch could not keep: the hook fails, so Claude Code
 /// keeps the worktree and the work in it.
 pub fn handle(state: &State, input: &[u8]) -> Output {
+    // Notes first, from the payload's head: a tool's output can make the
+    // rest larger than Dispatch reads. Once claimed they are always printed.
+    let head = super::head(input);
+    let event = head.get("hook_event_name").map(String::as_str);
+    let notes = match (event, head.get("cwd")) {
+        (Some(event @ ("SessionStart" | "PostToolUse")), Some(cwd)) => {
+            super::deliver(state, std::path::Path::new(cwd), event).map(|notes| (event, notes))
+        }
+        _ => None,
+    };
+    if event == Some("PostToolUse") {
+        return notice(Ok(Reply::Silent), notes);
+    }
     let event = match parse(input) {
         Ok(Some(event)) => event,
-        Ok(None) => return notice(Ok(Reply::Silent)),
-        Err(error) => return notice(Err(error)),
+        Ok(None) => return notice(Ok(Reply::Silent), notes),
+        Err(error) => return notice(Err(error), notes),
     };
     // Recorded only, never replied to: `Stop`'s stdout reaches Claude Code.
     if matches!(event.kind, EventKind::NeedsYou { .. }) {
         let _ = super::ingest(state, event);
-        return notice(Ok(Reply::Silent));
+        return notice(Ok(Reply::Silent), None);
     }
     if !matches!(event.kind, EventKind::WorkspaceRemoved) {
-        return notice(super::ingest(state, event));
+        return notice(super::ingest(state, event), notes);
     }
     // Run it where a deadline can be kept; if the deadline passes, this
     // process exits and the attempt with it, leaving nothing half-written
@@ -156,7 +172,7 @@ pub fn handle(state: &State, input: &[u8]) -> Output {
         .recv_timeout(REMOVAL_DEADLINE)
         .unwrap_or_else(|_| Err(anyhow::anyhow!("keeping its changes took too long")));
     match outcome {
-        Ok(reply) => notice(Ok(reply)),
+        Ok(reply) => notice(Ok(reply), None),
         Err(error) => Output {
             stdout: String::new(),
             stderr: format!(
@@ -168,29 +184,45 @@ pub fn handle(state: &State, input: &[u8]) -> Output {
     }
 }
 
-fn notice(reply: Result<Reply>) -> Output {
-    let stdout = match reply {
-        Ok(Reply::Silent) => String::new(),
-        Ok(Reply::Notice(text)) => serde_json::json!({"systemMessage": text}).to_string(),
-        Err(error) => serde_json::json!({
-            "systemMessage": format!("Dispatch could not track this session: {error:#}")
-        })
-        .to_string(),
+/// The reply: `reply` shown to the person, and `notes` for the agent after
+/// the hook event that delivered them.
+fn notice(reply: Result<Reply>, notes: Option<(&str, String)>) -> Output {
+    let mut output = serde_json::Map::new();
+    let message = match reply {
+        Ok(Reply::Silent) => None,
+        Ok(Reply::Notice(text)) => Some(text),
+        Err(error) => Some(format!("Dispatch could not track this session: {error:#}")),
     };
+    if let Some(message) = message {
+        output.insert("systemMessage".into(), message.into());
+    }
+    if let Some((event, notes)) = notes {
+        output.insert(
+            "hookSpecificOutput".into(),
+            serde_json::json!({"hookEventName": event, "additionalContext": notes}),
+        );
+    }
     Output {
-        stdout,
+        stdout: if output.is_empty() {
+            String::new()
+        } else {
+            serde_json::Value::Object(output).to_string()
+        },
         stderr: String::new(),
         code: 0,
     }
 }
+
+type HookSet = [(&'static str, Option<&'static str>, u64)];
 
 /// The hook events Dispatch installs, with the matcher and timeout each
 /// gets. A `WorktreeRemove` hook outlasts `REMOVAL_DEADLINE`, so Dispatch
 /// always decides before Claude Code gives up on it. Claude Code matches a
 /// `Notification` matcher of plain words separated by `|` exactly against
 /// `notification_type` (its hooks reference), so only the types in `WAITING`
-/// run Dispatch at all.
-const INSTALLED: [(&str, Option<&str>, u64); 6] = [
+/// run Dispatch at all. `PostToolUse`, with no matcher, runs after every
+/// tool call, and does nothing but deliver notes.
+const INSTALLED: &HookSet = &[
     ("SessionStart", None, 60),
     ("SessionEnd", None, 5),
     ("WorktreeRemove", None, 300),
@@ -201,15 +233,31 @@ const INSTALLED: [(&str, Option<&str>, u64); 6] = [
         5,
     ),
     ("Stop", None, 5),
+    ("PostToolUse", None, 5),
 ];
 
-/// The hooks every Dispatch from 0.4.6 to 0.4.16 installed. Settings holding
-/// exactly these are Dispatch's own, to be updated, not changed by hand.
-const EARLIER: [(&str, Option<&str>, u64); 4] = [
-    ("SessionStart", None, 60),
-    ("SessionEnd", None, 5),
-    ("WorktreeRemove", None, 300),
-    ("PreToolUse", Some("ExitWorktree"), 300),
+/// The hooks earlier Dispatches installed: 0.4.6 to 0.4.16, then 0.4.17.
+/// Settings holding exactly one of these are Dispatch's own, to be updated,
+/// not changed by hand.
+const EARLIER: [&HookSet; 2] = [
+    &[
+        ("SessionStart", None, 60),
+        ("SessionEnd", None, 5),
+        ("WorktreeRemove", None, 300),
+        ("PreToolUse", Some("ExitWorktree"), 300),
+    ],
+    &[
+        ("SessionStart", None, 60),
+        ("SessionEnd", None, 5),
+        ("WorktreeRemove", None, 300),
+        ("PreToolUse", Some("ExitWorktree"), 300),
+        (
+            "Notification",
+            Some("permission_prompt|idle_prompt|agent_needs_input"),
+            5,
+        ),
+        ("Stop", None, 5),
+    ],
 ];
 
 /// For Work in a `claude --worktree` workspace that began from source other
@@ -302,12 +350,12 @@ pub fn without_hooks(mut settings: serde_json::Value) -> serde_json::Value {
 
 /// `settings` with exactly one set of Dispatch's hooks, running `command`.
 pub fn with_hooks(settings: serde_json::Value, command: &str) -> Result<serde_json::Value> {
-    with_set(settings, &INSTALLED, command)
+    with_set(settings, INSTALLED, command)
 }
 
 fn with_set(
     settings: serde_json::Value,
-    set: &[(&str, Option<&str>, u64)],
+    set: &HookSet,
     command: &str,
 ) -> Result<serde_json::Value> {
     let mut settings = without_hooks(settings);
@@ -348,13 +396,15 @@ pub fn hook(path: &std::path::Path) -> Result<Hook> {
     };
     let command = first["command"].as_str().unwrap_or_default().to_owned();
     let written = |set| with_set(serde_json::json!({}), set, &command).map(|s| installed(&s));
-    Ok(if found == written(&INSTALLED)? {
-        Hook::Exact(command)
-    } else if found == written(&EARLIER)? {
-        Hook::Earlier(command)
-    } else {
-        Hook::Changed
-    })
+    if found == written(INSTALLED)? {
+        return Ok(Hook::Exact(command));
+    }
+    for set in EARLIER {
+        if found == written(set)? {
+            return Ok(Hook::Earlier(command));
+        }
+    }
+    Ok(Hook::Changed)
 }
 
 /// Rewrite the settings at `path` with `change`, after keeping a backup
@@ -941,5 +991,68 @@ mod tests {
         let path = temp.path().join("settings.json");
         assert!(install_hooks(&path, COMMAND).unwrap().is_none());
         assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
+    }
+
+    #[test]
+    fn the_hooks_of_0_4_17_are_recognised_and_upgraded_to_deliver_notes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let old = "'/old/dispatch' --state-dir '/s' hook claude";
+        // The six hooks 0.4.17 installed, beside a hook of the person's.
+        let mut settings = with_set(serde_json::json!({}), EARLIER[1], old).unwrap();
+        settings["hooks"]["PostToolUse"] = serde_json::json!([{"matcher": "Bash", "hooks": [{"type": "command", "command": "lint"}]}]);
+        std::fs::write(&path, settings.to_string()).unwrap();
+        assert_eq!(hook(&path).unwrap(), Hook::Earlier(old.into()));
+        install_hooks(&path, COMMAND).unwrap();
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let tools = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(tools[0]["hooks"][0]["command"], "lint");
+        // Every tool, within Claude Code's five seconds.
+        assert_eq!(
+            tools[1],
+            serde_json::json!({"hooks": [{"type": "command", "command": COMMAND, "timeout": 5}]})
+        );
+        // Anything between the earlier sets and this one is not as any
+        // Dispatch wrote it.
+        let partial = with_set(serde_json::json!({}), &INSTALLED[..5], COMMAND).unwrap();
+        std::fs::write(&path, partial.to_string()).unwrap();
+        assert_eq!(hook(&path).unwrap(), Hook::Changed);
+    }
+
+    #[test]
+    fn notes_ride_with_the_reply_and_a_tool_call_with_none_prints_nothing() {
+        let both = notice(
+            Ok(Reply::Notice("Dispatch is tracking this worktree".into())),
+            Some(("SessionStart", "Work 01ABC landed fn f.".into())),
+        );
+        let reply: serde_json::Value = serde_json::from_str(&both.stdout).unwrap();
+        assert_eq!(
+            reply,
+            serde_json::json!({
+                "systemMessage": "Dispatch is tracking this worktree",
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "Work 01ABC landed fn f.",
+                },
+            })
+        );
+        assert_eq!(notice(Ok(Reply::Silent), None).stdout, "");
+        // A tool call in no repository, with an output past what the rest of
+        // the hook reads: nothing to deliver, and nothing said.
+        let temp = tempfile::tempdir().unwrap();
+        let state = State {
+            root: temp.path().join("state"),
+        };
+        let mut input = probe(
+            "PostToolUse",
+            serde_json::json!({"cwd": temp.path(), "tool_name": "Read"}),
+        );
+        input.truncate(input.len() - 1);
+        input.extend(format!(r#", "tool_response": "{}"}}"#, "x".repeat(100 * 1024)).bytes());
+        let output = handle(&state, &input[..super::super::MAX_INPUT_BYTES + 1]);
+        assert_eq!((output.stdout.as_str(), output.code), ("", 0));
+        assert!(!state.root.exists());
     }
 }

@@ -595,6 +595,8 @@ pub(crate) struct Owner {
     last_signal: Option<world::Signal>,
     /// Each followed run's work signal when it was last evaluated.
     work: HashMap<String, String>,
+    /// Each Work's workspace HEAD when its S0 was last looked at.
+    heads: HashMap<String, String>,
     /// Each Ready result's world signal when it was last checked.
     checked: HashMap<String, world::Signal>,
     /// Each unintegrated Work's footprint, with the digest of the Δ it was
@@ -617,6 +619,8 @@ pub(crate) struct Owner {
     /// moves, and the facts each Work's (S0, Δ) was found to assume.
     worlds: world::Worlds,
     memo: facts::Memo,
+    /// What the notes step remembers between ticks.
+    told: super::notify::Told,
     scratch: tempfile::TempDir,
 }
 
@@ -682,6 +686,7 @@ pub(crate) struct Cost {
     pub apply: Duration,
     pub footprint: Duration,
     pub pairs: Duration,
+    pub notes: Duration,
     pub runs: usize,
     pub followed: usize,
     pub evaluated: usize,
@@ -700,7 +705,7 @@ impl std::fmt::Display for Cost {
         let ms = |d: Duration| d.as_millis();
         write!(
             f,
-            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted in {} ms · pairs in {} ms · total {} ms",
+            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms · {} footprinted in {} ms · pairs in {} ms · notes {} ms · total {} ms",
             ms(self.signal),
             self.runs,
             ms(self.load),
@@ -714,6 +719,7 @@ impl std::fmt::Display for Cost {
             self.footprinted,
             ms(self.footprint),
             ms(self.pairs),
+            ms(self.notes),
             ms(self.total)
         )
     }
@@ -732,6 +738,7 @@ impl Owner {
             kind,
             last_signal: None,
             work: HashMap::new(),
+            heads: HashMap::new(),
             checked: HashMap::new(),
             footprints: HashMap::new(),
             clean: HashMap::new(),
@@ -742,6 +749,7 @@ impl Owner {
             live: None,
             worlds: world::Worlds::default(),
             memo: facts::Memo::default(),
+            told: super::notify::Told::default(),
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -776,9 +784,10 @@ impl Owner {
         tick.cost.signal = started.elapsed();
 
         let started = Instant::now();
-        let runs = self.load(state, &mut tick);
+        let mut runs = self.load(state, &mut tick);
         tick.cost.load = started.elapsed();
         tick.cost.runs = runs.len();
+        hook_files(state, &self.root, &runs, &mut tick);
         tick.adopted = adopt_orphans(state, &runs, &mut tick);
         self.observe_starts(state, &runs, &mut tick);
         // Agent liveness remains at the coherence cadence; the separate fast
@@ -787,6 +796,7 @@ impl Owner {
             tick.report(&error);
         }
         clear_needs_you(state, &runs, &mut tick);
+        self.follow_integration(state, &mut runs, &mut tick);
         let moved = tick.moved || tick.adopted;
         self.reevaluate(state, &runs, &mut tick, moved);
         let started = Instant::now();
@@ -822,6 +832,7 @@ impl Owner {
         if tick.adopted || tick.persisted || tick.applied {
             self.interact(state, &runs, &mut tick);
         }
+        self.tell(state, &runs, &mut tick);
         self.measure(state, &runs, &mut tick);
         // Facts are kept only for each Work's (S0, Δ) as its footprint
         // stands now.
@@ -883,6 +894,36 @@ impl Owner {
         }
     }
 
+    /// Move the S0 of Work whose workspace integrated a newer source
+    /// (`s0::follow`), before anything evaluates it against the old one.
+    fn follow_integration(&mut self, state: &State, runs: &mut [RunRecord], tick: &mut Tick) {
+        let (moved, errors) = super::s0::follow(state, &self.root, runs, &mut self.heads);
+        tick.persisted |= moved;
+        for error in errors {
+            tick.report(&error);
+        }
+    }
+
+    /// Leave live agents their notes (`notify::tell`), from the interaction
+    /// view as it stands after this tick's landings.
+    fn tell(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+        let started = Instant::now();
+        if let Some(projection) = &self.shown {
+            let errors = super::notify::tell(
+                state,
+                &self.root,
+                runs,
+                projection,
+                &mut self.told,
+                Utc::now(),
+            );
+            for error in errors {
+                tick.report(&error);
+            }
+        }
+        tick.cost.notes = started.elapsed();
+    }
+
     /// Count the files changed in each patch followed this tick, the one
     /// kept as last-seen evidence, and write the counts when they changed.
     fn publish_live(&mut self, state: &State, tick: &mut Tick) {
@@ -918,6 +959,17 @@ impl Owner {
             tick.report(&error);
             Vec::new()
         })
+    }
+}
+
+/// What hooks left as files (`inbox::settle`): the marks of sessions that
+/// ended or wait on the person, and the notes hooks delivered or that
+/// expired. Anything recorded is in this tick's runs once they are reloaded.
+fn hook_files(state: &State, root: &Path, runs: &[RunRecord], tick: &mut Tick) {
+    let mut errors = Vec::new();
+    tick.persisted |= super::inbox::settle(state, root, runs, &mut errors);
+    for error in errors {
+        tick.report(&error);
     }
 }
 
