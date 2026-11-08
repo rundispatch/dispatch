@@ -6,8 +6,8 @@
 
 **Dispatch 0.4.18 — experimental developer preview**
 
-<p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch; once one lands, the other no longer fits, and dispatch accept refuses it as REFRESH, leaving the source unchanged."></a></p>
-<p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
+<p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch and tells the live agent in a note; once one lands, the other hears it, and when it merges the recorded commit its S0 follows, so its own change is judged again and dispatch accept applies it."></a></p>
+<p align="center"><sub>30 seconds, no sound. The full video and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another result is accepted, a teammate merges. Dispatch
@@ -50,9 +50,8 @@ curl -fsSL https://rundispatch.sh/install | sh
 ```
 
 It installs `dispatch` into `~/.local/bin` for macOS (Apple silicon or Intel) or Linux
-(x86_64 or aarch64), checked against the release's `SHA256SUMS`. Until the website
-redirects that address, use
-`https://github.com/rundispatch/dispatch/releases/latest/download/install.sh`. Manual
+(x86_64 or aarch64), checked against the release's `SHA256SUMS`. That address redirects
+to `https://github.com/rundispatch/dispatch/releases/latest/download/install.sh`. Manual
 download, upgrades and uninstalling: [install, upgrade, uninstall](docs/release-install.md).
 
 ## Quick start
