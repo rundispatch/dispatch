@@ -281,15 +281,17 @@ recorded. Condition 2 then rests on the Stop block.
      mark).
 
   Any payload size works on this path.
-- **Idle waiter.**
-  - A second Stop entry, `hook claude --wait`, with `asyncRewake: true` and P0's timeout.
+- **Idle waiter (settled by P0).**
+  - A second Stop entry, `hook claude --wait`, with `asyncRewake: true` and `timeout` 28800.
   - It exits 0 at once when the project is unwatched.
-  - It polls each second, and claims only once the transcript's mtime has settled after `TURN_SETTLE`
-    and hasn't changed since. A new turn is the next Stop's to handle. P0 may drop this rule.
+  - It polls each second and claims whenever its workspace has a catch-up, idle or mid-turn. P0
+    showed a wake during a turn arrives at the next tool boundary.
   - On a claim: stderr, then exit 2.
-  - It exits 0 when a newer waiter replaces it (`state/waiters/<session>.pid`), when the session's
-    process is gone (the worktree lock's pid and start: one `ps`, then `kill(pid, 0)`), or before
-    Claude's timeout.
+  - It exits 0:
+    - when a newer waiter from the same session replaces it (`state/waiters/<session>.pid`);
+    - when `getppid()` changes (Claude Code spawns hooks directly, and SIGTERMs them at `/exit`,
+      Ctrl-D and a hangup);
+    - a minute before its timeout.
   - A hidden max-wait flag is for tests, and tests kill children on drop.
 - **Hook sets.**
   - `HookSet` gains a command suffix and an async flag. `ours()` accepts both suffixes.
@@ -323,8 +325,9 @@ recorded. Condition 2 then rests on the Stop block.
 
 ### P2h Catch-up for Hermes, and how asked Work reads (Claude Code, Opus 5.5; wave 2)
 
-- **Hermes:** a `pre_verify` hook returns `{"action":"continue","message"}` with the pending catch-up, if
-  P0 confirms it. Otherwise it arrives at the next turn through `pre_llm_call`.
+- **Hermes:** a `pre_verify` hook returns `{"action":"continue","message"}` with the pending catch-up
+  when `extra.attempt` is 0, at the end of a turn that edited files (P0). Otherwise it arrives at the
+  next turn through `pre_llm_call`.
   - The Hermes block grows to three hooks, and `EARLIER` becomes a list.
   - Setup says the allowlist asks once more.
 - **Status and watch:** asked Work shows "asked to catch up with `<landing>`" and when. Its REFRESH next
@@ -486,3 +489,26 @@ path and the waiter.
 ## Execution log
 
 - 2026-11-09: plan approved. Branch `release-0.5.0` from `764336b`.
+- P0 done (evidence in `~/dispatch-dev/p0-0500/`, each part with its FINDINGS.md):
+  - **Claude (approved probe):**
+    - A Stop `decision:"block"` keeps the turn going. The person sees it as "Stop hook error: …".
+    - `stop_hook_active` is true on the next Stop, and it precedes `last_assistant_message` in the
+      payload.
+    - An `asyncRewake` waiter wakes an idle session ("Stop hook feedback"). A wake during a turn
+      arrives at the next tool boundary and is harmless, so the transcript rule is dropped from P2.
+    - Hooks are spawned directly by `claude` (`getppid()` is the session).
+    - `timeout` is enforced by SIGTERM, silently, and 28800 s is honoured. Each Stop starts another
+      waiter, so supersede is needed.
+    - `/exit`, Ctrl-D and a hangup all SIGTERM running waiters, with no orphans.
+    - Hooks are re-read mid-session.
+  - **Hermes (approved probe):**
+    - `pre_verify` fires at the end of edit turns only, with `TERMINAL_CWD` as the worktree. Its
+      `continue` message reaches the model.
+    - `max_verify_nudges` defaults to 3, and the allowlist asks once.
+    - Config restored (sha256 `aa1e6c1b…`) and allowlist removed. The person's own hook was
+      declined.
+  - **Git:** `git apply --3way --cached` with the baseline's objects as alternates merges changed
+    context and refuses a same-line edit, identically on Git 2.39.5 (the CI image) and 2.54.
+    Alternates are required when S0's blobs exist only in the baseline, and every command on the
+    staged index needs them.
+  - **Baseline:** 0.4.18's Stop hook, unwatched: p50 3.54 ms, p95 4.17 ms (n=300, load 3.2).
