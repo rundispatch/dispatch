@@ -21,7 +21,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -87,7 +87,7 @@ fn read(state: &State, root: &Path) -> Option<Inventory> {
 
 /// Claude Code writes `CLAUDE_BASE` a moment before it locks a new worktree
 /// (14 ms apart in the 0.4.12 trial): a younger worktree without a session
-/// lock is looked at again on the next tick rather than listed for good.
+/// lock is looked at again on the next tick rather than listed.
 const GRACE: Duration = Duration::from_secs(3);
 
 /// Registrations that failed, by worktree, so each is noted once.
@@ -340,18 +340,31 @@ fn relocked(run: &RunRecord, lock: &Lock) -> bool {
     over && run.outcome.closed.is_none() && !seen && claude::liveness(lock) == Liveness::Running
 }
 
-/// Whether a worktree `listed` without a lock is now locked by the Hermes
-/// process that made it. Hermes makes its worktree and then locks it, two
-/// Git commands that a busy machine can hold apart for longer than `GRACE`:
-/// it was listed while Hermes was still making it.
+/// Whether a worktree `listed` without a lock is now locked by the running
+/// session that made it. Claude Code and Hermes make a worktree and then
+/// lock it, steps a busy machine can hold apart for longer than `GRACE`: it
+/// was listed while its maker was still making it. A Claude session made it
+/// if its process started no later than Git made the worktree, to the second
+/// its lock records; one that started later is a new session in a listed
+/// worktree.
 fn locked_by_its_maker(listed: &InventoryEntry, found: &Found) -> bool {
     listed.lock.is_none()
-        && matches!(found.made, Made::Hermes(_))
-        && found
-            .lock
-            .as_deref()
-            .and_then(hermes::lock_pid)
-            .is_some_and(|pid| hermes::liveness(pid, &found.path) == Liveness::Running)
+        && match &found.made {
+            Made::Claude(WorktreeSignals {
+                lock: Some(lock), ..
+            }) => {
+                let started = session(lock, false).map(|session| session.started_at);
+                let made = made_at(&found.path).map(DateTime::<Utc>::from);
+                matches!((started, made), (Ok(started), Ok(made)) if started <= made)
+                    && claude::liveness(lock) == Liveness::Running
+            }
+            Made::Hermes(_) => found
+                .lock
+                .as_deref()
+                .and_then(hermes::lock_pid)
+                .is_some_and(|pid| hermes::liveness(pid, &found.path) == Liveness::Running),
+            _ => false,
+        }
 }
 
 fn lock_pid(lock: &Lock) -> Option<u32> {
@@ -453,12 +466,11 @@ fn session(lock: &Lock, ended: bool) -> Result<RuntimeSession> {
 /// not recorded, so since Git made the worktree, its `.git` file written
 /// then; open, since its end is not observable.
 fn unobserved_session(agent: &str, session_id: &str, worktree: &Path) -> RuntimeSession {
-    let made = fs::metadata(worktree.join(".git")).and_then(|metadata| metadata.modified());
     RuntimeSession {
         provider: agent.into(),
         session_id: session_id.into(),
         source: "discovered".into(),
-        started_at: made.map_or_else(|_| Utc::now(), DateTime::<Utc>::from),
+        started_at: made_at(worktree).map_or_else(|_| Utc::now(), DateTime::<Utc>::from),
         ended_at: None,
         end_reason: None,
         model: None,
@@ -520,11 +532,14 @@ fn runtime_worktrees(root: &Path) -> Result<Vec<Found>> {
     Ok(found)
 }
 
-/// Whether the worktree was made less than `GRACE` ago: its `.git` file is
-/// written once, when Git makes it.
+/// When Git made `worktree`: its `.git` file is written once, then.
+fn made_at(worktree: &Path) -> std::io::Result<SystemTime> {
+    fs::metadata(worktree.join(".git")).and_then(|metadata| metadata.modified())
+}
+
+/// Whether the worktree was made less than `GRACE` ago.
 fn young(worktree: &Path) -> bool {
-    fs::metadata(worktree.join(".git"))
-        .and_then(|metadata| metadata.modified())
+    made_at(worktree)
         .ok()
         .and_then(|made| made.elapsed().ok())
         .is_some_and(|age| age < GRACE)
@@ -565,5 +580,90 @@ mod tests {
             start: "yesterday".into(),
         };
         assert!(session(&unreadable, true).is_err());
+    }
+
+    #[cfg(unix)]
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// Two Claude worktrees a scan listed without a lock, now each locked by
+    /// a running session, this test process. Git made `made` after that
+    /// process started, so the session made it; `older` a day before, so the
+    /// session is a new one there.
+    #[cfg(unix)]
+    #[test]
+    fn a_listed_worktree_becomes_work_only_once_its_maker_locks_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "--quiet", "-m", "initial"]);
+        let root = fs::canonicalize(&root).unwrap();
+        let state = State::discover(Some(temp.path().join("state"))).unwrap();
+        state.initialize().unwrap();
+        let pid = std::process::id();
+        let ps = std::process::Command::new("ps")
+            .env("TZ", "UTC0")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let start = String::from_utf8(ps.stdout).unwrap();
+        let [made, older] = ["made", "older"].map(|name| {
+            let path = format!(".claude/worktrees/{name}");
+            git(&root, &["worktree", "add", "--quiet", "-b", name, &path]);
+            let gitdir = root.join(".git/worktrees").join(name);
+            fs::write(gitdir.join("CLAUDE_BASE"), "base\n").unwrap();
+            let lock = format!("claude session {name} (pid {pid} start {})", start.trim());
+            fs::write(gitdir.join("locked"), lock).unwrap();
+            root.join(path)
+        });
+        fs::File::options()
+            .write(true)
+            .open(older.join(".git"))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(86_400))
+            .unwrap();
+        let listed = |path: &Path| InventoryEntry {
+            path: path.to_owned(),
+            first_seen: Utc::now(),
+            base: Some("base".into()),
+            lock: None,
+        };
+        let inventory = Inventory {
+            version: 1,
+            entries: vec![listed(&made), listed(&older)],
+            ..Inventory::default()
+        };
+        write(&state, &root, &inventory).unwrap();
+
+        scan(&state, &root, &[]).unwrap();
+
+        let runs = crate::orchestrator::serve::load_source_runs(&state, &root).unwrap();
+        let [run] = runs.try_into().unwrap();
+        let attachment = run.attachment.unwrap();
+        assert_eq!(attachment.workspace, made);
+        assert_eq!(
+            attachment.sessions[0].session_id,
+            format!("lock:made@{pid}")
+        );
+        assert_eq!(attachment.agent_process.map(|agent| agent.pid), Some(pid));
+        let left: Vec<PathBuf> = Inventory::load(&state, &root)
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        assert_eq!(left, [older]);
     }
 }
