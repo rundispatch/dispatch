@@ -512,3 +512,7 @@ path and the waiter.
     Alternates are required when S0's blobs exist only in the baseline, and every command on the
     staged index needs them.
   - **Baseline:** 0.4.18's Stop hook, unwatched: p50 3.54 ms, p95 4.17 ms (n=300, load 3.2).
+- 2026-11-10, defect seen in real use (setup, 0.4.18): in `dispatch setup --checks` the first menu
+  defaults to "Change checks…" and the next one to the first suggestion. Two Enters replaced the
+  clone's three `checks.verify` commands with `cargo test --locked` and recorded no consent. The
+  integrator restored `dispatch.yml`. Queued for wave 2 (Q-b or a small packet).
