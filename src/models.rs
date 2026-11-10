@@ -479,6 +479,9 @@ pub enum ReasonCode {
     AlreadyApplied,
     IntegrationCheckFailed,
     AnalysisUncertain,
+    /// Δ applies only merged 3-way from S0: alone it leaves CONTINUE, which
+    /// the merged checks decide at accept.
+    MergedThreeWay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

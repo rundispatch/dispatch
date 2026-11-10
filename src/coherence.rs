@@ -3,8 +3,9 @@
 //!
 //! This is the pure evaluator: L0 (file and patch state) then L1 (symbol and
 //! file facts, see `facts`). It reads the source tree, the candidate patch and
-//! the run's baseline, and runs `git apply` only with `--check`, so it never
-//! mutates the source, and it never touches the database or the run record.
+//! the run's baseline, and runs `git apply` on the source only with `--check`,
+//! or 3-way in a temporary index, so it never changes the source's files,
+//! index or HEAD, and it never touches the database or the run record.
 //! The one file it may write is Git's complaint about a conflicting patch,
 //! beside the run, when finish or accept asks (`evaluate_run`).
 
@@ -22,7 +23,7 @@ use crate::{
     },
     config::Config,
     lock::OperationLock,
-    source::{git_command, run_git},
+    source::{Patch, Stage, git_command, run_git},
 };
 
 pub mod facts;
@@ -99,9 +100,7 @@ fn evaluate_run_in(
     let (mut validity, conflict) =
         assess(&world, &WorkView::of(run, candidate), kept.as_deref(), memo)?;
     if rests_on_merged_checks(&validity) {
-        let skipped = run
-            .baseline_path
-            .parent()
+        let skipped = run_directory(run)
             .context("the run has no directory")
             .and_then(|run_dir| {
                 integration::checks_skipped(
@@ -413,13 +412,15 @@ pub fn overridable(validity: &Validity) -> bool {
 }
 
 /// Whether `validity` is a CONTINUE that the merged checks decide at accept:
-/// one carrying weak mentions that changed.
+/// one carrying weak mentions that changed, or Δ merged 3-way from S0.
 pub fn rests_on_merged_checks(validity: &Validity) -> bool {
     validity.decision == Decision::Continue
-        && validity
-            .reasons
-            .iter()
-            .any(|reason| reason.code == ReasonCode::MentionChanged)
+        && validity.reasons.iter().any(|reason| {
+            matches!(
+                reason.code,
+                ReasonCode::MentionChanged | ReasonCode::MergedThreeWay
+            )
+        })
 }
 
 /// Such a CONTINUE when the merged checks cannot run: REFRESH, saying why first.
@@ -435,6 +436,15 @@ fn cannot_rest_on_merged_checks(validity: &mut Validity, why: impl fmt::Display)
         },
     );
     validity.reasons.truncate(MAX_REASONS);
+}
+
+/// The run's directory, which holds its frozen configuration: where its first
+/// baseline is. An S0 move puts the next ones in the directory's `s0/`.
+pub(crate) fn run_directory(run: &RunRecord) -> Option<&Path> {
+    run.baseline_history
+        .first()
+        .map_or(&run.baseline_path, |first| &first.baseline_path)
+        .parent()
 }
 
 /// The configuration frozen with the run, or `None` when the snapshot cannot be
@@ -604,38 +614,49 @@ fn assess(
     let (decision, mut reasons) = if !world_changed || patch_is_empty(work.delta_patch)? {
         (Decision::Continue, Vec::new())
     } else if apply_check(work, true)?.is_none() {
-        let reason = Reason {
-            code: ReasonCode::AlreadyApplied,
-            fact_id: None,
-            path: None,
-            detail: "the patch is already present in the source".into(),
-        };
-        (Decision::Stop, vec![reason])
-    } else if let Some(stderr) = apply_check(work, false)? {
-        let paths = conflicting_paths(&stderr);
-        let reason = Reason {
-            code: ReasonCode::PatchConflict,
-            fact_id: None,
-            path: paths.first().cloned(),
-            detail: conflict_detail(&stderr, &paths, kept),
-        };
-        conflict = Some(stderr);
-        (Decision::Refresh, vec![reason])
+        (Decision::Stop, vec![already_applied()])
     } else {
-        let (found, level) = facts::check(work, world, memo)?;
-        analysis = level;
-        (
-            if found.is_empty()
-                || found
+        match onto_world(work)? {
+            Onto::Applies { merged } => {
+                // L1 runs against the world either way: on the merged tree,
+                // every declaration Δ edits would read as edited by both.
+                let (mut found, level) = facts::check(work, world, memo)?;
+                analysis = level;
+                let decision = if found
                     .iter()
                     .all(|reason| reason.code == ReasonCode::MentionChanged)
-            {
-                Decision::Continue
-            } else {
-                Decision::Refresh
-            },
-            found,
-        )
+                {
+                    Decision::Continue
+                } else {
+                    Decision::Refresh
+                };
+                if merged {
+                    found.truncate(MAX_REASONS - 1);
+                    found.push(Reason {
+                        code: ReasonCode::MergedThreeWay,
+                        fact_id: None,
+                        path: None,
+                        detail: "applied 3-way from S0".into(),
+                    });
+                }
+                (decision, found)
+            }
+            Onto::Present => (Decision::Stop, vec![already_applied()]),
+            Onto::Conflict { stderr, merged } => {
+                let paths = conflicting_paths(&stderr);
+                let reason = Reason {
+                    code: ReasonCode::PatchConflict,
+                    fact_id: None,
+                    path: paths.first().cloned(),
+                    detail: conflict_detail(&stderr, &paths, kept),
+                };
+                conflict = Some(match merged {
+                    Some(output) => format!("{stderr}\n\nMerged 3-way from S0:\n{output}"),
+                    None => stderr,
+                });
+                (Decision::Refresh, vec![reason])
+            }
+        }
     };
     reasons.truncate(MAX_REASONS);
     let validity = Validity {
@@ -648,6 +669,50 @@ fn assess(
         analysis,
     };
     Ok((validity, conflict))
+}
+
+fn already_applied() -> Reason {
+    Reason {
+        code: ReasonCode::AlreadyApplied,
+        fact_id: None,
+        path: None,
+        detail: "the patch is already present in the source".into(),
+    }
+}
+
+/// How Δ goes onto the world, once it is not already there.
+enum Onto {
+    /// As it is, or `merged` 3-way from S0.
+    Applies { merged: bool },
+    /// Merged 3-way from S0, it changes nothing.
+    Present,
+    /// Neither way: Git's complaint, and what the 3-way merge said if it ran.
+    Conflict {
+        stderr: String,
+        merged: Option<String>,
+    },
+}
+
+/// `git apply --check` of Δ in the source, then, when that fails, Git's own
+/// 3-way merge from the blobs S0 holds onto the world as a tree, in a
+/// temporary index (`memo::staged_on_world`).
+fn onto_world(work: &WorkView) -> Result<Onto> {
+    let Some(stderr) = apply_check(work, false)? else {
+        return Ok(Onto::Applies { merged: false });
+    };
+    let patch = Patch::new(work.delta_patch, work.baseline);
+    Ok(match memo::staged_on_world(work.source, &[patch])? {
+        None => Onto::Conflict {
+            stderr,
+            merged: None,
+        },
+        Some((_, Stage::Conflict { output })) => Onto::Conflict {
+            stderr,
+            merged: Some(output),
+        },
+        Some((world, Stage::Staged { tree })) if tree == world => Onto::Present,
+        Some(_) => Onto::Applies { merged: true },
+    })
 }
 
 /// The paths `git apply --check` names in `stderr`, once each, in order:
@@ -694,13 +759,16 @@ fn conflict_detail(stderr: &str, paths: &[String], kept: Option<&Path>) -> Strin
     detail.chars().take(MAX_DETAIL_CHARS).collect()
 }
 
-/// Whether the whole of a candidate's retained patch is in the source now:
-/// the reverse-apply check behind STOP's `already_applied`. Partial presence
-/// is not presence, and an empty patch is never present. `Some` carries the
-/// digest of the world it was found in, for the record.
+/// Whether the whole of a candidate's retained patch is in the source now, as
+/// STOP's `already_applied` finds it: it reverses cleanly, or merged 3-way
+/// from S0 it changes nothing. Partial presence is not presence, and an empty
+/// patch is never present. `Some` carries the digest of the world it was
+/// found in, for the record.
 pub fn patch_present(run: &RunRecord, candidate_label: &str) -> Result<Option<String>> {
     let work = WorkView::of(run, find_candidate(run, candidate_label)?);
-    if patch_is_empty(work.delta_patch)? || apply_check(&work, true)?.is_some() {
+    if patch_is_empty(work.delta_patch)?
+        || (apply_check(&work, true)?.is_some() && !matches!(onto_world(&work)?, Onto::Present))
+    {
         return Ok(None);
     }
     let world = world::observe(
@@ -747,7 +815,7 @@ mod tests {
     use super::*;
     use crate::{
         CandidateRecord, CandidateStatus, CoherenceRecord, DiffStats, SourceKind,
-        source::{SourceSnapshot, create_snapshot},
+        source::{SourceSnapshot, collect_diff, create_candidate_workspace, create_snapshot},
     };
 
     struct Fixture {
@@ -758,6 +826,11 @@ mod tests {
 
     impl Fixture {
         fn new(git: bool, files: &[(&str, &str)]) -> Self {
+            Self::initialized(git.then_some(&["init", "--quiet"]), files)
+        }
+
+        /// A Git source initialized with `init`, or a plain directory.
+        fn initialized(init: Option<&[&str]>, files: &[(&str, &str)]) -> Self {
             let root = TempDir::new().unwrap();
             let source = root.path().join("source");
             fs::create_dir_all(&source).unwrap();
@@ -765,8 +838,8 @@ mod tests {
             for (path, contents) in files {
                 write(&source.join(path), contents);
             }
-            if git {
-                git_in(&source, &["init", "--quiet"]);
+            if let Some(init) = init {
+                git_in(&source, init);
                 git_in(&source, &["add", "-A"]);
                 git_in(&source, &["commit", "--quiet", "-m", "initial"]);
             }
@@ -785,6 +858,17 @@ mod tests {
         fn patch(&self, contents: &str) -> PathBuf {
             let path = self.root.path().join("delta.patch");
             fs::write(&path, contents).unwrap();
+            path
+        }
+
+        /// Δ as Dispatch collects it, with full blob ids: what `edit` does to
+        /// a workspace of S0.
+        fn delta(&self, edit: impl FnOnce(&Path)) -> PathBuf {
+            let workspace = self.root.path().join("workspace");
+            create_candidate_workspace(&self.snapshot.baseline_path, &workspace).unwrap();
+            edit(&workspace);
+            let path = self.root.path().join("delta.patch");
+            collect_diff(&self.snapshot.baseline_path, &workspace, &path).unwrap();
             path
         }
 
@@ -1017,6 +1101,222 @@ mod tests {
             assert_eq!(reason_codes(&validity), case.reasons, "{}", case.name);
             assert_eq!(validity.world_changed, case.world_changed, "{}", case.name);
             assert_eq!(validity.analysis, AnalysisLevel::FilesOnly, "{}", case.name);
+        }
+    }
+
+    /// Three functions. The comment on line 8 is context for an edit to the
+    /// body of `three` on line 10, and part of no declaration.
+    const LIB: &str = "pub fn one() -> i32 {\n    1\n}\n\npub fn two() -> i32 {\n    2\n}\n\
+                       // three\npub fn three() -> i32 {\n    3\n}\n";
+
+    const SHA1: &[&str] = &["init", "--quiet"];
+    const SHA256: &[&str] = &["init", "--quiet", "--object-format=sha256"];
+
+    fn agent_edits_three(workspace: &Path) {
+        write(
+            &workspace.join("src/lib.rs"),
+            &LIB.replace("    3\n", "    30\n"),
+        );
+    }
+
+    /// The comment above `three`, which the agent's hunk holds as context.
+    fn world_edits_context(f: &Fixture) {
+        f.write(
+            "src/lib.rs",
+            &LIB.replace("// three\n", "// three, the last\n"),
+        );
+    }
+
+    struct ThreeWay {
+        name: &'static str,
+        init: Option<&'static [&'static str]>,
+        attributes: &'static str,
+        /// What the agent does to its workspace of S0.
+        agent: fn(&Path),
+        /// What then happens to the source.
+        world: fn(&Fixture),
+        decision: Decision,
+        reasons: &'static [ReasonCode],
+        analysis: AnalysisLevel,
+    }
+
+    /// L0 merges Δ 3-way from S0 when it does not apply as it is, only onto
+    /// an exact world. L1 then judges Δ against the world: on the merged
+    /// tree, `three` would read as edited on both sides.
+    #[test]
+    fn l0_merges_3_way_from_s0_only_onto_an_exact_world_and_without_conflict() {
+        let refused = |name, init, attributes, world: fn(&Fixture)| ThreeWay {
+            name,
+            init,
+            attributes,
+            agent: agent_edits_three,
+            world,
+            decision: Decision::Refresh,
+            reasons: &[ReasonCode::PatchConflict],
+            analysis: AnalysisLevel::FilesOnly,
+        };
+        let cases = [
+            ThreeWay {
+                name: "a changed context line merges",
+                init: Some(SHA1),
+                attributes: "",
+                agent: agent_edits_three,
+                world: world_edits_context,
+                decision: Decision::Continue,
+                reasons: &[ReasonCode::MergedThreeWay],
+                analysis: AnalysisLevel::Symbols,
+            },
+            ThreeWay {
+                name: "the same change with changed context is already there",
+                world: |f| {
+                    let both = LIB
+                        .replace("// three\n", "// three, the last\n")
+                        .replace("    3\n", "    30\n");
+                    f.write("src/lib.rs", &both);
+                },
+                decision: Decision::Stop,
+                reasons: &[ReasonCode::AlreadyApplied],
+                ..refused("", Some(SHA1), "", world_edits_context)
+            },
+            refused("the same line edited on both sides", Some(SHA1), "", |f| {
+                f.write("src/lib.rs", &LIB.replace("    3\n", "    33\n"))
+            }),
+            ThreeWay {
+                agent: |workspace| write(&workspace.join("b.bin"), "bin\0agent\n"),
+                ..refused("a binary file changed on both sides", Some(SHA1), "", |f| {
+                    f.write("b.bin", "bin\0world\n")
+                })
+            },
+            refused("a plain directory", None, "", world_edits_context),
+            refused(
+                "bytes Git converts",
+                Some(SHA1),
+                "*.rs text\n",
+                world_edits_context,
+            ),
+            refused(
+                "a SHA-256 repository",
+                Some(SHA256),
+                "",
+                world_edits_context,
+            ),
+        ];
+        for case in cases {
+            let mut files = vec![("src/lib.rs", LIB), ("b.bin", "bin\0ary\n")];
+            if !case.attributes.is_empty() {
+                files.push((".gitattributes", case.attributes));
+            }
+            let fixture = Fixture::initialized(case.init, &files);
+            let patch = fixture.delta(case.agent);
+            (case.world)(&fixture);
+            let index = fs::read(fixture.source.join(".git/index")).ok();
+
+            let validity = fixture.evaluate(&patch);
+
+            let name = case.name;
+            assert_eq!(validity.decision, case.decision, "{name}: {validity:?}");
+            assert_eq!(reason_codes(&validity), case.reasons, "{name}");
+            assert_eq!(validity.analysis, case.analysis, "{name}");
+            assert_eq!(fs::read(fixture.source.join(".git/index")).ok(), index);
+            if case.decision == Decision::Continue {
+                assert_eq!(validity.reasons[0].detail, "applied 3-way from S0");
+                assert!(rests_on_merged_checks(&validity));
+            }
+        }
+    }
+
+    /// What STOP finds by a 3-way merge that changes nothing, `close
+    /// --reason already-present` finds too; a part of Δ is still not all.
+    #[test]
+    fn a_patch_already_there_with_changed_context_is_present() {
+        let fixture = Fixture::initialized(Some(SHA1), &[("src/lib.rs", LIB)]);
+        let run = fixture.run(fixture.delta(|workspace| {
+            let both = LIB
+                .replace("    1\n", "    10\n")
+                .replace("    3\n", "    30\n");
+            write(&workspace.join("src/lib.rs"), &both);
+        }));
+        let three = LIB
+            .replace("// three\n", "// three, the last\n")
+            .replace("    3\n", "    30\n");
+        fixture.write("src/lib.rs", &three);
+        assert_eq!(patch_present(&run, "A").unwrap(), None, "partial");
+        fixture.write("src/lib.rs", &three.replace("    1\n", "    10\n"));
+
+        let validity = evaluate_run(&run, "A", None).unwrap();
+        let present = patch_present(&run, "A").unwrap();
+
+        assert_eq!(reason_codes(&validity), [ReasonCode::AlreadyApplied]);
+        assert_eq!(present, Some(validity.world_digest));
+    }
+
+    /// An S0 move puts the run's baseline in `s0/<n>/` of its directory,
+    /// where its frozen configuration is not: whether the merged checks can
+    /// run is still read from the run's own directory.
+    #[test]
+    fn a_3_way_merge_after_an_s0_move_rests_on_the_runs_own_configuration() {
+        let fixture = Fixture::initialized(Some(SHA1), &[("src/lib.rs", LIB)]);
+        let mut run = fixture.run(fixture.delta(agent_edits_three));
+        run.environment.unsafe_local = true;
+        let run_dir = fixture.root.path().join("run");
+        fs::write(
+            run_dir.join("config.snapshot.yml"),
+            "checks:\n  verify:\n    - \"true\"\n",
+        )
+        .unwrap();
+        // S0 moves to a commit with the same files, as a move materializes it.
+        let commit = crate::source::world_commit(&fixture.source).unwrap();
+        let moved = crate::source::materialize_baseline_from_commit(
+            &fixture.source,
+            &commit,
+            &run_dir.join("s0").join("1"),
+        )
+        .unwrap();
+        run.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: std::mem::replace(&mut run.baseline_path, moved.baseline_path),
+            baseline_commit: std::mem::replace(&mut run.baseline_commit, moved.baseline_commit),
+            commit: commit.clone(),
+            moved_to: commit,
+            moved_at: Utc::now(),
+            recorded_at: Utc::now(),
+            landed_run: None,
+            back: false,
+        });
+        world_edits_context(&fixture);
+
+        let validity = evaluate_run(&run, "A", None).unwrap();
+
+        assert_eq!(validity.decision, Decision::Continue, "{validity:?}");
+        assert_eq!(reason_codes(&validity), [ReasonCode::MergedThreeWay]);
+    }
+
+    /// Kept beside the run: Git's complaint, then what its 3-way merge said,
+    /// unless no 3-way merge was tried, as for a SHA-256 repository.
+    #[test]
+    fn a_conflict_keeps_what_the_3_way_merge_said_unless_none_was_tried() {
+        for (init, merged) in [(SHA1, true), (SHA256, false)] {
+            let fixture = Fixture::initialized(Some(init), &[("src/lib.rs", LIB)]);
+            let run = fixture.run(fixture.delta(agent_edits_three));
+            let both = LIB
+                .replace("// three\n", "// three, the last\n")
+                .replace("    3\n", "    33\n");
+            fixture.write("src/lib.rs", &both);
+            let run_dir = fixture.root.path().join("run");
+
+            let validity = evaluate_run(&run, "A", Some(&run_dir)).unwrap();
+
+            assert_eq!(reason_codes(&validity), [ReasonCode::PatchConflict]);
+            let kept = fs::read_to_string(run_dir.join(CONFLICT_OUTPUT)).unwrap();
+            assert!(
+                kept.starts_with("error: patch failed: src/lib.rs:"),
+                "{kept}"
+            );
+            assert_eq!(
+                kept.contains("\n\nMerged 3-way from S0:\n"),
+                merged,
+                "{kept}"
+            );
+            assert_eq!(kept.contains("U src/lib.rs"), merged, "{kept}");
         }
     }
 
