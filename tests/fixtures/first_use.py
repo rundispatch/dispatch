@@ -188,7 +188,8 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         commands = [hook['command'] for event in settings['hooks'].values()
                     for entry in event for hook in entry['hooks']]
         assert commands and all(binary in command and str(case.state) in command
-                                and command.endswith('hook claude') for command in commands), commands
+                                and command.endswith(('hook claude', 'hook claude-wait'))
+                                for command in commands), commands
         case.watcher_record()
         assert_nothing_ran(case)
 
@@ -353,10 +354,10 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         assert json.loads(case.settings.read_text()) == json.loads(theirs)
         assert_nothing_ran(case)
 
-    # 0.4.16 installed four hooks; this Dispatch installs seven. Such a file,
-    # upgraded in place, holds Dispatch's own hooks: setup offers Update, shows
-    # the change, and leaves exactly seven beside the person's own Stop hook.
-    # Runtime integrations writes the same bytes.
+    # 0.4.16 installed four hooks; this Dispatch installs eight, the waiter
+    # among them. Such a file, upgraded in place, holds Dispatch's own hooks:
+    # setup offers Update, shows the change, and leaves exactly eight beside
+    # the person's own Stop hook. Runtime integrations writes the same bytes.
     with Case(parent, 'claude-upgrade') as case:
         command = f"'{binary}' --state-dir '{case.state}' hook claude"
 
@@ -386,13 +387,18 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             finish_setup(ui, 'Watching')
         upgraded = case.settings.read_bytes()
         settings = json.loads(upgraded)
-        found = sorted((event, entry.get('matcher', ''), hook['timeout'])
+        found = sorted((event, entry.get('matcher', ''), hook['timeout'], hook['command'] != command,
+                        hook.get('asyncRewake', False))
                        for event, entries in settings['hooks'].items()
-                       for entry in entries for hook in entry['hooks'] if hook['command'] == command)
-        assert found == sorted([('SessionStart', '', 60), ('SessionEnd', '', 5),
-                                ('WorktreeRemove', '', 300), ('PreToolUse', 'ExitWorktree', 300),
-                                ('Notification', 'permission_prompt|idle_prompt|agent_needs_input', 5),
-                                ('Stop', '', 5), ('PostToolUse', '', 5)]), found
+                       for entry in entries for hook in entry['hooks']
+                       if hook['command'] in (command, command + '-wait'))
+        assert found == sorted([('SessionStart', '', 60, False, False), ('SessionEnd', '', 5, False, False),
+                                ('WorktreeRemove', '', 300, False, False),
+                                ('PreToolUse', 'ExitWorktree', 300, False, False),
+                                ('Notification', 'permission_prompt|idle_prompt|agent_needs_input', 5,
+                                 False, False),
+                                ('Stop', '', 5, False, False), ('Stop', '', 28800, True, True),
+                                ('PostToolUse', '', 5, False, False)]), found
         assert settings['model'] == 'keep' and settings['hooks']['Stop'][0] == mine, settings
         case.settings.write_text(earlier)
         through_menu(case, 'claude-upgrade-menu', '1) Update Claude Code hooks',

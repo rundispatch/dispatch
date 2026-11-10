@@ -389,7 +389,8 @@ async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
         "Runtime integrations\nClaude Code hooks: {} ({})\nHermes hook: {} ({})\nWith them, a Claude Code session in its own worktree of a project you watch \
          (dispatch start) appears as Work by itself; a session in the checkout itself is told Dispatch cannot follow it. \
          Hermes's hooks keep a hermes --worktree session's exact changes before Hermes removes its worktree. \
-         Both deliver Dispatch's notes on other Work to the agent.",
+         Both deliver Dispatch's notes on other Work to the agent, and Claude Code's ask it to catch up, \
+         once per landing, when other Work lands a change its Work relies on.",
         installed(&claude),
         path.display(),
         match &hermes {
@@ -494,6 +495,10 @@ const HERMES_CONSENT: &str = "Hermes asks you once for each of these hooks, at i
      in a terminal, and they don't run until you allow them (hermes hooks list shows which are \
      allowed); a run without a terminal needs hermes --accept-hooks.";
 
+/// What the second Claude Code `Stop` hook in the preview does.
+const CLAUDE_WAITER: &str = "The second Stop hook waits in the background after each turn, \
+     for at most 8 hours, to wake the session when its Work is asked to catch up with a landing.";
+
 /// One runtime's hook, the step both setup's pass and Runtime integrations
 /// take. It shows exactly what changes and where, with the existing and new
 /// command on an Update, and needs a deliberate choice: focus starts on Skip,
@@ -525,11 +530,11 @@ async fn hook_step(ui: &mut Ui, state: &State, runtime: Runtime, menu: bool) -> 
     };
     let what = match (runtime, change) {
         (Runtime::Claude, Change::Install) => format!(
-            "Add these hooks to {shown}?\n{}\nOther settings and hooks are kept (key order may change); a backup is kept beside the file.",
+            "Add these hooks to {shown}?\n{}\n{CLAUDE_WAITER}\nOther settings and hooks are kept (key order may change); a backup is kept beside the file.",
             claude::hooks_preview(&command)
         ),
         (Runtime::Claude, Change::Update) => format!(
-            "Update Dispatch's hooks in {shown}?\n{commands}\nDispatch's hooks there are replaced by exactly these:\n{}\nOther settings and hooks are kept; a backup is kept beside the file.",
+            "Update Dispatch's hooks in {shown}?\n{commands}\nDispatch's hooks there are replaced by exactly these:\n{}\n{CLAUDE_WAITER}\nOther settings and hooks are kept; a backup is kept beside the file.",
             claude::hooks_preview(&command)
         ),
         (Runtime::Claude, Change::Remove) => format!(

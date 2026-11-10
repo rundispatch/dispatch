@@ -203,9 +203,17 @@ enum Command {
     /// `dispatch setup`: reads the runtime's event on stdin. Claude Code's fails
     /// only when it cannot keep a worktree's changes, which stops that removal;
     /// Hermes's reports any failure, which Hermes logs before removing the
-    /// worktree anyway.
+    /// worktree anyway. `claude-wait` is Claude Code's waiter, whose exit
+    /// status 2 delivers an ask to catch up and wakes the session; a Dispatch
+    /// that does not know a runtime's name refuses it with status 1, which
+    /// wakes nothing.
     #[command(hide = true)]
-    Hook { provider: String },
+    Hook {
+        provider: String,
+        /// The most seconds `claude-wait` waits.
+        #[arg(long, hide = true, value_name = "SECONDS")]
+        max_wait: Option<u64>,
+    },
     /// Print a candidate's patch.
     Diff {
         run_id: Option<String>,
@@ -732,11 +740,15 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Command::Hook { provider } => {
+        Command::Hook { provider, max_wait } => {
             use std::io::Read;
             anyhow::ensure!(
-                matches!(provider.as_str(), "claude" | "hermes"),
+                matches!(provider.as_str(), "claude" | "claude-wait" | "hermes"),
                 "unknown agent runtime: {provider}"
+            );
+            anyhow::ensure!(
+                max_wait.is_none() || provider == "claude-wait",
+                "only Claude Code's waiter waits"
             );
             let mut input = Vec::new();
             let mut stdin = std::io::stdin().lock();
@@ -746,7 +758,11 @@ async fn run() -> Result<()> {
             // The rest is read and dropped: a runtime writing a larger
             // payload never meets a closed pipe.
             std::io::copy(&mut stdin, &mut std::io::sink())?;
-            let output = if provider == "hermes" {
+            let output = if provider == "claude-wait" {
+                let most = max_wait.map(std::time::Duration::from_secs);
+                let most = most.unwrap_or(dispatch::runtime::claude::MAX_WAIT);
+                dispatch::runtime::claude::wait(&state, &input, most)
+            } else if provider == "hermes" {
                 // Hermes gives the worktree only in the hook's environment.
                 let worktree = std::env::var_os("TERMINAL_CWD");
                 dispatch::runtime::hermes::handle(&state, &input, worktree.as_deref())

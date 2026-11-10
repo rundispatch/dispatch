@@ -119,7 +119,7 @@ pub fn handle(state: &State, input: &[u8], terminal_cwd: Option<&OsStr>) -> Outp
     // conversation, however long that has grown.
     if super::head(input)
         .get("hook_event_name")
-        .map(String::as_str)
+        .and_then(serde_json::Value::as_str)
         == Some("pre_llm_call")
     {
         let notes =

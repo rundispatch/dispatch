@@ -621,6 +621,8 @@ pub(crate) struct Owner {
     memo: facts::Memo,
     /// What the notes step remembers between ticks.
     told: super::notify::Told,
+    /// What the catch-up step remembers between ticks.
+    landed: super::catchup::Landings,
     scratch: tempfile::TempDir,
 }
 
@@ -750,6 +752,7 @@ impl Owner {
             worlds: world::Worlds::default(),
             memo: facts::Memo::default(),
             told: super::notify::Told::default(),
+            landed: super::catchup::Landings::default(),
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -833,6 +836,7 @@ impl Owner {
             self.interact(state, &runs, &mut tick);
         }
         self.tell(state, &runs, &mut tick);
+        self.catch_up(state, &runs, &mut tick);
         self.measure(state, &runs, &mut tick);
         // Facts are kept only for each Work's (S0, Δ) as its footprint
         // stands now.
@@ -922,6 +926,14 @@ impl Owner {
             }
         }
         tick.cost.notes = started.elapsed();
+    }
+
+    /// Ask live agents to catch up with landings that broke what their Work
+    /// relies on (`catchup::step`), and record the asks hooks delivered.
+    fn catch_up(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+        for error in super::catchup::step(state, &self.root, runs, &mut self.landed) {
+            tick.report(&error);
+        }
     }
 
     /// Count the files changed in each patch followed this tick, the one

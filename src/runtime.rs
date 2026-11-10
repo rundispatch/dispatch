@@ -12,8 +12,9 @@
 //! project someone chose to watch with `dispatch start`.
 //!
 //! A hook never waits on Dispatch: a session's end or a wait on the person
-//! is left as a mark for the project owner, and notes for the agent are
-//! delivered from the files alone (`deliver`), before anything else.
+//! is left as a mark for the project owner, and notes and asks to catch up
+//! are delivered to the agent from the files alone (`deliver`, `catch_up`),
+//! before anything else.
 
 pub mod claude;
 pub mod codex;
@@ -33,6 +34,7 @@ use crate::{
     orchestrator::{
         attach,
         background::{self, Watcher},
+        catchup,
         inbox::{self, Mark, Marked},
         registration::{self, Outcome, Registration},
     },
@@ -100,15 +102,7 @@ const SHARED_CHECKOUT: &str = "Dispatch: this session works directly in your che
 
 /// Validate an event's fields; anything malformed is refused whole.
 pub fn validate(event: &RuntimeEvent) -> Result<()> {
-    anyhow::ensure!(
-        !event.session_id.is_empty()
-            && event.session_id.len() <= 128
-            && event
-                .session_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
-        "invalid session id"
-    );
+    anyhow::ensure!(session_id(&event.session_id), "invalid session id");
     anyhow::ensure!(
         event.cwd.is_absolute() && event.cwd.as_os_str().len() <= 4096,
         "the working directory must be an absolute path"
@@ -150,6 +144,16 @@ pub fn validate(event: &RuntimeEvent) -> Result<()> {
         "invalid model"
     );
     Ok(())
+}
+
+/// Whether `id` is a session id Dispatch takes: short, and safe as a file
+/// name.
+pub(crate) fn session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// Apply one event. Sessions are followed only in a watched project; a
@@ -256,26 +260,36 @@ fn leave_mark(
 }
 
 /// The notes pending for the workspace that holds `cwd`, claimed for
-/// delivery through `via`, the runtime's event. Found from the files alone:
-/// the workspace is the nearest directory above `cwd` with a `.git`, and no
-/// Git command, database, lock or network is involved.
+/// delivery through `via`, the runtime's event. Found from the files alone
+/// (`workspace`): no Git command, database, lock or network is involved.
 pub(crate) fn deliver(state: &State, cwd: &Path, via: &str) -> Option<String> {
+    inbox::claim(state, &workspace(cwd)?, via)
+}
+
+/// The ask to catch up pending for the workspace that holds `cwd`, claimed
+/// for delivery through `via` (`stop` or `wake`), found as notes are.
+pub(crate) fn catch_up(state: &State, cwd: &Path, via: &str) -> Option<String> {
+    catchup::claim(state, &workspace(cwd)?, via)
+}
+
+/// The workspace that holds `cwd`, from the files alone: the nearest
+/// directory above it with a `.git`, as a canonical path.
+pub(crate) fn workspace(cwd: &Path) -> Option<PathBuf> {
     if !cwd.is_absolute() {
         return None;
     }
     let cwd = std::fs::canonicalize(cwd).ok()?;
-    let workspace = cwd
-        .ancestors()
-        .find(|directory| std::fs::symlink_metadata(directory.join(".git")).is_ok())?;
-    inbox::claim(state, workspace, via)
+    cwd.ancestors()
+        .find(|directory| std::fs::symlink_metadata(directory.join(".git")).is_ok())
+        .map(Path::to_owned)
 }
 
-/// The top-level string fields of the JSON object `input` begins with, read
-/// until `input` ends or stops being one: a payload's head says what the
-/// event is however large the rest, a tool's output or a whole conversation,
-/// may be.
-pub(crate) fn head(input: &[u8]) -> std::collections::HashMap<String, String> {
-    struct Fields<'a>(&'a mut std::collections::HashMap<String, String>);
+/// The top-level string and boolean fields of the JSON object `input`
+/// begins with, read until `input` ends or stops being one: a payload's head
+/// says what the event is however large the rest, a tool's output or a whole
+/// conversation, may be.
+pub(crate) fn head(input: &[u8]) -> std::collections::HashMap<String, serde_json::Value> {
+    struct Fields<'a>(&'a mut std::collections::HashMap<String, serde_json::Value>);
     impl<'de> serde::de::Visitor<'de> for Fields<'_> {
         type Value = ();
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -283,7 +297,8 @@ pub(crate) fn head(input: &[u8]) -> std::collections::HashMap<String, String> {
         }
         fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
             while let Some(key) = map.next_key::<String>()? {
-                if let serde_json::Value::String(value) = map.next_value()? {
+                let value = map.next_value()?;
+                if let serde_json::Value::String(_) | serde_json::Value::Bool(_) = value {
                     self.0.insert(key, value);
                 }
             }
@@ -573,11 +588,13 @@ mod tests {
     #[test]
     fn a_payloads_head_is_read_however_the_rest_ends() {
         let whole = br#"{"session_id": "s1", "effort": {"level": "high"}, "n": 3,
-            "hook_event_name": "PostToolUse", "tool_response": {"stdout": "a very long"}}"#;
+            "hook_event_name": "PostToolUse", "stop_hook_active": true,
+            "tool_response": {"stdout": "a very long"}}"#;
         let fields = head(whole);
         assert_eq!(fields["hook_event_name"], "PostToolUse");
         assert_eq!(fields["session_id"], "s1");
-        assert_eq!(fields.len(), 2, "only strings: {fields:?}");
+        assert_eq!(fields["stop_hook_active"], true);
+        assert_eq!(fields.len(), 3, "only strings and booleans: {fields:?}");
         // Cut inside the tool's output, as a bounded read cuts it.
         let cut = &whole[..whole.len() - 12];
         assert_eq!(head(cut)["hook_event_name"], "PostToolUse");

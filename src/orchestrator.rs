@@ -1,6 +1,7 @@
 mod apply;
 pub mod attach;
 pub mod background;
+pub(crate) mod catchup;
 pub mod discovery;
 pub mod inbox;
 pub(crate) mod liveness;
