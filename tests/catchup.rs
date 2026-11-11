@@ -648,3 +648,114 @@ fn a_live_agent_is_asked_once_to_catch_up_merges_and_its_work_continues() {
     assert_eq!(p.events(&b, "catchup.written").len(), 1, "once per landing");
     assert!(p.events(&b, "catchup.expired").is_empty());
 }
+
+/// A stale result whose session ended in its worktree, and whose S0 moved
+/// once: `check` says to resume the session there and merge the newest
+/// recorded source, named by its whole commit. Done so, the session goes on
+/// as new Work from the same S0, the result closes as superseded, and the
+/// merge moves the new Work's S0: it continues, with no agent run again.
+#[test]
+fn a_stale_result_is_resumed_in_its_worktree_merges_and_continues() {
+    let mut p = Project::new();
+    let (wa, a) = p.session("a");
+    let (wb, b) = p.session("b");
+    let (wc, c) = p.session("c");
+    let changed = LIB.replace("scale(n: i32)", "scale(n: i32, by: i32)");
+    fs::write(wa.join("src/lib.rs"), changed.replace("n * 2", "n * by")).unwrap();
+    let report = "pub fn report() -> i32 {\n    crate::scale(3)\n}\n";
+    fs::write(wb.join("src/report.rs"), report).unwrap();
+    fs::write(wc.join("src/notes.rs"), "pub const NOTE: i32 = 1;\n").unwrap();
+    p.start_owner();
+    let recorded = |landing: usize| {
+        let sources = p
+            .state
+            .join("projects")
+            .join(key(&p.root))
+            .join("sources.json");
+        let sources: Value = serde_json::from_slice(&fs::read(sources).unwrap()).unwrap();
+        sources[landing]["commit"].as_str().unwrap().to_owned()
+    };
+
+    // C lands first, and B merges it: B's S0 moves once.
+    p.ok(&["finish", &c]);
+    p.ok(&["accept", &c]);
+    git(&wb, &["add", "-A"]);
+    git(&wb, &["commit", "--quiet", "-m", "report"]);
+    git(&wb, &["merge", "--quiet", "--no-edit", &recorded(0)]);
+    until("B's S0 moved to C's landing", || {
+        p.events(&b, "attach.s0_moved")
+            .iter()
+            .any(|moved| moved["landed_run"] == c.as_str())
+    });
+    // Then A lands a change to scale's signature, which B uses.
+    p.ok(&["finish", &a]);
+    p.ok(&["accept", &a]);
+
+    // B's session ends, and its result is frozen stale.
+    let end = payload(&[
+        ("session_id", "b".into()),
+        (
+            "transcript_path",
+            "/home/u/.claude/projects/p/b.jsonl".into(),
+        ),
+        ("cwd", wb.to_str().unwrap().into()),
+        ("hook_event_name", "SessionEnd".into()),
+        ("reason", "prompt_input_exit".into()),
+    ]);
+    assert_eq!(p.claude(&end), Value::Null);
+    until("B's session is recorded as ended", || {
+        !p.run(&b)["attachment"]["sessions"][0]["ended_at"].is_null()
+    });
+    p.ok(&["finish", &b]);
+    let check = p.ok(&["check", &b]);
+    let commit = recorded(1);
+    assert!(check.contains("Coherence: REFRESH"), "{check}");
+    let next = check
+        .lines()
+        .find(|line| line.starts_with("Next: "))
+        .unwrap();
+    assert_eq!(
+        next,
+        format!(
+            "Next: resume its session in {}, then commit there and run git merge {commit}; the \
+             session goes on as new Work from this Work's S0, and this Work closes as \
+             superseded; Dispatch then moves that S0 and checks it again  (or dispatch reject {b})",
+            wb.display()
+        )
+    );
+
+    // Its session resumes there, and does as the step says.
+    let resumed = p.claude(&payload(&[
+        ("session_id", "b".into()),
+        (
+            "transcript_path",
+            "/home/u/.claude/projects/p/b.jsonl".into(),
+        ),
+        ("cwd", wb.to_str().unwrap().into()),
+        ("hook_event_name", "SessionStart".into()),
+        ("source", "resume".into()),
+        ("model", "claude-opus-5-5".into()),
+    ]));
+    let new = resumed["systemMessage"]
+        .as_str()
+        .and_then(|notice| notice.strip_prefix("Dispatch is tracking this worktree as Work "))
+        .and_then(|rest| rest.split(';').next())
+        .unwrap_or_else(|| panic!("not registered: {resumed}"))
+        .to_owned();
+    assert_ne!(new, b);
+    until("B closes as superseded", || {
+        p.run(&b)["outcome"]["closed"]["reason"] == "superseded"
+    });
+    assert_eq!(p.run(&b)["outcome"]["closed"]["replacement"], new.as_str());
+    // Its work is committed already.
+    git(&wb, &["merge", "--quiet", "--no-edit", &commit]);
+    until("the new Work's S0 moved to the landing", || {
+        p.events(&new, "attach.s0_moved")
+            .iter()
+            .any(|moved| moved["landed_run"] == a.as_str())
+    });
+    until("the new Work continues", || {
+        p.run(&new)["coherence"]["validity"]["decision"] == "continue"
+    });
+    p.stop_owner();
+}

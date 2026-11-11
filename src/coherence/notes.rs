@@ -108,9 +108,12 @@ pub fn compose(
             {
                 item += &format!("\nSignature: {} → {}", cap(old), cap(new));
             }
+            // The whole commit, and not the ref, so that an agent can merge
+            // it: Claude Code's worktree isolation refuses any command naming
+            // `refs/dispatch/source` (2.1.296).
             item += &format!(
-                "\nThe source with this change is commit {} (refs/dispatch/source).",
-                landing.commit.get(..8).unwrap_or(&landing.commit)
+                "\nThe source with this change is commit {}.",
+                landing.commit
             );
             next.pending.entry(key).or_insert(item);
         }
@@ -320,7 +323,7 @@ mod tests {
                 "{HEADER}\nbbbbbbbb (Hermes), landed: it changes the signature of validate \
                  (src/auth.rs), which this Work uses\n\
                  Signature: fn validate() → fn validate(token: &str)\n\
-                 The source with this change is commit 12345678 (refs/dispatch/source)."
+                 The source with this change is commit 1234567890abcdef."
             )
         );
     }

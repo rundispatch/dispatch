@@ -548,6 +548,10 @@ fn only_a_session_lock_registers_and_human_worktrees_are_never_listed() {
         Some(&session_lock("unlocked", std::process::id())),
     );
     wait_until("Work for its maker", || p.runs_in(&unlocked).len() == 1);
+    // The scan records the Work, then writes the inventory without it.
+    wait_until("its maker's worktree unlisted", || {
+        !p.listed().iter().any(|name| name == "unlocked")
+    });
     assert_eq!(p.listed(), ["other"]);
     // Each was noted once, however many ticks saw it.
     assert_eq!(

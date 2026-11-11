@@ -648,7 +648,7 @@ fn assess(
                     code: ReasonCode::PatchConflict,
                     fact_id: None,
                     path: paths.first().cloned(),
-                    detail: conflict_detail(&stderr, &paths, kept),
+                    detail: conflict_detail(&stderr, &paths, merged.is_some(), kept),
                 };
                 conflict = Some(match merged {
                     Some(output) => format!("{stderr}\n\nMerged 3-way from S0:\n{output}"),
@@ -737,16 +737,24 @@ fn conflicting_paths(stderr: &str) -> Vec<String> {
     paths
 }
 
-/// A patch conflict in one bounded line: the paths, where Git's whole
-/// complaint is kept, and as much of it as fits.
-fn conflict_detail(stderr: &str, paths: &[String], kept: Option<&Path>) -> String {
-    let mut detail = match paths {
-        [] => "the patch does not apply to the current source".to_owned(),
-        [one] => format!("the patch no longer applies to {one}"),
-        [first, second] => format!("the patch no longer applies to {first} and {second}"),
-        [first, second, rest @ ..] => format!(
-            "the patch no longer applies to {first}, {second} and {} more",
-            rest.len()
+/// A patch conflict in one bounded line: the paths, whether a 3-way merge
+/// from S0 was tried as well (`three_way`), where Git's whole complaint is
+/// kept, and as much of it as fits.
+fn conflict_detail(stderr: &str, paths: &[String], three_way: bool, kept: Option<&Path>) -> String {
+    let files = match paths {
+        [] => None,
+        [one] => Some(one.clone()),
+        [first, second] => Some(format!("{first} and {second}")),
+        [first, second, rest @ ..] => Some(format!("{first}, {second} and {} more", rest.len())),
+    };
+    let mut detail = match (files, three_way) {
+        (None, false) => "the patch does not apply to the current source".to_owned(),
+        (Some(files), false) => format!("the patch no longer applies to {files}"),
+        (None, true) => {
+            "the patch does not apply as it is, and a 3-way merge from its S0 conflicts".to_owned()
+        }
+        (Some(files), true) => format!(
+            "the patch does not apply as it is to {files}, and a 3-way merge from its S0 conflicts"
         ),
     };
     if let Some(path) = kept {
@@ -1335,22 +1343,30 @@ mod tests {
         }
     }
 
+    /// It says what was tried: in a Git source, the patch as it is and a
+    /// 3-way merge from S0; in a directory, the patch as it is alone.
     #[test]
     fn conflict_reason_carries_bounded_git_detail() {
-        let fixture = Fixture::new(true, &base_files());
-        let patch = fixture.patch(PATCH_A);
-        fixture.write("a.txt", "one\ntwo changed elsewhere\nthree\nfour\nfive\n");
-        let validity = fixture.evaluate(&patch);
-        let detail = &validity.reasons[0].detail;
-        assert!(
-            detail.starts_with(
-                "the patch no longer applies to a.txt; git: error: patch failed: a.txt:1"
+        for (git, said) in [
+            (
+                true,
+                "the patch does not apply as it is to a.txt, and a 3-way merge from its S0 conflicts; git: error: patch failed: a.txt:1",
             ),
-            "{detail}"
-        );
-        assert_eq!(validity.reasons[0].path.as_deref(), Some("a.txt"));
-        assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
-        assert_eq!(validity.changed_files, 1);
+            (
+                false,
+                "the patch no longer applies to a.txt; git: error: patch failed: a.txt:1",
+            ),
+        ] {
+            let fixture = Fixture::new(git, &base_files());
+            let patch = fixture.patch(PATCH_A);
+            fixture.write("a.txt", "one\ntwo changed elsewhere\nthree\nfour\nfive\n");
+            let validity = fixture.evaluate(&patch);
+            let detail = &validity.reasons[0].detail;
+            assert!(detail.starts_with(said), "{detail}");
+            assert_eq!(validity.reasons[0].path.as_deref(), Some("a.txt"));
+            assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
+            assert_eq!(validity.changed_files, 1);
+        }
     }
 
     /// Finish and accept keep Git's whole complaint beside the run and say
@@ -1391,17 +1407,32 @@ mod tests {
                       error: c d.txt: does not exist in index\nerror: corrupt patch at line 9";
         assert_eq!(conflicting_paths(stderr), ["src/a.rs", "b.txt", "c d.txt"]);
         let paths = conflicting_paths(stderr);
-        let detail = conflict_detail(stderr, &paths, Some(Path::new("/r/patch-conflict.txt")));
-        assert!(
-            detail.starts_with(
-                "the patch no longer applies to src/a.rs, b.txt and 1 more; Git's full output: /r/patch-conflict.txt; git: error: patch failed: src/a.rs:12 error:"
+        let kept = Some(Path::new("/r/patch-conflict.txt"));
+        for (three_way, said) in [
+            (
+                false,
+                "the patch no longer applies to src/a.rs, b.txt and 1 more; Git's full output: /r/patch-conflict.txt; git: error: patch failed: src/a.rs:12 error:",
             ),
-            "{detail}"
-        );
-        assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
+            (
+                true,
+                "the patch does not apply as it is to src/a.rs, b.txt and 1 more, and a 3-way merge from its S0 conflicts; Git's full output: /r/patch-conflict.txt; git: error: patch failed: src/a.rs:12 error:",
+            ),
+        ] {
+            let detail = conflict_detail(stderr, &paths, three_way, kept);
+            assert!(detail.starts_with(said), "{detail}");
+            assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
+        }
         assert_eq!(
-            conflict_detail("", &[], None),
+            conflict_detail("", &[], false, None),
             "the patch does not apply to the current source"
+        );
+        assert_eq!(
+            conflict_detail("", &[], true, None),
+            "the patch does not apply as it is, and a 3-way merge from its S0 conflicts"
+        );
+        assert_eq!(
+            conflict_detail("", &paths[..2], true, None),
+            "the patch does not apply as it is to src/a.rs and b.txt, and a 3-way merge from its S0 conflicts"
         );
     }
 

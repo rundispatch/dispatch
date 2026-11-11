@@ -606,6 +606,9 @@ pub(crate) struct Owner {
     clean: HashMap<String, Footprint>,
     /// What the interaction view says now; `None` until it is first written.
     shown: Option<Projection>,
+    /// Work whose reopen was noted before the runs were last loaded
+    /// (`attach::reopening`).
+    reopened: HashSet<String>,
     /// Landed runs whose every counterpart has its outcome recorded, or that
     /// are too old to measure: never looked at again by this owner.
     measured: HashSet<String>,
@@ -745,6 +748,7 @@ impl Owner {
             footprints: HashMap::new(),
             clean: HashMap::new(),
             shown: None,
+            reopened: HashSet::new(),
             measured: HashSet::new(),
             started: Utc::now(),
             starts: HashSet::new(),
@@ -966,7 +970,14 @@ impl Owner {
         }
     }
 
-    fn load(&self, state: &State, tick: &mut Tick) -> Vec<RunRecord> {
+    /// The root's runs, and the Work noted as reopened, read just before
+    /// them: a reopen that closes its old Work while they load leaves that
+    /// Work open in them, and still noted here.
+    fn load(&mut self, state: &State, tick: &mut Tick) -> Vec<RunRecord> {
+        match super::attach::reopening(state) {
+            Ok(reopened) => self.reopened = reopened,
+            Err(error) => tick.report(&error),
+        }
         load_source_runs(state, &self.root).unwrap_or_else(|error| {
             tick.report(&error);
             Vec::new()
@@ -1295,11 +1306,16 @@ impl Owner {
     /// Derive each unintegrated Work's footprint from its own (S0, Δ), compare
     /// every pair, and publish where they interact for `watch` and `status`.
     /// Advisory only: nothing here changes a verdict, a lock or a decision. A
-    /// footprint is derived again only when its Δ changed.
+    /// footprint is derived again only when its Δ changed. Work noted as
+    /// reopened is left out as if closed: with the Work that reopened it, it
+    /// is one piece of work, and notes name only the Work shown here.
     fn interact(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
         let mut works = Vec::new();
         let mut participants = Vec::new();
         for run in runs {
+            if self.reopened.contains(&run.id) {
+                continue;
+            }
             let Some((patch, frozen)) = self.delta_of(run, tick) else {
                 continue;
             };
@@ -2067,6 +2083,109 @@ mod tests {
         let runs = [waiting, reviewed];
         let rows: Vec<&str> = view_rows(&runs).iter().map(|run| run.id.as_str()).collect();
         assert_eq!(rows, ["waiting"]);
+    }
+
+    /// From the moment a session's reopen is noted, the Work it reopened is
+    /// out of the owner's view, as if closed: a tick before it closes, while
+    /// a finish or a tick holds it, pairs it with nothing and tells neither
+    /// Work of the other. Whether it was a result awaiting review or Work
+    /// being finished by consent.
+    #[tokio::test]
+    async fn work_noted_as_reopened_never_interacts_with_the_work_that_reopened_it() {
+        use super::super::{attach, inbox, registration};
+
+        let git = |dir: &Path, args: &[&str]| {
+            let mut git = source::git_command(dir);
+            git.args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"]);
+            assert!(git.args(args).status().unwrap().success(), "git {args:?}");
+        };
+        let session = |id: &str| crate::RuntimeSession {
+            provider: "claude".into(),
+            session_id: id.into(),
+            source: "startup".into(),
+            started_at: Utc::now(),
+            ended_at: None,
+            end_reason: None,
+            model: None,
+        };
+        for finishing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap().join("project");
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("src/lib.rs"), "pub fn f() -> i32 {\n    1\n}\n").unwrap();
+            git(&root, &["init", "--quiet"]);
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "--quiet", "-m", "initial"]);
+            let state = State::discover(Some(temp.path().join("state"))).unwrap();
+            state.initialize().unwrap();
+            let workspace = root.with_file_name("x");
+            git(
+                &root,
+                &["worktree", "add", "--quiet", workspace.to_str().unwrap()],
+            );
+            let discovered = |id: &str| {
+                registration::discovered(&state, &root, &workspace, session(id), None)
+                    .unwrap()
+                    .unwrap()
+            };
+            let old = discovered("s1");
+            fs::write(
+                workspace.join("src/lib.rs"),
+                "pub fn f() -> i32 {\n    2\n}\n",
+            )
+            .unwrap();
+            if finishing {
+                let ended = attach::record_session_end(
+                    &state,
+                    &old,
+                    "claude",
+                    "s1",
+                    "exit",
+                    Utc::now(),
+                    Duration::ZERO,
+                );
+                assert!(ended.unwrap());
+                fs::write(
+                    state.run_dir(&old).join("finishing-by-consent"),
+                    std::process::id().to_string(),
+                )
+                .unwrap();
+            } else {
+                attach::finish(&state, &old, true).await.unwrap();
+            }
+            let held = OperationLock::acquire(
+                &state.run_dir(&old).join(".operation.lock"),
+                "test holds the run",
+            )
+            .unwrap();
+            let new = discovered("s2");
+            drop(held);
+            assert_eq!(
+                attach::reopen_noted(&state, &root).unwrap(),
+                [(old.clone(), new.clone())],
+                "finishing: {finishing}"
+            );
+
+            let mut owner = Owner::new(root.clone(), SourceKind::Git).unwrap();
+            let tick = owner.tick(&state);
+
+            let heard = inbox::claim(&state, &workspace, "SessionStart");
+            assert_eq!(heard, None, "finishing: {finishing}");
+            let db = Database::open_read_only(state.db_path()).unwrap();
+            for id in [&old, &new] {
+                let events = db.events_for_run(id).unwrap();
+                assert!(
+                    events.iter().all(|e| e.event_type != inbox::WRITTEN),
+                    "finishing: {finishing}"
+                );
+            }
+            let shown = owner.projection().unwrap();
+            let shown: Vec<&str> = shown.participants.iter().map(|p| &*p.run_id).collect();
+            assert_eq!(shown, [new.as_str()], "finishing: {finishing}");
+            assert_eq!(tick.error, None, "finishing: {finishing}");
+            let old = state.load_run(&old).unwrap();
+            assert_eq!(old.outcome.closed, None, "not closed yet");
+        }
     }
 
     /// An edit that lands between a pass's scratch capture and its

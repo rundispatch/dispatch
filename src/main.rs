@@ -439,14 +439,45 @@ struct AcceptArgs {
 #[tokio::main]
 async fn main() {
     dispatch::runtime::mark_process_start();
-    if let Err(error) = run().await {
+    // Rust ignores SIGPIPE, so `println!` to a closed pipe panics. Help, and
+    // a command that only reads and prints, are ended by it instead, as a
+    // shell pipeline's writers are. Every other command ignores it again: it
+    // may hold children that only its guards stop on the way out.
+    #[cfg(unix)]
+    sigpipe(libc::SIG_DFL);
+    let cli = Cli::parse();
+    #[cfg(unix)]
+    if !matches!(
+        cli.command,
+        Some(
+            Command::Version
+                | Command::History { .. }
+                | Command::Status { .. }
+                | Command::Explain { .. }
+                | Command::Show { .. }
+                | Command::Diff { .. }
+                | Command::Events { .. }
+                | Command::Resources
+                | Command::Check { merged: false, .. }
+                | Command::Watch { json: true, .. }
+        )
+    ) {
+        sigpipe(libc::SIG_IGN);
+    }
+    if let Err(error) = run(cli).await {
         eprintln!("error: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
+#[cfg(unix)]
+fn sigpipe(disposition: libc::sighandler_t) {
+    // SAFETY: `SIGPIPE` is a fixed constant, and `disposition` is `SIG_DFL`
+    // or `SIG_IGN`, both always valid.
+    unsafe { libc::signal(libc::SIGPIPE, disposition) };
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let filter = match cli.verbose {
         0 => EnvFilter::new("warn"),
         1 => EnvFilter::new("dispatch=info"),

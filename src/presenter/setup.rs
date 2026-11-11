@@ -889,7 +889,11 @@ async fn project_checks_menu(
         Choice::new(toggle),
         Choice::new("Back"),
     ];
-    match ui.select(&body, &rows, 0).await? {
+    // Focus starts on what the person most likely came for: letting Work run
+    // the checks (Allow is still a choice of its own), or, once Work may,
+    // changing them. Stopping takes effect at once, so it is never focused.
+    let focus = if current.is_valid() { 0 } else { 1 };
+    match ui.select(&body, &rows, focus).await? {
         Some(0) => checks(ui, source).await,
         Some(1) if current.is_valid() => {
             consent::revoke(state, &root)?;
@@ -912,6 +916,15 @@ async fn project_checks_menu(
 }
 
 pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> {
+    // With checks configured, a suggestion chosen joins them: they stay
+    // selected until the person clears them, and only Save writes.
+    if !crate::consent::effective_checks(source)?.is_empty() {
+        anyhow::ensure!(
+            choose_project_checks(ui, source).await?,
+            "check selection cancelled"
+        );
+        return Ok(());
+    }
     let expected = setup::project_config_bytes(source)?;
     let commands = setup::check_choices(source);
     let mut choices = commands.iter().map(|c| Choice::new(*c)).collect::<Vec<_>>();

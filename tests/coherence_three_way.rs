@@ -318,6 +318,14 @@ fn overlapping_edits_stay_refresh_and_keep_what_the_3_way_merge_said() {
         f.verdict(&id),
         ("refresh".into(), vec!["patch_conflict".into()])
     );
+    // It says what was tried: the patch as it is, then a 3-way merge from S0.
+    let check = f.ok(&["check", &id]);
+    assert!(
+        check.contains(
+            "\n  patch_conflict: the patch does not apply as it is to src/lib.rs, and a 3-way merge from its S0 conflicts; git: error: patch failed: src/lib.rs:"
+        ),
+        "{check}"
+    );
     let refused = f.dispatch(&["accept", &id]);
 
     assert!(!refused.status.success());

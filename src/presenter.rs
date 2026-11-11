@@ -1677,6 +1677,34 @@ fn parse_auto_apply_command(text: &str) -> Option<AutoApplyCommand> {
 const AUTO_APPLY_ON_LINE: &str = "Auto-apply on: eligible results will be applied without review.";
 const AUTO_APPLY_OFF_LINE: &str = "Auto-apply off: results wait for your review.";
 
+async fn session_git_context(source: &std::path::Path) -> io::Result<String> {
+    let inside = tokio::process::Command::from(crate::source::plain_git_command())
+        .arg("-C")
+        .arg(source)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !inside.status.success() {
+        return Ok("Plain directory · local source".to_owned());
+    }
+    let branch = tokio::process::Command::from(crate::source::plain_git_command())
+        .arg("-C")
+        .arg(source)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    Ok(if branch.status.success() {
+        format!(
+            "Git checkout · branch {}",
+            sanitize(&String::from_utf8_lossy(&branch.stdout)).trim()
+        )
+    } else {
+        "Git checkout · detached HEAD".into()
+    })
+}
+
 pub async fn session(state: &State, mut options: Options) -> Result<()> {
     anyhow::ensure!(
         suitable(),
@@ -1694,37 +1722,11 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
             options.ascii,
         ))?;
     }
-    let context = tokio::time::timeout(Duration::from_millis(200), async {
-        let inside = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .kill_on_drop(true)
-            .output()
-            .await?;
-        if !inside.status.success() {
-            return Ok::<_, io::Error>("Plain directory · local source".to_owned());
-        }
-        let branch = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .kill_on_drop(true)
-            .output()
-            .await?;
-        Ok(if branch.status.success() {
-            format!(
-                "Git checkout · branch {}",
-                sanitize(&String::from_utf8_lossy(&branch.stdout)).trim()
-            )
-        } else {
-            "Git checkout · detached HEAD".into()
-        })
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or_else(|| "Project context unavailable · local source".into());
+    let context = tokio::time::timeout(Duration::from_millis(200), session_git_context(&source))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| "Project context unavailable · local source".into());
     ui.commit(&context)?;
     loop {
         let prompt = if ui.reviewed.is_some() {
@@ -2106,6 +2108,62 @@ async fn review_goal(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    /// With a `git` first on `PATH` that answers "forged", the session's
+    /// context still names the branch Git has.
+    #[cfg(unix)]
+    #[test]
+    fn session_git_context_ignores_a_git_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let init = crate::source::plain_git_command()
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-b", "real-branch"])
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let fake_git = bin.join("git");
+        std::fs::write(&fake_git, "#!/bin/sh\nprintf 'forged\\n'\n").unwrap();
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // In a process of its own: `PATH` is the whole process's.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--ignored",
+                "presenter::tests::session_git_context_here",
+            ])
+            .current_dir(&repo)
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && said.contains("1 passed"),
+            "{said}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess helper, exercised by session_git_context_ignores_a_git_on_path"]
+    async fn session_git_context_here() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            session_git_context(&here).await.unwrap(),
+            "Git checkout · branch real-branch"
+        );
+    }
 
     fn run() -> RunRecord {
         serde_json::from_value(serde_json::json!({

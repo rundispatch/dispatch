@@ -2250,6 +2250,17 @@ pub(crate) fn note_reopen(state: &State, old: &str, new: &str) -> Result<()> {
     crate::state::write_durably(&reopen_notes(state).join(old), new.as_bytes())
 }
 
+/// The Work of every project noted to close as superseded, from the moment
+/// its reopen is noted, whether or not the new Work is published yet.
+pub(crate) fn reopening(state: &State) -> Result<HashSet<String>> {
+    let Ok(listing) = fs::read_dir(reopen_notes(state)) else {
+        return Ok(HashSet::new());
+    };
+    listing
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect()
+}
+
 /// The reopen notes of Work in the project at `root` whose new Work is
 /// published, as (old, new). A note whose new Work will never be published
 /// is removed.
@@ -2670,7 +2681,7 @@ fn print_verdict_and_next(state: &State, run: &RunRecord) {
     if awaits_review(run) {
         print_standing(state, run, validity);
     }
-    print_review_commands(run, validity);
+    print_review_commands(state, run, validity);
 }
 
 /// A short equivalent of `print_single_result_summary` for attached work:
@@ -2705,7 +2716,7 @@ fn print_finish_summary(state: &State, run: &RunRecord) {
     if awaits_review(run) {
         print_standing(state, run, validity);
     }
-    print_review_commands(run, validity);
+    print_review_commands(state, run, validity);
 }
 
 #[cfg(test)]

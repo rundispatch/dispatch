@@ -1386,7 +1386,7 @@ fn finish_says_a_patch_that_no_longer_applies_is_stale_and_check_agrees() {
     );
     assert!(summary.contains("Verification\n  PASS"), "{summary}");
     assert!(summary.contains("Coherence: REFRESH"), "{summary}");
-    let conflict = "patch_conflict: the patch no longer applies to src/lib.rs";
+    let conflict = "patch_conflict: the patch does not apply as it is to src/lib.rs, and a 3-way merge from its S0 conflicts;";
     assert!(summary.contains(conflict), "{summary}");
     assert!(summary.contains("Git's full output: "), "{summary}");
     let full = fs::read_to_string(&kept).unwrap();

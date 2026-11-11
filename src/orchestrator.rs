@@ -980,7 +980,7 @@ fn print_single_result_summary(
             closed.describe()
         );
     } else {
-        print_review_commands(run, validity);
+        print_review_commands(state, run, validity);
     }
 }
 
@@ -997,11 +997,11 @@ fn patch_line(candidate: &CandidateRecord) -> String {
 /// The commands for `run`'s result, each naming it in full: with several
 /// results waiting, an ID-less decision refuses. While it waits for review,
 /// the next step follows its verdict (`validity`).
-fn print_review_commands(run: &RunRecord, validity: Option<&crate::Validity>) {
+fn print_review_commands(state: &State, run: &RunRecord, validity: Option<&crate::Validity>) {
     println!("Review\n  dispatch diff {}\n", run.id);
     if awaits_review(run) {
         let decision = validity.map_or(Decision::Continue, |validity| validity.decision);
-        let (step, alternative) = next_step(run, decision);
+        let (step, alternative) = next_step(run, decision, newest_source(state, run).as_ref());
         println!("Then\n  {step}");
         if let Some(alternative) = alternative {
             println!("  {alternative}");
@@ -1010,25 +1010,85 @@ fn print_review_commands(run: &RunRecord, validity: Option<&crate::Validity>) {
 }
 
 /// What a person can do with a result waiting for review, given its verdict:
-/// the step, and its alternative. Accept only while it holds; a REFRESH is
-/// redone and a STOP closed. Each names the Work.
-fn next_step(run: &RunRecord, decision: Decision) -> (String, Option<String>) {
+/// the step, and its alternative. Accept only while it holds; a STOP is
+/// closed. A REFRESH is redone: a native run by `dispatch refresh`, attached
+/// Work whose session can go on in its worktree by merging the newest source
+/// recorded at its project (`source`) there (`resume_step`), and any other
+/// attached Work by running its agent again. Each names the Work; `watch`
+/// shows the same step.
+pub(crate) fn next_step(
+    run: &RunRecord,
+    decision: Decision,
+    source: Option<&s0::Recorded>,
+) -> (String, Option<String>) {
     let id = &run.id;
     let reject = Some(format!("dispatch reject {id}"));
     match decision {
         Decision::Continue => (format!("dispatch accept {id}"), reject),
-        Decision::Refresh if run.mode == RunMode::Attached => (
-            format!(
-                "run your agent again on the current source and attach it; once that Work is finished: dispatch close {id} --reason superseded --replacement <new-id>"
+        Decision::Refresh if run.mode == RunMode::Attached => match resume_step(run, source) {
+            Some(step) => (step, reject),
+            None => (
+                format!(
+                    "run your agent again on the current source and attach it; once that Work is finished: dispatch close {id} --reason superseded --replacement <new-id>"
+                ),
+                reject,
             ),
-            reject,
-        ),
+        },
         Decision::Refresh => (format!("dispatch refresh {id}"), reject),
         Decision::Stop => (
             format!("dispatch close {id} --reason already-present"),
             None,
         ),
     }
+}
+
+/// The REFRESH step for a result whose session can be resumed in its
+/// worktree to merge `source`, the newest recorded, when that came after its
+/// S0. A session starting there again goes on from its S0 as new Work and
+/// closes this one as superseded (`attach::reopenable`) when its runtime's
+/// hook registered it, every session of it ended and its Git worktree is
+/// still there. The merge moves the new Work's S0 (`s0::follow`) only to a
+/// source recorded after that S0, and the new Work keeps when it was only
+/// from a move: one that never moved takes the new Work's start, and nothing
+/// landed before then moves it. The command names the commit: Claude Code
+/// refuses one that names `refs/dispatch/source`.
+fn resume_step(run: &RunRecord, source: Option<&s0::Recorded>) -> Option<String> {
+    let attachment = run.attachment.as_ref()?;
+    let moved = run.baseline_history.last()?;
+    let source = source.filter(|source| source.at > moved.recorded_at)?;
+    let resumable = awaits_review(run)
+        && run.outcome.closed.is_none()
+        && matches!(
+            run.source_kind,
+            crate::SourceKind::Git | crate::SourceKind::GitWorktree
+        )
+        && matches!(
+            attachment.provenance,
+            crate::BaselineProvenance::WorkspaceAtStart { .. }
+        )
+        && attachment.workspace_removed.is_none()
+        && attachment.workspace.is_dir()
+        && !attachment.sessions.is_empty()
+        && attachment
+            .sessions
+            .iter()
+            .all(|session| session.ended_at.is_some());
+    resumable.then(|| {
+        format!(
+            "resume its session in {}, then commit there and run git merge {}; the session goes on as new Work from this Work's S0, and this Work closes as superseded; Dispatch then moves that S0 and checks it again",
+            attachment.workspace.display(),
+            source.commit
+        )
+    })
+}
+
+/// The newest source recorded at `run`'s project, which a REFRESH of
+/// attached Work may merge; `None` when none can be read.
+fn newest_source(state: &State, run: &RunRecord) -> Option<s0::Recorded> {
+    if run.mode != RunMode::Attached {
+        return None;
+    }
+    s0::recorded(state, &run.source_path).ok()?.pop()
 }
 
 /// How many of a verdict's reasons a summary shows; `check` shows them all.
@@ -1739,6 +1799,7 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
             let Some(run) = latest_for_source(state, &root, false)? else {
                 println!("No Work in {} yet.", root.display());
                 println!("\nProject: {}", background::project_line(state, &root));
+                print_found_not_tracked(state, &root)?;
                 return Ok(());
             };
             run
@@ -1782,7 +1843,12 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
         "\nProject: {}",
         background::project_line(state, &run.source_path)
     );
-    let found = found_not_tracked(state, &run.source_path)?;
+    print_found_not_tracked(state, &run.source_path)?;
+    Ok(())
+}
+
+fn print_found_not_tracked(state: &State, root: &Path) -> Result<()> {
+    let found = found_not_tracked(state, root)?;
     if !found.is_empty() {
         println!("\nFound, not tracked");
         for entry in found {
@@ -1840,8 +1906,21 @@ pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Resul
         None => {
             let root = source::resolve_source(Some(source_path))?;
             let Some(run) = latest_for_source(state, &root, false)? else {
-                // No Work here yet.
-                println!("null");
+                let found = found_not_tracked(state, &root)?;
+                if found.is_empty() {
+                    println!("null");
+                } else {
+                    let entries = found
+                        .iter()
+                        .map(|entry| {
+                            serde_json::json!({
+                                "path": entry.path,
+                                "attach": serve::attach_command(&entry.path),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!("{}", serde_json::json!({"found_not_tracked": entries}));
+                }
                 return Ok(());
             };
             run
@@ -2672,7 +2751,7 @@ fn print_check(
         return;
     }
     println!("At accept: {}", accept_scope(state, run, validity));
-    match next_step(run, validity.decision) {
+    match next_step(run, validity.decision, newest_source(state, run).as_ref()) {
         (step, Some(alternative)) => println!("Next: {step}  (or {alternative})"),
         (step, None) => println!("Next: {step}"),
     }
@@ -4130,6 +4209,175 @@ mod tests {
         let json = serde_json::to_value(&run.outcome).unwrap();
         assert_eq!(json["closed"]["reason"], "already_present");
         assert!(json["closed"].get("replacement").is_none());
+    }
+
+    /// A result waiting for review in a Git worktree, registered by its
+    /// runtime's hook when its session started, with that session ended,
+    /// whose S0 moved once, to a source recorded at 10:30.
+    fn resumable(workspace: &Path) -> RunRecord {
+        let mut run: RunRecord = serde_json::from_value(serde_json::json!({
+            "id":"01WORK", "task":"t", "exact_prompt":"t",
+            "source_path":"/source", "source_kind":"git_worktree", "source_git_head":"5e3cb514",
+            "source_fingerprint":"b", "baseline_path":"/b", "baseline_commit":"abc",
+            "status":"ready_for_evaluation", "created_at":"2026-11-10T10:00:00Z", "completed_at":null,
+            "environment":{"dispatch_version":"t","os":"t","architecture":"t","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "applied_candidate":null
+        }))
+        .unwrap();
+        run.mode = RunMode::Attached;
+        run.outcome.work_result = WorkResult::Ready;
+        run.attachment = Some(crate::AttachmentRecord {
+            version: 1,
+            workspace: workspace.to_owned(),
+            integration_root: PathBuf::from("/source"),
+            repo_key: None,
+            provenance: crate::BaselineProvenance::WorkspaceAtStart {
+                commit: "e4a15cd9".into(),
+            },
+            confidence: crate::AttachConfidence::Full,
+            agent: Some("claude".into()),
+            command: None,
+            owner: None,
+            agent_process: None,
+            owner_state: crate::OwnerState::Unknown,
+            capabilities: crate::AttachCapabilities {
+                observe: true,
+                signal: false,
+                control: false,
+                integrate: true,
+            },
+            attached_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            finish_reason: None,
+            workspace_owner: crate::WorkspaceOwner::Runtime,
+            managed: None,
+            sessions: vec![crate::RuntimeSession {
+                provider: "claude".into(),
+                session_id: "s1".into(),
+                source: "startup".into(),
+                started_at: Utc::now(),
+                ended_at: Some(Utc::now()),
+                end_reason: Some("prompt_input_exit".into()),
+                model: None,
+            }],
+            workspace_removed: None,
+            source_at_start: None,
+            needs_you: None,
+        });
+        run.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: PathBuf::from("/b0"),
+            baseline_commit: "abc0".into(),
+            commit: "e4a15cd9".into(),
+            moved_to: "7d1e0c2a".into(),
+            moved_at: "2026-11-10T10:31:00Z".parse().unwrap(),
+            recorded_at: "2026-11-10T10:30:00Z".parse().unwrap(),
+            landed_run: Some("01EARLIER".into()),
+            back: false,
+        });
+        run
+    }
+
+    /// A REFRESH's step is what the Work's record says it can do: a session
+    /// that can be resumed in its worktree merges the newest recorded source
+    /// there, named by its whole commit; other attached Work runs its agent
+    /// again; a native run is refreshed. CONTINUE and STOP keep their steps.
+    #[test]
+    fn a_refresh_step_follows_what_the_work_can_do() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("worktree");
+        fs::create_dir(&workspace).unwrap();
+        let commit = "9f2c41d07be35a68c1d4e0f7a2b9c3d5e6f70812";
+        let landed = |at: &str| s0::Recorded {
+            commit: commit.into(),
+            at: at.parse().unwrap(),
+            landed_run: "01LANDED".into(),
+        };
+        let after = landed("2026-11-10T11:00:00Z");
+        let before = landed("2026-11-10T10:00:00Z");
+        let reject = Some("dispatch reject 01WORK".to_owned());
+        let rerun = "run your agent again on the current source and attach it; once that Work is finished: dispatch close 01WORK --reason superseded --replacement <new-id>";
+        let resume = format!(
+            "resume its session in {}, then commit there and run git merge {commit}; the session goes on as new Work from this Work's S0, and this Work closes as superseded; Dispatch then moves that S0 and checks it again",
+            workspace.display()
+        );
+        let run = resumable(&workspace);
+        let step = next_step(&run, Decision::Refresh, Some(&after));
+        assert_eq!(step, (resume, reject.clone()));
+        assert!(!step.0.contains("refs/dispatch/source"), "{}", step.0);
+
+        // Anything else it can't do takes it back to running its agent again.
+        let refresh = |run: &RunRecord, source| next_step(run, Decision::Refresh, source);
+        assert_eq!(refresh(&run, None), (rerun.to_owned(), reject.clone()));
+        assert_eq!(
+            refresh(&run, Some(&before)).0,
+            rerun,
+            "nothing landed since its S0"
+        );
+        let mut unmoved = run.clone();
+        unmoved.baseline_history.clear();
+        assert_eq!(
+            refresh(&unmoved, Some(&after)).0,
+            rerun,
+            "its S0 never moved"
+        );
+        let mut live = run.clone();
+        live.attachment.as_mut().unwrap().sessions[0].ended_at = None;
+        assert_eq!(refresh(&live, Some(&after)).0, rerun, "its session is live");
+        let mut removed = run.clone();
+        removed.attachment.as_mut().unwrap().workspace_removed = Some(crate::WorkspaceRemoval {
+            at: Utc::now(),
+            exact: true,
+            last_seen_at: None,
+        });
+        assert_eq!(
+            refresh(&removed, Some(&after)).0,
+            rerun,
+            "its worktree is gone"
+        );
+        let gone = resumable(&temp.path().join("gone"));
+        assert_eq!(
+            refresh(&gone, Some(&after)).0,
+            rerun,
+            "its worktree is not there"
+        );
+        let mut wrapped = run.clone();
+        wrapped.attachment.as_mut().unwrap().provenance = crate::BaselineProvenance::GitMergeBase {
+            commit: "e4a15cd9".into(),
+        };
+        assert_eq!(
+            refresh(&wrapped, Some(&after)).0,
+            rerun,
+            "no hook registered it"
+        );
+        let mut directory = run.clone();
+        directory.source_kind = crate::SourceKind::Directory;
+        assert_eq!(refresh(&directory, Some(&after)).0, rerun, "no S0 to move");
+        let mut rejected = run.clone();
+        rejected.outcome.review = ReviewState::Rejected;
+        assert_eq!(
+            refresh(&rejected, Some(&after)).0,
+            rerun,
+            "it no longer waits"
+        );
+
+        let mut native = run.clone();
+        native.mode = RunMode::Native;
+        native.attachment = None;
+        assert_eq!(
+            refresh(&native, Some(&after)),
+            ("dispatch refresh 01WORK".to_owned(), reject.clone())
+        );
+        assert_eq!(
+            next_step(&run, Decision::Continue, Some(&after)),
+            ("dispatch accept 01WORK".to_owned(), reject)
+        );
+        assert_eq!(
+            next_step(&run, Decision::Stop, Some(&after)),
+            (
+                "dispatch close 01WORK --reason already-present".to_owned(),
+                None
+            )
+        );
     }
 
     #[test]

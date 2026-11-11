@@ -255,20 +255,35 @@ fn an_item_names_the_other_work_by_short_id_and_runtime_the_target_and_the_chang
 }
 
 #[test]
-fn a_landing_note_names_the_recorded_commit() {
+fn a_landing_note_names_the_whole_recorded_commit() {
     let text = only(&first(WORK, &empty(), &[landing(vec![same_declaration()])]))
         .text
         .clone();
-    let line = text
-        .lines()
-        .find(|line| line.starts_with("The source with this change is commit "))
-        .unwrap_or_else(|| panic!("no commit line: {text}"));
-    let short = line
-        .strip_prefix("The source with this change is commit ")
-        .and_then(|rest| rest.strip_suffix(" (refs/dispatch/source)."))
-        .unwrap_or_else(|| panic!("{line}"));
-    assert!(short.len() >= 7 && short.len() < SHA.len(), "{line}");
-    assert!(SHA.starts_with(short), "{line}");
+    let line = format!("The source with this change is commit {SHA}.");
+    assert!(text.lines().any(|l| l == line), "{text}");
+}
+
+/// Agents merged the ref a note named, and Claude Code's worktree isolation
+/// refuses any command naming it. Every landing item names the commit
+/// instead.
+#[test]
+fn a_landing_note_never_names_the_ref() {
+    let signed = Landing {
+        signatures: BTreeMap::from([(
+            symbol("src/auth.rs", "validate"),
+            ("fn validate()".into(), "fn validate(token: &str)".into()),
+        )]),
+        ..landing(vec![uses_theirs()])
+    };
+    for landed in [
+        landing(vec![same_declaration()]),
+        landing(vec![textual()]),
+        signed,
+    ] {
+        let text = only(&first(WORK, &empty(), &[landed])).text.clone();
+        assert!(text.contains(SHA), "{text}");
+        assert!(!text.contains(dispatch::source::SOURCE_REF), "{text}");
+    }
 }
 
 #[test]
@@ -385,7 +400,7 @@ fn a_landing_is_its_own_key_even_after_a_note_on_the_same_target() {
         &sent,
         later,
     );
-    assert!(only(&notes).text.contains("refs/dispatch/source"));
+    assert!(only(&notes).text.contains(SHA));
     let much_later = later + Duration::minutes(11);
     let (again, _) = compose(
         WORK,
@@ -423,12 +438,7 @@ fn a_burst_is_merged_into_one_note_and_nothing_is_dropped() {
         t0(),
     );
     let text = only(&notes).text.clone();
-    for part in [
-        "validate",
-        "src/api.rs",
-        "src/config.py",
-        "refs/dispatch/source",
-    ] {
+    for part in ["validate", "src/api.rs", "src/config.py", SHA] {
         assert!(text.contains(part), "{part} missing:\n{text}");
     }
     assert_eq!(

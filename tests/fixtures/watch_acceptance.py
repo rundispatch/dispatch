@@ -710,8 +710,9 @@ def widths(binary, base):
             details = watch.details()
             assert "Verdict REFRESH · " in details or "Verdict REFRESH" in details, details
             assert "def validate(token)" in details, ("the reason is visible", width, watch.screen())
-            assert "Next It can't be accepted as is. r reject it, then run the agent again from the current source." \
-                in details, (width, watch.screen())
+            assert ("Next It can't be accepted as is: run your agent again on the current source and attach it; "
+                    f"once that Work is finished: dispatch close {project.ids['me-endpoint']} --reason superseded "
+                    "--replacement <new-id>. Or r reject it.") in details, (width, watch.screen())
             hint = watch.hint()
             assert hint.startswith("r reject · d review"), (width, hint)
             assert hint.endswith("↑↓ select · q leave" if wide else "↑↓ · q leave"), (width, hint)
@@ -982,7 +983,9 @@ def states_ready(binary, base):
         "auto": ("applied", "–", "passed", ["applied by auto-apply · it was CONTINUE"],
                  "Nothing to do: it is in tinyauth.", "↑↓ select · q leave"),
         "refresh-me": ("blocked", "REFRESH", "passed", ["Verdict REFRESH · "],
-                       "It can't be accepted as is. r reject it, then run the agent again from the current source.",
+                       "It can't be accepted as is: run your agent again on the current source and attach it; "
+                       f"once that Work is finished: dispatch close {project.ids['refresh-me']} --reason superseded "
+                       "--replacement <new-id>. Or r reject it.",
                        "r reject · d review · ↑↓ select · q leave"),
         "stop-me": ("blocked", "STOP", "passed", ["Verdict STOP · its changes are already in the source"],
                     "Its changes are already in the source. c close it.",
