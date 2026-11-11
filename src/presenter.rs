@@ -51,6 +51,16 @@ pub fn suitable() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
+/// Ask `question`, with `yes` and Cancel to choose from. Focus starts on
+/// Cancel: Enter alone never says yes.
+pub async fn confirm(question: &str, yes: &str, mut options: Options) -> Result<bool> {
+    options.plain |= std::env::var("TERM").is_ok_and(|v| v == "dumb");
+    let mut ui = Ui::new(options)?;
+    ui.auto_apply_mode = false;
+    let rows = [Choice::new(yes), Choice::new("Cancel")];
+    Ok(ui.select(question, &rows, 1).await? == Some(0))
+}
+
 /// Strip terminal control strings as units, including OSC clipboard/title and
 /// DCS. Also remove C1 and bidi controls; preserve only useful text whitespace.
 pub fn sanitize(text: &str) -> String {

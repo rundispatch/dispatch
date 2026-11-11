@@ -1,6 +1,7 @@
 mod apply;
 pub mod attach;
 pub mod background;
+mod batch;
 pub(crate) mod catchup;
 pub mod discovery;
 pub mod inbox;
@@ -2157,6 +2158,48 @@ pub enum ReviewDecision {
     Reject,
 }
 
+/// `dispatch accept`. With no id, when two or more results here can land
+/// together, the batch is proposed (`batch::offer`), and `expect` is a hex
+/// prefix of its digest. Confirming the proposal is `accept --expect <batch
+/// digest>`, run from the start. Otherwise, as `accept_or_reject_latest`.
+#[allow(clippy::too_many_arguments)]
+pub async fn accept(
+    state: &State,
+    run_id: Option<&str>,
+    source_path: &Path,
+    despite_refresh: bool,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+    expect: Option<&str>,
+    options: crate::presenter::Options,
+) -> Result<()> {
+    let mut expect = expect.map(str::to_owned);
+    if run_id.is_none() && !despite_refresh {
+        if expect.is_none()
+            && let Some(eligible) = batch::eligible(state, source_path)?
+        {
+            match batch::offer(state, &eligible, options).await? {
+                Some(digest) => expect = Some(digest),
+                None => return Ok(()),
+            }
+        }
+        if let Some(expected) = &expect
+            && let Some(eligible) = batch::eligible(state, source_path)?
+        {
+            return batch::land(state, eligible, expected, reasons, explanation).await;
+        }
+    }
+    accept_or_reject_latest(
+        state,
+        run_id,
+        source_path,
+        ReviewDecision::Accept { despite_refresh },
+        reasons,
+        explanation,
+        expect.as_deref(),
+    )
+}
+
 /// `expect` (`accept --expect`) is a hex prefix of the Δ the person
 /// reviewed: unless the frozen Δ's digest starts with it, nothing happens.
 pub fn accept_or_reject_latest(
@@ -3433,6 +3476,37 @@ fn review_locked(
             }
         }
     }
+    let revision = record_review(state, &mut run, accept, reasons, explanation, None)?;
+    if !quiet {
+        println!("Review recorded (revision {revision}).");
+        if let Some(attachment) = run.attachment.as_ref().filter(|attachment| {
+            attachment
+                .managed
+                .as_ref()
+                .is_some_and(|made| !made.removed)
+        }) && run.outcome.review == ReviewState::Rejected
+        {
+            println!(
+                "The workspace Dispatch made for it is kept at {}.",
+                attachment.workspace.display()
+            );
+        }
+    }
+    Ok(merged)
+}
+
+/// Record a person's review of `run`: a feedback revision (`reasons`, already
+/// normalized, and `explanation` verbatim), `outcome.review`, and
+/// `review.accepted` or `review.rejected` with the Δ digest and, for Work
+/// that landed in a batch, the batch's digest. Returns the revision.
+fn record_review(
+    state: &State,
+    run: &mut RunRecord,
+    accept: bool,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+    batch: Option<&str>,
+) -> Result<u32> {
     let outcome = if accept {
         ReviewOutcome::Accepted
     } else {
@@ -3445,6 +3519,15 @@ fn review_locked(
     } else {
         ReviewState::Rejected
     };
+    let mut payload = serde_json::json!({
+        "feedback_revision": feedback.revision,
+        "delta_digest": sole_candidate(run)
+            .ok()
+            .and_then(|candidate| delta_digest(&candidate.diff_path).ok()),
+    });
+    if let Some(batch) = batch {
+        payload["batch"] = serde_json::json!(batch);
+    }
     persist_event(
         state,
         &database,
@@ -3461,32 +3544,12 @@ fn review_locked(
             }
             .into(),
             timestamp: feedback.created_at,
-            payload: serde_json::json!({
-                "feedback_revision": feedback.revision,
-                "delta_digest": sole_candidate(&run)
-                    .ok()
-                    .and_then(|candidate| delta_digest(&candidate.diff_path).ok()),
-            }),
+            payload,
             ..EventRecord::default()
         },
-        &mut run,
+        run,
     )?;
-    if !quiet {
-        println!("Review recorded (revision {}).", feedback.revision);
-        if let Some(attachment) = run.attachment.as_ref().filter(|attachment| {
-            attachment
-                .managed
-                .as_ref()
-                .is_some_and(|made| !made.removed)
-        }) && run.outcome.review == ReviewState::Rejected
-        {
-            println!(
-                "The workspace Dispatch made for it is kept at {}.",
-                attachment.workspace.display()
-            );
-        }
-    }
-    Ok(merged)
+    Ok(feedback.revision)
 }
 
 pub fn read_verbatim(path: &Path) -> Result<String> {
@@ -3550,8 +3613,17 @@ fn latest_for_source(state: &State, source_path: &Path, single: bool) -> Result<
     Ok(None)
 }
 
+/// A finished result with one candidate, Dispatch's or attached, waiting for
+/// review (`awaits_review`): what an ID-less `accept` or `reject` decides.
+fn waits_for_decision(run: &RunRecord) -> bool {
+    run.outcome.lifecycle == LifecycleState::Finished
+        && run.candidates.len() == 1
+        && (run.allocation.is_some() || run.execution.is_some() || run.mode == RunMode::Attached)
+        && awaits_review(run)
+}
+
 /// The result an ID-less `accept` or `reject` (`command`) decides: the only
-/// one for this source waiting for review (`awaits_review`). With none, or
+/// one for this source waiting for review (`waits_for_decision`). With none, or
 /// several, nothing is decided, and the refusal names each result with its
 /// command, and the Work still in progress, which does not count.
 fn sole_awaiting_review(state: &State, source_path: &Path, command: &str) -> Result<RunRecord> {
@@ -3567,12 +3639,7 @@ fn sole_awaiting_review(state: &State, source_path: &Path, command: &str) -> Res
         let run = state.load_run(&projected.id)?;
         if run.outcome.lifecycle != LifecycleState::Finished {
             working.push(run);
-        } else if run.candidates.len() == 1
-            && (run.allocation.is_some()
-                || run.execution.is_some()
-                || run.mode == RunMode::Attached)
-            && awaits_review(&run)
-        {
+        } else if waits_for_decision(&run) {
             waiting.push(run);
         }
     }

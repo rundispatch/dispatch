@@ -60,21 +60,28 @@ pub(crate) fn recorded(state: &State, root: &Path) -> Result<Vec<Recorded>> {
 /// Record the source of `run`, which just landed, under the source lock that
 /// every landing holds, so no two records race.
 pub(crate) fn record(state: &State, run: &RunRecord) -> Result<()> {
-    if !matches!(run.source_kind, SourceKind::Git | SourceKind::GitWorktree) {
+    record_together(state, &[run], &format!("dispatch: Work {} landed", run.id))
+}
+
+/// `record` for Work that landed together in one batch: one commit, and an
+/// entry naming it for each Work.
+pub(crate) fn record_together(state: &State, runs: &[&RunRecord], message: &str) -> Result<()> {
+    let Some(first) = runs.first() else {
+        return Ok(());
+    };
+    if !matches!(first.source_kind, SourceKind::Git | SourceKind::GitWorktree) {
         return Ok(());
     }
-    let commit = source::record_source(
-        &run.source_path,
-        &format!("dispatch: Work {} landed", run.id),
-    )?;
-    let mut sources = recorded(state, &run.source_path)?;
-    sources.push(Recorded {
-        commit,
-        at: Utc::now(),
+    let commit = source::record_source(&first.source_path, message)?;
+    let mut sources = recorded(state, &first.source_path)?;
+    let at = Utc::now();
+    sources.extend(runs.iter().map(|run| Recorded {
+        commit: commit.clone(),
+        at,
         landed_run: run.id.clone(),
-    });
+    }));
     crate::state::write_durably(
-        &sources_path(state, &run.source_path),
+        &sources_path(state, &first.source_path),
         &serde_json::to_vec_pretty(&sources)?,
     )
 }

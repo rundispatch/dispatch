@@ -223,7 +223,8 @@ enum Command {
         #[arg(long, conflicts_with = "stat")]
         name_only: bool,
     },
-    /// Accept and safely apply a result; without an ID, the only one waiting.
+    /// Accept and safely apply a result; without an ID, the only one waiting,
+    /// or, when several can land together, all of them behind one approval.
     Accept(AcceptArgs),
     /// Reject a result without changing the source tree; without an ID, the
     /// only one waiting.
@@ -429,6 +430,8 @@ struct AcceptArgs {
 
     /// Accept only if the frozen change's digest starts with this (12 or
     /// more hex characters, as `Δ` shows it); otherwise nothing happens.
+    /// Without an ID, when several results can land together, the batch's
+    /// digest as `dispatch accept` shows it.
     #[arg(long, value_name = "DIGEST", value_parser = delta_prefix)]
     expect: Option<String>,
 }
@@ -796,17 +799,21 @@ async fn run() -> Result<()> {
         Command::Accept(args) => {
             keep_watching(&state, None)?;
             let explanation = args.review.feedback.explanation.read()?;
-            orchestrator::accept_or_reject_latest(
+            orchestrator::accept(
                 &state,
                 args.review.run_id.as_deref(),
                 &std::env::current_dir()?,
-                orchestrator::ReviewDecision::Accept {
-                    despite_refresh: args.despite_refresh,
-                },
+                args.despite_refresh,
                 args.review.feedback.reasons,
                 explanation,
                 args.expect.as_deref(),
+                dispatch::presenter::Options {
+                    plain: cli.plain,
+                    ascii: cli.ascii,
+                    no_color: cli.no_color,
+                },
             )
+            .await
         }
         Command::Reject(args) => {
             let explanation = args.feedback.explanation.read()?;

@@ -749,9 +749,11 @@ const ONE: &str = "pub fn f() -> i32 {\n    1\n}\n";
 
 /// The 0.4.12 release blocker (P0's R1): attach A, then B; finish B, then A.
 /// A's summary names A in every command it suggests. With two results
-/// waiting, an ID-less accept or reject decides nothing and names both, and
-/// the Work still in progress, which does not count. Named, A is accepted,
-/// not B. Once B is the only result waiting, an ID-less reject means B.
+/// waiting, an ID-less reject decides nothing and names both, and the Work
+/// still in progress, which does not count. An ID-less accept proposes
+/// landing both together and, without a terminal, decides nothing either.
+/// Named, A is accepted, not B. Once B is the only result waiting, an
+/// ID-less reject means B.
 #[test]
 fn finish_summaries_name_their_work_and_id_less_decisions_refuse_two_results() {
     let f = Fixture::new(true);
@@ -777,18 +779,27 @@ fn finish_summaries_name_their_work_and_id_less_decisions_refuse_two_results() {
         "every suggested command names A: {summary}"
     );
 
-    for command in ["accept", "reject"] {
-        let stderr = Fixture::stderr(&f.dispatch_in_root(&[command]).failure());
-        assert!(stderr.contains("2 results wait for review"), "{stderr}");
-        for id in [&a, &b] {
-            assert!(
-                stderr.contains(&format!("dispatch {command} {id}")),
-                "{stderr}"
-            );
-        }
-        let (_, listed) = stderr.split_once("Still in progress").expect(&stderr);
-        assert!(listed.contains(&in_progress), "{stderr}");
+    let stderr = Fixture::stderr(&f.dispatch_in_root(&["reject"]).failure());
+    assert!(stderr.contains("2 results wait for review"), "{stderr}");
+    for id in [&a, &b] {
+        assert!(
+            stderr.contains(&format!("dispatch reject {id}")),
+            "{stderr}"
+        );
     }
+    let (_, listed) = stderr.split_once("Still in progress").expect(&stderr);
+    assert!(listed.contains(&in_progress), "{stderr}");
+    let proposed = f.dispatch_in_root(&["accept"]).failure();
+    let (stdout, stderr) = (Fixture::stdout(&proposed), Fixture::stderr(&proposed));
+    assert!(stdout.contains("2 results can land together"), "{stdout}");
+    for id in [&a, &b] {
+        assert!(stdout.contains(id.as_str()), "{stdout}");
+    }
+    assert!(!stdout.contains(&in_progress), "{stdout}");
+    assert!(
+        stderr.contains("nothing was decided") && stderr.contains("dispatch accept --expect "),
+        "{stderr}"
+    );
     // Nothing changed: the source, the reviews and the events are as they were.
     assert_eq!(fs::read_to_string(f.root.join("src/lib.rs")).unwrap(), ONE);
     assert!(!f.root.join("src/b.rs").exists());

@@ -235,7 +235,9 @@ fn fence(validity: Option<&Validity>) -> ExpectedWorld<'_> {
 /// 3-way landing, so the human path's event otherwise stays byte-for-byte
 /// what it was before auto-apply existed. After it, still under the source
 /// lock: `interaction.landed`, `refs/dispatch/source` and the workspace
-/// release.
+/// release. Work that landed in the batch `batch` names it, and the batch
+/// records `refs/dispatch/source` once for all of its Work.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn persist_applied(
     state: &State,
     mut run: RunRecord,
@@ -244,6 +246,7 @@ pub(super) fn persist_applied(
     validity: Option<&Validity>,
     authority: ApplyAuthority,
     landing: Option<Landing>,
+    batch: Option<&str>,
 ) -> Result<RunRecord> {
     // Δ is what the person reviewed; a 3-way merge of it is what landed. The
     // source has changed either way, so a digest that cannot be read is null.
@@ -282,6 +285,9 @@ pub(super) fn persist_applied(
         payload["confirmed"] = serde_json::json!(report.unconfirmed.is_empty());
         payload["unconfirmed"] = serde_json::json!(report.unconfirmed);
     }
+    if let Some(batch) = batch {
+        payload["batch"] = serde_json::json!(batch);
+    }
     persist_event(
         state,
         &db,
@@ -302,7 +308,9 @@ pub(super) fn persist_applied(
     }
     // The source with this change, for Work that merges it (`s0`). Still
     // under the source lock; like the measurement, it never fails the landing.
-    if let Err(error) = super::s0::record(state, &run) {
+    if batch.is_none()
+        && let Err(error) = super::s0::record(state, &run)
+    {
         eprintln!("Could not record the source after this landing: {error:#}");
     }
     // Applied, so a workspace Dispatch made for this Work holds nothing the
@@ -325,24 +333,7 @@ fn observe_landing(
     gated: Option<&Validity>,
 ) -> Option<Landing> {
     let gathered = || -> Result<Landing> {
-        let view = match background::watcher(state, &run.source_path)? {
-            Watcher::NotWatched => OwnerView::Unwatched,
-            Watcher::Watched(_) => match background::interactions(state, &run.source_path) {
-                Some(projection) => OwnerView::Watched(projection),
-                None => {
-                    OwnerView::Unavailable("the owner's interaction view could not be read".into())
-                }
-            },
-        };
-        let counterparts: Vec<RunRecord> = match &view {
-            OwnerView::Watched(projection) => projection
-                .participants
-                .iter()
-                .filter(|participant| participant.run_id != run.id)
-                .filter_map(|participant| state.load_run(&participant.run_id).ok())
-                .collect(),
-            _ => Vec::new(),
-        };
+        let (view, counterparts) = owner_view(state, &run.source_path, &[run.id.as_str()])?;
         let patch = fs::read(&sole_candidate(run)?.diff_path)?;
         Ok(landing::capture(
             run,
@@ -358,22 +349,51 @@ fn observe_landing(
         .ok()
 }
 
+/// The owner's view of the Work in progress at `root`, and the runs it lists
+/// other than `landed`, as far as they could be read.
+pub(super) fn owner_view(
+    state: &State,
+    root: &Path,
+    landed: &[&str],
+) -> Result<(OwnerView, Vec<RunRecord>)> {
+    let view = match background::watcher(state, root)? {
+        Watcher::NotWatched => OwnerView::Unwatched,
+        Watcher::Watched(_) => match background::interactions(state, root) {
+            Some(projection) => OwnerView::Watched(projection),
+            None => OwnerView::Unavailable("the owner's interaction view could not be read".into()),
+        },
+    };
+    let counterparts = match &view {
+        OwnerView::Watched(projection) => projection
+            .participants
+            .iter()
+            .filter(|participant| !landed.contains(&participant.run_id.as_str()))
+            .filter_map(|participant| state.load_run(&participant.run_id).ok())
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok((view, counterparts))
+}
+
 /// Commit `interaction.landed` on the applied `run`, with the world as it is
-/// right after applying (`None` when it cannot be observed).
+/// right after applying (`None` when it cannot be observed), unless the
+/// landing already carries it.
 fn record_landing(
     state: &State,
     db: &Database,
     run: &mut RunRecord,
     mut landing: Landing,
 ) -> Result<()> {
-    landing.world_after = world::observe(
-        &run.source_path,
-        &run.baseline_path,
-        &run.baseline_commit,
-        &run.source_kind,
-    )
-    .ok()
-    .map(|world| world.digest);
+    if landing.world_after.is_none() {
+        landing.world_after = world::observe(
+            &run.source_path,
+            &run.baseline_path,
+            &run.baseline_commit,
+            &run.source_kind,
+        )
+        .ok()
+        .map(|world| world.digest);
+    }
     persist_event(
         state,
         db,
@@ -606,6 +626,7 @@ pub(super) fn apply_locked(
         validity.as_ref(),
         authority,
         landing,
+        None,
     )?;
     if !quiet {
         println!(
@@ -787,13 +808,13 @@ fn decide(
 /// for the human path.
 /// Planned goals (removed in 0.4.1) delivered through an integrity chain this
 /// version no longer verifies, so their results are never applied.
-fn was_planned(run: &RunRecord) -> bool {
+pub(super) fn was_planned(run: &RunRecord) -> bool {
     run.execution
         .as_ref()
         .is_some_and(|goal| goal.provenance == "planned_policy_chain")
 }
 
-fn is_fence_failure(message: &str) -> bool {
+pub(super) fn is_fence_failure(message: &str) -> bool {
     message.contains("source changed during apply validation")
         || message.contains("source has changed since this run was created")
 }
@@ -919,6 +940,7 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
                     validity.as_ref(),
                     ApplyAuthority::AutoApply,
                     landing,
+                    None,
                 )?;
                 return Ok(ApplyOutcome::Applied { report, validity });
             }

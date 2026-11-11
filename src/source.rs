@@ -1337,7 +1337,7 @@ pub(crate) fn check_workspace_path(state_root: &Path, source: &Path) -> PathBuf 
     state_root.join("check-workspaces").join(key)
 }
 
-fn check_git_command(workspace: &Path, work_tree: &Path) -> Command {
+pub(crate) fn check_git_command(workspace: &Path, work_tree: &Path) -> Command {
     let mut command = plain_git_command();
     command
         .arg("--git-dir")
@@ -1577,7 +1577,13 @@ pub(crate) fn prepare_check_workspace(
             bail!("candidate patch does not apply to the merged tree: {output}")
         }
     };
+    check_out(workspace, &tree_id)?;
+    Ok(tree_id)
+}
 
+/// Update the private checkout `workspace` to `tree`, already in its
+/// repository, and confirm that it holds exactly that tree.
+pub(crate) fn check_out(workspace: &Path, tree_id: &str) -> Result<()> {
     // Checks may change file times without changing bytes. Refresh the
     // checkout index's stat data so read-tree leaves those files in place.
     // A check may also edit tracked files; read-tree below resets those.
@@ -1585,7 +1591,7 @@ pub(crate) fn prepare_check_workspace(
     refresh.args(["update-index", "--refresh"]);
     let _ = run_git(refresh, None, "failed to refresh the check workspace index")?;
     let mut checkout = check_git_command(workspace, workspace);
-    checkout.args(["read-tree", "--reset", "-u", &tree_id]);
+    checkout.args(["read-tree", "--reset", "-u", tree_id]);
     checked_output(checkout, "failed to update the check workspace")?;
     let mut clean = check_git_command(workspace, workspace);
     clean.args(["clean", "-fd"]);
@@ -1613,7 +1619,7 @@ pub(crate) fn prepare_check_workspace(
             .is_empty(),
         "check workspace contains files outside the intended tree"
     );
-    Ok(tree_id)
+    Ok(())
 }
 
 /// The first parent of `relative` under `root` that is a symlink, if any.
