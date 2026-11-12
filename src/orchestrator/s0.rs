@@ -88,7 +88,7 @@ pub(crate) fn record_together(state: &State, runs: &[&RunRecord], message: &str)
 
 /// Attached Git Work still in progress, unowned by a live wrapper (whose
 /// watcher keeps the S0 it began with), and with a commit for S0.
-fn movable(run: &RunRecord) -> Option<&AttachmentRecord> {
+pub(super) fn movable(run: &RunRecord) -> Option<&AttachmentRecord> {
     let attachment = run.attachment.as_ref()?;
     let wrapped = attachment
         .owner
@@ -862,6 +862,46 @@ mod tests {
         let root = &project.root;
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "agent\n");
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "landed\n");
+    }
+
+    /// Work found stale against a landing, which it then merges, is checked
+    /// again against its new S0, though its Δ is the same bytes against
+    /// either and the source has not moved since.
+    #[tokio::test]
+    async fn stale_work_that_merges_the_landing_continues_though_its_delta_is_unchanged() {
+        let project = Project::new();
+        let lib = "pub fn scale(n: i32) -> i32 {\n    n * 2\n}\n";
+        fs::write(project.root.join("lib.rs"), lib).unwrap();
+        git(&project.root, &["add", "lib.rs"]);
+        git(&project.root, &["commit", "--quiet", "-m", "lib"]);
+        let workspace = project.worktree("agent");
+        let work = project.attach(&workspace);
+        let report = "pub fn report() -> i32 {\n    crate::scale(3)\n}\n";
+        fs::write(workspace.join("report.rs"), report).unwrap();
+        git(&workspace, &["add", "report.rs"]);
+        git(&workspace, &["commit", "--quiet", "-m", "report"]);
+        let changed = lib.replace("(n: i32)", "(n: i32, by: i32)");
+        project.land("landing", "lib.rs", &changed).await;
+        let stored = || {
+            let run = project.run(&work.id);
+            run.coherence.and_then(|c| c.validity).map(|v| v.decision)
+        };
+        let mut owner = project.owner();
+        owner.tick(&project.state);
+        assert_eq!(stored(), Some(Decision::Refresh));
+        let before = delta(&project.run(&work.id));
+
+        git(
+            &workspace,
+            &["merge", "--quiet", "--no-edit", source::SOURCE_REF],
+        );
+        let tick = owner.tick(&project.state);
+
+        assert!(tick.error.is_none(), "{:?}", tick.error);
+        let run = project.run(&work.id);
+        assert_eq!(run.baseline_history.len(), 1);
+        assert_eq!(delta(&run), before);
+        assert_eq!(stored(), Some(Decision::Continue));
     }
 
     #[tokio::test]

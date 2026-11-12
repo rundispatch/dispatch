@@ -267,7 +267,8 @@ pub(crate) fn deliver(state: &State, cwd: &Path, via: &str) -> Option<String> {
 }
 
 /// The ask to catch up pending for the workspace that holds `cwd`, claimed
-/// for delivery through `via` (`stop` or `wake`), found as notes are.
+/// for delivery through `via` (`stop`, `wake`, `verify` or `turn`), found as
+/// notes are.
 pub(crate) fn catch_up(state: &State, cwd: &Path, via: &str) -> Option<String> {
     catchup::claim(state, &workspace(cwd)?, via)
 }

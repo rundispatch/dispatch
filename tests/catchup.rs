@@ -1,10 +1,10 @@
 //! Catch-up in place, through `dispatch hook claude` as Claude Code runs it:
 //! the `Stop` hook that keeps a turn going with an ask, the waiter that wakes
-//! an idle session with one (`hook claude-wait`), and, end to end, two
-//! stand-in Claude Code sessions where one lands a change to a signature the
-//! other uses, which is asked once, merges, and continues. Payloads are the P0
-//! probes', paths replaced. Every waiter a test starts is killed when the test
-//! ends, however it ends.
+//! an idle session with one (`hook claude-wait`), and, end to end, a stand-in
+//! Claude Code session that lands a change to a signature a stand-in Claude
+//! Code or Hermes session uses, which is asked once, merges, and continues.
+//! Payloads are the P0 probes', paths replaced. Every waiter or stand-in
+//! process a test starts is killed when the test ends, however it ends.
 #![cfg(unix)]
 
 use std::{
@@ -73,6 +73,41 @@ fn stop(session: &str, cwd: &Path, active: bool, last: &str) -> String {
         ("background_tasks", serde_json::json!([])),
         ("session_crons", serde_json::json!([])),
     ])
+}
+
+/// `pre_verify` as Hermes Agent 0.18.2 sends it, in its order: the main
+/// checkout as `cwd`, the turn's `attempt`, then its final `response`.
+fn pre_verify(root: &Path, worktree: &Path, attempt: u64, response: &str) -> String {
+    let extra = payload(&[
+        ("platform", "cli".into()),
+        ("model", "gpt-6.1-sol".into()),
+        ("coding", false.into()),
+        ("attempt", attempt.into()),
+        ("final_response", response.into()),
+        (
+            "changed_paths",
+            serde_json::json!([worktree.join("src/report.rs")]),
+        ),
+        ("telemetry_schema_version", "hermes.observer.v1".into()),
+    ]);
+    let head = payload(&[
+        ("hook_event_name", "pre_verify".into()),
+        ("tool_name", Value::Null),
+        ("tool_input", Value::Null),
+        ("session_id", "20261109_203614_66344e".into()),
+        ("cwd", root.to_str().unwrap().into()),
+    ]);
+    format!("{}, \"extra\": {extra}}}", &head[..head.len() - 1])
+}
+
+/// A process the test started, killed when the test ends.
+struct Process(std::process::Child);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 struct Project {
@@ -179,6 +214,42 @@ impl Project {
             "" => Value::Null,
             reply => serde_json::from_str(reply).unwrap(),
         }
+    }
+
+    /// `dispatch hook hermes` with `input`, Hermes's worktree in
+    /// `TERMINAL_CWD`, and what it printed.
+    fn hermes(&self, input: &str, worktree: &Path) -> Value {
+        let mut child = self
+            .dispatch()
+            .args(["hook", "hermes"])
+            .env("TERMINAL_CWD", worktree)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output: Output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "" => Value::Null,
+            reply => serde_json::from_str(reply).unwrap(),
+        }
+    }
+
+    /// The Work in `workspace`, once there is one.
+    fn work_in(&self, workspace: &Path) -> Option<String> {
+        fs::read_dir(self.state.join("runs"))
+            .ok()?
+            .filter_map(|entry| fs::read(entry.ok()?.path().join("metadata.json")).ok())
+            .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .find(|run| run["attachment"]["workspace"].as_str() == workspace.to_str())
+            .map(|run| run["id"].as_str().unwrap().to_owned())
     }
 
     /// `dispatch hook claude-wait`, the waiter, after `Stop` in `cwd`.
@@ -644,6 +715,112 @@ fn a_live_agent_is_asked_once_to_catch_up_merges_and_its_work_continues() {
     let delivered = p.events(&b, "catchup.delivered");
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0]["via"], "stop");
+    assert_eq!(delivered[0]["landings"], serde_json::json!([a]));
+    assert_eq!(p.events(&b, "catchup.written").len(), 1, "once per landing");
+    assert!(p.events(&b, "catchup.expired").is_empty());
+}
+
+#[test]
+fn a_hermes_agent_is_asked_once_at_its_first_verify_merges_and_its_work_continues() {
+    let mut p = Project::new();
+    // As Hermes does before it makes a worktree.
+    fs::write(p.root.join(".gitignore"), ".claude/\n.worktrees/\n").unwrap();
+    git(&p.root, &["commit", "--quiet", "-am", "ignore worktrees"]);
+    let (wa, a) = p.session("a");
+    let changed = LIB.replace("scale(n: i32)", "scale(n: i32, by: i32)");
+    fs::write(wa.join("src/lib.rs"), changed.replace("n * 2", "n * by")).unwrap();
+    p.start_owner();
+
+    // B: `hermes chat --worktree` after watching began, its worktree locked
+    // by its process (a stand-in), where it adds a use of scale.
+    let hermes = Process(Command::new("sleep").arg("600").spawn().unwrap());
+    let worktree = ".worktrees/hermes-0a1b2c3d";
+    let branch = "hermes/hermes-0a1b2c3d";
+    git(
+        &p.root,
+        &["worktree", "add", "--quiet", "-b", branch, worktree],
+    );
+    let lock = format!("hermes pid={}", hermes.0.id());
+    git(&p.root, &["worktree", "lock", "--reason", &lock, worktree]);
+    let wb = fs::canonicalize(p.root.join(worktree)).unwrap();
+    until("the owner finds B", || p.work_in(&wb).is_some());
+    let b = p.work_in(&wb).unwrap();
+    let report = "pub fn report() -> i32 {\n    crate::scale(3)\n}\n";
+    fs::write(wb.join("src/report.rs"), report).unwrap();
+    until("the owner sees B use what A changes", || {
+        p.view().is_some_and(|view| {
+            view["edges"].as_array().unwrap().iter().any(|edge| {
+                edge["interactions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i["rule"] == "uses")
+            })
+        })
+    });
+    p.ok(&["finish", &a]);
+    until("the owner lists A's frozen patch", || p.lists_frozen(&a));
+    p.ok(&["accept", &a]);
+    until("B is asked", || !p.events(&b, "catchup.written").is_empty());
+
+    // A nudge after the turn's first is the person's: the ask waits. The
+    // first, however long the turn's final response, keeps it going, once.
+    let verify =
+        |attempt, response: &str| p.hermes(&pre_verify(&p.root, &wb, attempt, response), &wb);
+    assert_eq!(verify(1, "Done."), Value::Null);
+    let reply = verify(0, &"x".repeat(1024 * 1024));
+    assert_eq!(reply["action"], "continue", "{reply}");
+    let message = reply["message"].as_str().unwrap();
+    let lines: Vec<&str> = message.lines().collect();
+    assert_eq!(lines.len(), 4, "{message}");
+    assert_eq!(
+        lines[0],
+        format!(
+            "Dispatch: Work {} (Claude Code) landed a change this Work relies on.",
+            &a[..8]
+        )
+    );
+    assert_eq!(verify(1, "Merged."), Value::Null);
+    assert_eq!(verify(0, "Done."), Value::Null);
+    until("the ask is recorded as delivered", || {
+        !p.events(&b, "catchup.delivered").is_empty()
+    });
+    let status = p.ok(&["status", &b]);
+    let asked = format!("\nCatch-up\n  asked to catch up with {} at ", &a[..8]);
+    assert!(status.contains(&asked), "{status}");
+
+    // B does as asked: commits, merges the commit it was given, and updates
+    // its use of scale.
+    let given = lines[3]
+        .split_once("run git merge ")
+        .and_then(|(_, rest)| rest.split_once(','))
+        .map(|(commit, _)| commit)
+        .unwrap();
+    git(&wb, &["add", "-A"]);
+    git(&wb, &["commit", "--quiet", "-m", "report"]);
+    git(&wb, &["merge", "--quiet", "--no-edit", given]);
+    fs::write(
+        wb.join("src/report.rs"),
+        report.replace("scale(3)", "scale(3, 2)"),
+    )
+    .unwrap();
+    git(
+        &wb,
+        &["commit", "--quiet", "-am", "report with the new scale"],
+    );
+    until("B's S0 moved to the landing", || {
+        p.events(&b, "attach.s0_moved")
+            .iter()
+            .any(|moved| moved["landed_run"] == a.as_str())
+    });
+    until("B continues", || {
+        p.run(&b)["coherence"]["validity"]["decision"] == "continue"
+    });
+    assert!(!p.ok(&["status", &b]).contains("Catch-up"), "followed");
+    p.stop_owner();
+    let delivered = p.events(&b, "catchup.delivered");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["via"], "verify");
     assert_eq!(delivered[0]["landings"], serde_json::json!([a]));
     assert_eq!(p.events(&b, "catchup.written").len(), 1, "once per landing");
     assert!(p.events(&b, "catchup.expired").is_empty());

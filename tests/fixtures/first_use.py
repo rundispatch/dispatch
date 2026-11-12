@@ -274,6 +274,21 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         assert hermes_config.read_text().startswith(prefix)
         assert old_executable not in hermes_config.read_text()
         assert binary in hermes_config.read_text()
+        # 0.4.18's two hooks: Hermes's allowlist asks once more, for pre_verify.
+        current = hermes_config.read_text()
+        hermes_config.write_text(current[:current.index('  pre_verify:\n')])
+        with case.session('hermes-update-earlier') as ui:
+            ui.wait('Keep current checks')
+            ui.send('\r')
+            ui.wait('Hermes hook · Update')
+            ui.wait('The pre_verify hook is new')
+            ui.wait('Hermes asks you about it once more, the first time Hermes starts.')
+            ui.wait('2) Skip')
+            ui.wait('[2] >')
+            ui.send('1\r')
+            ui.wait('Hermes hook updated')
+            finish_setup(ui, 'Already watching')
+        assert hermes_config.read_text() == current
         assert_nothing_ran(case)
 
     # Canceling setup at checks writes nothing; canceling consent retains the

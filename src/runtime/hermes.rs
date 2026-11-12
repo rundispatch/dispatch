@@ -18,6 +18,13 @@
 //! `{"context": …}` reply is added to that turn's user message, which is how
 //! pending notes reach a Hermes agent. Its payload carries the whole
 //! conversation.
+//!
+//! `pre_verify` runs at the end of a turn that edited files, with the turn's
+//! `extra.attempt`, 0 the first time: a `{"action": "continue", "message":
+//! …}` reply keeps the turn going with the message, at most
+//! `agent.max_verify_nudges` times (3 by default). Its payload carries the
+//! turn's final response. An ask to catch up that no edited turn takes comes
+//! with the next turn's `pre_llm_call`.
 
 use std::{
     ffi::OsStr,
@@ -107,7 +114,8 @@ struct Input {
     extra: serde_json::Value,
 }
 
-/// `dispatch hook hermes`, with the hook's `TERMINAL_CWD`. Only the
+/// `dispatch hook hermes`, with the hook's `TERMINAL_CWD`. `pre_llm_call`
+/// and `pre_verify` deliver what waits for the worktree. Otherwise only the
 /// `shutdown` `on_session_finalize` of the process that locked a Hermes
 /// worktree of the payload's repository is acted on: the exact Δ is kept if
 /// Hermes is about to remove the worktree, the session's end recorded if it
@@ -116,34 +124,82 @@ struct Input {
 /// and the Δ the owner last saw is what remains.
 pub fn handle(state: &State, input: &[u8], terminal_cwd: Option<&OsStr>) -> Output {
     // From the payload's head alone, which names the event before its
-    // conversation, however long that has grown.
-    if super::head(input)
-        .get("hook_event_name")
-        .and_then(serde_json::Value::as_str)
-        == Some("pre_llm_call")
-    {
-        let notes =
-            terminal_cwd.and_then(|cwd| super::deliver(state, Path::new(cwd), "pre_llm_call"));
-        return Output {
-            stdout: notes.map_or_else(String::new, |notes| {
-                serde_json::json!({"context": notes}).to_string()
-            }),
-            stderr: String::new(),
-            code: 0,
-        };
-    }
-    let (stderr, code) = match finalize(state, input, terminal_cwd, parent_pid()) {
-        Ok(()) => (String::new(), 0),
-        Err(error) => (
-            format!("Dispatch could not keep this Hermes worktree's changes: {error:#}"),
-            1,
-        ),
+    // conversation or final response, however long that has grown.
+    let event = super::head(input).remove("hook_event_name");
+    let worktree = terminal_cwd.map(Path::new);
+    let reply = match event.as_ref().and_then(serde_json::Value::as_str) {
+        Some("pre_llm_call") => {
+            // An ask no edited turn took comes after the notes.
+            let notes = worktree.and_then(|cwd| super::deliver(state, cwd, "pre_llm_call"));
+            let ask = worktree.and_then(|cwd| super::catch_up(state, cwd, "turn"));
+            let context: Vec<String> = notes.into_iter().chain(ask).collect();
+            (!context.is_empty()).then(|| serde_json::json!({"context": context.join("\n")}))
+        }
+        // Only the turn's first verify: the nudges after it are the person's.
+        Some("pre_verify") if attempt(input) == Some(0) => worktree
+            .and_then(|cwd| super::catch_up(state, cwd, "verify"))
+            .map(|ask| serde_json::json!({"action": "continue", "message": ask})),
+        Some("pre_verify") => None,
+        _ => {
+            let (stderr, code) = match finalize(state, input, terminal_cwd, parent_pid()) {
+                Ok(()) => (String::new(), 0),
+                Err(error) => (
+                    format!("Dispatch could not keep this Hermes worktree's changes: {error:#}"),
+                    1,
+                ),
+            };
+            return Output {
+                stdout: String::new(),
+                stderr,
+                code,
+            };
+        }
     };
     Output {
-        stdout: String::new(),
-        stderr,
-        code,
+        stdout: reply.map_or_else(String::new, |reply| reply.to_string()),
+        stderr: String::new(),
+        code: 0,
     }
+}
+
+/// `extra.attempt` of a `pre_verify` payload, read without what follows it:
+/// Hermes sends it before the turn's final response, however long that is.
+fn attempt(input: &[u8]) -> Option<u64> {
+    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
+    /// The number at the path `.0` in the JSON object being read, put in
+    /// `.1`; the fields before each step are skipped, and reading stops there.
+    struct At<'a>(&'a [&'a str], &'a mut Option<u64>);
+    impl<'de> DeserializeSeed<'de> for At<'_> {
+        type Value = ();
+        fn deserialize<D: Deserializer<'de>>(self, input: D) -> Result<(), D::Error> {
+            if self.0.is_empty() {
+                *self.1 = Some(u64::deserialize(input)?);
+                return Ok(());
+            }
+            input.deserialize_map(self)
+        }
+    }
+    impl<'de> Visitor<'de> for At<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let (field, rest) = self.0.split_first().expect("a field to read");
+            while let Some(key) = map.next_key::<String>()? {
+                if key == *field {
+                    return map.next_value_seed(At(rest, self.1));
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut found = None;
+    let mut input = serde_json::Deserializer::from_slice(input);
+    // Stopping inside an object reads as an error once the field is read.
+    let _ = At(&["extra", "attempt"], &mut found).deserialize(&mut input);
+    found
 }
 
 fn finalize(
@@ -284,11 +340,19 @@ const MARKER: &str = "# Added by dispatch setup, which removes it unless it is e
 /// The hooks Dispatch installs, each with its timeout. `on_session_finalize`
 /// has Hermes's most, which covers the minute keeping a removed worktree's Δ
 /// may wait for its registration and the minute it may wait for the Work's
-/// lock; `pre_llm_call` only renames a file.
-const INSTALLED: &[(&str, u64)] = &[("on_session_finalize", 300), ("pre_llm_call", 5)];
+/// lock; `pre_llm_call` and `pre_verify` only rename files.
+const INSTALLED: &[(&str, u64)] = &[
+    ("on_session_finalize", 300),
+    ("pre_llm_call", 5),
+    ("pre_verify", 5),
+];
 
-/// The one hook 0.4.15 to 0.4.17 installed.
-const EARLIER: &[(&str, u64)] = &[("on_session_finalize", 300)];
+/// The hooks earlier Dispatches installed, the most first: 0.4.18's, and the
+/// one 0.4.15 to 0.4.17 installed.
+const EARLIER: &[&[(&str, u64)]] = &[
+    &[("on_session_finalize", 300), ("pre_llm_call", 5)],
+    &[("on_session_finalize", 300)],
+];
 
 /// The lines under `hooks:` that run `command` for each hook of `set`.
 fn entries(command: &str, set: &[(&str, u64)]) -> Result<String> {
@@ -350,7 +414,7 @@ pub fn as_written(path: &Path) -> Result<bool> {
 
 /// Dispatch's hooks in the configuration at `path`, by what Hermes reads
 /// there: exact when they are just the hooks Dispatch installs, earlier when
-/// they are just the one an earlier Dispatch did, each running one command
+/// they are just those an earlier Dispatch did, each running one command
 /// with nothing else in its entry, and changed for any other `… hook hermes`
 /// hook. Hermes rewriting the file in its own form changes none of that.
 pub fn hook(path: &Path) -> Result<Hook> {
@@ -389,13 +453,15 @@ fn found(text: &str, path: &Path) -> Result<Hook> {
         let hooks = parse(&format!("hooks:\n{}", entries(&command, set)?), path)?;
         Ok(hooks["hooks"] == ours)
     };
-    Ok(if written(INSTALLED)? {
-        Hook::Exact(command)
-    } else if written(EARLIER)? {
-        Hook::Earlier(command)
-    } else {
-        Hook::Changed
-    })
+    if written(INSTALLED)? {
+        return Ok(Hook::Exact(command));
+    }
+    for set in EARLIER {
+        if written(set)? {
+            return Ok(Hook::Earlier(command));
+        }
+    }
+    Ok(Hook::Changed)
 }
 
 /// Append Dispatch's hooks to the configuration at `path`, every byte of it
@@ -412,9 +478,9 @@ pub fn install(path: &Path, command: &str) -> Result<Option<PathBuf>> {
     write(path, existing.as_deref(), &text, command)
 }
 
-/// Make the block Dispatch previously appended, the current one or 0.4.15's,
-/// run `command` with the hooks Dispatch installs now. Edited blocks and
-/// hooks the person added by hand remain theirs to update.
+/// Make the block Dispatch previously appended, the current one or an
+/// earlier Dispatch's, run `command` with the hooks Dispatch installs now.
+/// Edited blocks and hooks the person added by hand remain theirs to update.
 pub fn update(path: &Path, command: &str) -> Result<Option<PathBuf>> {
     let existing = read(path)?.unwrap_or_default();
     let (range, _) = ours(&existing).with_context(|| {
@@ -428,9 +494,9 @@ pub fn update(path: &Path, command: &str) -> Result<Option<PathBuf>> {
     write(path, Some(&existing), &text, command)
 }
 
-/// Remove exactly the block Dispatch appended, the current one or 0.4.15's,
-/// from the configuration at `path`, refusing if it was edited. Returns the
-/// backup.
+/// Remove exactly the block Dispatch appended, the current one or an earlier
+/// Dispatch's, from the configuration at `path`, refusing if it was edited.
+/// Returns the backup.
 pub fn uninstall(path: &Path) -> Result<Option<PathBuf>> {
     let existing = read(path)?.unwrap_or_default();
     let (range, _) = ours(&existing).with_context(|| {
@@ -456,13 +522,16 @@ fn ours(text: &str) -> Option<(std::ops::Range<usize>, String)> {
     if !command.ends_with(" hook hermes") {
         return None;
     }
-    [INSTALLED, EARLIER].into_iter().find_map(|set| {
-        let block = block(&command, set).ok()?;
-        let end = start + block.len();
-        let after = text.get(end..)?;
-        (text[start..].starts_with(&block) && !after.starts_with([' ', '\t', '-']))
-            .then(|| (start..end, command.clone()))
-    })
+    // The most hooks first: a block with fewer hooks begins one with more.
+    std::iter::once(INSTALLED)
+        .chain(EARLIER.iter().copied())
+        .find_map(|set| {
+            let block = block(&command, set).ok()?;
+            let end = start + block.len();
+            let after = text.get(end..)?;
+            (text[start..].starts_with(&block) && !after.starts_with([' ', '\t', '-']))
+                .then(|| (start..end, command.clone()))
+        })
 }
 
 /// The configuration's text, `None` when there is no file.
@@ -616,6 +685,97 @@ mod tests {
         assert_eq!(liveness(child.id(), worktree), Liveness::Gone);
     }
 
+    /// `pre_verify` as Hermes Agent 0.18.2 sent it (P0), in its order, paths
+    /// replaced: the turn's `attempt`, then its final `response`.
+    fn pre_verify(attempt: u64, response: &str) -> Vec<u8> {
+        format!(
+            "{{\"hook_event_name\": \"pre_verify\", \"tool_name\": null, \"tool_input\": null, \
+             \"session_id\": \"20261109_203614_66344e\", \"cwd\": \"/r/repo\", \"extra\": \
+             {{\"platform\": \"cli\", \"model\": \"gpt-6.1-sol\", \"coding\": false, \
+             \"attempt\": {attempt}, \"final_response\": {}, \"changed_paths\": \
+             [\"/r/repo/.worktrees/hermes-c1f297f3/notes.txt\"], \
+             \"telemetry_schema_version\": \"hermes.observer.v1\"}}}}",
+            serde_json::Value::from(response)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_verifys_attempt_is_read_before_its_final_response_however_long() {
+        let recorded = pre_verify(0, "Created notes.txt containing the single line: hello.");
+        let parsed: serde_json::Value = serde_json::from_slice(&recorded).unwrap();
+        assert_eq!(parsed["extra"]["attempt"], 0);
+        assert_eq!(attempt(&recorded), Some(0));
+        assert_eq!(attempt(&pre_verify(1, "Added ASPEN-5.")), Some(1));
+        // Cut inside the response, as Dispatch's bounded read cuts a long one.
+        let long = pre_verify(0, &"x".repeat(1024 * 1024));
+        assert_eq!(attempt(&long[..super::super::MAX_INPUT_BYTES + 1]), Some(0));
+        for other in [
+            &b""[..],
+            b"not json",
+            b"{}",
+            br#"{"extra": null}"#,
+            br#"{"attempt": 0, "extra": {"platform": "cli"}}"#,
+            br#"{"extra": {"attempt": "0"}}"#,
+            br#"{"extra": {"attempt": -1}}"#,
+        ] {
+            assert_eq!(attempt(other), None, "{}", String::from_utf8_lossy(other));
+        }
+    }
+
+    const ASK: &str = "Dispatch: Work 01AAAAAA (Claude Code) landed a change this Work relies on.";
+
+    #[test]
+    fn an_ask_keeps_only_the_first_verify_of_an_edited_turn_going() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = State {
+            root: temp.path().join("state"),
+        };
+        state.initialize().unwrap();
+        let worktree = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("repo/.worktrees/hermes-c1f297f3");
+        fs::create_dir_all(worktree.join(".git")).unwrap();
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        let verify = |attempt, response: &str, cwd: Option<&Path>| {
+            let output = handle(
+                &state,
+                &pre_verify(attempt, response),
+                cwd.map(Path::as_os_str),
+            );
+            assert_eq!((output.stderr.as_str(), output.code), ("", 0));
+            output.stdout
+        };
+        let pending = crate::orchestrator::catchup::pending(&state, &worktree);
+        let delivered = pending.with_file_name("delivered");
+        fs::create_dir_all(&delivered).unwrap();
+        // Nothing waits: the turn ends as Hermes would end it.
+        assert_eq!(verify(0, "Done.", Some(&worktree)), "");
+        let ask = serde_json::json!({"version": 1, "run_id": "r", "landings": [], "text": ASK});
+        fs::write(&pending, ask.to_string()).unwrap();
+        // Hermes gives the worktree only in `TERMINAL_CWD`, and the nudges
+        // after a turn's first verify are the person's.
+        assert_eq!(verify(0, "Done.", None), "");
+        assert_eq!(verify(1, "Done.", Some(&worktree)), "");
+        assert!(pending.exists());
+        // The first, however long the turn's response: kept going, once.
+        let long = "x".repeat(1024 * 1024);
+        let reply = verify(0, &long, Some(&worktree.join("src")));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap(),
+            serde_json::json!({"action": "continue", "message": ASK})
+        );
+        assert_eq!(verify(0, "Done.", Some(&worktree)), "");
+        let taken: Vec<String> = fs::read_dir(&delivered)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            matches!(&taken[..], [one] if one.ends_with(".verify.json")),
+            "{taken:?}"
+        );
+    }
+
     const COMMAND: &str =
         "'/Applications/my \"apps\"/dispatch' --state-dir '/s/it'\\''s' hook hermes";
 
@@ -638,13 +798,18 @@ mod tests {
             // As Hermes reads it: one hook for each event, whose command
             // splits into this Dispatch's arguments.
             let config: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
-            for (event, timeout) in [("on_session_finalize", 300), ("pre_llm_call", 5)] {
+            let hooks = [
+                ("on_session_finalize", 300),
+                ("pre_llm_call", 5),
+                ("pre_verify", 5),
+            ];
+            for (event, timeout) in hooks {
                 let hooks = config["hooks"][event].as_sequence().unwrap();
                 assert_eq!(hooks.len(), 1);
                 assert_eq!(hooks[0]["command"].as_str(), Some(COMMAND));
                 assert_eq!(hooks[0]["timeout"].as_u64(), Some(timeout));
             }
-            assert_eq!(config["hooks"].as_mapping().unwrap().len(), 2);
+            assert_eq!(config["hooks"].as_mapping().unwrap().len(), 3);
             assert_eq!(
                 shell_words::split(COMMAND).unwrap(),
                 [
@@ -675,7 +840,9 @@ mod tests {
         let Addition::ByHand(lines) = addition(&path, COMMAND).unwrap() else {
             panic!("a hooks: key is changed by hand");
         };
-        assert!(lines.contains("on_session_finalize:") && lines.contains("pre_llm_call:"));
+        for event in ["on_session_finalize:", "pre_llm_call:", "pre_verify:"] {
+            assert!(lines.contains(event), "{lines}");
+        }
         assert!(install(&path, COMMAND).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
         // Added by hand as shown: Dispatch's hooks, but not its bytes to
@@ -747,24 +914,47 @@ mod tests {
     }
 
     #[test]
-    fn the_earlier_one_hook_block_is_updated_to_both_hooks_or_removed() {
+    fn every_earlier_dispatchs_block_is_updated_to_the_three_hooks_or_removed() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.yaml");
+        // 0.4.18's and 0.4.15 to 0.4.17's, as they wrote them.
+        let blocks = [
+            "\n# Added by dispatch setup, which removes it unless it is edited.\nhooks:\n  \
+             on_session_finalize:\n    - command: \"OLD\"\n      timeout: 300\n  \
+             pre_llm_call:\n    - command: \"OLD\"\n      timeout: 5\n",
+            "\n# Added by dispatch setup, which removes it unless it is edited.\nhooks:\n  \
+             on_session_finalize:\n    - command: \"OLD\"\n      timeout: 300\n",
+        ];
         let old = "'/old/dispatch' --state-dir '/s' hook hermes";
-        let earlier = format!("{THEIRS}{}", block(old, EARLIER).unwrap());
-        fs::write(&path, &earlier).unwrap();
-        assert_eq!(hook(&path).unwrap(), Hook::Earlier(old.into()));
-        assert!(as_written(&path).unwrap());
-        update(&path, COMMAND).unwrap().unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            text,
-            format!("{THEIRS}{}", block(COMMAND, INSTALLED).unwrap())
-        );
-        assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
-        fs::write(&path, &earlier).unwrap();
-        uninstall(&path).unwrap().unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), THEIRS);
+        for written in blocks {
+            for (theirs, after) in [(THEIRS, ""), ("model: x\n", "display:\n  skin: x\n")] {
+                let earlier = format!("{theirs}{}{after}", written.replace("OLD", old));
+                fs::write(&path, &earlier).unwrap();
+                assert_eq!(hook(&path).unwrap(), Hook::Earlier(old.into()));
+                assert!(as_written(&path).unwrap());
+                update(&path, COMMAND).unwrap().unwrap();
+                let installed = block(COMMAND, INSTALLED).unwrap();
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    format!("{theirs}{installed}{after}")
+                );
+                assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
+                // Removed from the earlier block, and from the updated one.
+                fs::write(&path, &earlier).unwrap();
+                uninstall(&path).unwrap().unwrap();
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    format!("{theirs}{after}")
+                );
+                update(&path, COMMAND).unwrap_err();
+                install(&path, COMMAND).unwrap().unwrap();
+                uninstall(&path).unwrap().unwrap();
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    format!("{theirs}{after}")
+                );
+            }
+        }
     }
 
     /// The user's configuration after `hermes config set` (2026-11-04),
@@ -784,12 +974,17 @@ hooks:
     const USERS: &str =
         "'/Users/u/.local/bin/dispatch' --state-dir '/Users/u/.dispatch' hook hermes";
 
-    /// `pre_llm_call` as Hermes's dumper would write it, with `timeout`.
-    fn pre_llm_call(timeout: u64) -> String {
+    /// Dispatch's `event` hook as Hermes's dumper would write it, with
+    /// `timeout`.
+    fn dumped(event: &str, timeout: u64) -> String {
         format!(
-            "  pre_llm_call:\n  - command: '{}'\n    timeout: {timeout}\n",
+            "  {event}:\n  - command: '{}'\n    timeout: {timeout}\n",
             USERS.replace('\'', "''")
         )
+    }
+
+    fn pre_llm_call(timeout: u64) -> String {
+        dumped("pre_llm_call", timeout)
     }
 
     #[test]
@@ -808,13 +1003,25 @@ hooks:
         assert_eq!(fs::read_to_string(&path).unwrap(), REWRITTEN);
         let shown: serde_yaml::Value =
             serde_yaml::from_str(&format!("hooks:\n{}", wanted(USERS).unwrap())).unwrap();
-        // Added by hand, in Hermes's form: exactly Dispatch's hooks.
+        // 0.4.18's hooks, added by hand in Hermes's form, are an earlier
+        // Dispatch's; with `pre_verify` too, exactly Dispatch's hooks.
         let added = format!("{REWRITTEN}{}", pre_llm_call(5));
+        fs::write(&path, &added).unwrap();
+        assert_eq!(hook(&path).unwrap(), Hook::Earlier(USERS.into()));
+        let added = format!("{added}{}", dumped("pre_verify", 5));
         fs::write(&path, &added).unwrap();
         assert_eq!(hook(&path).unwrap(), Hook::Exact(USERS.into()));
         let config: serde_yaml::Value = serde_yaml::from_str(&added).unwrap();
         assert_eq!(config["hooks"], shown["hooks"]);
         assert_eq!(config["agent"]["reasoning_effort"], "xhigh");
+        // The person's own hooks beside them are theirs, and change nothing.
+        let theirs = "  - command: afplay done.aiff\n    timeout: 2\n";
+        let beside = added.replace("    timeout: 300\n", &format!("    timeout: 300\n{theirs}"));
+        let beside = format!("{beside}  on_session_start:\n{theirs}");
+        fs::write(&path, &beside).unwrap();
+        assert_eq!(hook(&path).unwrap(), Hook::Exact(USERS.into()));
+        assert!(update(&path, USERS).is_err() && uninstall(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), beside);
         // Removed by hand.
         let removed = &REWRITTEN[..REWRITTEN.find("hooks:").unwrap()];
         fs::write(&path, removed).unwrap();

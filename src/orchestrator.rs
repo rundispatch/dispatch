@@ -1001,7 +1001,8 @@ fn print_review_commands(state: &State, run: &RunRecord, validity: Option<&crate
     println!("Review\n  dispatch diff {}\n", run.id);
     if awaits_review(run) {
         let decision = validity.map_or(Decision::Continue, |validity| validity.decision);
-        let (step, alternative) = next_step(run, decision, newest_source(state, run).as_ref());
+        let (step, alternative) =
+            next_step(run, decision, newest_source(state, run).as_ref(), None);
         println!("Then\n  {step}");
         if let Some(alternative) = alternative {
             println!("  {alternative}");
@@ -1014,17 +1015,26 @@ fn print_review_commands(state: &State, run: &RunRecord, validity: Option<&crate
 /// closed. A REFRESH is redone: a native run by `dispatch refresh`, attached
 /// Work whose session can go on in its worktree by merging the newest source
 /// recorded at its project (`source`) there (`resume_step`), and any other
-/// attached Work by running its agent again. Each names the Work; `watch`
-/// shows the same step.
+/// attached Work by running its agent again. Work in progress whose agent
+/// was `asked` to catch up waits for its S0 to move, which the project owner
+/// follows and checks. Each names the Work; `watch` shows the same step.
 pub(crate) fn next_step(
     run: &RunRecord,
     decision: Decision,
     source: Option<&s0::Recorded>,
+    asked: Option<&catchup::Asked>,
 ) -> (String, Option<String>) {
     let id = &run.id;
     let reject = Some(format!("dispatch reject {id}"));
     match decision {
         Decision::Continue => (format!("dispatch accept {id}"), reject),
+        Decision::Refresh if let Some(asked) = asked => (
+            format!(
+                "its agent was asked to merge {}; once its S0 moves, Dispatch checks it again",
+                asked.commit
+            ),
+            None,
+        ),
         Decision::Refresh if run.mode == RunMode::Attached => match resume_step(run, source) {
             Some(step) => (step, reject),
             None => (
@@ -1826,6 +1836,9 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     }
     if let Some(mark) = attach::waiting_on_you(&run) {
         println!("\n{}", attach::waiting_detail(mark));
+    }
+    if let Some(asked) = catchup::asked(state, &run) {
+        println!("\nCatch-up\n  {}", asked.line());
     }
     if let Some(attachment) = &run.attachment {
         println!("\nWorkspace");
@@ -2748,10 +2761,23 @@ fn print_check(
             patch.display(),
             run.id
         );
+        if validity.decision == Decision::Refresh
+            && let Some(asked) = catchup::asked(state, run)
+        {
+            println!(
+                "Next: {}",
+                next_step(run, validity.decision, None, Some(&asked)).0
+            );
+        }
         return;
     }
     println!("At accept: {}", accept_scope(state, run, validity));
-    match next_step(run, validity.decision, newest_source(state, run).as_ref()) {
+    match next_step(
+        run,
+        validity.decision,
+        newest_source(state, run).as_ref(),
+        None,
+    ) {
         (step, Some(alternative)) => println!("Next: {step}  (or {alternative})"),
         (step, None) => println!("Next: {step}"),
     }
@@ -4301,12 +4327,12 @@ mod tests {
             workspace.display()
         );
         let run = resumable(&workspace);
-        let step = next_step(&run, Decision::Refresh, Some(&after));
+        let step = next_step(&run, Decision::Refresh, Some(&after), None);
         assert_eq!(step, (resume, reject.clone()));
         assert!(!step.0.contains("refs/dispatch/source"), "{}", step.0);
 
         // Anything else it can't do takes it back to running its agent again.
-        let refresh = |run: &RunRecord, source| next_step(run, Decision::Refresh, source);
+        let refresh = |run: &RunRecord, source| next_step(run, Decision::Refresh, source, None);
         assert_eq!(refresh(&run, None), (rerun.to_owned(), reject.clone()));
         assert_eq!(
             refresh(&run, Some(&before)).0,
@@ -4368,11 +4394,11 @@ mod tests {
             ("dispatch refresh 01WORK".to_owned(), reject.clone())
         );
         assert_eq!(
-            next_step(&run, Decision::Continue, Some(&after)),
+            next_step(&run, Decision::Continue, Some(&after), None),
             ("dispatch accept 01WORK".to_owned(), reject)
         );
         assert_eq!(
-            next_step(&run, Decision::Stop, Some(&after)),
+            next_step(&run, Decision::Stop, Some(&after), None),
             (
                 "dispatch close 01WORK --reason already-present".to_owned(),
                 None

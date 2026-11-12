@@ -593,8 +593,9 @@ pub(crate) struct Owner {
     root: PathBuf,
     kind: SourceKind,
     last_signal: Option<world::Signal>,
-    /// Each followed run's work signal when it was last evaluated.
-    work: HashMap<String, String>,
+    /// Each followed run's S0 and work signal when it was last evaluated:
+    /// Δ against the S0 it moved to may be the same bytes as before.
+    work: HashMap<String, (String, String)>,
     /// Each Work's workspace HEAD when its S0 was last looked at.
     heads: HashMap<String, String>,
     /// Each Ready result's world signal when it was last checked.
@@ -1167,8 +1168,10 @@ impl Owner {
         // are followed side by side.
         let started = Instant::now();
         let captured = side_by_side(&pending, |(candidate, workspace, scratch)| {
-            follow(&candidate.baseline_path, workspace, scratch)
-                .and_then(|_| Ok(hex::encode(Sha256::digest(fs::read(scratch)?))))
+            follow(&candidate.baseline_path, workspace, scratch).and_then(|_| {
+                let delta = hex::encode(Sha256::digest(fs::read(scratch)?));
+                Ok((candidate.baseline_commit.clone(), delta))
+            })
         });
         tick.cost.follow += started.elapsed();
         tick.cost.followed += pending.len();

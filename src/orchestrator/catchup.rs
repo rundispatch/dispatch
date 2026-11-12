@@ -8,9 +8,10 @@
 //!
 //! - **The trigger**, each tick of the project owner: a landing recorded at
 //!   the project (`s0::recorded`) whose `interaction.landed` was observed with
-//!   live Claude Code Work as a counterpart that uses a declaration whose
-//!   signature the landing changed or which it removed, or that changes the
-//!   same declaration. A whole-file or textual interaction never asks.
+//!   live Claude Code or Hermes Work as a counterpart that uses a declaration
+//!   whose signature the landing changed or which it removed, or that changes
+//!   the same declaration. A whole-file or textual interaction never asks, nor
+//!   is Work whose S0 a merge would not move: a live wrapper keeps its S0.
 //! - **The record**, `catchup/work/<key>.json`, kept while the Work is in
 //!   progress: the landings it was asked about. A landing is put there before
 //!   its ask is written, so a crash asks at most once. That the record exists
@@ -39,7 +40,7 @@ use ulid::Ulid;
 
 use super::{inbox, notify, s0};
 use crate::{
-    LifecycleState, RunRecord,
+    EventRecord, LifecycleState, RunRecord,
     coherence::{
         interactions::{Change, Interaction, Rule, Side, Target},
         measure,
@@ -57,7 +58,7 @@ pub const EXPIRED: &str = "catchup.expired";
 const DIRECTORY: &str = "catchup";
 
 /// The runtimes whose hooks deliver an ask, as sessions name them.
-const ASKED: [&str; 1] = ["claude"];
+const ASKED: [&str; 2] = ["claude", "hermes"];
 
 /// The most targets an ask lists; the rest are counted.
 const TARGETS: usize = 4;
@@ -530,23 +531,90 @@ fn in_progress(run: &RunRecord) -> bool {
     run.outcome.lifecycle == LifecycleState::Working && run.outcome.closed.is_none()
 }
 
-/// Work in progress in a workspace still there, where a session of a runtime
-/// whose hooks deliver an ask has not ended.
+/// Work whose S0 follows the merge it would be asked to make (`s0::movable`:
+/// in progress, and no live wrapper keeps the S0 it began with), in a
+/// workspace still there, where a session of a runtime whose hooks deliver an
+/// ask has not ended.
 fn live(run: &RunRecord) -> bool {
-    in_progress(run)
-        && run.attachment.as_ref().is_some_and(|attachment| {
-            attachment.workspace_removed.is_none()
-                && attachment.workspace.is_dir()
-                && attachment.sessions.iter().any(|session| {
-                    ASKED.contains(&session.provider.as_str()) && session.ended_at.is_none()
-                })
+    s0::movable(run).is_some_and(|attachment| {
+        attachment.workspace.is_dir()
+            && attachment.sessions.iter().any(|session| {
+                ASKED.contains(&session.provider.as_str()) && session.ended_at.is_none()
+            })
+    })
+}
+
+/// What the agent of Work in progress was asked to catch up with that its S0
+/// has not followed yet: the landings delivered asks named that were recorded
+/// after its S0, the newest one's commit, and when the last ask naming them
+/// was delivered.
+pub(crate) struct Asked {
+    landings: Vec<String>,
+    pub(crate) commit: String,
+    at: DateTime<Utc>,
+}
+
+impl Asked {
+    /// As status and watch show it.
+    pub(crate) fn line(&self) -> String {
+        let ids: Vec<&str> = self.landings.iter().map(String::as_str).collect();
+        let short = crate::state::short_ids(&ids);
+        let named: Vec<&str> = ids.iter().map(|id| short[id]).collect();
+        format!(
+            "asked to catch up with {} at {}",
+            named.join(" and "),
+            self.at.format("%Y-%m-%d %H:%M UTC")
+        )
+    }
+}
+
+/// `run`'s ask, from its `catchup.delivered` events and the sources recorded
+/// at its project; `None` when there is none, or it cannot be read.
+pub(crate) fn asked(state: &State, run: &RunRecord) -> Option<Asked> {
+    if !in_progress(run) {
+        return None;
+    }
+    let (_, since) = run.s0_commit()?;
+    let db = Database::open_read_only(state.db_path()).ok()?;
+    let events = db.events_for_run(&run.id).ok()?;
+    let delivered: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == DELIVERED)
+        .collect();
+    if delivered.is_empty() {
+        return None;
+    }
+    let names = |event: &EventRecord, id: &str| {
+        let landings = event.payload["landings"].as_array();
+        landings.is_some_and(|ids| ids.iter().any(|named| named.as_str() == Some(id)))
+    };
+    // Oldest first, so the last holds the others.
+    let open: Vec<s0::Recorded> = s0::recorded(state, &run.source_path)
+        .ok()?
+        .into_iter()
+        .filter(|source| source.at > since)
+        .filter(|source| {
+            delivered
+                .iter()
+                .any(|event| names(event, &source.landed_run))
         })
+        .collect();
+    let at = delivered
+        .iter()
+        .filter(|event| open.iter().any(|source| names(event, &source.landed_run)))
+        .map(|event| event.timestamp)
+        .max()?;
+    Some(Asked {
+        commit: open.last()?.commit.clone(),
+        landings: open.into_iter().map(|source| source.landed_run).collect(),
+        at,
+    })
 }
 
 /// The hook's side: take the ask pending for `workspace`, a canonical path,
-/// for delivery through `via` (`stop` or `wake`), and return its text; `None`
-/// when there is none. The rename is the claim, so an ask reaches the agent
-/// once however many hooks race for it.
+/// for delivery through `via` (`stop`, `wake`, `verify` or `turn`), and
+/// return its text; `None` when there is none. The rename is the claim, so an
+/// ask reaches the agent once however many hooks race for it.
 pub(crate) fn claim(state: &State, workspace: &Path, via: &str) -> Option<String> {
     let pending = pending(state, workspace);
     let taken = pending
@@ -590,7 +658,10 @@ mod tests {
     use crate::{
         CloseReason, RuntimeSession,
         coherence::measure::LANDED,
-        orchestrator::attach::{self, AttachRequest, RuntimeStart},
+        orchestrator::{
+            attach::{self, AttachRequest, RuntimeStart},
+            registration,
+        },
         source,
     };
 
@@ -666,6 +737,57 @@ mod tests {
                         discovered: false,
                         reopens: None,
                     }),
+                },
+            )
+            .unwrap()
+        }
+
+        /// Hermes Work in `.worktrees/hermes-<id>`, as the owner's discovery
+        /// registers a `hermes chat --worktree` session.
+        fn hermes(&self, id: &str) -> RunRecord {
+            let name = format!("hermes-{id}");
+            let workspace = self.root.join(".worktrees").join(&name);
+            let path = workspace.to_str().unwrap();
+            let branch = format!("hermes/{name}");
+            git(
+                &self.root,
+                &["worktree", "add", "--quiet", "-b", &branch, path],
+            );
+            let session = RuntimeSession {
+                provider: "hermes".into(),
+                session_id: name,
+                source: "discovered".into(),
+                started_at: Utc::now(),
+                ended_at: None,
+                end_reason: None,
+                model: None,
+            };
+            let found =
+                registration::discovered(&self.state, &self.root, &workspace, session, None);
+            self.state.load_run(&found.unwrap().unwrap()).unwrap()
+        }
+
+        /// Work a wrapped agent runs in a new worktree: `dispatch attach --
+        /// <agent>`, whose wrapper is this process.
+        fn wrapped(&self, name: &str, agent: &str) -> RunRecord {
+            let workspace = self.root.with_file_name(name);
+            let path = workspace.to_str().unwrap();
+            git(
+                &self.root,
+                &["worktree", "add", "--quiet", "-b", name, path],
+            );
+            attach::create(
+                &self.state,
+                AttachRequest {
+                    workspace,
+                    root: Some(self.root.clone()),
+                    task: None,
+                    agent: Some(agent.into()),
+                    pid: None,
+                    command: Some(vec![agent.into(), "chat".into()]),
+                    allow_unsafe_local: true,
+                    auto_apply: false,
+                    runtime: None,
                 },
             )
             .unwrap()
@@ -1008,12 +1130,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_live_claude_work_an_observed_landing_breaks_is_asked() {
+    async fn only_live_hooked_work_an_observed_landing_breaks_is_asked() {
         let mut p = Project::new();
         let a = p.work("a", "claude");
         let reader = p.work("reader", "claude");
         let writer = p.work("writer", "claude");
-        let hermes = p.work("hermes", "hermes");
+        let hermes = p.hermes("0a1b2c3d");
         let ended = p.work("ended", "claude");
         attach::record_session_end(
             &p.state,
@@ -1025,6 +1147,20 @@ mod tests {
             std::time::Duration::ZERO,
         )
         .unwrap();
+        // Hermes's session ended and its worktree kept, or the worktree
+        // removed with the session.
+        let (shut, removed) = (p.hermes("1b2c3d4e"), p.hermes("2c3d4e5f"));
+        attach::record_session_end(
+            &p.state,
+            &shut.id,
+            "hermes",
+            "hermes-1b2c3d4e",
+            "shutdown",
+            Utc::now(),
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        fs::remove_dir_all(workspace(&removed)).unwrap();
         let changed = LIB.replace("total(n: i32)", "total(n: i32, by: i32)");
         let theirs = Some(Change::Signature);
         let reverse = interaction(Rule::Uses, Some(Side::B), symbol("total"), theirs);
@@ -1037,14 +1173,27 @@ mod tests {
             (&writer, vec![reverse, whole]),
             (&hermes, vec![breaks_use_of("total")]),
             (&ended, vec![breaks_use_of("total")]),
+            (&shut, vec![breaks_use_of("total")]),
+            (&removed, vec![breaks_use_of("total")]),
         ];
         p.land(&a, &changed, "observed", &breaks).await;
         p.step();
         assert!(p.hook(&reader).is_some());
-        for run in [&writer, &hermes, &ended] {
+        assert!(followed(&p.state, workspace(&hermes)));
+        let ask = claim(&p.state, workspace(&hermes), "verify").expect("Hermes is asked");
+        assert!(
+            ask.contains("- total (src/lib.rs), which this Work uses: "),
+            "{ask}"
+        );
+        for run in [&writer, &ended, &shut, &removed] {
             assert_eq!(p.hook(run), None, "{}", workspace(run).display());
             assert!(p.events(run, WRITTEN).is_empty());
         }
+        p.step();
+        let delivered = p.events(&hermes, DELIVERED);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0]["via"], "verify");
+        assert_eq!(delivered[0]["landings"], serde_json::json!([a.id]));
 
         // A landing the owner's view did not see as it was applied asks
         // nothing.
@@ -1079,6 +1228,94 @@ mod tests {
         assert_eq!(expired[0]["why"], "s0_moved");
         assert_eq!(expired[0]["landings"], serde_json::json!([a.id]));
         assert!(followed(&p.state, workspace(&b)), "still in progress");
+    }
+
+    #[tokio::test]
+    async fn work_whose_wrapper_keeps_its_s0_is_never_asked() {
+        let mut p = Project::new();
+        let (a, hooked) = (p.work("a", "claude"), p.work("hooked", "claude"));
+        // `dispatch attach -- claude`: Claude Code's SessionStart joins the
+        // wrapped Work, whose wrapper is this process.
+        let wrapped = p.wrapped("wrapped", "claude");
+        let session = RuntimeSession {
+            provider: "claude".into(),
+            session_id: "wrapped".into(),
+            source: "startup".into(),
+            started_at: Utc::now(),
+            ended_at: None,
+            end_reason: None,
+            model: None,
+        };
+        let wait = std::time::Duration::ZERO;
+        assert!(attach::record_session_start(&p.state, &wrapped.id, session, wait).unwrap());
+        // No Hermes hook gives wrapped Work a session at all.
+        let hermes = p.wrapped("hermes", "hermes");
+        let changed = LIB.replace("total(n: i32)", "total(n: i32, by: i32)");
+        let breaks = [
+            (&hooked, vec![breaks_use_of("total")]),
+            (&wrapped, vec![breaks_use_of("total")]),
+            (&hermes, vec![breaks_use_of("total")]),
+        ];
+        p.land(&a, &changed, "observed", &breaks).await;
+        p.step();
+        assert!(p.hook(&hooked).is_some());
+        // Its merge would fold the landing into its Δ, not move its S0.
+        for run in [&wrapped, &hermes] {
+            assert!(!followed(&p.state, workspace(run)), "no waiter waits there");
+            assert_eq!(p.hook(run), None, "{}", workspace(run).display());
+            assert!(p.events(run, WRITTEN).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn work_reads_as_asked_from_its_delivery_until_its_s0_follows() {
+        let mut p = Project::new();
+        let (a, b) = (p.work("a", "claude"), p.hermes("0a1b2c3d"));
+        let changed = LIB.replace("total(n: i32)", "total(n: i32, by: i32)");
+        let breaks = [(&b, vec![breaks_use_of("total")])];
+        p.land(&a, &changed, "observed", &breaks).await;
+        p.step();
+        let b = p.state.load_run(&b.id).unwrap();
+        assert!(asked(&p.state, &b).is_none(), "written, not delivered");
+        claim(&p.state, workspace(&b), "turn").unwrap();
+        p.step();
+        let delivered = Database::open(p.state.db_path())
+            .unwrap()
+            .events_for_run(&b.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == DELIVERED)
+            .unwrap();
+        let recorded = s0::recorded(&p.state, &p.root).unwrap()[0].commit.clone();
+        let b = p.state.load_run(&b.id).unwrap();
+        let found = asked(&p.state, &b).expect("asked");
+        assert_eq!(
+            found.line(),
+            format!(
+                "asked to catch up with {} at {}",
+                &a.id[..8],
+                delivered.timestamp.format("%Y-%m-%d %H:%M UTC")
+            )
+        );
+        assert_eq!(found.commit, recorded);
+        // Its REFRESH step waits for its S0, which Dispatch follows.
+        let step = |asked| super::super::next_step(&b, crate::Decision::Refresh, None, asked);
+        let waits = format!(
+            "its agent was asked to merge {recorded}; once its S0 moves, Dispatch checks it again"
+        );
+        assert_eq!(step(Some(&found)), (waits, None));
+        assert!(step(None).0.starts_with("run your agent again"));
+        // Finished, it has nothing left to follow.
+        let mut finished = b.clone();
+        finished.outcome.lifecycle = LifecycleState::Finished;
+        assert!(asked(&p.state, &finished).is_none());
+
+        git(workspace(&b), &["merge", "--quiet", "--no-edit", &recorded]);
+        let mut runs = p.runs();
+        let (moved, errors) = s0::follow(&p.state, &p.root, &mut runs, &mut HashMap::new());
+        assert!(moved && errors.is_empty(), "{errors:?}");
+        let b = p.state.load_run(&b.id).unwrap();
+        assert!(asked(&p.state, &b).is_none(), "its S0 followed");
     }
 
     #[tokio::test]

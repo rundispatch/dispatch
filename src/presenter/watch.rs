@@ -127,6 +127,9 @@ struct Context<'a> {
     /// `agent running (pid N)` for Work whose recorded agent process is
     /// alive (`orchestrator::agent_running`).
     running: &'a HashMap<String, String>,
+    /// What REFRESH Work's agent was asked to catch up with
+    /// (`catchup::asked`).
+    asked: &'a HashMap<String, String>,
     /// The newest source recorded at the project, for a REFRESH's step.
     source: Option<&'a orchestrator::s0::Recorded>,
 }
@@ -272,6 +275,7 @@ fn item(
                             reasons.len() - 3
                         ));
                     }
+                    lines.extend(context.asked.get(&run.id).cloned());
                     lines
                 }
                 "STOP" => vec!["STOP · its changes are already in the source".to_owned()],
@@ -540,7 +544,7 @@ fn next(
         "rejected" | "closed" | "finished" => ("Nothing to do.".into(), vec![]),
         // Ready, or blocked: what accepting it would do.
         _ if verdict == "REFRESH" => {
-            let (step, _) = orchestrator::next_step(run, Decision::Refresh, context.source);
+            let (step, _) = orchestrator::next_step(run, Decision::Refresh, context.source, None);
             (
                 format!("It can't be accepted as is: {step}. Or r reject it."),
                 vec![REJECT, REVIEW],
@@ -927,6 +931,17 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                     Some((run.id.clone(), running))
                 })
                 .collect();
+            let asked = runs
+                .iter()
+                .filter(|run| {
+                    let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+                    validity.is_some_and(|validity| validity.decision == Decision::Refresh)
+                })
+                .filter_map(|run| {
+                    let asked = orchestrator::catchup::asked(state, run)?;
+                    Some((run.id.clone(), asked.line()))
+                })
+                .collect();
             found = serve::untracked(
                 &orchestrator::discovery::Inventory::load(state, &root),
                 &runs,
@@ -944,6 +959,7 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                     checks: &checks,
                     live: live.as_ref(),
                     running: &running,
+                    asked: &asked,
                     source: source.as_ref(),
                 },
             );
@@ -2118,6 +2134,7 @@ mod tests {
                 checks: &checks,
                 live,
                 running,
+                asked: &HashMap::new(),
                 source: None,
             },
         )
@@ -2449,6 +2466,7 @@ mod tests {
                 checks: &checks,
                 live: None,
                 running: &HashMap::new(),
+                asked: &HashMap::new(),
                 source: None,
             },
         )
@@ -2504,11 +2522,12 @@ mod tests {
                     checks: &checks,
                     live: None,
                     running: &HashMap::new(),
+                    asked: &HashMap::new(),
                     source: Some(&source),
                 },
             )
             .remove(0);
-            let (step, _) = orchestrator::next_step(&run, Decision::Refresh, Some(&source));
+            let (step, _) = orchestrator::next_step(&run, Decision::Refresh, Some(&source), None);
             assert!(step.starts_with(starts), "{step}");
             assert_eq!(
                 item.next,
@@ -2824,6 +2843,41 @@ mod tests {
                 .starts_with("discovered claude · S0 commit 2216f677 (moved from e4a15cd9) · "),
             "{line}"
         );
+    }
+
+    #[test]
+    fn work_asked_to_catch_up_says_so_under_its_refresh() {
+        let id = "01M4DRXH00000000000000000B";
+        let mut advisory = working(worktree(id, "me-endpoint", 1));
+        judge(&mut advisory, Decision::Refresh, true, &[REASON]);
+        let line = "asked to catch up with 01M4AAAA at 2026-11-11 14:05 UTC";
+        let asked = HashMap::from([(id.to_owned(), line.to_owned())]);
+        let build = |asked: &HashMap<String, String>| {
+            build(
+                std::slice::from_ref(&advisory),
+                &Context {
+                    root: Path::new(ROOT),
+                    home: None,
+                    watched: true,
+                    projection: None,
+                    checks: &HashMap::new(),
+                    live: None,
+                    running: &HashMap::new(),
+                    asked,
+                    source: None,
+                },
+            )
+            .remove(0)
+        };
+        assert_eq!(
+            lines(&build(&asked), "Verdict"),
+            [
+                format!("REFRESH · {REASON}"),
+                line.into(),
+                "Advisory while the agent works: nothing is stopped.".into(),
+            ]
+        );
+        assert!(!lines(&build(&HashMap::new()), "Verdict").contains(&line.to_owned()));
     }
 
     #[test]
@@ -3606,6 +3660,7 @@ mod tests {
                     checks: &checks,
                     live: None,
                     running: &HashMap::new(),
+                    asked: &HashMap::new(),
                     source: None,
                 },
             );
