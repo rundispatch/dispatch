@@ -2063,6 +2063,7 @@ mod tests {
             provenance: BaselineProvenance::WorkspaceAtStart {
                 commit: "e4a15cd9ffffffff".into(),
             },
+            s0_since: None,
             confidence: AttachConfidence::Full,
             agent: Some("claude".into()),
             command: None,

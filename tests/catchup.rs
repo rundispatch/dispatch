@@ -369,6 +369,17 @@ impl Project {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
+    /// The commit of the project's `landing`th recorded source, oldest first.
+    fn recorded(&self, landing: usize) -> String {
+        let sources = self
+            .state
+            .join("projects")
+            .join(key(&self.root))
+            .join("sources.json");
+        let sources: Value = serde_json::from_slice(&fs::read(sources).unwrap()).unwrap();
+        sources[landing]["commit"].as_str().unwrap().to_owned()
+    }
+
     /// The owner's interaction view, once it has written one.
     fn view(&self) -> Option<Value> {
         fs::read_dir(self.state.join("watchers"))
@@ -843,22 +854,13 @@ fn a_stale_result_is_resumed_in_its_worktree_merges_and_continues() {
     fs::write(wb.join("src/report.rs"), report).unwrap();
     fs::write(wc.join("src/notes.rs"), "pub const NOTE: i32 = 1;\n").unwrap();
     p.start_owner();
-    let recorded = |landing: usize| {
-        let sources = p
-            .state
-            .join("projects")
-            .join(key(&p.root))
-            .join("sources.json");
-        let sources: Value = serde_json::from_slice(&fs::read(sources).unwrap()).unwrap();
-        sources[landing]["commit"].as_str().unwrap().to_owned()
-    };
 
     // C lands first, and B merges it: B's S0 moves once.
     p.ok(&["finish", &c]);
     p.ok(&["accept", &c]);
     git(&wb, &["add", "-A"]);
     git(&wb, &["commit", "--quiet", "-m", "report"]);
-    git(&wb, &["merge", "--quiet", "--no-edit", &recorded(0)]);
+    git(&wb, &["merge", "--quiet", "--no-edit", &p.recorded(0)]);
     until("B's S0 moved to C's landing", || {
         p.events(&b, "attach.s0_moved")
             .iter()
@@ -867,8 +869,95 @@ fn a_stale_result_is_resumed_in_its_worktree_merges_and_continues() {
     // Then A lands a change to scale's signature, which B uses.
     p.ok(&["finish", &a]);
     p.ok(&["accept", &a]);
+    let commit = p.recorded(1);
+    resumed_merges_and_continues(&mut p, &wb, &b, &a, &commit);
+}
 
-    // B's session ends, and its result is frozen stale.
+/// The same with an S0 that never moved: the new Work keeps the time of the
+/// S0 it goes on from, B's start, so A's landing, made after that and before
+/// the resume, is newer than S0, and its merge moves S0.
+#[test]
+fn a_stale_result_whose_s0_never_moved_is_resumed_merges_and_continues() {
+    let mut p = Project::new();
+    let (wa, a) = p.session("a");
+    let (wb, b) = p.session("b");
+    let changed = LIB.replace("scale(n: i32)", "scale(n: i32, by: i32)");
+    fs::write(wa.join("src/lib.rs"), changed.replace("n * 2", "n * by")).unwrap();
+    let report = "pub fn report() -> i32 {\n    crate::scale(3)\n}\n";
+    fs::write(wb.join("src/report.rs"), report).unwrap();
+    git(&wb, &["add", "-A"]);
+    git(&wb, &["commit", "--quiet", "-m", "report"]);
+    p.start_owner();
+
+    // A lands a change to scale's signature, which B uses.
+    p.ok(&["finish", &a]);
+    p.ok(&["accept", &a]);
+    let commit = p.recorded(0);
+    resumed_merges_and_continues(&mut p, &wb, &b, &a, &commit);
+    assert!(
+        p.run(&b)["baseline_history"].is_null(),
+        "B's S0 never moved"
+    );
+}
+
+/// When the resumed session undoes that merge, S0 moves back to the S0 it
+/// went on from, with that S0's time, B's start: A's landing is newer than
+/// it still, so a second merge moves S0 to it again, and the Work continues.
+#[test]
+fn an_undone_merge_moves_a_resumed_s0_back_to_its_time_and_a_new_merge_moves_it_again() {
+    let mut p = Project::new();
+    let (wa, a) = p.session("a");
+    let (wb, b) = p.session("b");
+    let changed = LIB.replace("scale(n: i32)", "scale(n: i32, by: i32)");
+    fs::write(wa.join("src/lib.rs"), changed.replace("n * 2", "n * by")).unwrap();
+    let report = "pub fn report() -> i32 {\n    crate::scale(3)\n}\n";
+    fs::write(wb.join("src/report.rs"), report).unwrap();
+    git(&wb, &["add", "-A"]);
+    git(&wb, &["commit", "--quiet", "-m", "report"]);
+    p.start_owner();
+    p.ok(&["finish", &a]);
+    p.ok(&["accept", &a]);
+    let commit = p.recorded(0);
+    resumed_merges_and_continues(&mut p, &wb, &b, &a, &commit);
+    let new = p.run(&b)["outcome"]["closed"]["replacement"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The merge undone, S0 moves back to the S0 B began from, with B's time.
+    p.start_owner();
+    git(&wb, &["reset", "--quiet", "--hard", "HEAD~1"]);
+    until("the new Work's S0 moved back", || {
+        p.events(&new, "attach.s0_moved").len() >= 2
+    });
+    let back = &p.run(&new)["baseline_history"][1];
+    assert_eq!(back["back"], true);
+    assert_eq!(back["recorded_at"], p.run(&b)["created_at"]);
+    until("the new Work is stale again", || {
+        p.run(&new)["coherence"]["validity"]["decision"] == "refresh"
+    });
+
+    // A's landing is newer than that, so merged again it moves S0 to it.
+    git(&wb, &["merge", "--quiet", "--no-edit", &commit]);
+    until("the new Work's S0 moved to the landing again", || {
+        let moves = p.events(&new, "attach.s0_moved");
+        moves.len() > 2
+            && moves
+                .last()
+                .is_some_and(|moved| moved["to"] == commit && moved["landed_run"] == a.as_str())
+    });
+    until("the new Work continues again", || {
+        p.run(&new)["coherence"]["validity"]["decision"] == "continue"
+    });
+    p.stop_owner();
+}
+
+/// B's session ends in `wb`, its work committed, and B is finished stale
+/// after A's landing at `commit`. `check` says to resume the session there
+/// and merge `commit`, named in full. Done so, the session goes on as new
+/// Work from B's S0, B closes as superseded by it, and the merge moves the
+/// new Work's S0 to A's landing: it continues, with no agent run again.
+fn resumed_merges_and_continues(p: &mut Project, wb: &Path, b: &str, a: &str, commit: &str) {
     let end = payload(&[
         ("session_id", "b".into()),
         (
@@ -881,11 +970,10 @@ fn a_stale_result_is_resumed_in_its_worktree_merges_and_continues() {
     ]);
     assert_eq!(p.claude(&end), Value::Null);
     until("B's session is recorded as ended", || {
-        !p.run(&b)["attachment"]["sessions"][0]["ended_at"].is_null()
+        !p.run(b)["attachment"]["sessions"][0]["ended_at"].is_null()
     });
-    p.ok(&["finish", &b]);
-    let check = p.ok(&["check", &b]);
-    let commit = recorded(1);
+    p.ok(&["finish", b]);
+    let check = p.ok(&["check", b]);
     assert!(check.contains("Coherence: REFRESH"), "{check}");
     let next = check
         .lines()
@@ -921,15 +1009,15 @@ fn a_stale_result_is_resumed_in_its_worktree_merges_and_continues() {
         .to_owned();
     assert_ne!(new, b);
     until("B closes as superseded", || {
-        p.run(&b)["outcome"]["closed"]["reason"] == "superseded"
+        p.run(b)["outcome"]["closed"]["reason"] == "superseded"
     });
-    assert_eq!(p.run(&b)["outcome"]["closed"]["replacement"], new.as_str());
+    assert_eq!(p.run(b)["outcome"]["closed"]["replacement"], new.as_str());
     // Its work is committed already.
-    git(&wb, &["merge", "--quiet", "--no-edit", &commit]);
+    git(wb, &["merge", "--quiet", "--no-edit", commit]);
     until("the new Work's S0 moved to the landing", || {
         p.events(&new, "attach.s0_moved")
             .iter()
-            .any(|moved| moved["landed_run"] == a.as_str())
+            .any(|moved| moved["landed_run"] == a)
     });
     until("the new Work continues", || {
         p.run(&new)["coherence"]["validity"]["decision"] == "continue"

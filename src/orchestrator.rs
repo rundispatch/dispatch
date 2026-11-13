@@ -1057,15 +1057,13 @@ pub(crate) fn next_step(
 /// S0. A session starting there again goes on from its S0 as new Work and
 /// closes this one as superseded (`attach::reopenable`) when its runtime's
 /// hook registered it, every session of it ended and its Git worktree is
-/// still there. The merge moves the new Work's S0 (`s0::follow`) only to a
-/// source recorded after that S0, and the new Work keeps when it was only
-/// from a move: one that never moved takes the new Work's start, and nothing
-/// landed before then moves it. The command names the commit: Claude Code
-/// refuses one that names `refs/dispatch/source`.
+/// still there. The new Work keeps that S0 and its time, and the merge moves
+/// it (`s0::follow`) to a source recorded after it. The command names the
+/// commit: Claude Code refuses one that names `refs/dispatch/source`.
 fn resume_step(run: &RunRecord, source: Option<&s0::Recorded>) -> Option<String> {
     let attachment = run.attachment.as_ref()?;
-    let moved = run.baseline_history.last()?;
-    let source = source.filter(|source| source.at > moved.recorded_at)?;
+    let (_, since) = run.s0_commit()?;
+    let source = source.filter(|source| source.at > since)?;
     let resumable = awaits_review(run)
         && run.outcome.closed.is_none()
         && matches!(
@@ -4260,6 +4258,7 @@ mod tests {
             provenance: crate::BaselineProvenance::WorkspaceAtStart {
                 commit: "e4a15cd9".into(),
             },
+            s0_since: None,
             confidence: crate::AttachConfidence::Full,
             agent: Some("claude".into()),
             command: None,
@@ -4319,6 +4318,7 @@ mod tests {
             landed_run: "01LANDED".into(),
         };
         let after = landed("2026-11-10T11:00:00Z");
+        let between = landed("2026-11-10T10:15:00Z");
         let before = landed("2026-11-10T10:00:00Z");
         let reject = Some("dispatch reject 01WORK".to_owned());
         let rerun = "run your agent again on the current source and attach it; once that Work is finished: dispatch close 01WORK --reason superseded --replacement <new-id>";
@@ -4328,23 +4328,30 @@ mod tests {
         );
         let run = resumable(&workspace);
         let step = next_step(&run, Decision::Refresh, Some(&after), None);
-        assert_eq!(step, (resume, reject.clone()));
+        assert_eq!(step, (resume.clone(), reject.clone()));
         assert!(!step.0.contains("refs/dispatch/source"), "{}", step.0);
-
-        // Anything else it can't do takes it back to running its agent again.
+        // An S0 that never moved is S0 since the Work began, or since the
+        // Work it reopened began.
         let refresh = |run: &RunRecord, source| next_step(run, Decision::Refresh, source, None);
-        assert_eq!(refresh(&run, None), (rerun.to_owned(), reject.clone()));
-        assert_eq!(
-            refresh(&run, Some(&before)).0,
-            rerun,
-            "nothing landed since its S0"
-        );
         let mut unmoved = run.clone();
         unmoved.baseline_history.clear();
+        assert_eq!(refresh(&unmoved, Some(&between)).0, resume);
+        let mut reopened = unmoved.clone();
+        reopened.attachment.as_mut().unwrap().s0_since =
+            Some("2026-11-10T09:30:00Z".parse().unwrap());
+        assert_eq!(refresh(&reopened, Some(&before)).0, resume);
+
+        // Anything else it can't do takes it back to running its agent again.
+        assert_eq!(refresh(&run, None), (rerun.to_owned(), reject.clone()));
         assert_eq!(
-            refresh(&unmoved, Some(&after)).0,
+            refresh(&run, Some(&between)).0,
             rerun,
-            "its S0 never moved"
+            "nothing landed since its S0 moved"
+        );
+        assert_eq!(
+            refresh(&unmoved, Some(&before)).0,
+            rerun,
+            "nothing landed since its S0"
         );
         let mut live = run.clone();
         live.attachment.as_mut().unwrap().sessions[0].ended_at = None;

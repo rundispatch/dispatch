@@ -287,7 +287,7 @@ fn newer_source(
 /// earlier S0 it does descend from, or else the S0 the Work began from (a
 /// world commit no HEAD descends from, or a commit reset away too): the
 /// baseline kept for it, and what Δ would be had S0 never moved. `None`
-/// while it descends from S0.
+/// while it descends from S0, and once S0 is back where the Work began.
 fn earlier_s0(root: &Path, run: &RunRecord, head: &str) -> Option<Target> {
     let (s0, _) = run.s0_commit()?;
     let history = &run.baseline_history;
@@ -300,11 +300,11 @@ fn earlier_s0(root: &Path, run: &RunRecord, head: &str) -> Option<Target> {
             let earlier = &history[index].commit;
             earlier != s0 && is_ancestor(root, earlier, head).unwrap_or(false)
         })
-        .unwrap_or(0);
-    // It was S0 since the move to it, or since the Work began.
+        .or((history[0].commit != s0).then_some(0))?;
+    // It was S0 since the move to it, or as the S0 the Work began from.
     let (recorded_at, landed_run) = match index.checked_sub(1).map(|before| &history[before]) {
         Some(before) => (before.recorded_at, before.landed_run.clone()),
-        None => (run.created_at, None),
+        None => (run.first_s0_since(), None),
     };
     let earlier = &history[index];
     Some(Target {
@@ -1125,6 +1125,50 @@ mod tests {
         let root = &project.root;
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "agent\n");
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "landed\n");
+    }
+
+    #[tokio::test]
+    async fn s0_back_where_the_session_began_stays_there_until_a_merge_moves_it() {
+        let project = Project::new();
+        let workspace = project.worktree("agent");
+        fs::write(workspace.join("c.txt"), "the session's own\n").unwrap();
+        let work = project.attach_session(&workspace);
+        commit(&workspace, "a.txt", "agent\n");
+        let landed = project.land("landing", "b.txt", "landed\n").await;
+        git(
+            &workspace,
+            &["merge", "--quiet", "--no-edit", source::SOURCE_REF],
+        );
+        let mut owner = project.owner();
+        owner.tick(&project.state);
+        git(&workspace, &["reset", "--quiet", "--hard", "HEAD^1"]);
+        owner.tick(&project.state);
+        assert_eq!(project.events(&work.id).len(), 2);
+
+        // Its HEAD never has that world commit, and S0 is it already: no
+        // move to itself, on later ticks or after a commit of its own.
+        owner.tick(&project.state);
+        owner.tick(&project.state);
+        commit(&workspace, "a.txt", "agent, again\n");
+        owner.tick(&project.state);
+        let run = project.run(&work.id);
+        assert_eq!(project.events(&work.id).len(), 2);
+        assert_eq!(run.baseline_history.len(), 2);
+        assert_eq!(run.s0_commit(), work.s0_commit());
+
+        // Merged again, it moves forward.
+        git(
+            &workspace,
+            &["merge", "--quiet", "--no-edit", source::SOURCE_REF],
+        );
+        owner.tick(&project.state);
+        let run = project.run(&work.id);
+        assert_eq!(run.baseline_history.len(), 3);
+        assert!(!run.baseline_history[2].back);
+        assert_eq!(
+            run.baseline_history[2].landed_run.as_deref(),
+            Some(landed.as_str())
+        );
     }
 
     #[tokio::test]

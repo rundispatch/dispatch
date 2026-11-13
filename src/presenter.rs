@@ -2233,6 +2233,7 @@ mod tests {
             provenance: BaselineProvenance::GitMergeBase {
                 commit: "0123456789abcdef".into(),
             },
+            s0_since: None,
             confidence: AttachConfidence::Full,
             agent: Some("claude".into()),
             command: Some(vec!["claude".into()]),

@@ -2700,6 +2700,7 @@ mod tests {
             provenance: crate::BaselineProvenance::GitMergeBase {
                 commit: "0123456789abcdef".into(),
             },
+            s0_since: None,
             confidence: crate::AttachConfidence::Full,
             agent: Some("claude".into()),
             command: Some(vec!["claude".into()]),
