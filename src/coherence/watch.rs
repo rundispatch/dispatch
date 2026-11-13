@@ -187,12 +187,17 @@ fn check(
 
 /// Parse errors while a person is mid-edit are normal, so uncertainty must not
 /// invalidate work mid-run. Drop `AnalysisUncertain` reasons; a refresh that
-/// rested only on them is a continue.
+/// rested only on them is a continue, merged 3-way or not.
 pub(crate) fn settle(mut validity: Validity) -> Validity {
     validity
         .reasons
         .retain(|reason| reason.code != ReasonCode::AnalysisUncertain);
-    if validity.decision == Decision::Refresh && validity.reasons.is_empty() {
+    if validity.decision == Decision::Refresh
+        && validity
+            .reasons
+            .iter()
+            .all(|reason| reason.code == ReasonCode::MergedThreeWay)
+    {
         validity.decision = Decision::Continue;
     }
     validity
@@ -419,6 +424,17 @@ mod tests {
         assert_eq!(sent.decision, Decision::Refresh);
         assert_eq!(sent.reasons.len(), 1);
         assert_eq!(sent.reasons[0].code, ReasonCode::FactBroken);
+    }
+
+    #[test]
+    fn a_3_way_merge_that_rested_on_uncertain_reasons_continues() {
+        let codes = [ReasonCode::AnalysisUncertain, ReasonCode::MergedThreeWay];
+        let settled = settle(verdict(Decision::Refresh, "w1", &codes));
+        assert_eq!(settled.decision, Decision::Continue);
+        assert_eq!(settled.reasons[0].code, ReasonCode::MergedThreeWay);
+        let broken = [ReasonCode::FactBroken, ReasonCode::MergedThreeWay];
+        let settled = settle(verdict(Decision::Refresh, "w1", &broken));
+        assert_eq!(settled.decision, Decision::Refresh);
     }
 
     fn unreadable_spec(root: &std::path::Path) -> WatchSpec {

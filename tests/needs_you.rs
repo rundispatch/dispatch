@@ -405,7 +405,9 @@ fn watch_json_emits_a_work_line_when_the_mark_changes_and_when_it_clears() {
     let needs_you = &line["needs_you"];
     assert_eq!(needs_you["kind"], "permission", "{line}");
     assert_eq!(needs_you["message"], "Claude needs your permission");
-    assert_eq!(needs_you["since"], p.mark(&id)["at"]);
+    // Watch reads the mark the owner committed to the database, which may be
+    // a moment before the owner writes `metadata.json`.
+    assert_eq!(needs_you["since"], p.marked(&id, "permission")["at"]);
     assert_eq!(line["state"], "working");
 
     p.stop();

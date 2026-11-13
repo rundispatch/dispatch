@@ -303,6 +303,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
     )?;
 
     let mut history = Vec::new();
+    let mut s0_since = None;
     let (snapshot, provenance, confidence, workspace, managed_workspace) = if *managed {
         let (snapshot, provenance, workspace, made) = make_workspace(state, root, run_id, &dir)
             .map_err(|error| error.context("could not make a workspace"))?;
@@ -318,12 +319,14 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
             .map_err(|error| error.context("could not record S0"))?;
         let commit = runtime.commit.clone();
         let (provenance, confidence) = if let Some(old) = &runtime.reopens {
-            // It goes on from the Work it reopens: the same S0, attributed
-            // as that Work's was, and moved as that Work's was.
+            // It goes on from the Work it reopens: the same S0, S0 since the
+            // same time, attributed as that Work's was, and moved as that
+            // Work's was.
             let old = state.load_run(old)?;
+            s0_since = Some(old.first_s0_since());
             history = old.baseline_history;
-            let old = old.attachment.context("not attached Work")?;
-            (old.provenance, old.confidence)
+            let attachment = old.attachment.context("not attached Work")?;
+            (attachment.provenance, attachment.confidence)
         } else if runtime.discovered {
             // The worktree appeared after watching began: every change in it
             // is its runtime's.
@@ -446,6 +449,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         integration_root: root.clone(),
         repo_key: repo_key.clone(),
         provenance,
+        s0_since,
         confidence,
         agent: request.agent.clone(),
         command: request.command.clone(),
@@ -2250,6 +2254,17 @@ pub(crate) fn note_reopen(state: &State, old: &str, new: &str) -> Result<()> {
     crate::state::write_durably(&reopen_notes(state).join(old), new.as_bytes())
 }
 
+/// The Work of every project noted to close as superseded, from the moment
+/// its reopen is noted, whether or not the new Work is published yet.
+pub(crate) fn reopening(state: &State) -> Result<HashSet<String>> {
+    let Ok(listing) = fs::read_dir(reopen_notes(state)) else {
+        return Ok(HashSet::new());
+    };
+    listing
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect()
+}
+
 /// The reopen notes of Work in the project at `root` whose new Work is
 /// published, as (old, new). A note whose new Work will never be published
 /// is removed.
@@ -2670,7 +2685,7 @@ fn print_verdict_and_next(state: &State, run: &RunRecord) {
     if awaits_review(run) {
         print_standing(state, run, validity);
     }
-    print_review_commands(run, validity);
+    print_review_commands(state, run, validity);
 }
 
 /// A short equivalent of `print_single_result_summary` for attached work:
@@ -2705,7 +2720,7 @@ fn print_finish_summary(state: &State, run: &RunRecord) {
     if awaits_review(run) {
         print_standing(state, run, validity);
     }
-    print_review_commands(run, validity);
+    print_review_commands(state, run, validity);
 }
 
 #[cfg(test)]
@@ -2932,6 +2947,90 @@ mod last_seen_tests {
         gone.wait_with_output().unwrap();
         fs::write(&finishing, pid.to_string()).unwrap();
         assert_eq!(reopens(), None);
+    }
+
+    /// Work that reopens another goes on from its S0 with that S0's time:
+    /// since the old Work began when its S0 never moved, and since its last
+    /// move when it did. A record without the time is S0 since the Work's
+    /// own start, as before.
+    #[test]
+    fn reopened_work_keeps_the_time_of_the_s0_it_goes_on_from() {
+        let (_temp, state, run) = attached();
+        let at =
+            |time: &str| -> DateTime<Utc> { format!("2026-11-10T{time}:00Z").parse().unwrap() };
+        let workspace = run.attachment.as_ref().unwrap().workspace.clone();
+        let reopen = |old: &RunRecord, started: &str| {
+            let request = AttachRequest {
+                workspace: workspace.clone(),
+                root: Some(old.source_path.clone()),
+                task: None,
+                agent: Some("claude".into()),
+                pid: None,
+                command: None,
+                allow_unsafe_local: false,
+                auto_apply: false,
+                runtime: Some(RuntimeStart {
+                    session: RuntimeSession {
+                        provider: "claude".into(),
+                        session_id: "s".into(),
+                        source: "resume".into(),
+                        started_at: at(started),
+                        ended_at: None,
+                        end_reason: None,
+                        model: None,
+                    },
+                    resumed: true,
+                    commit: old.s0_commit().unwrap().0.to_owned(),
+                    discovered: false,
+                    reopens: Some(old.id.clone()),
+                }),
+            };
+            create(&state, request).unwrap()
+        };
+        let save = |run: &RunRecord| {
+            Database::open(state.db_path())
+                .unwrap()
+                .sync_run(run)
+                .unwrap();
+            state.save_run(run).unwrap();
+        };
+        // A hook's result that began at 10:00, its S0 never moved.
+        let mut old = state.load_run(&run.id).unwrap();
+        old.created_at = at("10:00");
+        let commit = old.s0_commit().unwrap().0.to_owned();
+        old.attachment.as_mut().unwrap().provenance = BaselineProvenance::WorkspaceAtStart {
+            commit: commit.clone(),
+        };
+        save(&old);
+
+        let new = reopen(&old, "11:00");
+        assert_eq!(new.created_at, at("11:00"));
+        assert_eq!(new.s0_commit(), Some((commit.as_str(), at("10:00"))));
+        let mut without = serde_json::to_value(&new).unwrap();
+        without["attachment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("s0_since");
+        let without: RunRecord = serde_json::from_value(without).unwrap();
+        assert_eq!(without.s0_commit(), Some((commit.as_str(), at("11:00"))));
+
+        // Its S0 moves to a source recorded at 11:30, and a session reopens it.
+        let mut moved = new;
+        let landed = source::world_commit(&workspace).unwrap();
+        moved.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: moved.baseline_path.clone(),
+            baseline_commit: moved.baseline_commit.clone(),
+            commit: commit.clone(),
+            moved_to: landed.clone(),
+            moved_at: at("11:31"),
+            recorded_at: at("11:30"),
+            landed_run: None,
+            back: false,
+        });
+        save(&moved);
+        let newer = reopen(&moved, "12:00");
+        assert_eq!(newer.s0_commit(), Some((landed.as_str(), at("11:30"))));
+        assert_eq!(newer.baseline_history, moved.baseline_history);
     }
 
     #[tokio::test]

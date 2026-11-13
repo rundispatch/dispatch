@@ -531,14 +531,28 @@ fn only_a_session_lock_registers_and_human_worktrees_are_never_listed() {
     assert!(!log.contains("human"), "{log}");
 
     // Listed is final: a session that later locks a listed worktree does not
-    // make it Work.
+    // make it Work. Its process started after Git made the worktree, since
+    // listing waits out the grace.
+    let mut later = Command::new("sleep").arg("600").spawn().unwrap();
+    p.lock(&unlocked, Some(&session_lock("unlocked", later.id())));
+    p.ticks();
+    later.kill().unwrap();
+    later.wait().unwrap();
+    assert_eq!(p.runs().len(), 1);
+    assert_eq!(p.listed(), ["other", "unlocked"]);
+    // Unless it is the session that made it: this test process, which started
+    // before Git made the worktree and, as on a busy machine, locked it only
+    // after the grace.
     p.lock(
         &unlocked,
         Some(&session_lock("unlocked", std::process::id())),
     );
-    p.ticks();
-    assert_eq!(p.runs().len(), 1);
-    assert_eq!(p.listed(), ["other", "unlocked"]);
+    wait_until("Work for its maker", || p.runs_in(&unlocked).len() == 1);
+    // The scan records the Work, then writes the inventory without it.
+    wait_until("its maker's worktree unlisted", || {
+        !p.listed().iter().any(|name| name == "unlocked")
+    });
+    assert_eq!(p.listed(), ["other"]);
     // Each was noted once, however many ticks saw it.
     assert_eq!(
         p.owner_log()

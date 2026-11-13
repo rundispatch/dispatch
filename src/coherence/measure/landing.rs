@@ -35,6 +35,7 @@ pub fn capture(
         world_after: None,
         projection_computed_at: None,
         counterparts: Vec::new(),
+        batch: None,
     };
     let projection = match view {
         OwnerView::Unwatched => {
@@ -93,6 +94,17 @@ pub fn capture(
         landing.status = LandingStatus::Stale;
         landing.detail = Some(why.to_owned());
     }
+    landing
+}
+
+/// `landing` for Work that landed in the batch `batch` together with
+/// `members`: those were integrated with it, so they are not its
+/// counterparts.
+pub fn in_batch(mut landing: Landing, batch: &str, members: &[String]) -> Landing {
+    landing
+        .counterparts
+        .retain(|counterpart| !members.contains(&counterpart.identity.run_id));
+    landing.batch = Some(batch.to_owned());
     landing
 }
 

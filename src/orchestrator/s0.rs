@@ -60,28 +60,35 @@ pub(crate) fn recorded(state: &State, root: &Path) -> Result<Vec<Recorded>> {
 /// Record the source of `run`, which just landed, under the source lock that
 /// every landing holds, so no two records race.
 pub(crate) fn record(state: &State, run: &RunRecord) -> Result<()> {
-    if !matches!(run.source_kind, SourceKind::Git | SourceKind::GitWorktree) {
+    record_together(state, &[run], &format!("dispatch: Work {} landed", run.id))
+}
+
+/// `record` for Work that landed together in one batch: one commit, and an
+/// entry naming it for each Work.
+pub(crate) fn record_together(state: &State, runs: &[&RunRecord], message: &str) -> Result<()> {
+    let Some(first) = runs.first() else {
+        return Ok(());
+    };
+    if !matches!(first.source_kind, SourceKind::Git | SourceKind::GitWorktree) {
         return Ok(());
     }
-    let commit = source::record_source(
-        &run.source_path,
-        &format!("dispatch: Work {} landed", run.id),
-    )?;
-    let mut sources = recorded(state, &run.source_path)?;
-    sources.push(Recorded {
-        commit,
-        at: Utc::now(),
+    let commit = source::record_source(&first.source_path, message)?;
+    let mut sources = recorded(state, &first.source_path)?;
+    let at = Utc::now();
+    sources.extend(runs.iter().map(|run| Recorded {
+        commit: commit.clone(),
+        at,
         landed_run: run.id.clone(),
-    });
+    }));
     crate::state::write_durably(
-        &sources_path(state, &run.source_path),
+        &sources_path(state, &first.source_path),
         &serde_json::to_vec_pretty(&sources)?,
     )
 }
 
 /// Attached Git Work still in progress, unowned by a live wrapper (whose
 /// watcher keeps the S0 it began with), and with a commit for S0.
-fn movable(run: &RunRecord) -> Option<&AttachmentRecord> {
+pub(super) fn movable(run: &RunRecord) -> Option<&AttachmentRecord> {
     let attachment = run.attachment.as_ref()?;
     let wrapped = attachment
         .owner
@@ -280,7 +287,7 @@ fn newer_source(
 /// earlier S0 it does descend from, or else the S0 the Work began from (a
 /// world commit no HEAD descends from, or a commit reset away too): the
 /// baseline kept for it, and what Δ would be had S0 never moved. `None`
-/// while it descends from S0.
+/// while it descends from S0, and once S0 is back where the Work began.
 fn earlier_s0(root: &Path, run: &RunRecord, head: &str) -> Option<Target> {
     let (s0, _) = run.s0_commit()?;
     let history = &run.baseline_history;
@@ -293,11 +300,11 @@ fn earlier_s0(root: &Path, run: &RunRecord, head: &str) -> Option<Target> {
             let earlier = &history[index].commit;
             earlier != s0 && is_ancestor(root, earlier, head).unwrap_or(false)
         })
-        .unwrap_or(0);
-    // It was S0 since the move to it, or since the Work began.
+        .or((history[0].commit != s0).then_some(0))?;
+    // It was S0 since the move to it, or as the S0 the Work began from.
     let (recorded_at, landed_run) = match index.checked_sub(1).map(|before| &history[before]) {
         Some(before) => (before.recorded_at, before.landed_run.clone()),
-        None => (run.created_at, None),
+        None => (run.first_s0_since(), None),
     };
     let earlier = &history[index];
     Some(Target {
@@ -857,6 +864,46 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "landed\n");
     }
 
+    /// Work found stale against a landing, which it then merges, is checked
+    /// again against its new S0, though its Δ is the same bytes against
+    /// either and the source has not moved since.
+    #[tokio::test]
+    async fn stale_work_that_merges_the_landing_continues_though_its_delta_is_unchanged() {
+        let project = Project::new();
+        let lib = "pub fn scale(n: i32) -> i32 {\n    n * 2\n}\n";
+        fs::write(project.root.join("lib.rs"), lib).unwrap();
+        git(&project.root, &["add", "lib.rs"]);
+        git(&project.root, &["commit", "--quiet", "-m", "lib"]);
+        let workspace = project.worktree("agent");
+        let work = project.attach(&workspace);
+        let report = "pub fn report() -> i32 {\n    crate::scale(3)\n}\n";
+        fs::write(workspace.join("report.rs"), report).unwrap();
+        git(&workspace, &["add", "report.rs"]);
+        git(&workspace, &["commit", "--quiet", "-m", "report"]);
+        let changed = lib.replace("(n: i32)", "(n: i32, by: i32)");
+        project.land("landing", "lib.rs", &changed).await;
+        let stored = || {
+            let run = project.run(&work.id);
+            run.coherence.and_then(|c| c.validity).map(|v| v.decision)
+        };
+        let mut owner = project.owner();
+        owner.tick(&project.state);
+        assert_eq!(stored(), Some(Decision::Refresh));
+        let before = delta(&project.run(&work.id));
+
+        git(
+            &workspace,
+            &["merge", "--quiet", "--no-edit", source::SOURCE_REF],
+        );
+        let tick = owner.tick(&project.state);
+
+        assert!(tick.error.is_none(), "{:?}", tick.error);
+        let run = project.run(&work.id);
+        assert_eq!(run.baseline_history.len(), 1);
+        assert_eq!(delta(&run), before);
+        assert_eq!(stored(), Some(Decision::Continue));
+    }
+
     #[tokio::test]
     async fn a_merge_in_progress_does_not_move_s0_and_finishing_it_does() {
         let project = Project::new();
@@ -1078,6 +1125,50 @@ mod tests {
         let root = &project.root;
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "agent\n");
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "landed\n");
+    }
+
+    #[tokio::test]
+    async fn s0_back_where_the_session_began_stays_there_until_a_merge_moves_it() {
+        let project = Project::new();
+        let workspace = project.worktree("agent");
+        fs::write(workspace.join("c.txt"), "the session's own\n").unwrap();
+        let work = project.attach_session(&workspace);
+        commit(&workspace, "a.txt", "agent\n");
+        let landed = project.land("landing", "b.txt", "landed\n").await;
+        git(
+            &workspace,
+            &["merge", "--quiet", "--no-edit", source::SOURCE_REF],
+        );
+        let mut owner = project.owner();
+        owner.tick(&project.state);
+        git(&workspace, &["reset", "--quiet", "--hard", "HEAD^1"]);
+        owner.tick(&project.state);
+        assert_eq!(project.events(&work.id).len(), 2);
+
+        // Its HEAD never has that world commit, and S0 is it already: no
+        // move to itself, on later ticks or after a commit of its own.
+        owner.tick(&project.state);
+        owner.tick(&project.state);
+        commit(&workspace, "a.txt", "agent, again\n");
+        owner.tick(&project.state);
+        let run = project.run(&work.id);
+        assert_eq!(project.events(&work.id).len(), 2);
+        assert_eq!(run.baseline_history.len(), 2);
+        assert_eq!(run.s0_commit(), work.s0_commit());
+
+        // Merged again, it moves forward.
+        git(
+            &workspace,
+            &["merge", "--quiet", "--no-edit", source::SOURCE_REF],
+        );
+        owner.tick(&project.state);
+        let run = project.run(&work.id);
+        assert_eq!(run.baseline_history.len(), 3);
+        assert!(!run.baseline_history[2].back);
+        assert_eq!(
+            run.baseline_history[2].landed_run.as_deref(),
+            Some(landed.as_str())
+        );
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ does not change how agents are launched or admitted. It never starts an agent by
 | MustHold | A fact the work relied on, derived from (S0, Δ). | `MustHold` (`kind`: `Signature` or `File`; `origin`: `Modified`, `Referenced`, `FileFallback` or `Mentioned`, a weak fact). |
 | Validity | The verdict. | `Validity { decision, evaluated_at, world_digest, world_changed, changed_files, reasons, analysis }`. |
 | Decision | What to do. | `Decision`: `Continue`, `Refresh`, `Stop`. |
-| Reason | Why, with evidence. | `Reason { code, fact_id, path, detail }`; `ReasonCode` is `fact_broken`, `fact_missing`, `same_symbol_edited`, `patch_conflict`, `already_applied`, `integration_check_failed`, `analysis_uncertain`, `mention_changed`. |
+| Reason | Why, with evidence. | `Reason { code, fact_id, path, detail }`; `ReasonCode` is `fact_broken`, `fact_missing`, `same_symbol_edited`, `patch_conflict`, `already_applied`, `integration_check_failed`, `analysis_uncertain`, `mention_changed`, `merged_three_way` (0.5.0). |
 | Analysis level | How deep the check went. | `AnalysisLevel`: `symbols`, `files_only`, `integration`. |
 | Per-run record | Latest verdict and lineage. | `RunRecord.coherence: Option<CoherenceRecord>` with `version` (1), `refreshed_from`, `facts`, `validity`, `first_invalid_at`. |
 
@@ -51,6 +51,9 @@ there, and never otherwise (`orchestrator::s0`, "When S0 moves" in [attach.md](a
   so each earlier (S0, Δ) stays recomputable. From the move on, facts are derived from the
   new S0 and the Δ against it: the agent's own change, without what it merged.
 - Without the ancestry proof S0 stays, and the verdict is what it would have been.
+- Work a resumed session reopens keeps the S0 it goes on from: its `baseline_history`, and,
+  when that S0 never moved, the earlier Work's start as `attachment.s0_since` (0.5.0). A
+  landing recorded after that time is newer than its S0, so merging it moves S0.
 
 ### Verdicts
 
@@ -58,8 +61,9 @@ there, and never otherwise (`orchestrator::s0`, "When S0 moves" in [attach.md](a
 
 | Reason code | Produced by | Decision |
 |---|---|---|
-| `already_applied` | L0: the patch reverses cleanly against the current source | `Stop` |
-| `patch_conflict` | L0: the patch does not apply cleanly | `Refresh` |
+| `already_applied` | L0: the patch reverses cleanly against the current source, or its 3-way merge from S0 changes nothing | `Stop` |
+| `patch_conflict` | L0: the patch does not apply cleanly, and a 3-way merge from S0 conflicts or cannot be tried | `Refresh` |
+| `merged_three_way` | L0: the patch does not apply as it is, but merges 3-way from S0 without conflict (0.5.0) | `Continue` when the merged checks can run, which then decide at accept; otherwise `Refresh` |
 | `fact_broken` | L1: a referenced declaration's contract, or a watched file's bytes, changed | `Refresh` |
 | `fact_missing` | L1: the declaration or file no longer exists | `Refresh` |
 | `same_symbol_edited` | L1: a declaration the patch edits was also edited in the source | `Refresh` |
@@ -129,15 +133,38 @@ Next: dispatch refresh <id>  (or dispatch reject <id>)
 
 1. World unchanged, or the patch file is empty: `Continue`, no Git or parsing work.
 2. `git apply --check --reverse` in the source succeeds: `Stop`, `already_applied`.
-3. `git apply --check` fails: `Refresh`, `patch_conflict`. The detail names the
-   conflicting paths (`Reason.path` is the first), then, when Git's full output was kept,
-   where it is (`<run dir>/patch-conflict.txt`), then Git's words, at most 300 characters
-   in all. The file is written only when finish, the end of a native run or accept
-   evaluates; `check`, `status`, `explain`, `watch` and `refresh` write nothing.
+3. `git apply --check` fails: since 0.5.0, Dispatch asks Git to merge Δ 3-way from S0
+   onto the source as it is (`git apply --3way` in a temporary index, reading S0's blobs
+   from the run's baseline; the source's files, index and HEAD are not touched):
+   - A merge with conflicts, or none tried (a plain directory, a SHA-256 repository, a
+     source with an untracked nested repository or bytes Git converts as it stores them):
+     `Refresh`, `patch_conflict`. The detail names the conflicting paths (`Reason.path` is
+     the first) and says whether the 3-way merge was tried (`the patch does not apply as
+     it is to src/lib.rs, and a 3-way merge from its S0 conflicts`), then, when Git's full
+     output was kept, where it is (`<run dir>/patch-conflict.txt`, Git's complaint followed
+     by what the 3-way merge said), then Git's words, at most 300 characters in all. The
+     file is written only when finish, the end of a native run or accept evaluates;
+     `check`, `status`, `explain`, `watch` and `refresh` write nothing.
+   - A merged tree equal to the source's: `Stop`, `already_applied`.
+   - Otherwise L1 runs against the source as usual, never on the merged tree (where every
+     declaration Δ edits would read as edited on both sides), and `merged_three_way`
+     (`applied 3-way from S0`) is added after L1's reasons. Alone it leaves `Continue`.
 4. Otherwise go to L1.
 
-`git apply` is only ever run with `--check` during evaluation, so evaluation never
-modifies the source.
+During evaluation `git apply` runs on the source only with `--check`, and 3-way only in a
+temporary index, so evaluation never modifies the source.
+
+A `merged_three_way` result lands only through the merged checks. Like a changed weak
+mention, it rests on them (`coherence::rests_on_merged_checks`): when they cannot run (none
+configured, turned off, no recorded permission to run commands, strict accept, an
+unreadable frozen configuration), the verdict is `Refresh`. Then accept lands exactly the
+merged tree the checks passed on ("The accept path", below).
+
+Limits: in a file without symbol support, any change the source made to the same file is
+`Refresh` `fact_broken` by L1, merged or not, so 3-way turns `patch_conflict` into
+`Continue` for Rust and Python files. Git's 3-way merge cannot take a file Δ creates when
+the source created it too, so that stays `patch_conflict`. `--despite-refresh` does not
+cover a REFRESH that includes `merged_three_way`.
 
 ### L1: symbol and file facts (`facts.rs`, `symbols.rs`)
 
@@ -264,8 +291,10 @@ changes no verdict and applies nothing.
    directory and work tree are always named explicitly.
    - The source's current world (for Git sources exactly the non-ignored files; for
      plain directories the whole tree) is copied into a staging directory inside its
-     `.git`, staged into a kept index (`check.index`), and the patch is applied there
-     with `git apply --cached`. The staged tree's id is the run's `tree_id`.
+     `.git`, staged into a kept index (`check.index`), and the patches are staged on it in
+     order with `source::stage`: a plain `git apply --cached`, and, for an exact Git
+     source, `git apply --3way --cached` from the run's S0 objects when a patch does not
+     apply as it is (0.5.0). The staged tree's id is the run's `tree_id`.
    - The checkout is then updated from its previous tree with `read-tree --reset -u`
      after refreshing its index, and `git clean -fd` removes non-ignored leftovers.
      Ignored build output and the times of unchanged files survive, so builds are
@@ -314,14 +343,16 @@ tree's contents.
   recorded, never failures.
 - **The key** is the SHA-256 of:
   - the tree that was checked: for merged checks, the source's world
-    (`source::world_commit`) with Δ applied in a temporary index; for finish in the
+    (`source::world_tree`) with Δ staged on it in a temporary index, 3-way when needed
+    (0.5.0); for finish in the
     workspace, the workspace's world. Both are Git tree ids, ignored files left out;
   - the exact ordered commands;
   - an execution fingerprint: the frozen `execution` settings, the Docker image id for
     the docker backend, the environment a check gets (`PATH`, `HOME`, `TMPDIR`,
     `LANG`), each command's program as `PATH` resolves it (symlinks followed, local
     backend only) and the Dispatch version.
-- **No key, so the checks run as without it:** a plain directory; a Docker image that
+- **No key, so the checks run as without it:** a plain directory; a SHA-256 repository
+  (since 0.5.0); a Docker image that
   cannot be identified; any Git failure; a tree holding an untracked nested repository
   (the world leaves it out while the checks may see it); and a checkout where Git
   converts file contents, so that two different files could make one tree:
@@ -359,7 +390,7 @@ the source between the evaluation and the apply:
 - The configuration frozen with the run (`config.snapshot.yml` in the run directory)
   is read. If it cannot be read or parsed, the gate is `Legacy` (strict).
 - `coherence.accept: strict`, or a source whose fingerprint equals the
-  snapshot's: `Legacy`. The original all-or-nothing `safe_apply` runs. **Attached work
+  snapshot's: `Legacy`. The patch applies all or nothing through `source::apply_checked`, fenced by the snapshot's fingerprint. **Attached work
   (`run.mode == RunMode::Attached`) never takes the fingerprint half of this
   shortcut**: its S0 is a merge-base commit while its `source_fingerprint` is the
   root's working tree at attach time, so an equal fingerprint does not reliably mean
@@ -392,12 +423,67 @@ from the same conditions.
 Attached runs go through this same `gate` and the same `auto_apply` as native work —
 there is no second accept path for work Dispatch did not launch.
 
-`Compatible` applies through `source::apply_validated`, which requires the current
+`Compatible` applies through `apply::land` and `source::apply_checked`, which requires the current
 world digest to equal the evaluated one before the dry run and again after it, so a
 change during validation aborts with nothing applied. The error then says that the
 source changed after accept checked it, so nothing was applied, and to accept again
 to check it as it is now. All-or-nothing `git apply` semantics and the existing path
 safety checks are unchanged.
+
+**A 3-way landing** (0.5.0). When the verdict carries `merged_three_way`, `apply::land`
+merges Δ 3-way onto the source as it is again and lands only if that gives the tree the
+merged checks passed on (the run's `tree_id`, or the reused pass's); otherwise it refuses
+with `the 3-way merge is now tree <t>, which no longer matches the tree <v> the merged
+checks verified; the source was left unchanged`, before writing or applying anything. A
+3-way landing with no verified tree is refused too. It writes the patch from the source's
+tree to the merged tree as `runs/<id>/delta-landed.patch`, applies it through the same
+digest fence, and prints `Merged 3-way from S0; what landed: <path>`. Each path it changed
+is then compared with the merged tree; one that does not hold it is named on stderr
+(`Warning: not confirmed at <paths>: it changed as the patch landed; look at it in the
+source`) and in `result.applied`'s `unconfirmed`, and the landing is recorded as applied
+either way. Δ never changes: `--expect` binds Δ's digest, and `result.applied` records it
+with the landed patch's digest.
+
+### Landing order: batches (0.5.0)
+
+`dispatch accept` without an ID, in a Git project, may land several results together
+(`orchestrator::batch`; the commands are in [reference.md](reference.md#one-shot-cli)):
+
+- **Who.** Every result waiting for review there, finished, ready and unapplied, whose own
+  checks passed or are not configured, with a non-empty Δ, a readable frozen
+  configuration and no `coherence.accept: strict`. They are grouped by their frozen
+  `checks.verify`, execution and the reason the merged checks would not run; the largest
+  group is the batch. With fewer than two, accept is the single accept it always was.
+- **Order.** Footprints and edges come from `interactions` over the batch alone, as the
+  owner derives them, with no owner needed. Kahn's algorithm puts a `Uses` writer before
+  its reader and a file's one writer before the other side; ready results, symmetric edges
+  and cycles go by finish time, then ID. A change first is the safe order: a result that
+  uses what another changes is judged against that change, and left out when it breaks,
+  instead of landing first and leaving the break to the merged checks alone.
+- **Evaluation, under each member's run lock (taken in ID order) and the source lock.**
+  The source as it is, D0, is observed once. The warm check workspace is staged with the
+  source (T0). For each result in order, the workspace is checked out at T(k-1) and the
+  result evaluated against it as if it were the source, with L0's 3-way rule. A REFRESH or
+  STOP leaves the result out with its reasons; a CONTINUE that rests on merged checks the
+  batch cannot run is left out too. Otherwise its Δ is staged onto T(k-1), 3-way when
+  needed, giving T(k). These verdicts are proposal data only: never stored, never a fence.
+- **The digest** is SHA-256 over `<run id> <Δ sha256>\n` for each member, in order.
+- **Verification** (`accept --expect <batch digest>`): the batch is judged again, and
+  refused with nothing applied unless it is the same ordered set. The merged checks run
+  once on T(n), through `integration::run_or_reuse` with a patch from T0, so the memo and
+  the warm workspace apply as for any accept, and the checked tree must be the staged one.
+  If they fail, prefixes are checked by bisection, each tree once (at most ⌈log₂ n⌉ more
+  runs), to find the first failing member. If T(1) fails, nothing lands. When the batch's
+  checks are skipped for a reason every member shares (none configured, for example), it
+  lands on L0 and L1, as a single accept would.
+- **Landing.** The verified prefix is one patch, `git diff --binary --full-index T0 Tm` in
+  the check workspace, kept as `runs/<first member>/batch-<12 hex>.patch` and applied once
+  through `apply::land` with the D0 digest fence, so nothing half-lands. Every path it
+  touched is then compared with Tm, as for a 3-way landing. One `refs/dispatch/source`
+  commit is made for the batch, with a `sources.json` entry per member. Then, per member,
+  the single accept's recording tail: `result.applied`, `interaction.landed` (with D0 and
+  D(m), and no co-batched counterpart), `review.accepted`, and the workspace release.
+  `decide` is never called per member.
 
 A human acceptance is recorded only once the work has landed (since 0.4.4); a reject
 only records the review. When the gate blocks:
@@ -408,10 +494,14 @@ only records the review. When the gate blocks:
 - the latest validity is stored in `run.coherence.validity`;
 - an `application.failed` event carries `application`, `error` and `coherence`;
 - the error text says the merged checks did not run when the verdict refused the Work
-  before them (or why they were skipped), then names the next step: for `Stop`,
-  `dispatch close <id> --reason already-present`; for `Refresh`, `dispatch refresh <id>`
-  for a native run or running the agent again on the current source for attached Work,
-  with `dispatch reject <id>` as the alternative.
+  before them (or why they were skipped), then names the step `check` gives
+  (`orchestrator::next_step`): for `Stop`, `Run 'dispatch close <id> --reason
+  already-present'.`; for `Refresh`, `Next: <step> (or dispatch reject <id>).`. The step
+  is `dispatch refresh <id>` for a native run; for attached Work whose session can be
+  resumed in its worktree, resuming it and merging the newest recorded source by its
+  commit; for other attached Work, running the agent again on the current source
+  (0.5.0; 0.4.18 wrote its own REFRESH sentence, and for attached Work always said to run
+  the agent again).
 
 When a moved-world apply succeeds, the validity is stored and the `result.applied`
 event includes it under `coherence`. A typed error (`CoherenceBlocked`) replaced the
@@ -470,10 +560,10 @@ gate's merged checks run under the source lock auto-apply already holds:
 
 | Gate result | Authorized | Else |
 |---|---|---|
-| `Legacy`, current `fingerprint_tree(source) == source_fingerprint` (byte-identical world) | yes, via `safe_apply` | |
+| `Legacy`, current `fingerprint_tree(source) == source_fingerprint` (byte-identical world) | yes, via `apply_checked` with the fingerprint fence | |
 | `Legacy`, fingerprint differs (strict mode with a moved world; a config that was readable in stage 1 and became unreadable here) | no | `auto_apply.blocked { reason: strict_mode_drift }` |
-| `Compatible(v)`, `!v.world_changed` | yes, via `apply_validated` | |
-| `Compatible(v)`, `v.world_changed && v.analysis == integration` | yes, via `apply_validated` | |
+| `Compatible(v)`, `!v.world_changed` | yes, via `apply_checked` with the digest fence | |
+| `Compatible(v)`, `v.world_changed && v.analysis == integration` | yes, via `apply_checked` with the digest fence | |
 | `Compatible(v)`, `v.world_changed` and analysis is `symbols` or `files_only` (L2 skipped or disabled) | no | `auto_apply.blocked { reason: integration_evidence_missing }` |
 | `Blocked(v)`, `v.decision == Stop` | no | `auto_apply.blocked { reason: verdict_stop }` |
 | `Blocked(v)`, `v.decision == Refresh` | no | `auto_apply.blocked { reason: verdict_refresh }` |
@@ -492,7 +582,7 @@ above); auto-apply refuses that case (`integration_evidence_missing`).
 
 ### Stage 3: apply, and the one retry
 
-`source::safe_apply` or `source::apply_validated` runs with the gate's digest. If
+`apply::land` runs `source::apply_checked` with the gate's fence. If
 the digest fence fails — someone edited the source between authorization and the
 real `git apply` ("source changed during apply validation" or "source has changed
 since this run was created") — stage 2 is re-run exactly once against the new
@@ -590,7 +680,8 @@ records no verdict; verdicts, liveness and interactions stay on the `poll_secs` 
   the first time a non-`Continue` verdict is stored.
 - `mid_run: stop`: after `coherence.stopped` is recorded, the attempt's cancellation
   token is cancelled: `Stop` always stops, `Refresh` only with `stop_on_refresh: true`.
-  The existing supervisor kills the process group and confirms cleanup. The run ends
+  The existing supervisor kills the process group, again while anything is left in it
+  (0.5.0), and confirms cleanup. The run ends
   `Interrupted` with work result `cancelled`, `FailureKind::StaleWork` and exit code 1.
   If the goal deadline had already passed, the failure is `Deadline` instead. The partial
   patch is kept; no review is recorded (asserted by `tests/coherence_watch.rs`). A verdict that arrives after the attempt has
@@ -718,7 +809,7 @@ has checked that the work still holds may apply it anyway:
 - `coherence::gate` then runs `checks.verify` on the merged tree regardless of the
   analysis level (`AcceptGate::Overridden`); a failing check refuses, and so does a
   configuration where no check can run;
-- the apply goes through `apply_validated` against the verified world digest, under
+- the apply goes through `source::apply_checked` against the verified world digest, under
   the same locks and fences as any accept;
 - `CoherenceRecord.overridden` keeps the overridden verdict, `coherence.validity`
   the verification, and a `coherence.overridden {coherence, explanation}` event is
@@ -755,7 +846,8 @@ also gets the run's `outcome`, as for all events.
 | `coherence.checked` | Watcher verdict is `Continue` after an invalid one was sent. | `{"coherence": <Validity>}` |
 | `coherence.stopped` | `mid_run: stop` is about to cancel the attempt. | `{"coherence": <Validity>}` |
 | `application.failed` | Apply refused or failed. | `application`, `error`, and `coherence` when the gate blocked it; `applied_by: "auto_apply"` on the policy path only |
-| `result.applied` | Apply succeeded. | `files_changed`, and `coherence` when the world had moved; `applied_by: "auto_apply"` on the policy path only (absent, not `null`, on the human path) |
+| `result.applied` | Apply succeeded. | `files_changed`, and `coherence` when the world had moved; `applied_by: "auto_apply"` on the policy path only (absent, not `null`, on the human path). A 3-way landing adds `delta_digest`, `landed_patch`, `landed_digest`, `confirmed` and `unconfirmed`, and a batch member `batch` (0.5.0) |
+| `batch.proposed`, `batch.verified`, `batch.landed` | A batch was proposed, verified or landed (0.5.0; see "Landing order: batches"). | Payloads in [reference.md](reference.md#events). A member's `coherence.merged_checks` and `checks.reused` carry `batch`, and the merged checks, recorded on the first member, carry `members` |
 | `run.stopped` | After a watcher stop. | `failure: "stale_work"`, `reason` |
 | `auto_apply.skipped` | An auto-apply attempt was not eligible (see "Automatic application" above). | `{"reason": <string>}` |
 | `auto_apply.blocked` | The gate, or its stricter authorization predicate, refused an auto-apply attempt. | `{"reason": <string>, "coherence": <Validity or null>}` |
@@ -795,6 +887,12 @@ the notes' inbox files (`<state>/inbox/`, `<state>/marks/`). Each S0 move is sto
 run as `baseline_history`. None of these is a symbol index: they hold commits, notes and
 what each Work was sent, and facts are still derived from (S0, Δ).
 
+Since 0.5.0 also kept outside the database: asks to catch up and the landings each Work was
+asked about (`<state>/catchup/`), the Claude Code waiters' files (`<state>/waiters/`), what a
+3-way landing applied (`runs/<id>/delta-landed.patch`) and the patch a batch landed
+(`runs/<first member>/batch-<12 hex>.patch`). Batch proposals and their per-member verdicts
+are never stored: each accept computes them again.
+
 Stored: `RunRecord.coherence` in the run projection JSON (`runs.run_projection_json`
 and `run.json`): `refreshed_from`, the latest stored `validity` (with its world
 digest) and `first_invalid_at`. History is in the `events` table. The `facts` field
@@ -816,11 +914,11 @@ such a run gets coherence checking at accept time because everything needed
 - The watcher never writes state, and there is one writer of the run's revision.
 - Evaluation is read-only (`git apply --check` only); the check workspace is separate from the source and never one of its worktrees.
 - The apply is guarded by the evaluated world digest, before and after the dry run.
-- Strict mode and unmoved sources use the pre-existing `safe_apply` unchanged.
+- Strict mode and unmoved sources apply under the snapshot's fingerprint fence, as before.
 - Nothing launches an agent except an explicit `run` or `refresh`; refresh needs the same acknowledgements again.
 - Local execution is still not a sandbox; integration checks add no authority beyond the run's own approval.
 - The original-baseline lineage, completed-attempt evidence, the launch record and cancellation fencing are untouched. Coherence-stopped runs are not counted as agent failures.
-- Auto-apply reuses `gate` and `apply_validated`/`safe_apply` verbatim; it adds a
+- Auto-apply reuses `gate` and `apply::land` verbatim; it adds a
   stricter authorization predicate on top, never a weaker one, and applies through
   the same digest and fingerprint fences as human accept.
 - Auto-apply never records a review: it never writes a review revision or
@@ -872,13 +970,15 @@ How to read it:
 - Symbol facts: Rust and Python only. Other languages get file-level facts; any change to such a file is `REFRESH`, even a harmless one. A file only mentioned by path from test code or from a file without symbol support is a weak fact, decided by the merged checks; when they cannot run, it is `REFRESH` too.
 - Comments and test code are recognized only in Rust and Python. `#![cfg(test)]`, `#[cfg(all(test, …))]` and a file reached only through `#[cfg(test)] mod x;` are not test code, so paths there stay strong.
 - Referenced symbols bind by unique base name, not by name resolution; ambiguous, very common and short names are skipped. Names left unbound, and files whose baseline could not be analysed, are counted internally but not reported.
+- 3-way merging needs an exact Git source: never a plain directory, a SHA-256 repository, an untracked nested repository or bytes Git converts. Git's merge cannot take a file both sides created. A source with `core.fileMode=false` and an executable file could give the verified tree and the landing's different ids, so the landing would be refused (not observed).
+- A batch's order sees only the interactions among its own members, from their (S0, Δ); a member left out stays pending, with no stored verdict from the batch, and is accepted on its own or in a later batch.
 - Same-symbol concurrent edits are `REFRESH` (`same_symbol_edited` or `patch_conflict`).
   A Python edit that only appends after the last line of a function is not seen as a same-symbol edit by the symbol layer; the patch check and your checks still apply.
 - Transitive behavior changes are caught only if `checks.verify` covers them.
 - Integration checks use your `checks.verify` in one check workspace per project, so one project's merged checks run one at a time. Its first run builds from nothing; later runs keep its ignored build output. They hold the project's source lock while running, and cannot be cancelled.
 - A recorded pass is reused only for an identical tree, commands and execution fingerprint. A check run from an agent's shell, whose `PATH` differs from yours, does not match; neither do two Dispatch versions. Plain directories, checkouts where Git converts file contents and trees holding an untracked nested repository get no record. A native run's own checks and its S0 checks do not use the memo.
   They do not run for a local-backend run that was not approved for local execution.
-- `dispatch check`, `status`, `explain`, the finish summary and a native result's summary evaluate L0 and L1 only, fresh and never stored; integration checks run at accept, or on request with `dispatch check --merged`, which records the run but changes no verdict. `check`, finish and the native summary also print `At accept: …`, what accept would verify now, and a `Next` step driven by the verdict: REFRESH and STOP never offer accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
+- `dispatch check`, `status`, `explain`, the finish summary and a native result's summary evaluate L0 and L1 only, fresh and never stored; integration checks run at accept, or on request with `dispatch check --merged`, which records the run but changes no verdict. `check`, finish and the native summary also print `At accept: …`, what accept would verify now, and a `Next` step driven by the verdict, the step accept's refusal also ends with: REFRESH and STOP never offer accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
 - Plain-directory sources cannot honor `.gitignore`; ignored build output counts as world change (the patch usually still applies).
 - Nested repositories and submodules are not analysed.
 - A source that moved since S0 does not stop a native run, including the continuation after a clarification answer: every attempt starts from the run's original snapshot, the mid-run watcher reports what the move means for the work, and the accept gate judges the result against the source as it is then. (Before 0.4.4 a continuation stopped with `source_drift` whenever the tree differed.)

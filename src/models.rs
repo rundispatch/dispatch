@@ -479,6 +479,9 @@ pub enum ReasonCode {
     AlreadyApplied,
     IntegrationCheckFailed,
     AnalysisUncertain,
+    /// Δ applies only merged 3-way from S0: alone it leaves CONTINUE, which
+    /// the merged checks decide at accept.
+    MergedThreeWay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -622,9 +625,18 @@ impl RunRecord {
         match &self.attachment.as_ref()?.provenance {
             BaselineProvenance::GitMergeBase { commit }
             | BaselineProvenance::WorkspaceAtStart { commit }
-            | BaselineProvenance::Discovered { commit } => Some((commit, self.created_at)),
+            | BaselineProvenance::Discovered { commit } => Some((commit, self.first_s0_since())),
             BaselineProvenance::SnapshotAtAttach => None,
         }
+    }
+
+    /// Since when the S0 the Work began from has been the source: since the
+    /// Work began, or since the Work it reopens had it (`s0_since`).
+    pub fn first_s0_since(&self) -> DateTime<Utc> {
+        self.attachment
+            .as_ref()
+            .and_then(|a| a.s0_since)
+            .unwrap_or(self.created_at)
     }
 }
 
@@ -642,6 +654,12 @@ pub struct AttachmentRecord {
     /// `sha256(canonical git-common-dir)`; `None` for a plain directory.
     pub repo_key: Option<String>,
     pub provenance: BaselineProvenance,
+    /// Since when `provenance`'s commit has been S0, when not since the
+    /// run's `created_at`: Work that reopens another (`attach::reopenable`)
+    /// goes on from its S0, and keeps its time. `None` for any other Work,
+    /// and for Work made before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s0_since: Option<DateTime<Utc>>,
     pub confidence: AttachConfidence,
     /// `"claude" | "codex" | "cursor"` or other free text; never guessed.
     pub agent: Option<String>,
@@ -1118,6 +1136,7 @@ mod tests {
             provenance: BaselineProvenance::GitMergeBase {
                 commit: "0123456789abcdef".to_owned(),
             },
+            s0_since: None,
             confidence: AttachConfidence::Full,
             agent: Some("claude".to_owned()),
             command: Some(vec!["claude".to_owned(), "--dangerously...".to_owned()]),

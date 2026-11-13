@@ -12,18 +12,18 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use super::{
     background::{self, Watcher},
-    persist_event, sole_candidate, transition,
+    newest_source, next_step, persist_event, sole_candidate, transition,
 };
 use crate::{
     AnalysisLevel, ApplicationState, AppliedBy, CoherenceRecord, Decision, EventRecord,
-    LifecycleState, ReviewState, RunPhase, RunRecord, RunStatus, Validity, VerificationState,
-    WorkResult,
+    LifecycleState, ReasonCode, ReviewState, RunPhase, RunRecord, RunStatus, Validity,
+    VerificationState, WorkResult,
     coherence::{
         AcceptGate, CoherenceBlocked,
         integration::MergedChecks,
@@ -32,7 +32,7 @@ use crate::{
     },
     db::Database,
     lock::OperationLock,
-    source::{self, ApplyReport},
+    source::{self, ApplyReport, ExpectedWorld},
     state::State,
 };
 
@@ -172,13 +172,73 @@ pub(crate) fn source_lock_path(state: &State, run: &RunRecord) -> PathBuf {
         .join(format!("source-{source_key}.lock"))
 }
 
+/// Apply `patch` to `run`'s source through `fence`, under the caller's source
+/// lock. When `validity` merged `patch`, `run`'s Δ, 3-way from S0, what lands
+/// is that merge onto the world as it is now, and only if it is the tree the
+/// merged checks passed on (`verified`): the patch from the world to it,
+/// written beside the run (`source::LANDED_PATCH`) and applied through the
+/// same fence. Δ itself stays as frozen. Once applied it has landed, so paths
+/// that do not hold the merge right after are reported, not refused.
+pub(super) fn land(
+    state: &State,
+    run: &RunRecord,
+    validity: Option<&Validity>,
+    patch: &Path,
+    fence: ExpectedWorld,
+    verified: Option<&str>,
+) -> Result<ApplyReport> {
+    let candidate_label = sole_candidate(run)?.label.clone();
+    let merged = validity.is_some_and(|validity| {
+        validity
+            .reasons
+            .iter()
+            .any(|reason| reason.code == ReasonCode::MergedThreeWay)
+    });
+    if !merged {
+        let paths = source::apply_checked(run, patch, fence)?;
+        return Ok(ApplyReport {
+            candidate_label,
+            files_changed: paths.len() as u64,
+            landed_patch: None,
+            unconfirmed: Vec::new(),
+        });
+    }
+    let verified = verified.context(
+        "a 3-way merge lands only as the tree its merged checks verified, and none was; \
+         the source was left unchanged",
+    )?;
+    let landed = state.run_dir(&run.id).join(source::LANDED_PATCH);
+    let tree = source::write_landed_patch(run, patch, &landed, verified)?;
+    let paths = source::apply_checked(run, &landed, fence)?;
+    Ok(ApplyReport {
+        candidate_label,
+        files_changed: paths.len() as u64,
+        unconfirmed: source::unlanded(run, &paths, &tree),
+        landed_patch: Some(landed),
+    })
+}
+
+/// What a landing is fenced by: the moved world the gate validated, or with
+/// none, the source unchanged since snapshotting.
+fn fence(validity: Option<&Validity>) -> ExpectedWorld<'_> {
+    match validity {
+        Some(validity) => ExpectedWorld::Digest(&validity.world_digest),
+        None => ExpectedWorld::Fingerprint,
+    }
+}
+
 /// Set the shared "applied" outcome fields and commit `result.applied`.
 /// Shared by the human path (`apply_locked`) and the policy path
 /// (`auto_apply`); only the authority, and whether a validity is present,
 /// differ. `applied_by` is added to the payload only for a policy
-/// application, so the human path's event stays byte-for-byte what it was
-/// before auto-apply existed.
-fn persist_applied(
+/// application, and the digests and whether it was confirmed only for a
+/// 3-way landing, so the human path's event otherwise stays byte-for-byte
+/// what it was before auto-apply existed. After it, still under the source
+/// lock: `interaction.landed`, `refs/dispatch/source` and the workspace
+/// release. Work that landed in the batch `batch` names it, and the batch
+/// records `refs/dispatch/source` once for all of its Work.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn persist_applied(
     state: &State,
     mut run: RunRecord,
     candidate_label: &str,
@@ -186,7 +246,18 @@ fn persist_applied(
     validity: Option<&Validity>,
     authority: ApplyAuthority,
     landing: Option<Landing>,
+    batch: Option<&str>,
 ) -> Result<RunRecord> {
+    // Δ is what the person reviewed; a 3-way merge of it is what landed. The
+    // source has changed either way, so a digest that cannot be read is null.
+    let landed = match &report.landed_patch {
+        Some(landed) => Some((
+            landed,
+            super::delta_digest(&sole_candidate(&run)?.diff_path).ok(),
+            super::delta_digest(landed).ok(),
+        )),
+        None => None,
+    };
     if let Some(validity) = validity {
         remember_validity(&mut run, validity);
     }
@@ -206,6 +277,16 @@ fn persist_applied(
     });
     if authority == ApplyAuthority::AutoApply {
         payload["applied_by"] = serde_json::json!("auto_apply");
+    }
+    if let Some((patch, delta, merged)) = landed {
+        payload["delta_digest"] = serde_json::json!(delta);
+        payload["landed_patch"] = serde_json::json!(patch);
+        payload["landed_digest"] = serde_json::json!(merged);
+        payload["confirmed"] = serde_json::json!(report.unconfirmed.is_empty());
+        payload["unconfirmed"] = serde_json::json!(report.unconfirmed);
+    }
+    if let Some(batch) = batch {
+        payload["batch"] = serde_json::json!(batch);
     }
     persist_event(
         state,
@@ -227,7 +308,9 @@ fn persist_applied(
     }
     // The source with this change, for Work that merges it (`s0`). Still
     // under the source lock; like the measurement, it never fails the landing.
-    if let Err(error) = super::s0::record(state, &run) {
+    if batch.is_none()
+        && let Err(error) = super::s0::record(state, &run)
+    {
         eprintln!("Could not record the source after this landing: {error:#}");
     }
     // Applied, so a workspace Dispatch made for this Work holds nothing the
@@ -250,24 +333,7 @@ fn observe_landing(
     gated: Option<&Validity>,
 ) -> Option<Landing> {
     let gathered = || -> Result<Landing> {
-        let view = match background::watcher(state, &run.source_path)? {
-            Watcher::NotWatched => OwnerView::Unwatched,
-            Watcher::Watched(_) => match background::interactions(state, &run.source_path) {
-                Some(projection) => OwnerView::Watched(projection),
-                None => {
-                    OwnerView::Unavailable("the owner's interaction view could not be read".into())
-                }
-            },
-        };
-        let counterparts: Vec<RunRecord> = match &view {
-            OwnerView::Watched(projection) => projection
-                .participants
-                .iter()
-                .filter(|participant| participant.run_id != run.id)
-                .filter_map(|participant| state.load_run(&participant.run_id).ok())
-                .collect(),
-            _ => Vec::new(),
-        };
+        let (view, counterparts) = owner_view(state, &run.source_path, &[run.id.as_str()])?;
         let patch = fs::read(&sole_candidate(run)?.diff_path)?;
         Ok(landing::capture(
             run,
@@ -283,22 +349,51 @@ fn observe_landing(
         .ok()
 }
 
+/// The owner's view of the Work in progress at `root`, and the runs it lists
+/// other than `landed`, as far as they could be read.
+pub(super) fn owner_view(
+    state: &State,
+    root: &Path,
+    landed: &[&str],
+) -> Result<(OwnerView, Vec<RunRecord>)> {
+    let view = match background::watcher(state, root)? {
+        Watcher::NotWatched => OwnerView::Unwatched,
+        Watcher::Watched(_) => match background::interactions(state, root) {
+            Some(projection) => OwnerView::Watched(projection),
+            None => OwnerView::Unavailable("the owner's interaction view could not be read".into()),
+        },
+    };
+    let counterparts = match &view {
+        OwnerView::Watched(projection) => projection
+            .participants
+            .iter()
+            .filter(|participant| !landed.contains(&participant.run_id.as_str()))
+            .filter_map(|participant| state.load_run(&participant.run_id).ok())
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok((view, counterparts))
+}
+
 /// Commit `interaction.landed` on the applied `run`, with the world as it is
-/// right after applying (`None` when it cannot be observed).
+/// right after applying (`None` when it cannot be observed), unless the
+/// landing already carries it.
 fn record_landing(
     state: &State,
     db: &Database,
     run: &mut RunRecord,
     mut landing: Landing,
 ) -> Result<()> {
-    landing.world_after = world::observe(
-        &run.source_path,
-        &run.baseline_path,
-        &run.baseline_commit,
-        &run.source_kind,
-    )
-    .ok()
-    .map(|world| world.digest);
+    if landing.world_after.is_none() {
+        landing.world_after = world::observe(
+            &run.source_path,
+            &run.baseline_path,
+            &run.baseline_commit,
+            &run.source_kind,
+        )
+        .ok()
+        .map(|world| world.digest);
+    }
     persist_event(
         state,
         db,
@@ -441,8 +536,14 @@ pub(super) fn apply_locked(
                     landed_by: (validity.decision == Decision::Stop)
                         .then(|| landed_by(state, &run))
                         .flatten(),
+                    next: next_step(
+                        &run,
+                        validity.decision,
+                        newest_source(state, &run).as_ref(),
+                        None,
+                    )
+                    .0,
                     validity,
-                    attached: run.mode == crate::RunMode::Attached,
                     despite_refresh,
                     checks,
                 }
@@ -454,20 +555,21 @@ pub(super) fn apply_locked(
             print_check_lines(&checks);
         }
         let landing = observe_landing(state, &run, authority, validity.as_ref());
-        let report = match &validity {
-            None => source::safe_apply(&run, &normalized_label)?,
-            Some(validity) => {
-                source::apply_validated(&run, &normalized_label, &validity.world_digest).map_err(
-                    |error| {
-                        if is_fence_failure(&format!("{error:#}")) {
-                            error.context("the source changed after accept checked it, so nothing was applied; accept again to check it as it is now")
-                        } else {
-                            error
-                        }
-                    },
-                )?
+        let report = land(
+            state,
+            &run,
+            validity.as_ref(),
+            &sole_candidate(&run)?.diff_path,
+            fence(validity.as_ref()),
+            checks.ran().map(|ran| ran.tree_id.as_str()),
+        )
+        .map_err(|error| {
+            if validity.is_some() && is_fence_failure(&format!("{error:#}")) {
+                error.context("the source changed after accept checked it, so nothing was applied; accept again to check it as it is now")
+            } else {
+                error
             }
-        };
+        })?;
         Ok((report, validity, overridden, landing, checks))
     });
     // Each merged-check run is recorded with its per-command durations, or
@@ -530,6 +632,7 @@ pub(super) fn apply_locked(
         validity.as_ref(),
         authority,
         landing,
+        None,
     )?;
     if !quiet {
         println!(
@@ -538,6 +641,20 @@ pub(super) fn apply_locked(
             run.source_path.display(),
             report.files_changed
         );
+        if let Some(landed) = &report.landed_patch {
+            println!("Merged 3-way from S0; what landed: {}", landed.display());
+        }
+        if !report.unconfirmed.is_empty() {
+            let paths = report
+                .unconfirmed
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            eprintln!(
+                "Warning: not confirmed at {}: it changed as the patch landed; look at it in the source",
+                paths.join(", ")
+            );
+        }
     }
     Ok((overridden, checks))
 }
@@ -640,8 +757,9 @@ fn persist_apply_failed(
 enum Authorization {
     /// Byte-identical world: the fingerprint fence applies.
     Fingerprint,
-    /// A moved world whose evidence is complete for this run's exact digest.
-    Digest(Validity),
+    /// A moved world whose evidence is complete for this run's exact digest,
+    /// and the tree its merged checks passed on, if they ran.
+    Digest(Validity, Option<String>),
 }
 
 /// Stage 2: `coherence::gate` plus the stricter authorization predicate for
@@ -666,9 +784,10 @@ fn decide(
                     Err(("strict_mode_drift".into(), None))
                 }
             }
-            AcceptGate::Compatible { validity, .. } => {
+            AcceptGate::Compatible { validity, checks } => {
                 if !validity.world_changed || validity.analysis == AnalysisLevel::Integration {
-                    Ok(Authorization::Digest(validity))
+                    let verified = checks.ran().map(|ran| ran.tree_id.clone());
+                    Ok(Authorization::Digest(validity, verified))
                 } else {
                     Err(("integration_evidence_missing".into(), Some(validity)))
                 }
@@ -695,13 +814,13 @@ fn decide(
 /// for the human path.
 /// Planned goals (removed in 0.4.1) delivered through an integrity chain this
 /// version no longer verifies, so their results are never applied.
-fn was_planned(run: &RunRecord) -> bool {
+pub(super) fn was_planned(run: &RunRecord) -> bool {
     run.execution
         .as_ref()
         .is_some_and(|goal| goal.provenance == "planned_policy_chain")
 }
 
-fn is_fence_failure(message: &str) -> bool {
+pub(super) fn is_fence_failure(message: &str) -> bool {
     message.contains("source changed during apply validation")
         || message.contains("source has changed since this run was created")
 }
@@ -804,17 +923,19 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
             Ok(authorization) => authorization,
             Err((reason, validity)) => return persist_blocked(state, run, reason, validity),
         };
-        let validity = match &authorization {
-            Authorization::Fingerprint => None,
-            Authorization::Digest(validity) => Some(validity.clone()),
+        let (validity, verified) = match authorization {
+            Authorization::Fingerprint => (None, None),
+            Authorization::Digest(validity, verified) => (Some(validity), verified),
         };
         let landing = observe_landing(state, &run, ApplyAuthority::AutoApply, validity.as_ref());
-        let applied = match &authorization {
-            Authorization::Fingerprint => source::safe_apply(&run, &candidate_label),
-            Authorization::Digest(validity) => {
-                source::apply_validated(&run, &candidate_label, &validity.world_digest)
-            }
-        };
+        let applied = land(
+            state,
+            &run,
+            validity.as_ref(),
+            &sole_candidate(&run)?.diff_path,
+            fence(validity.as_ref()),
+            verified.as_deref(),
+        );
         match applied {
             Ok(report) => {
                 persist_applied(
@@ -825,6 +946,7 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
                     validity.as_ref(),
                     ApplyAuthority::AutoApply,
                     landing,
+                    None,
                 )?;
                 return Ok(ApplyOutcome::Applied { report, validity });
             }

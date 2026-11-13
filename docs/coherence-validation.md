@@ -29,8 +29,11 @@ of the product. The technical reference is [coherence.md](coherence.md).
 | While a project is watched, Codex and Cursor Agent worktrees that appear become Work with S0 at the merge base, recognized only by Codex's `codex-thread.json` marker or Cursor's documented location and branch | Shipped in 0.4.14; `tests/discovery.rs`; recognized from P0's real Codex 0.155.1 and Cursor Agent 2026.10.14 worktrees on macOS. Their sessions' end is not observable, so their liveness stays unknown |
 | `dispatch check --merged` runs the merged checks accept would run, before accept, and changes nothing; `accept --expect` lands only the reviewed Δ | Shipped in 0.4.14; `tests/merged_check.rs`. Used by the 0.4.14 integrator: `accept --expect` for every packet from P3 on, `check --merged` for P3, P2, P6, P6b and R |
 
-| While a project is watched, live Claude Code and Hermes sessions get notes in fixed text, through their hooks, about other Work that changes the same declaration, a declaration they use, or the same lines, and about such Work that landed, naming the recorded source commit. At most one note per Work per ten minutes; each item once | Shipped in 0.4.18; `tests/owner_notes.rs`, `tests/hook_delivery.rs`, `tests/notes_contract.rs`. Unmeasured on real work: what follows a note is counted by `docs/queries/notes-measured.sql`, and nothing is claimed about whether agents act on notes |
-| Attached Git Work's S0 follows the agent's merge or rebase of a recorded source, only with an ancestry proof, so Δ is the agent's own change; every earlier (S0, Δ) stays recomputable | Shipped in 0.4.18; the tests in `src/orchestrator/s0.rs` (merge, rebase, merge in progress, cherry-pick, revert, reset, detached HEAD) |
+| While a project is watched, live Claude Code and Hermes sessions get notes in fixed text, through their hooks, about other Work that changes the same declaration, a declaration they use, or the same lines, and about such Work that landed, naming the recorded source commit. At most one note per Work per ten minutes; each item once | Shipped in 0.4.18; `tests/owner_notes.rs`, `tests/hook_delivery.rs`, `tests/notes_contract.rs`. On 0.5.0's own build, `notes-measured.sql` counted 26 notes delivered and 0 unsettled; the next verdict was REFRESH for 7 (all 7 agree with it), CONTINUE for 7, none yet for 12. Nothing is claimed about whether agents act on notes |
+| Attached Git Work's S0 follows the agent's merge or rebase of a recorded source, only with an ancestry proof, so Δ is the agent's own change; every earlier (S0, Δ) stays recomputable | Shipped in 0.4.18; the tests in `src/orchestrator/s0.rs` (merge, rebase, merge in progress, cherry-pick, revert, reset, detached HEAD). Since 0.5.0 a resumed session's Work keeps its S0's time, and the owner checks Work again when its S0 moves with the same Δ |
+| When Work lands, a live Claude Code or Hermes agent whose Work uses a declaration the landing changed the signature of or removed, or changes a declaration the landing changed, is asked once, in fixed text, through its runtime's hooks, to merge the recorded commit. Claude Code: as a turn ends (`Stop`), or by waking an idle session within 8 hours of its last turn. Hermes: as an edit turn ends (`pre_verify`) or with the next turn. Never from a whole-file or textual interaction, never a relaunch, a merge on the agent's behalf or a second ask | Shipped in 0.5.0; `src/orchestrator/catchup.rs`, `tests/catchup.rs`, `tests/hook_delivery.rs`. On 0.5.0's own build (Claude Code only), `catchup-measured.sql` counted 2 asks naming 3 landings, 0 repeated, 0 file-level targets; 1 delivered by a wake, 1 by `Stop`; both followed by an S0 move (271 s and 96 s after delivery) and then CONTINUE. Hermes catch-up is shown by stand-in tests only. Four-harness cells: [[C: the coordination cells in harness-conformance.md]] |
+| `dispatch accept` without an ID lands the ready results of a Git project that can land together, a change before what uses it, behind one approval; the merged checks run once on the combined tree, and if they fail, only the results before the first failing one land, as one patch | Shipped in 0.5.0; `tests/batch_landing.rs`. On 0.5.0's own build, `batches-measured.sql` counted 2 batches landed (7 and 3 results), each with one merged-check run and no bisection; 15 Works landed behind 7 approvals; 20 suite runs, 1.33 per landed Work |
+| A Δ that no longer applies as it is, but merges 3-way from S0 without conflict, is CONTINUE `merged_three_way`, and lands only as the tree the merged checks passed on; an overlapping edit stays REFRESH | Shipped in 0.5.0; `tests/coherence_three_way.rs`, the `coherence::` and `source::` unit tests, on Git 2.39.5 (CI's Linux image) and macOS's Git. On 0.5.0's own build no landing needed it: no event carries `merged_three_way` and no `result.applied` a landed patch. That is read from the run events; no documented query counts it. Nothing is claimed about how often real work needs it |
 
 Every public statement must fit this table. When a row changes, change the
 README and the website in the same release.
@@ -199,6 +202,66 @@ interactions: the verdict is Dispatch's own, not a human judgment; a touch or an
 move after a note is not shown to come from it; small samples are quoted as counts.
 For a `Uses` note, an agent that fixes its own call sites has not touched the target,
 so `touched` stays 0.
+
+## Measuring catch-up and batches (0.5.0)
+
+Asks to catch up are recorded on the Work asked, as `catchup.written`, then
+`catchup.delivered` or `catchup.expired`; batches as `batch.proposed`, `batch.verified`
+and `batch.landed` on each result they name. The payloads are in
+[reference.md](reference.md#events). Two documented queries read them, read-only, with the
+same rules as the queries above:
+
+```bash
+sqlite3 -header -column <state>/dispatch.db < docs/queries/catchup-measured.sql
+sqlite3 -header -column <state>/dispatch.db < docs/queries/batches-measured.sql
+```
+
+`docs/queries/catchup-measured.sql` counts the asks to catch up written, delivered by each
+hook (`via`) and expired (`why`). It also counts any (Work, landing) asked twice and any
+file-level target, both of which must be 0. For each delivered ask it gives:
+
+- when its Work's S0 then moved forward to a source holding every landing it named;
+- how long after the delivery;
+- Dispatch's next verdict on the Work.
+
+It ends with the asks still unsettled. "Followed by" means recorded later, not caused by,
+and the next verdict is Dispatch's own.
+
+1. `catchup_counts`: asks written, delivered and expired, each with the landings they
+   name; for writes, `repeated_landings`, `symbol_targets` and `file_targets`.
+2. `catchup_s0`: one row per delivered ask, with `moved_at`, `seconds` and
+   `next_verdict`. A move back never counts, and neither does a move to a source recorded
+   before the ask's landings.
+3. `catchup_unsettled`: each write whose landings no delivery or expiry has settled yet,
+   with those landings. A landing written twice for one Work needs two settlements, so a
+   repeated ask shows here too. Work still in progress may have a pending ask; finished
+   Work should have none.
+
+`docs/queries/batches-measured.sql` gives three sets:
+
+1. `batch_members`: each batch's proposed, left-out and landed Work, once however many
+   offers recorded it.
+2. `batch_check_runs`: each verification's merged-check runs, on the whole batch
+   (`full_runs`) and bisecting it (`bisection_runs`), with `passed`, `lands` and
+   `failed`.
+3. `landing_counts`: over all Work, the Work landed, how many in batches, the batches,
+   approvals (one per batch, one per single accept), suite runs and reuses, counted as
+   0.4.17 and 0.4.18 counted them.
+
+An attached finish that checks in its workspace is counted from the `checks` table, so
+only a Work's last checks are seen. No event records a manual step, so neither query
+counts one.
+
+`tests/measurement_queries.rs` checks every result set against counts derived by hand
+from `tests/fixtures/measurement/catchup.jsonl` and `batches.jsonl`.
+
+Where each of 0.5.0's measured conditions reads from:
+
+- **Catch-up in place:** a `catchup_s0` row with `moved_at` and `next_verdict` `continue`,
+  and `catchup_counts` with `repeated_landings` 0 and `file_targets` 0.
+- **One decision:** `batch_check_runs` rows with `passed` 1 and `full_runs` equal to
+  `verifications`; then `approvals` over `landed_works`.
+- **Fast:** `suite_runs` over `landed_works` (at most 1.75), with `reuses` beside them.
 
 ## What would falsify the positioning
 

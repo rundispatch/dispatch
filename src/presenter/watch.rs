@@ -127,6 +127,11 @@ struct Context<'a> {
     /// `agent running (pid N)` for Work whose recorded agent process is
     /// alive (`orchestrator::agent_running`).
     running: &'a HashMap<String, String>,
+    /// What REFRESH Work's agent was asked to catch up with
+    /// (`catchup::asked`).
+    asked: &'a HashMap<String, String>,
+    /// The newest source recorded at the project, for a REFRESH's step.
+    source: Option<&'a orchestrator::s0::Recorded>,
 }
 
 /// The view model: one item per run in view, Work that needs you first, then
@@ -270,6 +275,7 @@ fn item(
                             reasons.len() - 3
                         ));
                     }
+                    lines.extend(context.asked.get(&run.id).cloned());
                     lines
                 }
                 "STOP" => vec!["STOP · its changes are already in the source".to_owned()],
@@ -538,11 +544,11 @@ fn next(
         "rejected" | "closed" | "finished" => ("Nothing to do.".into(), vec![]),
         // Ready, or blocked: what accepting it would do.
         _ if verdict == "REFRESH" => {
-            let mut text = "It can't be accepted as is. r reject it, then run the agent again from the current source.".to_owned();
-            if !attached {
-                text.push_str(&format!(" Or: dispatch refresh {short}."));
-            }
-            (text, vec![REJECT, REVIEW])
+            let (step, _) = orchestrator::next_step(run, Decision::Refresh, context.source, None);
+            (
+                format!("It can't be accepted as is: {step}. Or r reject it."),
+                vec![REJECT, REVIEW],
+            )
         }
         _ if verdict == "STOP" => (
             "Its changes are already in the source. c close it.".into(),
@@ -925,10 +931,24 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                     Some((run.id.clone(), running))
                 })
                 .collect();
+            let asked = runs
+                .iter()
+                .filter(|run| {
+                    let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+                    validity.is_some_and(|validity| validity.decision == Decision::Refresh)
+                })
+                .filter_map(|run| {
+                    let asked = orchestrator::catchup::asked(state, run)?;
+                    Some((run.id.clone(), asked.line()))
+                })
+                .collect();
             found = serve::untracked(
                 &orchestrator::discovery::Inventory::load(state, &root),
                 &runs,
             );
+            let source = orchestrator::s0::recorded(state, &root)
+                .ok()
+                .and_then(|mut recorded| recorded.pop());
             let fresh = build(
                 &runs,
                 &Context {
@@ -939,6 +959,8 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                     checks: &checks,
                     live: live.as_ref(),
                     running: &running,
+                    asked: &asked,
+                    source: source.as_ref(),
                 },
             );
             if let Some(left) = selection.follow(&items, &fresh) {
@@ -1117,11 +1139,10 @@ fn refusal(run: Option<&RunRecord>, error: &anyhow::Error) -> String {
     let blocked = run
         .filter(|run| run.outcome.application == ApplicationState::BlockedBySourceDrift)
         .and_then(|run| run.coherence.as_ref()?.validity.as_ref());
-    // The reason is on the Verdict line; the notice says what to do.
+    // The reason is on the Verdict line; the notice says what to do. A
+    // REFRESH's step can outrun the notice's two lines, so it points to Next.
     match blocked.map(|validity| validity.decision) {
-        Some(Decision::Refresh) => {
-            "not applied: stale (REFRESH). The source is unchanged. Next: r reject it.".into()
-        }
+        Some(Decision::Refresh) => "not applied: stale (REFRESH). See its Next line.".into(),
         Some(Decision::Stop) => {
             "not applied: STOP, its changes are already in the source. Next: c close it.".into()
         }
@@ -2041,6 +2062,7 @@ mod tests {
             provenance: BaselineProvenance::WorkspaceAtStart {
                 commit: "e4a15cd9ffffffff".into(),
             },
+            s0_since: None,
             confidence: AttachConfidence::Full,
             agent: Some("claude".into()),
             command: None,
@@ -2112,6 +2134,8 @@ mod tests {
                 checks: &checks,
                 live,
                 running,
+                asked: &HashMap::new(),
+                source: None,
             },
         )
     }
@@ -2335,14 +2359,14 @@ mod tests {
                 ready(run(id, "t", 1), Some((Decision::Refresh, true))),
                 "blocked",
                 "REFRESH",
-                "It can't be accepted as is. r reject it, then run the agent again from the current source. Or: dispatch refresh 01M4DRXH.",
+                "It can't be accepted as is: dispatch refresh 01M4DRXH00000000000000000B. Or r reject it.",
                 &[REJECT, REVIEW],
             ),
             (
                 ready(worktree(id, "wt", 1), Some((Decision::Refresh, true))),
                 "blocked",
                 "REFRESH",
-                "It can't be accepted as is. r reject it, then run the agent again from the current source.",
+                "It can't be accepted as is: run your agent again on the current source and attach it; once that Work is finished: dispatch close 01M4DRXH00000000000000000B --reason superseded --replacement <new-id>. Or r reject it.",
                 &[REJECT, REVIEW],
             ),
             (
@@ -2442,10 +2466,104 @@ mod tests {
                 checks: &checks,
                 live: None,
                 running: &HashMap::new(),
+                asked: &HashMap::new(),
+                source: None,
             },
         )
         .remove(0);
         assert_eq!(item.next, "a accept: applies it to tinyauth.");
+    }
+
+    /// A REFRESH says in watch what the CLI says (`next_step`): for a native
+    /// run, for attached Work, and for Work whose session can be resumed in
+    /// its worktree to merge the newest recorded source, with the same keys.
+    /// A refused accept's notice points to that line.
+    #[test]
+    fn a_refresh_says_what_the_cli_says() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = "01M4DRXH00000000000000000B";
+        let mut resumable = ready(worktree(id, "wt", 1), Some((Decision::Refresh, true)));
+        let attachment = resumable.attachment.as_mut().unwrap();
+        attachment.workspace = temp.path().to_owned();
+        attachment.sessions[0].ended_at = Some(chrono::Utc::now());
+        resumable.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: PathBuf::from("/b0"),
+            baseline_commit: "abc0".into(),
+            commit: "e4a15cd9".into(),
+            moved_to: "7d1e0c2a".into(),
+            moved_at: "2026-10-08T06:31:00Z".parse().unwrap(),
+            recorded_at: "2026-10-08T06:30:00Z".parse().unwrap(),
+            landed_run: Some("01M4DRXH00000000000000000E".into()),
+            back: false,
+        });
+        let source = orchestrator::s0::Recorded {
+            commit: "9f2c41d07be35a68c1d4e0f7a2b9c3d5e6f70812".into(),
+            at: "2026-10-08T07:00:00Z".parse().unwrap(),
+            landed_run: "01M4DRXH00000000000000000L".into(),
+        };
+        let checks = HashMap::new();
+        for (run, starts) in [
+            (
+                ready(run(id, "t", 1), Some((Decision::Refresh, true))),
+                "dispatch refresh",
+            ),
+            (
+                ready(worktree(id, "wt", 1), Some((Decision::Refresh, true))),
+                "run your agent again",
+            ),
+            (resumable, "resume its session in"),
+        ] {
+            let item = build(
+                std::slice::from_ref(&run),
+                &Context {
+                    root: Path::new(ROOT),
+                    home: None,
+                    watched: true,
+                    projection: None,
+                    checks: &checks,
+                    live: None,
+                    running: &HashMap::new(),
+                    asked: &HashMap::new(),
+                    source: Some(&source),
+                },
+            )
+            .remove(0);
+            let (step, _) = orchestrator::next_step(&run, Decision::Refresh, Some(&source), None);
+            assert!(step.starts_with(starts), "{step}");
+            assert_eq!(
+                item.next,
+                format!("It can't be accepted as is: {step}. Or r reject it.")
+            );
+            assert_eq!(item.keys, [REJECT, REVIEW]);
+            // A refused accept points there. At the narrowest width the
+            // notice shows whole, and so does the step.
+            let mut refused = run.clone();
+            refused.outcome.application = ApplicationState::BlockedBySourceDrift;
+            let notice = refusal(Some(&refused), &anyhow::anyhow!("stale"));
+            let listed = std::slice::from_ref(&item);
+            let buffer = draw_notice(
+                listed,
+                &item,
+                (Kind::Refused, &notice),
+                (40, 40),
+                &no_color(),
+            );
+            let text = rows(&buffer);
+            let (_, y) = find(&buffer, &format!("{}: not applied", item.name)).unwrap();
+            let at = usize::from(y);
+            assert_eq!(
+                format!("{} {}", text[at].trim(), text[at + 1].trim()),
+                format!(
+                    "{}: not applied: stale (REFRESH). See its Next line.",
+                    item.name
+                )
+            );
+            let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+            assert!(
+                squeezed(&text.concat()).contains(&squeezed(&format!("Next {}", item.next))),
+                "{text:#?}"
+            );
+        }
     }
 
     fn lines(item: &Item, label: &str) -> Vec<String> {
@@ -2757,6 +2875,41 @@ mod tests {
     }
 
     #[test]
+    fn work_asked_to_catch_up_says_so_under_its_refresh() {
+        let id = "01M4DRXH00000000000000000B";
+        let mut advisory = working(worktree(id, "me-endpoint", 1));
+        judge(&mut advisory, Decision::Refresh, true, &[REASON]);
+        let line = "asked to catch up with 01M4AAAA at 2026-11-11 14:05 UTC";
+        let asked = HashMap::from([(id.to_owned(), line.to_owned())]);
+        let build = |asked: &HashMap<String, String>| {
+            build(
+                std::slice::from_ref(&advisory),
+                &Context {
+                    root: Path::new(ROOT),
+                    home: None,
+                    watched: true,
+                    projection: None,
+                    checks: &HashMap::new(),
+                    live: None,
+                    running: &HashMap::new(),
+                    asked,
+                    source: None,
+                },
+            )
+            .remove(0)
+        };
+        assert_eq!(
+            lines(&build(&asked), "Verdict"),
+            [
+                format!("REFRESH · {REASON}"),
+                line.into(),
+                "Advisory while the agent works: nothing is stopped.".into(),
+            ]
+        );
+        assert!(!lines(&build(&HashMap::new()), "Verdict").contains(&line.to_owned()));
+    }
+
+    #[test]
     fn the_began_detail_says_where_s0_moved_since() {
         let item = items(&[moved("01M4DRXH00000000000000000B")]).remove(0);
         assert_eq!(
@@ -3013,7 +3166,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Next It can't be accepted as is. r reject it, then run the agent again from the current source."),
+            text.contains("Next It can't be accepted as is: run your agent again on the current source and attach it; once that Work is finished: dispatch close 01M4DRXH00000000000000000B --reason superseded --replacement <new-id>. Or r reject it."),
             "{text}"
         );
         assert!(
@@ -3155,7 +3308,7 @@ mod tests {
         let mut blocked = demo().remove(0);
         blocked.outcome.application = ApplicationState::BlockedBySourceDrift;
         let refused = refusal(Some(&blocked), &anyhow::anyhow!("stale"));
-        // At 60 columns the whole refusal shows, down to what to do next.
+        // At 60 columns the whole refusal shows, down to where to look next.
         let buffer = draw_notice(
             &listed,
             &listed[1],
@@ -3169,7 +3322,7 @@ mod tests {
         let at = usize::from(y);
         assert_eq!(
             format!("{} {}", text[at].trim(), text[at + 1].trim()),
-            "me-endpoint: not applied: stale (REFRESH). The source is unchanged. Next: r reject it."
+            "me-endpoint: not applied: stale (REFRESH). See its Next line."
         );
         assert!(text[at + 2].contains("q leave"), "{text:#?}");
         let mut stop = blocked.clone();
@@ -3536,6 +3689,8 @@ mod tests {
                     checks: &checks,
                     live: None,
                     running: &HashMap::new(),
+                    asked: &HashMap::new(),
+                    source: None,
                 },
             );
             assert!(listed.iter().all(|item| item.touches == Touches::Unknown));
@@ -3592,7 +3747,7 @@ mod tests {
         }));
         let listed = items(&runs);
         let palette = no_color();
-        let refused = "not applied: stale (REFRESH). The source is unchanged. Next: r reject it.";
+        let refused = "not applied: stale (REFRESH). See its Next line.";
         for item in &listed {
             for size in [(100, 10), (60, 12), (100, 8), (60, 9), (200, 7)] {
                 let buffer = draw_notice(&listed, item, (Kind::Refused, refused), size, &palette);
@@ -3629,10 +3784,12 @@ mod tests {
         assert!(text.contains("› me-endpoint "), "{text}");
         assert!(text.contains("Verdict  REFRESH · "), "{text}");
         assert!(
-            text.contains("Next     It can't be accepted as is."),
+            text.contains(
+                "Next     It can't be accepted as is: run your agent again on the current source and attach it;\n"
+            ),
             "{text}"
         );
-        assert!(!text.contains("current source."), "{text}");
+        assert!(!text.contains("once that Work is finished"), "{text}");
         // Narrow: the verdict wraps too; Next's second line goes first.
         let text = trimmed(&draw(&listed, Some(&me.id), (60, 9), false, &palette));
         assert!(text.contains("› me-endpoint "), "{text}");
@@ -3643,10 +3800,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Next     It can't be accepted as is."),
+            text.contains("Next     It can't be accepted as is: run your agent again\n"),
             "{text}"
         );
-        assert!(!text.contains("current source."), "{text}");
+        assert!(!text.contains("current source"), "{text}");
     }
 
     /// Seeing every Work matters more than the optional details.
@@ -3771,7 +3928,7 @@ mod tests {
         blocked.outcome.application = ApplicationState::BlockedBySourceDrift;
         assert_eq!(
             refusal(Some(&blocked), &error),
-            "not applied: stale (REFRESH). The source is unchanged. Next: r reject it."
+            "not applied: stale (REFRESH). See its Next line."
         );
         judge(&mut blocked, Decision::Stop, true, &[REASON]);
         assert_eq!(

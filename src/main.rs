@@ -203,9 +203,17 @@ enum Command {
     /// `dispatch setup`: reads the runtime's event on stdin. Claude Code's fails
     /// only when it cannot keep a worktree's changes, which stops that removal;
     /// Hermes's reports any failure, which Hermes logs before removing the
-    /// worktree anyway.
+    /// worktree anyway. `claude-wait` is Claude Code's waiter, whose exit
+    /// status 2 delivers an ask to catch up and wakes the session; a Dispatch
+    /// that does not know a runtime's name refuses it with status 1, which
+    /// wakes nothing.
     #[command(hide = true)]
-    Hook { provider: String },
+    Hook {
+        provider: String,
+        /// The most seconds `claude-wait` waits.
+        #[arg(long, hide = true, value_name = "SECONDS")]
+        max_wait: Option<u64>,
+    },
     /// Print a candidate's patch.
     Diff {
         run_id: Option<String>,
@@ -215,7 +223,8 @@ enum Command {
         #[arg(long, conflicts_with = "stat")]
         name_only: bool,
     },
-    /// Accept and safely apply a result; without an ID, the only one waiting.
+    /// Accept and safely apply a result; without an ID, the only one waiting,
+    /// or, when several can land together, all of them behind one approval.
     Accept(AcceptArgs),
     /// Reject a result without changing the source tree; without an ID, the
     /// only one waiting.
@@ -421,6 +430,8 @@ struct AcceptArgs {
 
     /// Accept only if the frozen change's digest starts with this (12 or
     /// more hex characters, as `Δ` shows it); otherwise nothing happens.
+    /// Without an ID, when several results can land together, the batch's
+    /// digest as `dispatch accept` shows it.
     #[arg(long, value_name = "DIGEST", value_parser = delta_prefix)]
     expect: Option<String>,
 }
@@ -428,14 +439,45 @@ struct AcceptArgs {
 #[tokio::main]
 async fn main() {
     dispatch::runtime::mark_process_start();
-    if let Err(error) = run().await {
+    // Rust ignores SIGPIPE, so `println!` to a closed pipe panics. Help, and
+    // a command that only reads and prints, are ended by it instead, as a
+    // shell pipeline's writers are. Every other command ignores it again: it
+    // may hold children that only its guards stop on the way out.
+    #[cfg(unix)]
+    sigpipe(libc::SIG_DFL);
+    let cli = Cli::parse();
+    #[cfg(unix)]
+    if !matches!(
+        cli.command,
+        Some(
+            Command::Version
+                | Command::History { .. }
+                | Command::Status { .. }
+                | Command::Explain { .. }
+                | Command::Show { .. }
+                | Command::Diff { .. }
+                | Command::Events { .. }
+                | Command::Resources
+                | Command::Check { merged: false, .. }
+                | Command::Watch { json: true, .. }
+        )
+    ) {
+        sigpipe(libc::SIG_IGN);
+    }
+    if let Err(error) = run(cli).await {
         eprintln!("error: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
+#[cfg(unix)]
+fn sigpipe(disposition: libc::sighandler_t) {
+    // SAFETY: `SIGPIPE` is a fixed constant, and `disposition` is `SIG_DFL`
+    // or `SIG_IGN`, both always valid.
+    unsafe { libc::signal(libc::SIGPIPE, disposition) };
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let filter = match cli.verbose {
         0 => EnvFilter::new("warn"),
         1 => EnvFilter::new("dispatch=info"),
@@ -732,11 +774,15 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Command::Hook { provider } => {
+        Command::Hook { provider, max_wait } => {
             use std::io::Read;
             anyhow::ensure!(
-                matches!(provider.as_str(), "claude" | "hermes"),
+                matches!(provider.as_str(), "claude" | "claude-wait" | "hermes"),
                 "unknown agent runtime: {provider}"
+            );
+            anyhow::ensure!(
+                max_wait.is_none() || provider == "claude-wait",
+                "only Claude Code's waiter waits"
             );
             let mut input = Vec::new();
             let mut stdin = std::io::stdin().lock();
@@ -746,7 +792,11 @@ async fn run() -> Result<()> {
             // The rest is read and dropped: a runtime writing a larger
             // payload never meets a closed pipe.
             std::io::copy(&mut stdin, &mut std::io::sink())?;
-            let output = if provider == "hermes" {
+            let output = if provider == "claude-wait" {
+                let most = max_wait.map(std::time::Duration::from_secs);
+                let most = most.unwrap_or(dispatch::runtime::claude::MAX_WAIT);
+                dispatch::runtime::claude::wait(&state, &input, most)
+            } else if provider == "hermes" {
                 // Hermes gives the worktree only in the hook's environment.
                 let worktree = std::env::var_os("TERMINAL_CWD");
                 dispatch::runtime::hermes::handle(&state, &input, worktree.as_deref())
@@ -780,17 +830,21 @@ async fn run() -> Result<()> {
         Command::Accept(args) => {
             keep_watching(&state, None)?;
             let explanation = args.review.feedback.explanation.read()?;
-            orchestrator::accept_or_reject_latest(
+            orchestrator::accept(
                 &state,
                 args.review.run_id.as_deref(),
                 &std::env::current_dir()?,
-                orchestrator::ReviewDecision::Accept {
-                    despite_refresh: args.despite_refresh,
-                },
+                args.despite_refresh,
                 args.review.feedback.reasons,
                 explanation,
                 args.expect.as_deref(),
+                dispatch::presenter::Options {
+                    plain: cli.plain,
+                    ascii: cli.ascii,
+                    no_color: cli.no_color,
+                },
             )
+            .await
         }
         Command::Reject(args) => {
             let explanation = args.feedback.explanation.read()?;

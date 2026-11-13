@@ -64,7 +64,7 @@ directories) and locks (the per-source apply lock), not by routing native runs t
 Attached Work is a `RunRecord` with `mode: RunMode::Attached` (`"attached"` in JSON)
 and exactly one candidate. This is the whole trick that keeps coherence from forking
 into two implementations: `check`, `explain`, `status`, `accept`, `reject`, `apply`,
-`auto_apply`, the watcher, `gate` and `apply_validated` all take a `RunRecord` and a
+`auto_apply`, the watcher, `gate` and `apply::land` all take a `RunRecord` and a
 candidate label, and none of them need to know whether Dispatch launched the agent.
 
 | `RunRecord` field | Attached value |
@@ -102,7 +102,7 @@ every fact compares S0 against the world now, and Δ is workspace minus S0.
 
 The baseline is materialized on disk, not referenced by pointer, so it survives a
 later rebase or garbage collection in the user's own repository, and `world::observe`,
-`facts`, `gate` and `apply_validated` see exactly the `baseline_path`/`baseline_commit`
+`facts`, `gate` and `apply::land` see exactly the `baseline_path`/`baseline_commit`
 shape they already handle for native runs.
 
 **Where this is visible today.** `attachment.provenance` and `attachment.confidence`
@@ -205,7 +205,9 @@ untracked files. An agent that merges it takes those into its branch. They are t
 S0, not Δ, so they never land through that Work.
 
 **The move.** An agent may integrate what landed with `git merge refs/dispatch/source` or
-`git rebase refs/dispatch/source`. For attached Git Work still in progress, on the first
+`git rebase refs/dispatch/source`, or with the recorded commit by its hash, which is what
+landing notes and asks to catch up name: Claude Code's worktree isolation refuses any
+command that names `refs/dispatch/source`. For attached Git Work still in progress, on the first
 tick after the workspace's HEAD moved, the project owner moves S0 to the newest of these
 that the HEAD descends from (`git merge-base --is-ancestor`):
 - a source recorded after the Work's S0, or recorded earlier but descending from S0's
@@ -227,7 +229,8 @@ cherry-pick or rebase is in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `rebase-
 cherry-pick or a squash of the landed change, or a merge of a source recorded before the
 Work began that does not descend from its S0. Native runs, plain directories, wrapped Work
 while its wrapper lives, and finished, closed or applied Work keep their S0. A resumed
-session goes on from the moved S0, with its history.
+session goes on from the same S0, moved or not, with its history and the time it has been
+S0, so a merge of a source recorded since then moves it.
 
 **Moving back.** If the agent later undoes the merge (a `reset`, or a rebase that drops it),
 so its HEAD no longer descends from the moved S0, S0 moves back to the newest earlier S0 the
@@ -237,8 +240,10 @@ history entry has `back: true`. A `git revert` committed on top is not an undo: 
 the revert is in Δ. The same happens when a rebase copies the recorded source's commit
 instead of keeping it as an ancestor (for example a rebase that flattens the merge): S0 goes
 back, the landed change is in Δ again, and the Work is REFRESH where it could have been
-CONTINUE. That is the verdict 0.4.17 gave, and never a revert landed. `git merge
-refs/dispatch/source`, or a rebase onto it, keeps the record as an ancestor.
+CONTINUE. That is the verdict 0.4.17 gave, and never a revert landed. `git merge` of the
+recorded commit, or a rebase onto it, keeps the record as an ancestor. Once S0 is back where
+the Work began, it stays there until HEAD moves again; before 0.5.0 a move back to a session's
+first S0 was recorded again on every tick.
 
 **Where it shows.** `explain` prints the S0 it is now, then each earlier one:
 
@@ -300,12 +305,20 @@ merged result is the Work's own tree`.
     up to five reasons;
   - `At accept`, the same line `check` prints, saying whether merged checks will run, would
     not run and why, or that accept would refuse it now;
-  - the next commands, each with the full ID: accept/reject for CONTINUE; for REFRESH, run
-    the agent again and close this Work as superseded, or reject; for STOP, close it as
-    already present.
+  - the next commands, each with the full ID: accept/reject for CONTINUE; for STOP, close it
+    as already present; for REFRESH, one step, which `check`, `watch` and accept's refusal
+    give too:
+    - when its session can be resumed in its worktree (registered by its runtime's hook,
+      every session ended, its worktree still there) and a source was recorded since its
+      S0: `resume its session in <worktree>, then commit there and run git merge <commit>;
+      the session goes on as new Work from this Work's S0, and this Work closes as
+      superseded; Dispatch then moves that S0 and checks it again`, or reject;
+    - otherwise, run the agent again and close this Work as superseded, or reject.
 
-  A patch that no longer applies names its paths and keeps Git's full output in
-  `<run dir>/patch-conflict.txt`. Only finish, the end of a native run and accept write that
+  A patch that no longer applies names its paths, says whether a 3-way merge from its S0
+  was tried and conflicted (`the patch does not apply as it is to src/lib.rs, and a 3-way
+  merge from its S0 conflicts`), and keeps Git's full output in
+  `<run dir>/patch-conflict.txt`, followed by what the 3-way merge said. Only finish, the end of a native run and accept write that
   file; `check`, `status` and `watch` write nothing. The wrapped form still prints one line.
 - After finish, the record behaves like any other Ready result: `check`, `accept`,
   `reject`, `close` and `auto_apply` apply to it unchanged.
@@ -619,7 +632,10 @@ directory is gone. Nothing is applied or launched on start or exit. `dispatch se
       authority of its own, and the project's standing check consent does not cover
       exactly those checks, it asks first, which is the same as `--allow-unsafe-local`.
       Under that consent it finishes at once (0.4.18; 0.4.17 asked then too);
-    - `a` is `dispatch accept`. A refusal is shown as accept prints it, and an accept
+    - `a` is `dispatch accept`. A refusal by the coherence gate names its verdict: a
+      STOP says `Next: c close it.`, and a REFRESH says `See its Next line.`, the
+      Work's Next line, which gives the same step as `check` and accept's refusal
+      (0.5.0). Any other refusal shows the first sentence accept prints. An accept
       names what became of the merged checks;
     - `r` is `dispatch reject`, after a confirmation with focus on Cancel. On unfinished
       Work it refuses before asking and names `dispatch close <id>`;
@@ -663,8 +679,10 @@ directory is gone. Nothing is applied or launched on start or exit. `dispatch se
       holds the project.
   - `dispatch status` ends with the same line (`Project: …`), followed by a "Found, not
     tracked" section when there is something to list. In a project with no Work it prints
-    `No Work in <root> yet.` and that line, and exits 0; `status --json` prints `null`,
-    and `status --jsonl` prints nothing. For attached Work that is not
+    `No Work in <root> yet.`, that line and the same "Found, not tracked" section, and
+    exits 0. `status --json` then prints `{"found_not_tracked": [{"path", "attach"}]}`
+    when something is found, and `null` when nothing is; `status --jsonl` prints nothing.
+    With Work, `status --json` carries no inventory. For attached Work that is not
     finished, its Candidate block reads `Runtime unknown`, `Tracked for 12m` and
     `Files changed <n> now`, or `unknown` as above. There is no Diff line until the
     Work is finished, and its Workspace section adds `agent running (pid N)` while the
@@ -781,13 +799,14 @@ A runtime's session in its own worktree becomes Work in a watched project in two
 ways: through Claude Code's hooks, described here, or without any hook, when the
 owner finds the worktree ("Work that appears without hooks", below). Either way
 there is one Work per worktree. Hermes's hooks register nothing; they keep the
-exact Δ of Work discovery found and deliver notes ("Hermes Agent", below).
+exact Δ of Work discovery found and deliver notes and asks to catch up ("Hermes
+Agent", below).
 
 With Claude Code's hooks installed, the runtime tells Dispatch about its sessions
 (`dispatch hook claude`, which reads the runtime's event on stdin). `dispatch setup`
 offers them when `claude` is on `PATH`, showing the exact additions, with focus on Skip.
-There are seven, each a `command` hook running `'<dispatch>' --state-dir '<state>' hook
-claude`:
+There are eight, each a `command` hook running `'<dispatch>' --state-dir '<state>' hook
+claude`, except the waiter, which runs `… hook claude-wait` with `asyncRewake: true`:
 
 | Event | Matcher | Timeout | Since |
 |---|---|---|---|
@@ -798,11 +817,16 @@ claude`:
 | `Notification` | `permission_prompt\|idle_prompt\|agent_needs_input` | 5 s | 0.4.17 |
 | `Stop` | | 5 s | 0.4.17 |
 | `PostToolUse` | | 5 s | 0.4.18 |
+| `Stop` (the waiter, `hook claude-wait`, `asyncRewake`) | | 28800 s | 0.5.0 |
 
 `PostToolUse` runs after every tool call and only delivers notes ("Notes to live agents",
-below). A settings file holding exactly the hooks an earlier Dispatch installed, 0.4.6 to
-0.4.16's four or 0.4.17's six, is offered as an Update, showing the hooks it becomes, for the same executable (`Hook command, unchanged:
-…`) or another. Hooks of Dispatch's edited by hand are left alone and reported as `changed
+below). The two `Stop` hooks deliver asks to catch up ("Catch-up in place", below); the
+consent screen says of the second: `The second Stop hook waits in the background after each
+turn, for at most 8 hours, to wake the session when its Work is asked to catch up with a
+landing.` A settings file holding exactly the hooks an earlier Dispatch installed, 0.4.6 to
+0.4.16's four, 0.4.17's six or 0.4.18's seven, is offered as an Update, showing the hooks it
+becomes, for the same executable (`Hook command, unchanged: …`) or another. The two `Stop`
+entries are Dispatch's in either order. Hooks of Dispatch's edited by hand are left alone and reported as `changed
 by hand`; the "Agents Dispatch launches…" → Runtime integrations menu removes them (`Only
 Dispatch's own hooks are removed, hook by hook`), then installs them again. A person's own
 hooks, in the same file or the same entry, are kept on install, update and removal.
@@ -959,12 +983,18 @@ it once it is ready`.
 awaits review (Ready, review pending, not applied, not closed), or is being finished by consent, does not
 join it:
 - the new Work begins from that Work's S0 and provenance, so its Δ holds both sessions'
-  changes, and records `work.reopened {reopens: <old>, provenance}`;
+  changes, and records `work.reopened {reopens: <old>, provenance}`. Since 0.5.0 it also
+  keeps that S0's time (`attachment.s0_since`, the earlier Work's start when that S0 never
+  moved), so a landing recorded after it is newer than its S0 even when it landed before
+  the resume, and merging it moves S0;
 - the earlier Work closes as superseded by it, its Δ kept, its review `not_requested`, with
   `work.closed {reason: "superseded", by: "reopen", replacement}`. A finish still running is
   cancelled first and its checks killed;
 - the note `<state>/reopen/<old id>`, written before the new Work is published, makes this
-  survive a crash: the owner closes the earlier Work within a tick when the hook could not.
+  survive a crash: the owner closes the earlier Work within a tick when the hook could not;
+- from the moment that note is written, the owner leaves the earlier Work out of its
+  interaction view, as if it were already closed: the two are one piece of work, so neither
+  is shown interacting with the other, and no note names one to the other (0.5.0).
 
 Either the `SessionStart` hook (`source: resume`) or discovery (a new running lock on the
 worktree) may see the session first; the outcome is the same, and the hook's reply names the
@@ -987,8 +1017,9 @@ SELECT run_id, json_extract(payload_json, '$.reopens'), json_extract(payload_jso
 ### Waiting on you
 
 Claude Code's `Notification` hook (matched to `permission_prompt`, `idle_prompt` and
-`agent_needs_input`) and `Stop` hook mark the worktree's Work in a watched project, and never
-reply, so they never keep Claude working:
+`agent_needs_input`) and `Stop` hook mark the worktree's Work in a watched project. They reply
+only when the `Stop` hook delivers an ask to catch up ("Catch-up in place", below); that
+`Stop` keeps the turn going and leaves no mark:
 - `permission_prompt` is `permission`; `idle_prompt` and `agent_needs_input` are `input`;
   `Stop` is `turn ended`, "waiting for your next prompt". Any other notification changes
   nothing. A newer mark replaces the older one.
@@ -1049,7 +1080,7 @@ Dispatch: other Work touches this Work (01M6T2KV), your changes in this workspac
 01M6T2KT (Claude Code): it changes the signature of validate (src/lib.rs), which this Work uses
 ```
 
-After the first Work landed, the second heard:
+After the first Work landed, the second heard (0.4.18's output):
 
 ```text
 Dispatch: other Work touches this Work (01M6T2KV), your changes in this workspace.
@@ -1057,6 +1088,11 @@ Dispatch: other Work touches this Work (01M6T2KV), your changes in this workspac
 Signature: pub fn validate(input: &str) -> bool → pub fn validate(input: &str, strict: bool) -> bool
 The source with this change is commit b768cb1b (refs/dispatch/source).
 ```
+
+Since 0.5.0 that last line names the whole commit and not the ref, `The source with this
+change is commit <40 hex>.`: Claude Code 2.1.296's worktree isolation refuses any command
+that names `refs/dispatch/source`, and an agent copies what the note names. The same landing
+may also ask the agent to catch up ("Catch-up in place", below).
 
 - **What gets a note** (`coherence::notes::compose`): an interaction with other Work in
   progress under the rules `SameDeclaration`, `Uses` or `TextualOverlap` ("Work against
@@ -1097,8 +1133,98 @@ The source with this change is commit b768cb1b (refs/dispatch/source).
   note, at a target the note named ("Measuring notes" in
   [coherence-validation.md](coherence-validation.md)).
 
-Claude Code's hooks and Hermes's need nothing else from the agent. Dispatch does not wake an
-idle session, block a turn or answer a `Stop` hook.
+Notes need nothing else from the agent. Since 0.5.0 one thing does ask: catch-up, below.
+
+### Catch-up in place
+
+Since 0.5.0, when Work lands, the project owner may ask a live agent once to bring the
+landing into its Work. It is the one thing Dispatch asks of an agent, in fixed text, never
+written by a model, and only through the runtime's hooks.
+
+- **What asks** (`orchestrator::catchup`, on each owner tick, after notes): a landing
+  recorded at the project whose `interaction.landed` the owner observed, with live Work as
+  a counterpart that
+  - uses a declaration whose signature the landing changed, or which it removed (`Uses`,
+    the landed Work the writer, on a declaration), or
+  - changes a declaration the landing also changed (`SameDeclaration` on a declaration).
+
+  A whole-file or textual interaction never asks, nor does a declaration this Work changes
+  and the landed Work uses.
+- **Which Work.** Work in progress whose S0 a merge can move ("When S0 moves", above:
+  attached Git Work, its workspace there, no live wrapper), with a live Claude Code or
+  Hermes session. Wrapped Work keeps its S0 while its wrapper lives, so it is never asked,
+  and neither is Codex or Cursor Work.
+- **Once.** Each landing is asked about once per Work. The landing is added to the Work's
+  record, `<state>/catchup/work/<key>.json`, before the ask is written, so a crash asks at
+  most once. Landings before a hook takes the ask are one ask, `<state>/catchup/<key>.json`,
+  naming each. An ask expires (`catchup.expired`) when the Work's S0 already moved to a
+  source recorded at or after its landings (`s0_moved`), or when the Work is no longer in
+  progress (`left_working`). Notes are unchanged: the same landing still makes its landing
+  note.
+- **What it says.** At most 8 lines: the landed Work and its runtime; each target, at most
+  four, then `- and <n> more.`; for a changed signature, the old and new one, each cut at
+  200 characters; the recorded commit, which is the newest named landing's and holds the
+  earlier ones; and the request. Packet S of 0.5.0 got this one:
+
+  ```text
+  Dispatch: Work 01M75EBG (Claude Code) landed changes this Work relies on.
+  - tests::a_refresh_step_follows_what_the_work_can_do (src/orchestrator.rs), which this Work also changes: 01M75EBG changed it
+  - next_step (src/orchestrator.rs), which this Work uses: 01M75EBG changed its signature, pub(crate) fn next_step( run: &RunRecord, decision: Decision, source: Option<&s0::Recorded>, ) -> (String, Option<String>) → pub(crate) fn next_step( run: &RunRecord, decision: Decision, source: Option<&s0::Recorded>, asked: Option<&catchup::Asked>, ) -> (String, Option<String>)
+  These changes are in refs/dispatch/source (commit 5e86363d).
+  To catch up: commit your work, run git merge 5e86363d7b31ffeffe31f4a1fa84256b7994badf, update what uses them, and run the project's checks. Dispatch asks once per landing.
+  ```
+
+  The command names the commit in full, because Claude Code's worktree isolation refuses
+  any command that names `refs/dispatch/source`.
+- **Claude Code, as a turn ends.** The `Stop` hook reads `hook_event_name`, `cwd` and
+  `stop_hook_active` from the start of the payload. Unless `stop_hook_active` is true, it
+  takes an ask waiting for its workspace and prints `{"decision":"block","reason":<the
+  ask>}`. Claude Code keeps the turn going with it and shows the person `Stop hook error:
+  Dispatch: …`. That `Stop` leaves no "turn ended" mark; the next `Stop`, with
+  `stop_hook_active: true`, takes nothing. A payload of any size works on this path.
+- **Claude Code, idle: the waiter.** The second `Stop` hook, `hook claude-wait`, runs in the
+  background (`asyncRewake`, timeout 28800 s).
+  - It ends at once in a project nobody watches, in a workspace with no Work the owner
+    keeps a record for, or for a payload with no session or `cwd`.
+  - Otherwise it makes itself its session's newest waiter (`<state>/waiters/<session>`),
+    waits one second, so that an ask already waiting at this `Stop` is the `Stop` hook's to
+    deliver, then looks for an ask once a second.
+  - When one waits, it takes it, writes it to stderr and exits 2. Claude Code then wakes
+    an idle session with it, shown as `Stop hook feedback`, or gives it at the next tool
+    call of a busy one (observed with Claude Code 2.1.296).
+  - It exits 0, quietly, when a newer waiter of its session replaces it (each `Stop`
+    starts one), when its parent, the Claude Code process, changes, or after 28,740 s, a
+    minute before Claude Code's timeout. Claude Code also ends running waiters at `/exit`,
+    Ctrl-D and a hangup. It never prints to stdout.
+  - So a session idle for more than 8 hours has no waiter left, and its ask arrives when
+    its next turn ends. In 0.5.0's own build, packet S was idle for 16.7 hours when the
+    landing came, and got its ask by `Stop` when it was next given a turn.
+  - Files in `waiters/` older than a day are removed when a waiter starts.
+- **Hermes.** At the end of a turn that edited files, Hermes runs `pre_verify` (5 s). When
+  `extra.attempt` is 0 and an ask waits, the hook prints `{"action":"continue","message":<the
+  ask>}` and Hermes keeps the turn going. Any later attempt gets nothing, so the ask uses
+  none of the nudges `agent.max_verify_nudges` allows (3 by default). Otherwise the ask
+  comes with the next turn through `pre_llm_call`, after any notes, in the same `{"context":
+  …}`. Hermes cannot be woken while idle, so an ask waits for its next turn.
+- **The hook side** opens no database, takes no lock, runs no Git and makes no network
+  call. It finds the workspace from its directory (Claude Code's `cwd`, Hermes's
+  `TERMINAL_CWD`) and takes the ask by renaming it into
+  `catchup/delivered/<ULID>.<via>.json`. A rename happens once, so an ask reaches the agent
+  once however many hooks race.
+- **What follows.** The agent's merge moves S0, as any merge of a recorded source does
+  ("When S0 moves", above), and the owner checks the Work again: since 0.5.0 it does so when
+  the Work's Δ, its S0 or the source changes. Dispatch never merges, refreshes or relaunches
+  anything itself, and never asks twice about one landing.
+- **Where it shows.** Work in progress whose agent was asked, and whose S0 has not yet moved
+  past those landings, shows `asked to catch up with <short id>[ and <short id>…] at
+  <YYYY-MM-DD HH:MM UTC>`: under `Catch-up` in `dispatch status <id>`, and in `watch`'s
+  details under its REFRESH. Once S0 moves, the line goes. While it shows, `dispatch check
+  <id> --merged` gives the REFRESH next step `its agent was asked to merge <commit>; once its
+  S0 moves, Dispatch checks it again`.
+- **Recorded:** `catchup.written {landings, targets, text}` when the owner writes or adds to
+  an ask, `catchup.delivered {via: stop | wake | verify | turn, landings}` timed when a hook
+  took it, and `catchup.expired {why, landings}`. `docs/queries/catchup-measured.sql` counts
+  them ("Measuring catch-up and batches" in [coherence-validation.md](coherence-validation.md)).
 
 ### Work that appears without hooks
 
@@ -1222,7 +1348,9 @@ its source:
   hear about leaves the last-seen Δ ("Workspace removal", above).
 - **The hooks.** `dispatch setup` (its Hooks step, or Runtime integrations → `Install
   the Hermes hook`) appends one block to `~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml`
-  when that is set). Since 0.4.18 it holds two hooks; `pre_llm_call` delivers notes:
+  when that is set). Since 0.5.0 it holds three hooks: `pre_llm_call` delivers notes and
+  asks to catch up, and `pre_verify` delivers an ask at the end of a turn that edited files
+  ("Catch-up in place", above):
 
   ```yaml
   # Added by dispatch setup, which removes it unless it is edited.
@@ -1231,6 +1359,9 @@ its source:
       - command: "'<dispatch>' --state-dir '<state>' hook hermes"
         timeout: 300
     pre_llm_call:
+      - command: "'<dispatch>' --state-dir '<state>' hook hermes"
+        timeout: 5
+    pre_verify:
       - command: "'<dispatch>' --state-dir '<state>' hook hermes"
         timeout: 5
   ```
@@ -1242,9 +1373,13 @@ its source:
     already has `hooks:` is left alone, and setup shows the lines to add under it.
   - Dispatch's hooks are recognized by value: every hook entry whose command ends in
     ` hook hermes`, under any event. They are Dispatch's, unedited, when they equal
-    exactly the entries above for one command, or the one `on_session_finalize` entry
-    0.4.15 to 0.4.17 installed (offered as an Update). A different timeout or event, an
-    extra key, or the two hooks running different commands is `changed by hand`.
+    exactly the entries above for one command, or 0.4.18's two (`on_session_finalize` and
+    `pre_llm_call`), or the one `on_session_finalize` entry 0.4.15 to 0.4.17 installed
+    (both offered as an Update). A different timeout or event, an extra key, or hooks
+    running different commands is `changed by hand`. The Update from an earlier block adds:
+    `The pre_verify hook is new: at the end of a turn that edited files, it gives the agent
+    an ask to catch up if one waits, so Hermes asks you about it once more, the first time
+    Hermes starts.`
   - Update and `Remove the Hermes hook` write only when Dispatch's marker block is there as
     Dispatch wrote it: they replace or take out exactly that block and give the file its
     other bytes back. `hermes config set` rewrites the file with PyYAML, which drops the
@@ -1267,8 +1402,13 @@ its source:
 - **`pre_llm_call`** runs before each model call. `dispatch hook hermes` reads the event's
   name from the start of the payload, which carries the whole conversation and grows past
   the hook's 64 KiB input limit in a long session, and takes the rest of stdin unread. It
-  delivers the inbox of the workspace `TERMINAL_CWD` is in as `{"context": …}`, or prints
-  nothing ("Notes to live agents", above).
+  delivers the inbox of the workspace `TERMINAL_CWD` is in, then a waiting ask to catch up,
+  joined in one `{"context": …}`, or prints nothing ("Notes to live agents" and "Catch-up in
+  place", above).
+- **`pre_verify`** runs at the end of a turn that edited files. The hook reads
+  `extra.attempt` without parsing `final_response`, so a long response does not matter.
+  Only on attempt 0, with an ask waiting, does it print `{"action":"continue","message": …}`;
+  otherwise it prints nothing.
 - **What `on_session_finalize` does** (`dispatch hook hermes`, reading Hermes's payload on
   stdin and the worktree from `TERMINAL_CWD`, since the payload's `cwd` is the main
   checkout):
@@ -1374,14 +1514,17 @@ review of attached work exactly as they do for native work (since 0.4.1): one
 accept, `apply_locked(..., ApplyAuthority::Human)` run under one hold of the run's
 operation lock.
 
-- **A decision without an ID needs exactly one candidate.** `dispatch accept` or
-  `dispatch reject` with no ID (`sole_awaiting_review`) acts only when exactly one
-  result for the source waits for review: finished, ready, review pending, not
-  applied and not closed, native or attached. With none or several it changes
-  nothing, exits 1, and lists each waiting result as `dispatch <accept|reject>
-  <full id>  (task)`, and Work still in progress as "not counted". An explicit ID
-  keeps the unique-prefix rule; the full ID is used for locks, writes and events.
-  Every finish and result summary prints its commands with the full ID.
+- **A decision without an ID.** `dispatch reject` with no ID (`sole_awaiting_review`)
+  acts only when exactly one result for the source waits for review: finished, ready,
+  review pending, not applied and not closed, native or attached. With none or several
+  it changes nothing, exits 1, and lists each waiting result as `dispatch <accept|reject>
+  <full id>  (task)`, and Work still in progress as "not counted". `dispatch accept`
+  with no ID does the same, except in a Git project where two or more of those results
+  can land together: since 0.5.0 it then proposes them as one batch, behind one approval
+  ([reference.md](reference.md#one-shot-cli)), and each result that lands is recorded as
+  a single accept records it, naming the batch. An explicit ID keeps the unique-prefix
+  rule; the full ID is used for locks, writes and events. Every finish and result
+  summary prints its commands with the full ID.
 - **The delivered-result guard.** A review is a judgment of a delivered result; an
   attached run that has not been finished yet has no Δ to judge. `reject` on
   unfinished attached Work refuses and names `dispatch close <id> --reason unfinished`
@@ -1391,8 +1534,12 @@ operation lock.
   or finished.
 - `dispatch refresh` has no meaning for attached work — there is no Dispatch task to
   relaunch — and is refused: *"attached work has no Dispatch task to refresh; finish,
-  reject or close it."* For a stale result, run the agent again on the current source,
-  and once that Work is finished, close the old one as superseded by it.
+  reject or close it."* For a stale result whose session can be resumed in its worktree,
+  resume it there and merge the newest recorded source by its commit (the finish
+  summary's REFRESH step, above). Otherwise run the agent again on the current source,
+  and once that Work is finished, close the old one as superseded by it. Since 0.5.0,
+  accept's refusal of a stale result ends with the same step: `Next: <step> (or dispatch
+  reject <id>).`.
 
 ### Closing Work
 
@@ -1447,10 +1594,13 @@ In addition to the existing coherence, application and review events (see
 | `note.delivered` | the owner saw a hook take it; timed when the hook took it | `{"note", "via": "PostToolUse" \| "SessionStart" \| "pre_llm_call"}` |
 | `note.expired` | the Work stopped being in progress before a hook took it | `{"note", "lifecycle"}` |
 | `note.touched` | the first change the Work's Δ made, after the note, at a target the note named | `{"note", "key": [kind, other run, path, name, change]}` |
+| `catchup.written` | the owner wrote or added to an ask to catch up (0.5.0; see "Catch-up in place") | `{"landings": [<run id>], "targets", "text"}`; `landings` new in this write, `text` the whole ask |
+| `catchup.delivered` | the owner saw a hook take the ask; timed when the hook took it | `{"via": "stop" \| "wake" \| "verify" \| "turn", "landings"}` |
+| `catchup.expired` | before a hook took it, the Work's S0 moved to a source recorded at or after its landings, or the Work was no longer in progress | `{"why": "s0_moved" \| "left_working", "landings"}` |
 | `workspace.removed` | the workspace is gone: kept exactly by a hook (Claude Code's or Hermes's), or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes", "last_seen_at"}`; `last_seen_at` since 0.4.15 |
 | `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
 | `work.closed` | a person closed Work (`dispatch close`, or `c` in `watch`), or a resumed session superseded it (`by: "reopen"`, 0.4.17). Before 0.4.12, a person rejected unfinished Work whose workspace was gone | `{"reason": "unfinished" \| "workspace_removed" \| "already_present" \| "superseded", "by": "human" \| "reopen", "world_digest"?, "replacement"?}` |
-| `interaction.landed` | after `result.applied`: what the owner's view said about this Work and the others in progress | `measure::Landing` (see [coherence.md](coherence.md#measuring-interactions-measurers)) |
+| `interaction.landed` | after `result.applied`: what the owner's view said about this Work and the others in progress | `measure::Landing` (see [coherence.md](coherence.md#measuring-interactions-measurers)); since 0.5.0 a batch member's carries `batch` and lists no Work that landed with it |
 | `interaction.outcome` | the owner's first verdict on one of those others after this Work landed | `measure::Outcome` |
 
 An attached run also commits the ordinary `run.created`/`run.finished` events, and
@@ -1563,6 +1713,10 @@ directory, exactly as it already refuses any newer schema.
 - A worktree removed while its finish by consent runs: the runtime's removal waits up
   to 60 s for the finish, then fails, and the worktree stays. Its changes were already
   kept when the finish began.
+- Asks to catch up reach only live Claude Code and Hermes Work whose S0 a merge can
+  move, and only for a declaration-level break. An idle Claude Code session is woken only
+  while its last turn's waiter lives (8 hours); after that, and always for Hermes, the
+  ask waits for the session's next turn. An ask is not delivered when a session starts.
 - "Waiting on you" comes only from Claude Code's hooks. A `turn ended` mark clears at
   the first transcript write more than 10 s after it, so a prompt typed within those
   10 s clears it only at the agent's next write; a person's own `Stop` hook slower

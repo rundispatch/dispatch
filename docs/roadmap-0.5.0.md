@@ -27,6 +27,37 @@ other's way.
    allowed to overlap, and its execution log shows the numbers. The four-harness conformance
    trials (run with the user's approval) pass, including new coordination cells.
 
+## Where the six conditions stand (2026-11-13)
+
+Measured on 0.5.0's own build: its first wave of packets ran under the pinned 0.4.18, and
+its second under a release build of the branch. The counts come from the documented
+queries on that build's state (`notes-measured.sql`, `catchup-measured.sql`,
+`batches-measured.sql`). A placeholder in double brackets waits on the coordination
+conformance packet (C).
+
+1. **Agents know about each other.** 26 notes delivered on real work, 0 unsettled. Their
+   next verdicts: REFRESH 7 (all 7 count as agreement with Dispatch's own later verdict),
+   CONTINUE 7, none yet 12. Counts only, with no target, as the plan asks.
+2. **Stale work catches up in place.** 2 asks on real work, naming 3 landings, with 0
+   asked twice and 0 file-level targets. One woke an idle Claude Code session, one came by
+   `Stop`. Each was followed by the agent's merge and an S0 move (271 s and 96 s after
+   delivery), then CONTINUE, with no relaunch. Hermes: stand-in tests only.
+3. **Landing is one decision.** Each landing of 2 or more ready results in the second
+   wave was one `dispatch accept` proposal and one approval: 7 results, then 3, each with
+   one merged-check run and no bisection. 15 Works landed behind 7 approvals in all.
+   Manual steps are not recorded by any event.
+4. **Out of the box.** [[C: install line, setup and accept on a temporary HOME with the release build: commands and flags]]
+5. **Fast.** 20 suite runs for 15 landed Works, 1.33 per landed Work (at most 1.75).
+   [[C: passing trees verified twice, from coherence.merged_checks by tree_id]]
+   [[C: p50 of 10 accepts of an already verified result on the release build, with the load]]
+   [[C: native start on the release build, median and load]]
+6. **Proven on itself.** The second wave was supervised by a release build of the branch,
+   and recorded symbol-level interactions between live Works, for example packet P2h
+   changing the signature of `next_step`, which packet S used; P2h's landing then asked S
+   to catch up. [[C: the four-harness coordination cells: notes, catch-up, S0 following the merge, batch landing, for Claude Code, Codex, Cursor and Hermes]]
+
+Also measured for the release: [[C: Stop hook p95 over 1,000 calls with an ask pending, on the release build, with the load]]
+
 ## The releases
 
 | Release | Theme | What it adds | Gate to the next |

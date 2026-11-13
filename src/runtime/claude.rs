@@ -5,16 +5,24 @@
 //! the person) as `RuntimeEvent`s, and the reply Claude Code shows the
 //! person. `SessionStart` and `PostToolUse` also deliver pending notes to the
 //! agent, as `additionalContext`: Claude Code shows it to the model before
-//! the first prompt, or right after the tool's result. Everything
-//! Claude-specific ends here.
+//! the first prompt, or right after the tool's result. A pending ask to catch
+//! up is delivered at `Stop`, which it keeps going, or by the waiter, a second
+//! `Stop` hook that wakes an idle session (`wait`). Everything Claude-specific
+//! ends here.
 
-use std::{sync::mpsc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::{EventKind, Hook, Reply, RuntimeEvent};
-use crate::{NeedsYouKind, state::State};
+use crate::{NeedsYouKind, orchestrator::catchup, state::State};
 
 #[derive(Deserialize)]
 struct Input {
@@ -134,13 +142,27 @@ const REMOVAL_DEADLINE: Duration = Duration::from_secs(240);
 /// be deleted whose Δ Dispatch could not keep: the hook fails, so Claude Code
 /// keeps the worktree and the work in it.
 pub fn handle(state: &State, input: &[u8]) -> Output {
-    // Notes first, from the payload's head: a tool's output can make the
-    // rest larger than Dispatch reads. Once claimed they are always printed.
+    // Asks and notes first, from the payload's head: a tool's output or the
+    // last message can make the rest larger than Dispatch reads. Once claimed
+    // they are always printed.
     let head = super::head(input);
-    let event = head.get("hook_event_name").map(String::as_str);
-    let notes = match (event, head.get("cwd")) {
+    let text = |name: &str| head.get(name).and_then(Value::as_str);
+    let (event, cwd) = (text("hook_event_name"), text("cwd").map(Path::new));
+    // An ask to catch up keeps the turn going, as its reason, so the turn
+    // has not ended. Never on a turn a `Stop` hook already kept going.
+    if event == Some("Stop")
+        && head.get("stop_hook_active") != Some(&Value::Bool(true))
+        && let Some(reason) = cwd.and_then(|cwd| super::catch_up(state, cwd, "stop"))
+    {
+        return Output {
+            stdout: serde_json::json!({"decision": "block", "reason": reason}).to_string(),
+            stderr: String::new(),
+            code: 0,
+        };
+    }
+    let notes = match (event, cwd) {
         (Some(event @ ("SessionStart" | "PostToolUse")), Some(cwd)) => {
-            super::deliver(state, std::path::Path::new(cwd), event).map(|notes| (event, notes))
+            super::deliver(state, cwd, event).map(|notes| (event, notes))
         }
         _ => None,
     };
@@ -213,7 +235,126 @@ fn notice(reply: Result<Reply>, notes: Option<(&str, String)>) -> Output {
     }
 }
 
-type HookSet = [(&'static str, Option<&'static str>, u64)];
+/// How long Claude Code lets the waiter run, in seconds: its `timeout`.
+const WAITER_TIMEOUT: u64 = 28_800;
+
+/// How long the waiter waits: a minute less than Claude Code lets it run, so
+/// that it ends by itself.
+pub const MAX_WAIT: Duration = Duration::from_secs(WAITER_TIMEOUT - 60);
+
+/// `dispatch hook claude-wait`, the waiter: the second `Stop` hook, which
+/// Claude Code runs in the background (`asyncRewake`). Its exit status 2
+/// gives the session its stderr, waking it when idle, or at the next tool
+/// call when busy (observed with Claude Code 2.1.296). It waits for an ask
+/// to catch up for its workspace, looking once a second with one `stat`, and
+/// leaves at once in a project nobody watches or a workspace the owner keeps
+/// no record for. It leaves when a newer waiter of its session starts, when
+/// its session ends (its parent, the Claude Code process, changes), and
+/// after `max_wait`. It never prints to stdout.
+pub fn wait(state: &State, input: &[u8], max_wait: Duration) -> Output {
+    let (began, claude) = (Instant::now(), parent());
+    let quiet = Output {
+        stdout: String::new(),
+        stderr: String::new(),
+        code: 0,
+    };
+    let head = super::head(input);
+    let text = |name: &str| head.get(name).and_then(Value::as_str);
+    let (Some(cwd), Some(session)) = (text("cwd").map(Path::new), text("session_id")) else {
+        return quiet;
+    };
+    if !super::session_id(session) || !cwd.is_absolute() || super::unwatched(state, cwd) {
+        return quiet;
+    }
+    let Some(workspace) = super::workspace(cwd).filter(|w| catchup::followed(state, w)) else {
+        return quiet;
+    };
+    let Some(newest) = Newest::start(state, session) else {
+        return quiet;
+    };
+    let pending = catchup::pending(state, &workspace);
+    // A second first: an ask waiting at this `Stop` is the `Stop` hook's to
+    // deliver, keeping the turn going rather than waking it once it ended.
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if began.elapsed() >= max_wait || parent() != claude || !newest.still() {
+            return quiet;
+        }
+        if pending.exists()
+            && let Some(text) = catchup::claim(state, &workspace, "wake")
+        {
+            return Output {
+                stdout: String::new(),
+                stderr: text,
+                code: 2,
+            };
+        }
+    }
+}
+
+/// A waiter as the newest of its session's: `waiters/<session>` is its own
+/// until a newer waiter of that session replaces it. Claude Code starts one
+/// at every `Stop`.
+struct Newest {
+    path: PathBuf,
+    written: SystemTime,
+}
+
+impl Newest {
+    /// Make this waiter its session's newest. Files older than a day, which
+    /// no waiter can own still, are removed.
+    fn start(state: &State, session: &str) -> Option<Self> {
+        let directory = state.root.join("waiters");
+        fs::create_dir_all(&directory).ok()?;
+        let stale = |entry: &fs::DirEntry| {
+            let age = entry.metadata().and_then(|m| m.modified()).ok()?.elapsed();
+            Some(age.ok()? > Duration::from_secs(24 * 60 * 60))
+        };
+        for entry in fs::read_dir(&directory).ok()?.flatten() {
+            if stale(&entry) == Some(true) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let mut file = tempfile::NamedTempFile::new_in(&directory).ok()?;
+        std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes()).ok()?;
+        // As written, before the rename that makes it the session's.
+        let written = file.as_file().metadata().ok()?.modified().ok()?;
+        let path = directory.join(session);
+        file.persist(&path).ok()?;
+        Some(Self { path, written })
+    }
+
+    fn still(&self) -> bool {
+        fs::metadata(&self.path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified == self.written)
+    }
+}
+
+/// The process that started this one: for a hook, the Claude Code process
+/// of its session, which starts hooks itself.
+#[cfg(unix)]
+fn parent() -> Option<u32> {
+    Some(std::os::unix::process::parent_id())
+}
+
+#[cfg(not(unix))]
+fn parent() -> Option<u32> {
+    None
+}
+
+/// What the waiter's command adds to `hook_command`: `hook claude-wait`. A
+/// runtime name, not an option, so a Dispatch that does not know it refuses
+/// it with status 1; a usage error's status 2 would wake the session.
+const WAIT: &str = "-wait";
+
+/// The matcher of `Notification`.
+const WAITING_TYPES: &str = "permission_prompt|idle_prompt|agent_needs_input";
+
+/// Hooks as Dispatch writes them: event, matcher, timeout, what the command
+/// adds to `hook_command`, and whether Claude Code runs it in the background
+/// and lets its exit status 2 wake the session (`asyncRewake`).
+type HookSet = [(&'static str, Option<&'static str>, u64, &'static str, bool)];
 
 /// The hook events Dispatch installs, with the matcher and timeout each
 /// gets. A `WorktreeRemove` hook outlasts `REMOVAL_DEADLINE`, so Dispatch
@@ -221,42 +362,45 @@ type HookSet = [(&'static str, Option<&'static str>, u64)];
 /// `Notification` matcher of plain words separated by `|` exactly against
 /// `notification_type` (its hooks reference), so only the types in `WAITING`
 /// run Dispatch at all. `PostToolUse`, with no matcher, runs after every
-/// tool call, and does nothing but deliver notes.
+/// tool call, and does nothing but deliver notes. `Stop` runs twice: once to
+/// record the turn's end or deliver an ask, and once as the waiter.
 const INSTALLED: &HookSet = &[
-    ("SessionStart", None, 60),
-    ("SessionEnd", None, 5),
-    ("WorktreeRemove", None, 300),
-    ("PreToolUse", Some("ExitWorktree"), 300),
-    (
-        "Notification",
-        Some("permission_prompt|idle_prompt|agent_needs_input"),
-        5,
-    ),
-    ("Stop", None, 5),
-    ("PostToolUse", None, 5),
+    ("SessionStart", None, 60, "", false),
+    ("SessionEnd", None, 5, "", false),
+    ("WorktreeRemove", None, 300, "", false),
+    ("PreToolUse", Some("ExitWorktree"), 300, "", false),
+    ("Notification", Some(WAITING_TYPES), 5, "", false),
+    ("Stop", None, 5, "", false),
+    ("Stop", None, WAITER_TIMEOUT, WAIT, true),
+    ("PostToolUse", None, 5, "", false),
 ];
 
-/// The hooks earlier Dispatches installed: 0.4.6 to 0.4.16, then 0.4.17.
-/// Settings holding exactly one of these are Dispatch's own, to be updated,
-/// not changed by hand.
-const EARLIER: [&HookSet; 2] = [
+/// The hooks earlier Dispatches installed: 0.4.6 to 0.4.16, 0.4.17, then
+/// 0.4.18. Settings holding exactly one of these are Dispatch's own, to be
+/// updated, not changed by hand.
+const EARLIER: [&HookSet; 3] = [
     &[
-        ("SessionStart", None, 60),
-        ("SessionEnd", None, 5),
-        ("WorktreeRemove", None, 300),
-        ("PreToolUse", Some("ExitWorktree"), 300),
+        ("SessionStart", None, 60, "", false),
+        ("SessionEnd", None, 5, "", false),
+        ("WorktreeRemove", None, 300, "", false),
+        ("PreToolUse", Some("ExitWorktree"), 300, "", false),
     ],
     &[
-        ("SessionStart", None, 60),
-        ("SessionEnd", None, 5),
-        ("WorktreeRemove", None, 300),
-        ("PreToolUse", Some("ExitWorktree"), 300),
-        (
-            "Notification",
-            Some("permission_prompt|idle_prompt|agent_needs_input"),
-            5,
-        ),
-        ("Stop", None, 5),
+        ("SessionStart", None, 60, "", false),
+        ("SessionEnd", None, 5, "", false),
+        ("WorktreeRemove", None, 300, "", false),
+        ("PreToolUse", Some("ExitWorktree"), 300, "", false),
+        ("Notification", Some(WAITING_TYPES), 5, "", false),
+        ("Stop", None, 5, "", false),
+    ],
+    &[
+        ("SessionStart", None, 60, "", false),
+        ("SessionEnd", None, 5, "", false),
+        ("WorktreeRemove", None, 300, "", false),
+        ("PreToolUse", Some("ExitWorktree"), 300, "", false),
+        ("Notification", Some(WAITING_TYPES), 5, "", false),
+        ("Stop", None, 5, "", false),
+        ("PostToolUse", None, 5, "", false),
     ],
 ];
 
@@ -290,19 +434,22 @@ pub fn hook_command(state: &State) -> Result<String> {
 }
 
 /// Whether `hook` is one Dispatch installed: a command running some Dispatch
-/// executable with its state directory, `hook claude`. Only such a hook is
-/// ever replaced or removed, never an entry or another hook beside it.
+/// executable with its state directory, `hook claude` or the waiter's `hook
+/// claude-wait`. Only such a hook is ever replaced or removed, never an
+/// entry or another hook beside it.
 fn ours(hook: &serde_json::Value) -> bool {
     hook["type"] == "command"
         && hook["command"].as_str().is_some_and(|command| {
             command.starts_with('\'')
                 && command.contains("' --state-dir '")
-                && command.ends_with("' hook claude")
+                && (command.ends_with("' hook claude")
+                    || command.ends_with(&format!("' hook claude{WAIT}")))
         })
 }
 
 /// Dispatch's hooks in `settings`, under any event, as `(event, matcher,
-/// hook)`, sorted by event and matcher.
+/// hook)`, sorted by event, matcher and hook, so that two under one event
+/// compare in any order.
 fn installed(settings: &serde_json::Value) -> Vec<(String, Option<String>, serde_json::Value)> {
     let mut found = Vec::new();
     for (event, entries) in settings["hooks"].as_object().into_iter().flatten() {
@@ -315,7 +462,9 @@ fn installed(settings: &serde_json::Value) -> Vec<(String, Option<String>, serde
             }
         }
     }
-    found.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    found.sort_by_cached_key(|(event, matcher, hook)| {
+        (event.clone(), matcher.clone(), hook.to_string())
+    });
     found
 }
 
@@ -366,10 +515,14 @@ fn with_set(
     if !settings["hooks"].is_object() {
         settings["hooks"] = serde_json::json!({});
     }
-    for &(event, matcher, timeout) in set {
-        let mut entry = serde_json::json!({
-            "hooks": [{"type": "command", "command": command, "timeout": timeout}]
+    for &(event, matcher, timeout, suffix, rewake) in set {
+        let mut hook = serde_json::json!({
+            "type": "command", "command": format!("{command}{suffix}"), "timeout": timeout
         });
+        if rewake {
+            hook["asyncRewake"] = true.into();
+        }
+        let mut entry = serde_json::json!({"hooks": [hook]});
         if let Some(matcher) = matcher {
             entry["matcher"] = serde_json::json!(matcher);
         }
@@ -382,8 +535,9 @@ fn with_set(
 }
 
 /// Dispatch's hooks in the settings at `path`, hook by hook: exact when they
-/// are just the hooks `with_hooks` writes, all running one command, and
-/// earlier when they are just the hooks an earlier Dispatch wrote.
+/// are just the hooks `with_hooks` writes, all running one command (the
+/// waiter's as `claude-wait`), and earlier when they are just the hooks an
+/// earlier Dispatch wrote.
 pub fn hook(path: &std::path::Path) -> Result<Hook> {
     let Ok(bytes) = std::fs::read(path) else {
         return Ok(Hook::Absent);
@@ -394,7 +548,8 @@ pub fn hook(path: &std::path::Path) -> Result<Hook> {
     let Some((_, _, first)) = found.first() else {
         return Ok(Hook::Absent);
     };
-    let command = first["command"].as_str().unwrap_or_default().to_owned();
+    let command = first["command"].as_str().unwrap_or_default();
+    let command = command.strip_suffix(WAIT).unwrap_or(command).to_owned();
     let written = |set| with_set(serde_json::json!({}), set, &command).map(|s| installed(&s));
     if found == written(INSTALLED)? {
         return Ok(Hook::Exact(command));
@@ -832,7 +987,7 @@ mod tests {
         assert_eq!(mark(probe("Notification", serde_json::json!({}))), None);
         // The matcher setup installs names exactly the types parsed as marks.
         let names: Vec<&str> = WAITING.iter().map(|(name, _)| *name).collect();
-        assert!(INSTALLED.contains(&("Notification", Some(&names.join("|")), 5)));
+        assert!(INSTALLED.contains(&("Notification", Some(&names.join("|")), 5, "", false)));
     }
 
     #[test]
@@ -886,12 +1041,21 @@ mod tests {
                 "hooks": [{"type": "command", "command": COMMAND, "timeout": 5}],
             })
         );
+        // Theirs, Dispatch's, and Dispatch's waiter, in the background for
+        // up to eight hours.
         let stops = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stops.len(), 2, "{stops:?}");
+        assert_eq!(stops.len(), 3, "{stops:?}");
         assert_eq!(stops[0], theirs["hooks"]["Stop"][0]);
         assert_eq!(
             stops[1],
             serde_json::json!({"hooks": [{"type": "command", "command": COMMAND, "timeout": 5}]})
+        );
+        assert_eq!(
+            stops[2],
+            serde_json::json!({"hooks": [{
+                "type": "command", "command": format!("{COMMAND}-wait"),
+                "timeout": 28_800, "asyncRewake": true,
+            }]})
         );
         assert_eq!(hook(&path).unwrap(), Hook::Exact(COMMAND.into()));
 
@@ -1054,5 +1218,203 @@ mod tests {
         let output = handle(&state, &input[..super::super::MAX_INPUT_BYTES + 1]);
         assert_eq!((output.stdout.as_str(), output.code), ("", 0));
         assert!(!state.root.exists());
+    }
+
+    const ASK: &str = "Dispatch: Work 01AAAAAA (Claude Code) landed a change this Work relies on.";
+
+    /// A watched repository with a linked worktree in which an ask to catch
+    /// up waits: the state, the worktree, and the lock that watches it.
+    fn asked(temp: &Path) -> (State, PathBuf, crate::lock::OperationLock) {
+        let temp = fs::canonicalize(temp).unwrap();
+        let repo = temp.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        let worktree = temp.join("wt");
+        for args in [
+            &["init", "--quiet"][..],
+            &["add", "."],
+            &["commit", "--quiet", "-m", "initial"],
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "wt",
+                worktree.to_str().unwrap(),
+            ],
+        ] {
+            let mut git = crate::source::git_command(&repo);
+            git.args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"]);
+            assert!(git.args(args).status().unwrap().success(), "git {args:?}");
+        }
+        let state = State {
+            root: temp.join("state"),
+        };
+        let serving = crate::orchestrator::background::acquire(&state, &repo).unwrap();
+        let pending = catchup::pending(&state, &worktree);
+        fs::create_dir_all(pending.with_file_name("delivered")).unwrap();
+        let ask = serde_json::json!({"version": 1, "run_id": "r", "landings": [], "text": ASK});
+        fs::write(&pending, ask.to_string()).unwrap();
+        (state, worktree, serving)
+    }
+
+    fn files(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_ask_keeps_the_turn_going_once_and_that_stop_ends_no_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, worktree, _serving) = asked(temp.path());
+        let stop = |active: bool| {
+            probe(
+                "Stop",
+                serde_json::json!({
+                    "cwd": worktree, "permission_mode": "auto", "effort": {"level": "high"},
+                    "stop_hook_active": active, "last_assistant_message": "done",
+                    "background_tasks": [], "session_crons": [],
+                }),
+            )
+        };
+        let marks = || files(&state.root.join("marks")).len();
+        // A turn a Stop hook already kept going is left to end: nothing is
+        // claimed, and its end is recorded as before.
+        let output = handle(&state, &stop(true));
+        assert_eq!((output.stdout.as_str(), output.code), ("", 0));
+        assert!(catchup::pending(&state, &worktree).exists());
+        assert_eq!(marks(), 1);
+
+        let output = handle(&state, &stop(false));
+        let reply: Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(
+            reply,
+            serde_json::json!({"decision": "block", "reason": ASK})
+        );
+        assert_eq!((output.stderr.as_str(), output.code), ("", 0));
+        assert_eq!(marks(), 1, "the turn did not end");
+        let delivered = files(&state.root.join("catchup/delivered"));
+        assert!(
+            delivered.len() == 1 && delivered[0].ends_with(".stop.json"),
+            "{delivered:?}"
+        );
+
+        // Asked once: the next Stop is as before.
+        let output = handle(&state, &stop(false));
+        assert_eq!((output.stdout.as_str(), output.code), ("", 0));
+        assert_eq!(marks(), 2);
+    }
+
+    /// Settings with `hooks` as an earlier Dispatch wrote them after `theirs`:
+    /// each in an entry of its own, running `command`.
+    fn written_by(
+        mut settings: Value,
+        command: &str,
+        hooks: &[(&str, Option<&str>, u64)],
+    ) -> Value {
+        for &(event, matcher, timeout) in hooks {
+            let mut entry = serde_json::json!({
+                "hooks": [{"type": "command", "command": command, "timeout": timeout}]
+            });
+            if let Some(matcher) = matcher {
+                entry["matcher"] = matcher.into();
+            }
+            match settings["hooks"][event].as_array_mut() {
+                Some(entries) => entries.push(entry),
+                None => settings["hooks"][event] = serde_json::json!([entry]),
+            }
+        }
+        settings
+    }
+
+    #[test]
+    fn every_earlier_dispatchs_hooks_are_upgraded_to_the_waiter_and_removed_with_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let old = "'/old/dispatch' --state-dir '/s' hook claude";
+        let read = || -> Value { serde_json::from_slice(&fs::read(&path).unwrap()).unwrap() };
+        let theirs = serde_json::json!({"model": "keep", "hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": "afplay done.aiff", "timeout": 2}]}],
+            "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "lint"}]}],
+        }});
+        let waiting = Some("permission_prompt|idle_prompt|agent_needs_input");
+        let removal = [
+            ("SessionStart", None, 60),
+            ("SessionEnd", None, 5),
+            ("WorktreeRemove", None, 300),
+            ("PreToolUse", Some("ExitWorktree"), 300),
+        ];
+        let marks = [("Notification", waiting, 5), ("Stop", None, 5)];
+        let notes = [("PostToolUse", None, 5)];
+        let releases = [
+            ("0.4.6", removal.to_vec()),
+            ("0.4.17", [&removal[..], &marks].concat()),
+            ("0.4.18", [&removal[..], &marks, &notes].concat()),
+        ];
+        for (release, hooks) in releases {
+            fs::write(&path, written_by(theirs.clone(), old, &hooks).to_string()).unwrap();
+            assert_eq!(hook(&path).unwrap(), Hook::Earlier(old.into()), "{release}");
+            install_hooks(&path, COMMAND).unwrap();
+            assert_eq!(
+                hook(&path).unwrap(),
+                Hook::Exact(COMMAND.into()),
+                "{release}"
+            );
+            let settings = read();
+            assert_eq!(settings, with_hooks(theirs.clone(), COMMAND).unwrap());
+            let stops = settings["hooks"]["Stop"].as_array().unwrap();
+            assert_eq!(stops[0], theirs["hooks"]["Stop"][0], "{release}");
+            assert_eq!(stops[1]["hooks"][0]["command"], COMMAND);
+            let waiter = &stops[2]["hooks"][0];
+            assert_eq!(waiter["command"], format!("{COMMAND}-wait"));
+            assert_eq!(
+                (&waiter["asyncRewake"], &waiter["timeout"]),
+                (&true.into(), &28_800.into())
+            );
+            uninstall_hooks(&path).unwrap();
+            assert_eq!(read(), theirs, "{release}: nothing of Dispatch's left");
+            assert_eq!(hook(&path).unwrap(), Hook::Absent);
+        }
+    }
+
+    #[test]
+    fn the_two_stop_hooks_are_dispatchs_in_either_order_and_only_as_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let found = |settings: &Value| {
+            fs::write(&path, settings.to_string()).unwrap();
+            hook(&path).unwrap()
+        };
+        let installed = with_hooks(serde_json::json!({}), COMMAND).unwrap();
+        let mut swapped = installed.clone();
+        swapped["hooks"]["Stop"].as_array_mut().unwrap().reverse();
+        assert_eq!(found(&swapped), Hook::Exact(COMMAND.into()));
+        // A waiter that does not wake the session, or waits longer, or a set
+        // with only the waiter added: changed by hand.
+        let mut sync = installed.clone();
+        sync["hooks"]["Stop"][1]["hooks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("asyncRewake");
+        let mut longer = installed.clone();
+        longer["hooks"]["Stop"][1]["hooks"][0]["timeout"] = 86_400.into();
+        let mut partial = installed.clone();
+        partial["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PostToolUse");
+        for changed in [sync, longer, partial] {
+            assert_eq!(found(&changed), Hook::Changed, "{changed}");
+        }
+        // Someone else's command that only ends like the waiter's is theirs.
+        let lookalike = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "my-tool hook claude-wait", "asyncRewake": true},
+        ]}]}});
+        assert_eq!(without_hooks(lookalike.clone()), lookalike);
     }
 }

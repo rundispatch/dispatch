@@ -28,7 +28,7 @@ use crate::{
     lock::OperationLock,
     orchestrator::source_lock_path,
     source::{
-        check_workspace_path, checked_output, fingerprint_tree, git_command, inspect_source,
+        Patch, check_workspace_path, checked_output, fingerprint_tree, git_command, inspect_source,
         prepare_check_workspace,
     },
     state::State,
@@ -449,7 +449,8 @@ pub(crate) async fn run_merged(
     };
     let source = SourceState::observe(&run.source_path, &run.source_kind)?;
     let workspace = check_workspace_path(state_root, &run.source_path);
-    let tree_id = prepare_check_workspace(&run.source_path, &run.source_kind, &workspace, patch)
+    let patches = [Patch::new(patch, &run.baseline_path)];
+    let tree_id = prepare_check_workspace(&run.source_path, &run.source_kind, &workspace, &patches)
         .context("failed to build the merged check workspace")?;
     fs::create_dir_all(logs).with_context(|| format!("failed to create {}", logs.display()))?;
     let load_average = load_average();

@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.18 — experimental developer preview**
+**Dispatch 0.5.0 — experimental developer preview**
 
 <p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch; once one lands, the other no longer fits, and dispatch accept refuses it as REFRESH, leaving the source unchanged."></a></p>
 <p align="center"><sub>30 seconds, no sound. The full minute and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>
@@ -28,7 +28,9 @@ service; Dispatch itself needs no account, no network service and no upload.
   checks them against the source now. [Coherence →](docs/coherence.md)
 - **Nothing lands unless it still holds.** When the source moved, `dispatch accept`
   runs your checks on the merged result first. A REFRESH or STOP is refused, and the
-  source is left unchanged. [Review and accept →](docs/product-guide.md#decisions-and-review)
+  source is left unchanged. When several results are ready in a Git project, `dispatch
+  accept` proposes landing them together, a change before what uses it, behind one
+  approval and one run of your checks. [Review and accept →](docs/product-guide.md#decisions-and-review)
 - **Checks you allow run by themselves.** Your consent names the exact commands. When
   a Claude Code or Hermes session ends, Dispatch freezes its change and runs them, and
   that finish never applies anything. A tree that passed is not checked again.
@@ -39,9 +41,11 @@ service; Dispatch itself needs no account, no network service and no upload.
 - **Live agents hear of each other.** A Claude Code or Hermes session in a watched
   project gets a short note through its hooks when other Work changes the same
   declaration, one it uses, or the same lines, and when such Work lands, naming the
-  recorded commit that holds it. A note is information and asks nothing. When the agent
-  merges that commit, its S0 follows, with proof, so its Δ is its own change again.
-  [Notes and S0 →](docs/attach.md#notes-to-live-agents)
+  recorded commit that holds it. A note is information and asks nothing. When a landing
+  changes or removes a declaration the agent's Work relies on, Dispatch asks the agent
+  once, through the same hooks, to merge it. When the agent merges that commit, its S0
+  follows, with proof, so its Δ is its own change again.
+  [Notes and catch-up →](docs/attach.md#notes-to-live-agents)
 
 ## Install
 

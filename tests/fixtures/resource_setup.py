@@ -129,6 +129,28 @@ for line in sys.stdin:
     with session('checks-consent-revoke',['--plain','setup','--checks']) as ui:
         ui.wait('runs them by themselves');ui.wait('2) Stop letting Work');ui.send('2\r');ui.wait('now asks you');ui.finish()
     assert not consents(), 'revoking left consent behind'
+    # Two Enters keep configured checks, none of them detected, byte for byte:
+    # focus starts on letting Work run them, whose consent focuses Cancel, and
+    # once Work may, on changing them, where they stay selected.
+    three=b'checks:\n  verify:\n  - cargo fmt --check\n  - cargo clippy --all-targets -- -D warnings\n  - cargo test\n'
+    (source/'dispatch.yml').write_bytes(three)
+    def two_enters(name):
+        with session(name,['--plain','setup','--checks']) as ui:
+            ui.wait('3) Back');ui.wait('] >');ui.send('\r');ui.wait('] >');ui.send('\r');ui.finish()
+        assert (source/'dispatch.yml').read_bytes()==three, (source/'dispatch.yml').read_text()
+    two_enters('checks-two-enters');assert not consents(), 'two Enters gave consent'
+    with session('checks-three-allow',['--plain','setup','--checks']) as ui:
+        ui.wait('2) Let Work run these checks');ui.send('2\r');ui.wait('2) Cancel');ui.send('1\r')
+        ui.wait('will run these checks by themselves');ui.finish()
+    granted=[path.read_bytes() for path in consents()];assert len(granted)==1 and b'cargo clippy' in granted[0], granted
+    two_enters('checks-two-enters-allowed');assert [path.read_bytes() for path in consents()]==granted
+    # Replacing them is deliberate. Rows: 1 sh ./verify.sh, 2-4 the three,
+    # 5 Other command…, 6 Save selected checks, 7 Keep current checks, 8 Cancel setup.
+    with session('checks-replace',['--plain','setup','--checks']) as ui:
+        ui.wait('1) Change checks');ui.send('1\r');ui.wait('8) Cancel setup')
+        for row in '2341':ui.wait('[7] >');ui.send(row+'\r')
+        ui.wait('[7] >');ui.send('6\r');ui.wait('Checks saved to dispatch.yml: sh ./verify.sh');ui.finish()
+    assert (source/'dispatch.yml').read_bytes()==b'checks:\n  verify:\n  - sh ./verify.sh\n'
     calls=[json.loads(l) for l in (root/'probe-args').read_text().splitlines()]
     assert all('--version' in c or 'app-server' in c or 'status' in c or 'login' in c for c in calls)
     assert not (state/'dispatch.db').exists(), 'setup acquired execution authority'

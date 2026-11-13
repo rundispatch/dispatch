@@ -45,6 +45,13 @@ pub struct SourceSnapshot {
 pub struct ApplyReport {
     pub candidate_label: String,
     pub files_changed: u64,
+    /// What landed instead of Δ, merged 3-way from S0 (`LANDED_PATCH`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_patch: Option<PathBuf>,
+    /// The paths it changed that did not hold the merge right after it
+    /// landed (`unlanded`): the landing is not confirmed there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unconfirmed: Vec<PathBuf>,
 }
 
 /// Resolve an explicit source directory, or the current directory when omitted.
@@ -407,6 +414,13 @@ pub fn world_commit(checkout: &Path) -> Result<String> {
     capture_settled(&checkout, || capture_world(&checkout))
 }
 
+/// The tree of `world_commit`, captured the same way but with no commit
+/// object written: for looking at a world rather than recording it.
+pub(crate) fn world_tree(checkout: &Path) -> Result<String> {
+    let checkout = resolve_source(Some(checkout))?;
+    capture_settled(&checkout, || Ok(capture_tree(&checkout)?.0))
+}
+
 /// The ref naming the source as it was after its latest landing.
 pub const SOURCE_REF: &str = "refs/dispatch/source";
 
@@ -449,6 +463,24 @@ fn capture_settled(checkout: &Path, mut capture: impl FnMut() -> Result<String>)
 const FSYNC_OBJECTS: [&str; 2] = ["-c", "core.fsync=loose-object"];
 
 fn capture_world(checkout: &Path) -> Result<String> {
+    let (tree, head) = capture_tree(checkout)?;
+    let mut commit = git_command(checkout);
+    commit
+        .env("GIT_AUTHOR_NAME", "Dispatch")
+        .env("GIT_AUTHOR_EMAIL", "dispatch@localhost")
+        .env("GIT_COMMITTER_NAME", "Dispatch")
+        .env("GIT_COMMITTER_EMAIL", "dispatch@localhost")
+        .args(FSYNC_OBJECTS)
+        .args(["commit-tree", &tree, "-m", "Dispatch S0"]);
+    if let Some(head) = &head {
+        commit.args(["-p", head]);
+    }
+    let commit = checked_output(commit, "failed to record the checkout's world")?.stdout;
+    Ok(String::from_utf8_lossy(&commit).trim().to_owned())
+}
+
+/// `capture_world`'s tree, and the checkout's HEAD.
+fn capture_tree(checkout: &Path) -> Result<(String, Option<String>)> {
     let scratch = Builder::new()
         .prefix("dispatch-world-")
         .tempdir()
@@ -515,21 +547,7 @@ fn capture_world(checkout: &Path) -> Result<String> {
         .args(FSYNC_OBJECTS)
         .arg("write-tree");
     let tree = checked_output(write_tree, "failed to write the checkout's world")?.stdout;
-    let tree = String::from_utf8_lossy(&tree).trim().to_owned();
-
-    let mut commit = git_command(checkout);
-    commit
-        .env("GIT_AUTHOR_NAME", "Dispatch")
-        .env("GIT_AUTHOR_EMAIL", "dispatch@localhost")
-        .env("GIT_COMMITTER_NAME", "Dispatch")
-        .env("GIT_COMMITTER_EMAIL", "dispatch@localhost")
-        .args(FSYNC_OBJECTS)
-        .args(["commit-tree", &tree, "-m", "Dispatch S0"]);
-    if let Some(head) = &head {
-        commit.args(["-p", head]);
-    }
-    let commit = checked_output(commit, "failed to record the checkout's world")?.stdout;
-    Ok(String::from_utf8_lossy(&commit).trim().to_owned())
+    Ok((String::from_utf8_lossy(&tree).trim().to_owned(), head))
 }
 
 /// A private workspace at `dir` that is the baseline plus `patch`: the Work
@@ -866,9 +884,7 @@ pub(crate) fn fingerprint_tree_strict(root: &Path) -> Result<String> {
 
 /// An unreadable frozen configuration keeps the strict, fail-closed fence.
 pub(crate) fn fingerprint_for_run(run: &RunRecord) -> Result<String> {
-    let strict = run
-        .baseline_path
-        .parent()
+    let strict = crate::coherence::run_directory(run)
         .and_then(crate::coherence::run_config)
         .is_none_or(|config| config.coherence.accept == crate::config::AcceptMode::Strict);
     if strict {
@@ -1039,27 +1055,12 @@ fn hash_tree(root: &Path, entries: Vec<(PathBuf, bool)>) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Apply one stored candidate patch after proving that the original source has
-/// not changed since snapshotting. `git apply` performs a complete dry run
-/// before the real application, and its default all-or-nothing behavior is kept.
-pub fn safe_apply(run: &RunRecord, candidate_label: &str) -> Result<ApplyReport> {
-    apply_checked(run, candidate_label, ExpectedWorld::Fingerprint)
-}
-
-/// Like `safe_apply`, but for a source that moved after snapshotting and whose
-/// current non-ignored world (`world_digest`) coherence validation has already
-/// judged compatible. The patch is applied only if that exact world is still
-/// present at the check, after the dry run, and therefore at the real apply.
-pub fn apply_validated(
-    run: &RunRecord,
-    candidate_label: &str,
-    world_digest: &str,
-) -> Result<ApplyReport> {
-    apply_checked(run, candidate_label, ExpectedWorld::Digest(world_digest))
-}
-
+/// What must still hold of the source for a patch to be applied: it has not
+/// changed since snapshotting (the run's fingerprint), or it is the moved
+/// world (`world::observe`'s digest) that coherence validation has already
+/// judged compatible.
 #[derive(Clone, Copy)]
-enum ExpectedWorld<'a> {
+pub enum ExpectedWorld<'a> {
     Fingerprint,
     Digest(&'a str),
 }
@@ -1082,47 +1083,33 @@ impl ExpectedWorld<'_> {
     }
 }
 
-fn apply_checked(
+/// Apply `patch` to `run`'s source, all of it or nothing, while `expected`
+/// holds: it is checked before Git's complete dry run and again before the
+/// real apply. Returns the paths the patch changed.
+pub fn apply_checked(
     run: &RunRecord,
-    candidate_label: &str,
+    patch: &Path,
     expected: ExpectedWorld,
-) -> Result<ApplyReport> {
-    let matches = run
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.label == candidate_label)
-        .collect::<Vec<_>>();
-    let candidate = match matches.as_slice() {
-        [candidate] => *candidate,
-        [] => bail!("candidate not found: {candidate_label}"),
-        _ => bail!("candidate label is ambiguous: {candidate_label}"),
-    };
-
+) -> Result<Vec<PathBuf>> {
     let source = resolve_source(Some(&run.source_path))?;
     ensure!(
         expected.holds(run, &source)?,
-        "source has changed since this run was created; refusing to apply candidate {candidate_label}"
+        "source has changed since this run was created; refusing to apply {}",
+        patch.display()
     );
 
-    let patch_metadata = fs::metadata(&candidate.diff_path).with_context(|| {
-        format!(
-            "failed to inspect candidate diff {}",
-            candidate.diff_path.display()
-        )
-    })?;
+    let patch_metadata = fs::metadata(patch)
+        .with_context(|| format!("failed to inspect candidate diff {}", patch.display()))?;
     ensure!(
         patch_metadata.is_file(),
         "candidate diff is not a file: {}",
-        candidate.diff_path.display()
+        patch.display()
     );
     if patch_metadata.len() == 0 {
-        return Ok(ApplyReport {
-            candidate_label: candidate_label.to_owned(),
-            files_changed: 0,
-        });
+        return Ok(Vec::new());
     }
 
-    let patch_paths = inspect_patch_paths(&source, &candidate.diff_path)?;
+    let patch_paths = inspect_patch_paths(&source, patch)?;
     ensure!(
         !patch_paths.is_empty(),
         "candidate diff contains no applicable file changes"
@@ -1134,7 +1121,7 @@ fn apply_checked(
     let mut check = git_command(&source);
     check
         .args(["apply", "--check", "--binary", "--whitespace=nowarn", "--"])
-        .arg(&candidate.diff_path);
+        .arg(patch);
     checked_output(
         check,
         "candidate cannot be applied cleanly; the source was left unchanged",
@@ -1150,16 +1137,120 @@ fn apply_checked(
     let mut apply = git_command(&source);
     apply
         .args(["apply", "--binary", "--whitespace=nowarn", "--"])
-        .arg(&candidate.diff_path);
+        .arg(patch);
     checked_output(
         apply,
         "candidate application failed; Git did not apply the patch",
     )?;
 
-    Ok(ApplyReport {
-        candidate_label: candidate_label.to_owned(),
-        files_changed: patch_paths.len() as u64,
+    Ok(patch_paths)
+}
+
+/// Beside the run: what a 3-way landing applies instead of Δ.
+pub const LANDED_PATCH: &str = "delta-landed.patch";
+
+/// Merge `run`'s Δ (`delta`) 3-way from S0 into its source's world as it is
+/// now and, only if that is the tree the merged checks passed on (`verified`),
+/// write to `out` the patch that takes the world to it, binary and with full
+/// blob ids like Δ. Returns that tree, whose objects are in the source's
+/// repository.
+pub(crate) fn write_landed_patch(
+    run: &RunRecord,
+    delta: &Path,
+    out: &Path,
+    verified: &str,
+) -> Result<String> {
+    let source = resolve_source(Some(&run.source_path))?;
+    let patch = Patch::new(delta, &run.baseline_path);
+    let (world, tree) = match crate::coherence::memo::staged_on_world(&source, &[patch])? {
+        Some((world, Stage::Staged { tree })) => (world, tree),
+        Some((_, Stage::Conflict { output })) => {
+            bail!("the patch no longer merges into the source: {output}")
+        }
+        None => bail!("the source cannot take a 3-way merge"),
+    };
+    ensure!(
+        tree == verified,
+        "the 3-way merge is now tree {tree}, which no longer matches the tree {verified} \
+         the merged checks verified; the source was left unchanged"
+    );
+    let mut diff = git_command(&source);
+    diff.args([
+        "diff-tree",
+        "-r",
+        "-p",
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--relative",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        &world,
+        &tree,
+    ]);
+    let landed = checked_output(diff, "failed to write the merged patch")?.stdout;
+    fs::write(out, landed).with_context(|| format!("failed to write {}", out.display()))?;
+    Ok(tree)
+}
+
+/// Which of `paths` in `run`'s source do not hold what `tree` holds there
+/// (kind, mode and bytes, or nothing where `tree` has nothing): all of them
+/// when Git cannot say. Read through a temporary index; the source's own is
+/// not touched.
+pub(crate) fn unlanded(run: &RunRecord, paths: &[PathBuf], tree: &str) -> Vec<PathBuf> {
+    differing(&run.source_path, paths, tree).unwrap_or_else(|error| {
+        tracing::debug!("could not compare the landed files with {tree}: {error:#}");
+        paths.to_vec()
     })
+}
+
+fn differing(source: &Path, paths: &[PathBuf], tree: &str) -> Result<Vec<PathBuf>> {
+    let scratch = Builder::new()
+        .prefix("dispatch-landed-")
+        .tempdir()
+        .context("failed to create a temporary Git index")?;
+    let index = scratch.path().join("index");
+    let mut read_tree = git_command(source);
+    read_tree
+        .env("GIT_INDEX_FILE", &index)
+        .args(["read-tree", tree]);
+    checked_output(read_tree, "failed to read the merged tree")?;
+    let mut listed = Vec::new();
+    for path in paths {
+        listed.extend(path_bytes(path));
+        listed.push(0);
+    }
+    let mut update = git_command(source);
+    update.env("GIT_INDEX_FILE", &index).args([
+        "update-index",
+        "-z",
+        "--add",
+        "--remove",
+        "--stdin",
+    ]);
+    let updated = run_git(update, Some(&listed), "failed to read the landed files")?;
+    ensure!(
+        updated.status.success(),
+        "failed to read the landed files: {}",
+        git_says(&updated)
+    );
+    let mut diff = git_command(source);
+    diff.env("GIT_INDEX_FILE", &index).args([
+        "diff-index",
+        "--cached",
+        "--name-only",
+        "-z",
+        "--relative",
+        tree,
+    ]);
+    let differ = checked_output(diff, "failed to compare the landed files")?.stdout;
+    Ok(differ
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(bytes_to_path)
+        .collect())
 }
 
 /// Test helper for applying a patch inside a disposable workspace.
@@ -1246,7 +1337,7 @@ pub(crate) fn check_workspace_path(state_root: &Path, source: &Path) -> PathBuf 
     state_root.join("check-workspaces").join(key)
 }
 
-fn check_git_command(workspace: &Path, work_tree: &Path) -> Command {
+pub(crate) fn check_git_command(workspace: &Path, work_tree: &Path) -> Command {
     let mut command = plain_git_command();
     command
         .arg("--git-dir")
@@ -1262,15 +1353,153 @@ fn check_git_command(workspace: &Path, work_tree: &Path) -> Command {
     command
 }
 
+/// One patch for `stage`: the file, and the objects of the baseline it was
+/// made against (a run's `baseline_path`), which hold the blobs a 3-way merge
+/// starts from.
+pub(crate) struct Patch<'a> {
+    pub file: &'a Path,
+    pub objects: PathBuf,
+}
+
+impl<'a> Patch<'a> {
+    pub(crate) fn new(file: &'a Path, baseline: &Path) -> Self {
+        Self {
+            file,
+            objects: baseline.join(".git").join("objects"),
+        }
+    }
+}
+
+/// What `stage` made of its patches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Every patch applied: the tree, whose objects are all in the repository.
+    Staged { tree: String },
+    /// A patch applied neither as it is nor 3-way. Git's output says why.
+    Conflict { output: String },
+}
+
+/// Apply `patches` in order onto the tree `base`, in a temporary index of the
+/// repository `git` runs in, never in its own index or at its HEAD. Each patch
+/// applies as it is if it can. Otherwise, with `three_way`, Git merges it 3-way
+/// from the blobs it was made from, which its baseline's objects hold, and
+/// from then on every command on the index sees them. Callers allow
+/// `three_way` only for a world whose tree is exact (`memo::exact`).
+pub(crate) fn stage(
+    git: &dyn Fn() -> Command,
+    base: &str,
+    patches: &[Patch],
+    three_way: bool,
+) -> Result<Stage> {
+    let scratch = Builder::new()
+        .prefix("dispatch-stage-")
+        .tempdir()
+        .context("failed to create a temporary Git index")?;
+    let index = scratch.path().join("index");
+    // The objects of every baseline merged from so far.
+    let mut alternates = Vec::new();
+    let on_index = |alternates: &[&Path]| -> Result<Command> {
+        let mut command = git();
+        command.env("GIT_INDEX_FILE", &index);
+        if !alternates.is_empty() {
+            let joined = std::env::join_paths(alternates)
+                .context("a baseline's path cannot be given to Git as an alternate")?;
+            command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", joined);
+        }
+        Ok(command)
+    };
+    let mut read_tree = on_index(&alternates)?;
+    read_tree.args(["read-tree", base]);
+    checked_output(read_tree, "failed to read the tree to stage on")?;
+    for patch in patches {
+        let size = fs::metadata(patch.file)
+            .with_context(|| format!("failed to inspect {}", patch.file.display()))?
+            .len();
+        if size == 0 {
+            continue;
+        }
+        let mut apply = on_index(&alternates)?;
+        apply
+            .args(["apply", "--cached", "--binary", "--whitespace=nowarn", "--"])
+            .arg(patch.file);
+        let applied = run_git(apply, None, "failed to stage a patch")?;
+        if applied.status.success() {
+            continue;
+        }
+        if !three_way {
+            return Ok(Stage::Conflict {
+                output: git_says(&applied),
+            });
+        }
+        alternates.push(patch.objects.as_path());
+        let mut merge = on_index(&alternates)?;
+        merge
+            .args([
+                "apply",
+                "--3way",
+                "--cached",
+                "--binary",
+                "--whitespace=nowarn",
+            ])
+            .arg("--")
+            .arg(patch.file);
+        let merged = run_git(merge, None, "failed to merge a patch 3-way")?;
+        if !merged.status.success() {
+            // The index keeps unmerged entries; it is thrown away.
+            return Ok(Stage::Conflict {
+                output: git_says(&merged),
+            });
+        }
+    }
+    let mut write_tree = on_index(&alternates)?;
+    write_tree.arg("write-tree");
+    let tree = checked_output(write_tree, "failed to write the staged tree")?.stdout;
+    let tree = String::from_utf8_lossy(trim_ascii(&tree)).into_owned();
+    if !alternates.is_empty() && tree != base {
+        // Git writes no object it finds among the alternates. Copy what the
+        // tree holds beyond `base` into the repository, which then reads it
+        // without them; objects already there are not written again.
+        let mut pack = on_index(&alternates)?;
+        pack.args(["pack-objects", "--revs", "--stdout", "--quiet"]);
+        let wanted = format!("{tree}\n^{base}\n");
+        let packed = run_git(pack, Some(wanted.as_bytes()), "failed to pack the merge")?;
+        ensure!(
+            packed.status.success(),
+            "failed to pack the merge: {}",
+            git_says(&packed)
+        );
+        let mut unpack = git();
+        unpack.args(["unpack-objects", "-q"]);
+        let unpacked = run_git(unpack, Some(&packed.stdout), "failed to keep the merge")?;
+        ensure!(
+            unpacked.status.success(),
+            "failed to keep the merge: {}",
+            git_says(&unpacked)
+        );
+    }
+    Ok(Stage::Staged { tree })
+}
+
+/// What Git printed, errors first.
+fn git_says(output: &Output) -> String {
+    let said = [&output.stderr, &output.stdout]
+        .into_iter()
+        .map(|bytes| String::from_utf8_lossy(trim_ascii(bytes)).into_owned())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    said.join("\n")
+}
+
 /// Stage the source's current, non-ignored world in a separate kept index,
-/// apply the patch there, and update the private checkout from its last tree.
-/// The default index remains the checkout's previous tree until read-tree, so
-/// unchanged files retain their times and ignored build output stays in place.
+/// stage `patches` onto it (`stage`, 3-way only for an exact source), and
+/// update the private checkout from the result. The default index remains the
+/// checkout's previous tree until read-tree, so unchanged files retain their
+/// times and ignored build output stays in place.
 pub(crate) fn prepare_check_workspace(
     source: &Path,
     kind: &SourceKind,
     workspace: &Path,
-    patch: &Path,
+    patches: &[Patch],
 ) -> Result<String> {
     let parent = workspace
         .parent()
@@ -1322,31 +1551,39 @@ pub(crate) fn prepare_check_workspace(
 
     // Staging happens outside the checkout: neither source files nor build
     // output in the warm workspace are overwritten while constructing Δ.
-    let stage = Builder::new()
+    let scratch = Builder::new()
         .prefix("stage-")
         .tempdir_in(workspace.join(".git"))?;
-    create_scratch_tree(source, kind, stage.path())?;
+    create_scratch_tree(source, kind, scratch.path())?;
     let index = workspace.join(".git/check.index");
     let mut empty = check_git_command(workspace, workspace);
     empty
         .env("GIT_INDEX_FILE", &index)
         .args(["read-tree", "--empty"]);
     checked_output(empty, "failed to reset the check staging index")?;
-    let mut add = check_git_command(workspace, stage.path());
+    let mut add = check_git_command(workspace, scratch.path());
     add.env("GIT_INDEX_FILE", &index)
         .args(["add", "-A", "-f", "--", "."]);
     checked_output(add, "failed to stage the current source for checks")?;
-    let mut apply = check_git_command(workspace, workspace);
-    apply
-        .env("GIT_INDEX_FILE", &index)
-        .args(["apply", "--cached", "--binary", "--whitespace=nowarn", "--"])
-        .arg(patch);
-    checked_output(apply, "candidate patch does not apply to the merged tree")?;
-    let mut staged_tree = check_git_command(workspace, workspace);
-    staged_tree.env("GIT_INDEX_FILE", &index).arg("write-tree");
-    let staged_tree = checked_output(staged_tree, "failed to write the staged check tree")?;
-    let tree_id = std::str::from_utf8(&staged_tree.stdout)?.trim().to_owned();
+    let mut world = check_git_command(workspace, workspace);
+    world.env("GIT_INDEX_FILE", &index).arg("write-tree");
+    let world = checked_output(world, "failed to write the staged check tree")?.stdout;
+    let world = std::str::from_utf8(trim_ascii(&world))?;
+    let three_way = crate::coherence::memo::exact(source)?;
+    let git = || check_git_command(workspace, workspace);
+    let tree_id = match stage(&git, world, patches, three_way)? {
+        Stage::Staged { tree } => tree,
+        Stage::Conflict { output } => {
+            bail!("candidate patch does not apply to the merged tree: {output}")
+        }
+    };
+    check_out(workspace, &tree_id)?;
+    Ok(tree_id)
+}
 
+/// Update the private checkout `workspace` to `tree`, already in its
+/// repository, and confirm that it holds exactly that tree.
+pub(crate) fn check_out(workspace: &Path, tree_id: &str) -> Result<()> {
     // Checks may change file times without changing bytes. Refresh the
     // checkout index's stat data so read-tree leaves those files in place.
     // A check may also edit tracked files; read-tree below resets those.
@@ -1354,7 +1591,7 @@ pub(crate) fn prepare_check_workspace(
     refresh.args(["update-index", "--refresh"]);
     let _ = run_git(refresh, None, "failed to refresh the check workspace index")?;
     let mut checkout = check_git_command(workspace, workspace);
-    checkout.args(["read-tree", "--reset", "-u", &tree_id]);
+    checkout.args(["read-tree", "--reset", "-u", tree_id]);
     checked_output(checkout, "failed to update the check workspace")?;
     let mut clean = check_git_command(workspace, workspace);
     clean.args(["clean", "-fd"]);
@@ -1363,7 +1600,7 @@ pub(crate) fn prepare_check_workspace(
     checked_tree.arg("write-tree");
     let checked_tree = checked_output(checked_tree, "failed to verify the checked-out tree")?;
     ensure!(
-        checked_tree.stdout == staged_tree.stdout,
+        trim_ascii(&checked_tree.stdout) == tree_id.as_bytes(),
         "check workspace tree differs from the staged source and patch"
     );
     let mut modified = check_git_command(workspace, workspace);
@@ -1382,7 +1619,7 @@ pub(crate) fn prepare_check_workspace(
             .is_empty(),
         "check workspace contains files outside the intended tree"
     );
-    Ok(tree_id)
+    Ok(())
 }
 
 /// The first parent of `relative` under `root` that is a symlink, if any.
@@ -2353,6 +2590,16 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
+    /// The run's patch applied through the fingerprint fence, as accept
+    /// applies onto a source unchanged since snapshotting.
+    fn apply_unmoved(run: &RunRecord) -> Result<Vec<PathBuf>> {
+        apply_checked(
+            run,
+            &run.candidates[0].diff_path,
+            ExpectedWorld::Fingerprint,
+        )
+    }
+
     fn initialize_user_repository(path: &Path) {
         run_git(path, &["init", "--quiet"]);
         run_git(path, &["config", "user.name", "Test User"]);
@@ -3235,7 +3482,7 @@ mod tests {
             &snapshot,
             candidate_record("A", workspace, diff_path, stats),
         );
-        safe_apply(&run, "A").unwrap();
+        apply_unmoved(&run).unwrap();
         assert_eq!(
             fs::read(source.join("line-endings.txt")).unwrap(),
             b"one\r\nchanged\r\n"
@@ -3355,9 +3602,7 @@ mod tests {
             candidate_record("A", workspace, diff_path, stats),
         );
 
-        let report = safe_apply(&run, "A").unwrap();
-        assert_eq!(report.candidate_label, "A");
-        assert_eq!(report.files_changed, 2);
+        assert_eq!(apply_unmoved(&run).unwrap().len(), 2);
         assert_eq!(
             fs::read_to_string(source.join("old.txt")).unwrap(),
             "after\n"
@@ -3389,7 +3634,7 @@ mod tests {
         );
 
         write(&source.join("two.txt"), "user edit\n");
-        let error = safe_apply(&run, "B").unwrap_err().to_string();
+        let error = apply_unmoved(&run).unwrap_err().to_string();
         assert!(error.contains("source has changed"));
         assert_eq!(
             fs::read_to_string(source.join("one.txt")).unwrap(),
@@ -3426,7 +3671,7 @@ mod tests {
         // all-files apply check.
         write(&source.join("two.txt"), "incompatible contents\n");
         run.source_fingerprint = fingerprint_tree(&source).unwrap();
-        let error = safe_apply(&run, "C").unwrap_err().to_string();
+        let error = apply_unmoved(&run).unwrap_err().to_string();
         assert!(error.contains("cannot be applied cleanly"));
         assert_eq!(
             fs::read_to_string(source.join("one.txt")).unwrap(),
@@ -3436,6 +3681,229 @@ mod tests {
             fs::read_to_string(source.join("two.txt")).unwrap(),
             "incompatible contents\n"
         );
+    }
+
+    /// After an S0 move the baseline is in `s0/<n>/` of the run's directory;
+    /// the fence still reads the run's own configuration, which is not strict
+    /// here, so ignored build output is not drift.
+    #[test]
+    fn the_fingerprint_fence_reads_the_runs_configuration_after_an_s0_move() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        write(&source.join(".gitignore"), "target/\n");
+        write(&source.join("a.txt"), "a\n");
+        initialize_user_repository(&source);
+        write(&source.join("target/out"), "built\n");
+        let run_dir = temp.path().join("run");
+        let snapshot = create_snapshot(&source, &run_dir).unwrap();
+        write(&run_dir.join("config.snapshot.yml"), "{}\n");
+        let candidate = candidate_record(
+            "A",
+            temp.path().join("workspace"),
+            temp.path().join("delta.patch"),
+            DiffStats::default(),
+        );
+        let mut run = run_record(&source, &snapshot, candidate);
+        assert_eq!(fingerprint_for_run(&run).unwrap(), run.source_fingerprint);
+
+        let moved = run_dir.join("s0").join("1").join(BASELINE_DIRECTORY);
+        run.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: std::mem::replace(&mut run.baseline_path, moved),
+            baseline_commit: run.baseline_commit.clone(),
+            commit: "s0".into(),
+            moved_to: "s1".into(),
+            moved_at: Utc::now(),
+            recorded_at: Utc::now(),
+            landed_run: None,
+            back: false,
+        });
+
+        assert_eq!(fingerprint_for_run(&run).unwrap(), run.source_fingerprint);
+    }
+
+    /// Lines `1` to `20`, one per line.
+    fn twenty_lines() -> String {
+        (1..=20).map(|n| format!("{n}\n")).collect()
+    }
+
+    /// A Git source of `a.txt` and `b.txt` (`twenty_lines` each), committed.
+    fn twenty_line_source(temp: &TempDir) -> PathBuf {
+        let source = temp.path().join("source");
+        write(&source.join("a.txt"), twenty_lines());
+        write(&source.join("b.txt"), twenty_lines());
+        initialize_user_repository(&source);
+        source
+    }
+
+    /// A run from `source` as it is now, named `name`, whose agent puts
+    /// `edit` on line 15 of `file` and adds `name.txt`.
+    fn edited_run(temp: &TempDir, source: &Path, name: &str, file: &str) -> RunRecord {
+        let snapshot = create_snapshot(source, &temp.path().join(name)).unwrap();
+        let workspace = temp.path().join(format!("{name}-workspace"));
+        create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+        let edited = fs::read_to_string(workspace.join(file))
+            .unwrap()
+            .replace("\n15\n", &format!("\n15 {name}\n"));
+        write(&workspace.join(file), edited);
+        write(&workspace.join(format!("{name}.txt")), format!("{name}\n"));
+        let diff_path = temp.path().join(format!("{name}.patch"));
+        let stats = collect_diff(&snapshot.baseline_path, &workspace, &diff_path).unwrap();
+        run_record(
+            source,
+            &snapshot,
+            candidate_record("A", workspace, diff_path, stats),
+        )
+    }
+
+    /// The source commits a change to line 13 of `file`: a context line of
+    /// a hunk at line 15, not a line it edits.
+    fn change_context(source: &Path, file: &str) {
+        write(
+            &source.join(file),
+            twenty_lines().replace("\n13\n", "\n13 world\n"),
+        );
+        run_git(source, &["commit", "--quiet", "-am", "world"]);
+    }
+
+    #[test]
+    fn stage_applies_patches_in_order_and_merges_3_way_only_where_needed() {
+        let temp = TempDir::new().unwrap();
+        let source = twenty_line_source(&temp);
+        let one = edited_run(&temp, &source, "one", "b.txt");
+        let two = edited_run(&temp, &source, "two", "a.txt");
+        change_context(&source, "a.txt");
+        let index = fs::read(source.join(".git/index")).unwrap();
+        let head = run_git(&source, &["rev-parse", "HEAD"]);
+        let world = run_git(&source, &["rev-parse", "HEAD^{tree}"]);
+        let patches = [
+            Patch::new(&one.candidates[0].diff_path, &one.baseline_path),
+            Patch::new(&two.candidates[0].diff_path, &two.baseline_path),
+        ];
+        let git = || git_command(&source);
+
+        let Stage::Conflict { output } = stage(&git, &world, &patches, false).unwrap() else {
+            panic!("the second patch does not apply as it is");
+        };
+        assert!(output.contains("patch failed: a.txt"), "{output}");
+        let Stage::Staged { tree } = stage(&git, &world, &patches, true).unwrap() else {
+            panic!("the second patch merges 3-way");
+        };
+
+        // Read without the alternates: the blob of `two.txt`, which only the
+        // second run's baseline held, was copied into the source's objects.
+        let show = |path: &str| run_git(&source, &["show", &format!("{tree}:{path}")]);
+        assert!(show("a.txt").contains("\n13 world\n14\n15 two\n"));
+        assert!(show("b.txt").contains("\n13\n14\n15 one\n"));
+        assert_eq!(
+            (show("one.txt"), show("two.txt")),
+            ("one".into(), "two".into())
+        );
+        assert_eq!(fs::read(source.join(".git/index")).unwrap(), index);
+        assert_eq!(run_git(&source, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run_git(&source, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn stage_reports_a_3_way_conflict_with_git_output() {
+        let temp = TempDir::new().unwrap();
+        let source = twenty_line_source(&temp);
+        let run = edited_run(&temp, &source, "agent", "a.txt");
+        write(
+            &source.join("a.txt"),
+            twenty_lines().replace("\n15\n", "\n15 world\n"),
+        );
+        run_git(&source, &["commit", "--quiet", "-am", "world"]);
+        let world = run_git(&source, &["rev-parse", "HEAD^{tree}"]);
+        let patch = Patch::new(&run.candidates[0].diff_path, &run.baseline_path);
+
+        let staged = stage(&|| git_command(&source), &world, &[patch], true).unwrap();
+
+        let Stage::Conflict { output } = staged else {
+            panic!("both sides edited line 15: {staged:?}");
+        };
+        assert!(output.contains("U a.txt"), "{output}");
+        assert_eq!(run_git(&source, &["status", "--porcelain"]), "");
+    }
+
+    /// The tree `run`'s Δ merges into on `source`'s committed world, as the
+    /// merged checks would have verified it.
+    fn merged_tree(source: &Path, run: &RunRecord) -> String {
+        let world = run_git(source, &["rev-parse", "HEAD^{tree}"]);
+        let patch = Patch::new(&run.candidates[0].diff_path, &run.baseline_path);
+        let staged = stage(&|| git_command(source), &world, &[patch], true).unwrap();
+        let Stage::Staged { tree } = staged else {
+            panic!("Δ merges 3-way: {staged:?}");
+        };
+        tree
+    }
+
+    #[test]
+    fn a_3_way_landing_is_written_only_for_the_tree_the_merged_checks_verified() {
+        let temp = TempDir::new().unwrap();
+        let source = twenty_line_source(&temp);
+        let run = edited_run(&temp, &source, "agent", "a.txt");
+        change_context(&source, "a.txt");
+        let verified = merged_tree(&source, &run);
+        let delta = run.candidates[0].diff_path.clone();
+        let frozen = fs::read(&delta).unwrap();
+        let landed = temp.path().join(LANDED_PATCH);
+        let world = run_git(&source, &["rev-parse", "HEAD^{tree}"]);
+
+        let error = write_landed_patch(&run, &delta, &landed, &world).unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("no longer matches the tree") && error.contains(&world),
+            "{error}"
+        );
+        assert!(!landed.exists());
+        assert_eq!(run_git(&source, &["status", "--porcelain"]), "");
+
+        assert_eq!(
+            write_landed_patch(&run, &delta, &landed, &verified).unwrap(),
+            verified
+        );
+        assert_eq!(fs::read(&delta).unwrap(), frozen);
+        let applied = apply_through_world(&run, &landed);
+        assert_eq!(
+            applied,
+            [PathBuf::from("a.txt"), PathBuf::from("agent.txt")]
+        );
+        let merged = fs::read_to_string(source.join("a.txt")).unwrap();
+        assert!(merged.contains("\n13 world\n14\n15 agent\n"), "{merged}");
+    }
+
+    #[test]
+    fn unlanded_names_the_paths_that_do_not_hold_the_merge() {
+        let temp = TempDir::new().unwrap();
+        let source = twenty_line_source(&temp);
+        let run = edited_run(&temp, &source, "agent", "a.txt");
+        change_context(&source, "a.txt");
+        let tree = merged_tree(&source, &run);
+        let landed = temp.path().join(LANDED_PATCH);
+        write_landed_patch(&run, &run.candidates[0].diff_path, &landed, &tree).unwrap();
+        let paths = apply_through_world(&run, &landed);
+
+        assert!(unlanded(&run, &paths, &tree).is_empty());
+        write(&source.join("agent.txt"), "changed as it landed\n");
+        assert_eq!(unlanded(&run, &paths, &tree), [PathBuf::from("agent.txt")]);
+        fs::remove_file(source.join("agent.txt")).unwrap();
+        assert_eq!(unlanded(&run, &paths, &tree), [PathBuf::from("agent.txt")]);
+        // Git cannot read a tree that is not there: nothing is confirmed.
+        assert_eq!(unlanded(&run, &paths, &"0".repeat(40)), paths);
+    }
+
+    /// `patch` applied to `run`'s source through the digest of its world now.
+    fn apply_through_world(run: &RunRecord, patch: &Path) -> Vec<PathBuf> {
+        let digest = crate::coherence::world::observe(
+            &run.source_path,
+            &run.baseline_path,
+            &run.baseline_commit,
+            &run.source_kind,
+        )
+        .unwrap()
+        .digest;
+        apply_checked(run, patch, ExpectedWorld::Digest(&digest)).unwrap()
     }
 
     #[test]

@@ -256,6 +256,16 @@ fn check_stops_when_the_patch_is_already_in_the_source() {
         )),
         "{stdout}"
     );
+    // Accept refuses it and says the same.
+    let refused = fixture.dispatch(&["accept", &fixture.run_id]).failure();
+    let stderr = Fixture::stderr(&refused);
+    assert!(
+        stderr.contains(&format!(
+            "Run 'dispatch close {} --reason already-present'.",
+            fixture.run_id
+        )),
+        "{stderr}"
+    );
 }
 
 /// A closed result reads as closed, never as waiting for review.
@@ -382,7 +392,7 @@ fn blocked_accept_names_refresh_and_reject() {
     assert!(stderr.contains("this work is stale"), "{stderr}");
     assert!(
         stderr.contains(&format!(
-            "Run 'dispatch refresh {id}' to redo the work on the current source, or 'dispatch reject {id}'."
+            "Next: dispatch refresh {id} (or dispatch reject {id})."
         )),
         "{stderr}"
     );

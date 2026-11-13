@@ -265,7 +265,7 @@ pub(crate) fn settle(
 }
 
 /// The files in `directory` with `extension`, by name; never a temporary one.
-fn files(directory: &Path, extension: &str) -> Vec<PathBuf> {
+pub(super) fn files(directory: &Path, extension: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = fs::read_dir(directory)
         .into_iter()
         .flatten()
@@ -392,7 +392,7 @@ fn expire(state: &State, db: &Database, run: &mut RunRecord, notes: &[Note]) -> 
     Ok(())
 }
 
-fn record(
+pub(super) fn record(
     state: &State,
     db: &Database,
     run: &mut RunRecord,
@@ -419,7 +419,7 @@ fn workspace(run: &RunRecord) -> Result<&Path> {
         .workspace)
 }
 
-fn run_lock(state: &State, run_id: &str) -> PathBuf {
+pub(super) fn run_lock(state: &State, run_id: &str) -> PathBuf {
     state.run_dir(run_id).join(".operation.lock")
 }
 
