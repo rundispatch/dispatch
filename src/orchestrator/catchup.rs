@@ -220,7 +220,8 @@ fn ask(
         .asked
         .extend(new.iter().map(|landed| landed.run_id.clone()));
     write_durably(&path, &serde_json::to_vec(&record)?)?;
-    let ask = put(state, workspace, &run.id, new.clone())?;
+    let named: Vec<&str> = runs.iter().map(|run| run.id.as_str()).collect();
+    let ask = put(state, workspace, &run.id, new.clone(), &named)?;
     let targets: Vec<&Target> = new
         .iter()
         .flat_map(|landed| landed.targets.iter().map(|(i, _)| &i.target))
@@ -290,9 +291,13 @@ fn breaks(interaction: &Interaction) -> bool {
 
 /// What an ask says: which Work landed, in which runtime, what it changed
 /// that this Work relies on, where those changes are, and what would bring
-/// them in. Fixed text, at most eight lines, that informs and asks.
-fn text(landings: &[Landed]) -> String {
-    let short = crate::state::short_ids(&ids(landings));
+/// them in. Fixed text, at most eight lines, that informs and asks. Each
+/// Work is named by as much of its ID as tells it apart from every Work in
+/// `named`, the project's, which holds every Work a note names.
+fn text(landings: &[Landed], named: &[&str]) -> String {
+    let mut ids = ids(landings);
+    ids.extend_from_slice(named);
+    let short = crate::state::short_ids(&ids);
     let works: Vec<String> = landings
         .iter()
         .map(|l| format!("Work {} ({})", short[l.run_id.as_str()], l.runtime))
@@ -378,8 +383,15 @@ fn ids(landings: &[Landed]) -> Vec<&str> {
 }
 
 /// Merge `new` into the ask pending for Work `run_id` in `workspace`, or
-/// write one, and return it. The caller holds the run's lock.
-fn put(state: &State, workspace: &Path, run_id: &str, new: Vec<Landed>) -> Result<Ask> {
+/// write one, and return it, naming Work as `text` does among `named`. The
+/// caller holds the run's lock.
+fn put(
+    state: &State,
+    workspace: &Path,
+    run_id: &str,
+    new: Vec<Landed>,
+    named: &[&str],
+) -> Result<Ask> {
     let pending = pending(state, workspace);
     fs::create_dir_all(pending.with_file_name("delivered"))?;
     let aside = pending.with_extension("merging");
@@ -398,7 +410,7 @@ fn put(state: &State, workspace: &Path, run_id: &str, new: Vec<Landed>) -> Resul
         );
     }
     ask.landings.extend(new);
-    ask.text = text(&ask.landings);
+    ask.text = text(&ask.landings, named);
     write_atomically(&aside, &serde_json::to_vec(&ask)?)?;
     fs::rename(&aside, &pending)?;
     Ok(ask)
@@ -704,6 +716,11 @@ mod tests {
 
         /// Work in a new worktree, registered by a session of `provider`.
         fn work(&self, name: &str, provider: &str) -> RunRecord {
+            self.work_as(name, provider, &Ulid::new().to_string())
+        }
+
+        /// `work`, as Work `id`.
+        fn work_as(&self, name: &str, provider: &str, id: &str) -> RunRecord {
             let workspace = self.root.with_file_name(name);
             let path = workspace.to_str().unwrap();
             git(
@@ -719,27 +736,28 @@ mod tests {
                 end_reason: None,
                 model: None,
             };
-            attach::create(
-                &self.state,
-                AttachRequest {
-                    workspace: workspace.clone(),
-                    root: Some(self.root.clone()),
-                    task: None,
-                    agent: Some(provider.into()),
-                    pid: None,
-                    command: None,
-                    allow_unsafe_local: true,
-                    auto_apply: false,
-                    runtime: Some(RuntimeStart {
-                        session,
-                        resumed: false,
-                        commit: source::world_commit(&workspace).unwrap(),
-                        discovered: false,
-                        reopens: None,
-                    }),
-                },
-            )
-            .unwrap()
+            let request = AttachRequest {
+                workspace: workspace.clone(),
+                root: Some(self.root.clone()),
+                task: None,
+                agent: Some(provider.into()),
+                pid: None,
+                command: None,
+                allow_unsafe_local: true,
+                auto_apply: false,
+                runtime: Some(RuntimeStart {
+                    session,
+                    resumed: false,
+                    commit: source::world_commit(&workspace).unwrap(),
+                    discovered: false,
+                    reopens: None,
+                }),
+            };
+            // As `attach::create` makes it, under the ID given.
+            let prepared = attach::prepare(&self.state, request).unwrap();
+            let _building = registration::begin(&self.state, id).unwrap();
+            let built = attach::build(&self.state, &prepared, id).unwrap();
+            attach::publish(&self.state, id, Some(built), None).unwrap()
         }
 
         /// Hermes Work in `.worktrees/hermes-<id>`, as the owner's discovery
@@ -983,7 +1001,7 @@ mod tests {
         // Code refuses to run in a worktree.
         let commit = format!("00000001{}", "c".repeat(32));
         assert_eq!(
-            text(std::slice::from_ref(&one)),
+            text(std::slice::from_ref(&one), &[]),
             format!(
                 "Dispatch: Work 01AAAAAA (Claude Code) landed a change this Work relies on.\n\
                  - f (src/lib.rs), which this Work uses: 01AAAAAA changed its signature, \
@@ -1012,7 +1030,7 @@ mod tests {
                 ],
             )
         };
-        let both = text(&[one, two]);
+        let both = text(&[one, two], &[]);
         let lines: Vec<&str> = both.lines().collect();
         assert_eq!(
             lines[..5],
@@ -1044,13 +1062,39 @@ mod tests {
                 (breaks_use_of(&format!("f{i}")), Some(old_new))
             })
             .collect();
-        let text = text(&[landed("01AAAAAAAAAA", 1, targets)]);
+        let text = text(&[landed("01AAAAAAAAAA", 1, targets)], &[]);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 8, "{text}");
         assert_eq!(lines[5], "- and 5 more.");
         assert!(lines.iter().all(|line| line.chars().count() <= 600));
         assert!(lines[0].starts_with("Dispatch: "));
         assert!(!text.to_lowercase().contains("must"), "{text}");
+    }
+
+    /// Work begun together shares the first characters of its ID: in a
+    /// trial, three Claude Code sessions begun within 256 ms. The ask names
+    /// the landed Work apart from all of them, as notes do.
+    #[tokio::test]
+    async fn an_ask_names_the_landed_work_apart_from_every_work_of_the_project() {
+        let mut p = Project::new();
+        let a = p.work_as("a", "claude", "01M7BEVQT4FX75FSQ3DKFB1A9M");
+        let b = p.work_as("b", "claude", "01M7BEVQSS8YSSP2RC8K67H52B");
+        p.work_as("c", "claude", "01M7BEVQSKH8NTDN9YZBQR04V6");
+        let changed = LIB.replace("total(n: i32)", "total(n: i32, by: i32)");
+        let breaks = [(&a, vec![breaks_use_of("total")])];
+        p.land(&b, &changed, "observed", &breaks).await;
+        p.step();
+
+        let text = p.hook(&a).expect("one ask");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[..2],
+            [
+                "Dispatch: Work 01M7BEVQSS (Claude Code) landed a change this Work relies on.",
+                "- total (src/lib.rs), which this Work uses: 01M7BEVQSS changed its signature, \
+                 pub fn total(n: i32) -> i32 → pub fn total(n: i32, by: i32) -> i32",
+            ]
+        );
     }
 
     #[tokio::test]

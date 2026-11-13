@@ -2063,6 +2063,7 @@ mod tests {
                 commit: "e4a15cd9ffffffff".into(),
             },
             s0_since: None,
+            began_detached: false,
             confidence: AttachConfidence::Full,
             agent: Some("claude".into()),
             command: None,

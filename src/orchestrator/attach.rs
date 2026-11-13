@@ -304,6 +304,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
 
     let mut history = Vec::new();
     let mut s0_since = None;
+    let mut began_detached = None;
     let (snapshot, provenance, confidence, workspace, managed_workspace) = if *managed {
         let (snapshot, provenance, workspace, made) = make_workspace(state, root, run_id, &dir)
             .map_err(|error| error.context("could not make a workspace"))?;
@@ -326,6 +327,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
             s0_since = Some(old.first_s0_since());
             history = old.baseline_history;
             let attachment = old.attachment.context("not attached Work")?;
+            began_detached = Some(attachment.began_detached);
             (attachment.provenance, attachment.confidence)
         } else if runtime.discovered {
             // The worktree appeared after watching began: every change in it
@@ -370,6 +372,10 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
             }
         };
         (snapshot, provenance, confidence, workspace.clone(), None)
+    };
+    let began_detached = match began_detached {
+        Some(kept) => kept,
+        None => repo_key.is_some() && super::s0::detached(&workspace)?,
     };
 
     let (source_kind, source_git_head) = source::inspect_source(root)?;
@@ -450,6 +456,7 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         repo_key: repo_key.clone(),
         provenance,
         s0_since,
+        began_detached,
         confidence,
         agent: request.agent.clone(),
         command: request.command.clone(),
@@ -1703,6 +1710,7 @@ pub(super) async fn finish_locked(
     reason: FinishReason,
     cancel: &CancellationToken,
 ) -> Result<RunRecord> {
+    super::s0::back_before_freeze(state, &mut run)?;
     let run_dir = state.run_dir(&run.id);
     let workspace = run.candidates[0].workspace_path.clone();
     let diff_path = run.candidates[0].diff_path.clone();
