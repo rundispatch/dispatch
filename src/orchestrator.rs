@@ -1017,7 +1017,8 @@ fn print_review_commands(state: &State, run: &RunRecord, validity: Option<&crate
 /// recorded at its project (`source`) there (`resume_step`), and any other
 /// attached Work by running its agent again. Work in progress whose agent
 /// was `asked` to catch up waits for its S0 to move, which the project owner
-/// follows and checks. Each names the Work; `watch` shows the same step.
+/// follows and checks. Each names the Work; `watch` and accept's refusal
+/// show the same step.
 pub(crate) fn next_step(
     run: &RunRecord,
     decision: Decision,

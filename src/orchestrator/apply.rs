@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     background::{self, Watcher},
-    persist_event, sole_candidate, transition,
+    newest_source, next_step, persist_event, sole_candidate, transition,
 };
 use crate::{
     AnalysisLevel, ApplicationState, AppliedBy, CoherenceRecord, Decision, EventRecord,
@@ -536,8 +536,14 @@ pub(super) fn apply_locked(
                     landed_by: (validity.decision == Decision::Stop)
                         .then(|| landed_by(state, &run))
                         .flatten(),
+                    next: next_step(
+                        &run,
+                        validity.decision,
+                        newest_source(state, &run).as_ref(),
+                        None,
+                    )
+                    .0,
                     validity,
-                    attached: run.mode == crate::RunMode::Attached,
                     despite_refresh,
                     checks,
                 }

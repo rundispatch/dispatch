@@ -1181,7 +1181,7 @@ def feedback(binary, base):
         watch.until("listed", lambda: listed_order(watch, order) == order)
         select(watch, "stale", order)
         watch.send("a")
-        watch.shows("stale: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.")
+        watch.shows("stale: not applied: stale (REFRESH). See its Next line.")
         assert not applied(project, "stale") and (project.root / "api.py").read_text() == source_before
         select(watch, "dup", order)
         watch.send("a")
@@ -1322,7 +1322,7 @@ def short_terminal(binary, base):
         with project.watch(width, height) as watch:
             watch.until("the selected Work on screen", lambda: watch.selected())
             watch.send("a")  # refused: a notice of up to two lines, shown whole
-            watch.shows("me-endpoint: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.")
+            watch.shows("me-endpoint: not applied: stale (REFRESH). See its Next line.")
             watch.settle()
             assert watch.selected() and selected_name(watch, order) == "me-endpoint", \
                 (width, height, "the selection is off screen", watch.screen())

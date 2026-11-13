@@ -193,9 +193,12 @@ Coherence section when the source moved or the run is a refresh.
   happens and both digests are named. If another process holds the Work (the
   project owner recording a verdict, another accept running the merged checks),
   `accept` waits, saying `Waiting for Work <id>: another process is using it.`
-  Without an ID it acts only when exactly
-  one result waits for review for the source, and so does `dispatch reject`;
-  with several they change nothing and list each one's command.
+  Without an ID, `dispatch reject` acts only when exactly one result waits for
+  review for the source, and with several changes nothing and lists each one's
+  command. `dispatch accept` without an ID does the same, except in a Git project
+  where two or more waiting results can land together: it then proposes them as
+  one batch, in a safe order, behind one approval, and runs the merged checks
+  once on all of them ([reference](reference.md#one-shot-cli)).
 - `dispatch close <id> --reason <reason>` retires a result without judging it:
   `already-present` when its whole patch is already in the source, or
   `superseded --replacement <id>` when other finished Work replaces it. It
@@ -402,8 +405,13 @@ the source as it is now with the Work's change, as accept checks it, so accept c
 reuse that pass; only if that fails do they also run in the workspace, to show
 whose change broke it. Its summary shows the patch, the
 verdict against the source now, what accept would verify, and the commands for
-this Work by its full ID. A stale result offers no accept: run the agent again on
-the current source, then `dispatch close <old-id> --reason superseded --replacement
+this Work by its full ID. A stale result offers no accept, and accept's refusal names
+the same step as the summary. When its session can be
+resumed in its worktree (registered by its runtime's hook, every session ended, the
+worktree still there), the step is to resume it there and merge the newest recorded
+source by its commit: the session goes on as new Work from the same S0, this Work
+closes as superseded, and the merge moves S0. Otherwise run the agent again on the
+current source, then `dispatch close <old-id> --reason superseded --replacement
 <new-id>`, or reject it. Unfinished Work nobody will finish is closed with
 `dispatch close <id> --reason unfinished`; `reject` refuses it, because there is no
 result to judge.
@@ -457,8 +465,8 @@ keys that apply:
 - `f` finishes attached Work, asking first, naming it, before running checks
   nobody has allowed;
 - `a` accepts, through the same gate as `dispatch accept`, and says what became
-  of the merged checks; a refusal names the Work and what to do instead, and its
-  details show the reason;
+  of the merged checks; a refusal names the Work and what to do instead (for a
+  REFRESH, `See its Next line.`, where the step is), and its details show the reason;
 - `r` rejects, after asking, naming it, with focus on Cancel. Unfinished Work has
   no result to reject, so `r` refuses and names `dispatch close`;
 - `c` closes it without a review, after asking why and then for a confirmation,

@@ -954,9 +954,10 @@ fn an_undone_merge_moves_a_resumed_s0_back_to_its_time_and_a_new_merge_moves_it_
 
 /// B's session ends in `wb`, its work committed, and B is finished stale
 /// after A's landing at `commit`. `check` says to resume the session there
-/// and merge `commit`, named in full. Done so, the session goes on as new
-/// Work from B's S0, B closes as superseded by it, and the merge moves the
-/// new Work's S0 to A's landing: it continues, with no agent run again.
+/// and merge `commit`, named in full, and accept's refusal says the same.
+/// Done so, the session goes on as new Work from B's S0, B closes as
+/// superseded by it, and the merge moves the new Work's S0 to A's landing:
+/// it continues, with no agent run again.
 fn resumed_merges_and_continues(p: &mut Project, wb: &Path, b: &str, a: &str, commit: &str) {
     let end = payload(&[
         ("session_id", "b".into()),
@@ -987,6 +988,15 @@ fn resumed_merges_and_continues(p: &mut Project, wb: &Path, b: &str, a: &str, co
              superseded; Dispatch then moves that S0 and checks it again  (or dispatch reject {b})",
             wb.display()
         )
+    );
+    // Accept refuses it and names the same step.
+    let refused = p.dispatch().args(["accept", b]).output().unwrap();
+    assert!(!refused.status.success(), "{refused:?}");
+    let (step, _) = next["Next: ".len()..].split_once("  (or ").unwrap();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("Next: {step} (or dispatch reject {b}).")),
+        "{stderr}"
     );
 
     // Its session resumes there, and does as the step says.

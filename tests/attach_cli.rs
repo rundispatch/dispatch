@@ -558,10 +558,17 @@ fn finish_then_root_moves_then_check_refreshes() {
     // Attached work has no Dispatch task to refresh: the advice says so.
     assert!(!stdout.contains("dispatch refresh"), "{stdout}");
     assert!(stdout.contains("run your agent again"), "{stdout}");
-    // Accepting stale attached work is refused and records no human review.
+    // Accepting stale attached work is refused, names the same step, and
+    // records no human review.
     let refused = f.dispatch(&["accept", &id]).failure();
     let stderr = String::from_utf8_lossy(&refused.get_output().stderr).into_owned();
     assert!(!stderr.contains("dispatch refresh"), "{stderr}");
+    let next = stdout.lines().find_map(|line| line.strip_prefix("Next: "));
+    let (step, _) = next.unwrap().split_once("  (or ").unwrap();
+    assert!(
+        stderr.contains(&format!("Next: {step} (or dispatch reject {id}).")),
+        "{stderr}"
+    );
     assert_eq!(f.metadata(&id)["outcome"]["review"], "pending");
     assert_eq!(f.goal_feedback_count(&id), 0);
     assert_eq!(f.event_count(&id, "review.accepted"), 0);

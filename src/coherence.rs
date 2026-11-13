@@ -288,8 +288,9 @@ pub fn verdict(decision: Decision) -> &'static str {
 pub struct CoherenceBlocked {
     pub run_id: String,
     pub validity: Validity,
-    /// Attached work has no Dispatch task to refresh.
-    pub attached: bool,
+    /// What to do instead: the step `check` and `watch` give for its verdict
+    /// (`orchestrator::next_step`).
+    pub next: String,
     /// The human asked to override (`--despite-refresh`).
     pub despite_refresh: bool,
     /// For a STOP, the applied run that already landed the same patch.
@@ -323,22 +324,12 @@ impl fmt::Display for CoherenceBlocked {
             )?,
         }
         if self.validity.decision == Decision::Stop {
-            write!(
-                f,
-                "Run 'dispatch close {} --reason already-present'.",
-                self.run_id
-            )?;
-        } else if self.attached {
-            write!(
-                f,
-                "Run your agent again on the current source and attach it, or run 'dispatch reject {}'.",
-                self.run_id
-            )?;
+            write!(f, "Run '{}'.", self.next)?;
         } else {
             write!(
                 f,
-                "Run 'dispatch refresh {id}' to redo the work on the current source, or 'dispatch reject {id}'.",
-                id = self.run_id
+                "Next: {} (or dispatch reject {}).",
+                self.next, self.run_id
             )?;
         }
         if self.despite_refresh {
@@ -1530,7 +1521,7 @@ mod tests {
         let text = CoherenceBlocked {
             run_id: "RUN1".into(),
             validity: validity.clone(),
-            attached: false,
+            next: "dispatch close RUN1 --reason already-present".into(),
             despite_refresh: false,
             landed_by: None,
             checks: None,
@@ -1538,43 +1529,33 @@ mod tests {
         .to_string();
         assert!(
             text.contains("STOP")
-                && text.contains("Run 'dispatch close RUN1 --reason already-present'")
+                && text.ends_with("Run 'dispatch close RUN1 --reason already-present'."),
+            "{text}"
         );
+        // A REFRESH names the step it is given, and offers reject.
         let refresh = CoherenceBlocked {
             run_id: "RUN1".into(),
             validity: Validity {
                 decision: Decision::Refresh,
                 ..validity.clone()
             },
-            attached: false,
+            next: "resume its session in /wt, then commit there".into(),
             despite_refresh: false,
             landed_by: None,
             checks: None,
         }
         .to_string();
-        assert!(refresh.contains(
-            "Run 'dispatch refresh RUN1' to redo the work on the current source, or 'dispatch reject RUN1'."
-        ));
-        // Attached work has no Dispatch task to refresh.
-        let attached = CoherenceBlocked {
-            run_id: "RUN1".into(),
-            validity: Validity {
-                decision: Decision::Refresh,
-                ..validity.clone()
-            },
-            attached: true,
-            despite_refresh: false,
-            landed_by: None,
-            checks: None,
-        }
-        .to_string();
-        assert!(!attached.contains("dispatch refresh"), "{attached}");
-        assert!(attached.contains("Run your agent again on the current source"));
+        assert!(
+            refresh.ends_with(
+                "Next: resume its session in /wt, then commit there (or dispatch reject RUN1)."
+            ),
+            "{refresh}"
+        );
         // A STOP is never overridable, and the refusal says so.
         let stop = CoherenceBlocked {
             run_id: "RUN1".into(),
             validity,
-            attached: false,
+            next: "dispatch close RUN1 --reason already-present".into(),
             despite_refresh: true,
             landed_by: None,
             checks: None,

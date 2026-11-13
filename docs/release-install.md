@@ -114,6 +114,84 @@ To roll back, stop every session and restore a complete matching backup into a s
 directory; point the matching old binary at it with `--state-dir`. Never point an old binary
 at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.5.0
+
+No migration; the schema stays at 24. Existing records are not rewritten.
+- **Rollback.** Back up the whole state directory before upgrading, and roll back only by
+  restoring it. 0.4.18 cannot read a run whose verdict carries the new reason
+  `merged_three_way`: ``error: invalid committed run projection: unknown variant
+  `merged_three_way`, …``.
+- **The owner.** After an upgrade in place, the next Dispatch command in a watched project
+  restarts its owner with 0.5.0, as since 0.4.17. Until then no ask to catch up is written.
+- **Claude Code hooks.** They are now eight: `Stop` gets a second entry, the waiter (`…
+  hook claude-wait`, `asyncRewake: true`, timeout 28800). A settings file holding 0.4.18's
+  seven, 0.4.17's six or 0.4.16's four is offered once as an Update in `dispatch setup`,
+  which says what the waiter is for and keeps every hook of yours. Claude Code reads hooks
+  again mid-session (observed with 2.1.296), so live sessions pick up the update. Until it,
+  an ask arrives as a turn ends, through the existing `Stop` hook, but an idle session is
+  not woken.
+- **One sleeping waiter per idle Claude Code session** in a watched project whose
+  workspace has Work. It looks for an ask once a second, and ends with its session, when
+  the next turn's waiter replaces it, or after 8 hours. Outside a watched project, or in a
+  workspace with no Work, it ends at once. `pgrep -fl 'hook claude-wait'` lists them.
+- **Going back to an older Dispatch** with 0.5.0's hooks in place: it refuses the waiter
+  with `unknown agent runtime: claude-wait` and status 1 at the end of every turn, which
+  wakes nothing; Claude Code may show the hook's error in verbose output. The older setup
+  reads the eight hooks as changed by hand and leaves them, so remove Dispatch's Claude
+  Code hooks first with the 0.5.0 binary (`dispatch setup` → Agents Dispatch launches… →
+  Runtime integrations → Remove Claude Code hooks), then install them with the older one.
+- **Hermes hooks.** The block in `config.yaml` gains `pre_verify` (5 s) beside
+  `on_session_finalize` and `pre_llm_call`. `dispatch setup` offers 0.4.18's two-hook block,
+  or the one hook of 0.4.15 to 0.4.17, as an Update, and says: `The pre_verify hook is new:
+  at the end of a turn that edited files, it gives the agent an ask to catch up if one
+  waits, so Hermes asks you about it once more, the first time Hermes starts.` Hermes asks
+  for it at its next start in a terminal, and it does not run until you allow it; a run
+  without a terminal needs `hermes --accept-hooks`. If `hermes config set` rewrote the file,
+  setup shows the lines to set by hand and writes nothing.
+- **New state files.** `<state>/catchup/` (pending asks; `delivered/`, asks a hook took;
+  `work/`, the landings each Work in progress was asked about), `<state>/waiters/` (each
+  Claude Code session's newest waiter), `runs/<id>/delta-landed.patch` for a 3-way landing,
+  and `runs/<first member>/batch-<12 hex>.patch` for a batch.
+- **Additive JSON and events.**
+  - New events: `batch.proposed`, `batch.verified`, `batch.landed`, `catchup.written`,
+    `catchup.delivered`, `catchup.expired`. Their payloads are in
+    [reference.md](reference.md#events).
+  - A batch member's `result.applied`, `interaction.landed`, `review.accepted`,
+    `coherence.merged_checks` and `checks.reused` gain `batch`; the merged checks gain
+    `members`. A 3-way landing's `result.applied` gains `delta_digest`, `landed_patch`,
+    `landed_digest`, `confirmed` and `unconfirmed`.
+  - A new reason code, `merged_three_way`, which leaves CONTINUE.
+  - Work a resumed session reopened carries `attachment.s0_since`, since when its first S0
+    has been the source; it is absent otherwise, and a record without it reads as before.
+  - `status --json` with no Work prints `{"found_not_tracked": [{"path", "attach"}]}` when
+    something is found, and `null`, as before, when nothing is.
+- **Changed behaviour.**
+  - **`dispatch accept` without an ID**, in a Git project where two or more results can
+    land together, proposes them as one batch instead of refusing with `<n> results wait
+    for review for <source>`. Without a terminal it exits 1 and prints the `dispatch accept
+    --expect <batch digest>` to run. `reject` without an ID is unchanged.
+  - **3-way.** A result whose patch no longer applies as it is but merges 3-way from S0 is
+    CONTINUE where it was REFRESH `patch_conflict`, and accept runs the merged checks before
+    landing it. `patch_conflict` now says when a 3-way merge was tried.
+  - **REFRESH next steps** are one step, the same in `check`, `finish`, `watch` and
+    accept's refusal, and a result whose session can be resumed gets the resume step.
+    Watch's REFRESH Next reads `It can't be accepted as is: <step>. Or r reject it.`.
+    Accept's refusal of a REFRESH ends `Next: <step> (or dispatch reject <id>).` (for a
+    native run, `Next: dispatch refresh <id> (or dispatch reject <id>).`), and watch's
+    notice after it reads `<name>: not applied: stale (REFRESH). See its Next line.`. A
+    script that matched 0.4.18's `Run 'dispatch refresh <id>' to redo the work …` or `Run
+    your agent again …` needs the new text. A STOP's refusal is unchanged.
+  - **Asks to catch up** reach live Claude Code and Hermes agents, and `dispatch status
+    <id>` shows a `Catch-up` section for asked Work.
+  - **Landing notes** end `The source with this change is commit <40 hex>.`, without
+    `(refs/dispatch/source)`.
+  - **`dispatch setup --checks`** opens on letting Work run the checks while consent does
+    not hold, and keeps every configured check selected when you change them.
+  - **`status` with no Work** lists the worktrees found, not tracked.
+  - **A command that only reads and prints**, and `--help`, are ended by `SIGPIPE` (status
+    141 in a shell) when their reader goes away (`dispatch history | head -1`), instead of
+    panicking with `failed printing to stdout: Broken pipe`.
+
 ### Upgrading to 0.4.18
 
 No migration; the schema stays at 24. Existing records are not rewritten.

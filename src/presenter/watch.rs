@@ -1139,11 +1139,10 @@ fn refusal(run: Option<&RunRecord>, error: &anyhow::Error) -> String {
     let blocked = run
         .filter(|run| run.outcome.application == ApplicationState::BlockedBySourceDrift)
         .and_then(|run| run.coherence.as_ref()?.validity.as_ref());
-    // The reason is on the Verdict line; the notice says what to do.
+    // The reason is on the Verdict line; the notice says what to do. A
+    // REFRESH's step can outrun the notice's two lines, so it points to Next.
     match blocked.map(|validity| validity.decision) {
-        Some(Decision::Refresh) => {
-            "not applied: stale (REFRESH). The source is unchanged. Next: r reject it.".into()
-        }
+        Some(Decision::Refresh) => "not applied: stale (REFRESH). See its Next line.".into(),
         Some(Decision::Stop) => {
             "not applied: STOP, its changes are already in the source. Next: c close it.".into()
         }
@@ -2478,6 +2477,7 @@ mod tests {
     /// A REFRESH says in watch what the CLI says (`next_step`): for a native
     /// run, for attached Work, and for Work whose session can be resumed in
     /// its worktree to merge the newest recorded source, with the same keys.
+    /// A refused accept's notice points to that line.
     #[test]
     fn a_refresh_says_what_the_cli_says() {
         let temp = tempfile::tempdir().unwrap();
@@ -2535,6 +2535,34 @@ mod tests {
                 format!("It can't be accepted as is: {step}. Or r reject it.")
             );
             assert_eq!(item.keys, [REJECT, REVIEW]);
+            // A refused accept points there. At the narrowest width the
+            // notice shows whole, and so does the step.
+            let mut refused = run.clone();
+            refused.outcome.application = ApplicationState::BlockedBySourceDrift;
+            let notice = refusal(Some(&refused), &anyhow::anyhow!("stale"));
+            let listed = std::slice::from_ref(&item);
+            let buffer = draw_notice(
+                listed,
+                &item,
+                (Kind::Refused, &notice),
+                (40, 40),
+                &no_color(),
+            );
+            let text = rows(&buffer);
+            let (_, y) = find(&buffer, &format!("{}: not applied", item.name)).unwrap();
+            let at = usize::from(y);
+            assert_eq!(
+                format!("{} {}", text[at].trim(), text[at + 1].trim()),
+                format!(
+                    "{}: not applied: stale (REFRESH). See its Next line.",
+                    item.name
+                )
+            );
+            let squeezed = |text: &str| text.split_whitespace().collect::<String>();
+            assert!(
+                squeezed(&text.concat()).contains(&squeezed(&format!("Next {}", item.next))),
+                "{text:#?}"
+            );
         }
     }
 
@@ -3280,7 +3308,7 @@ mod tests {
         let mut blocked = demo().remove(0);
         blocked.outcome.application = ApplicationState::BlockedBySourceDrift;
         let refused = refusal(Some(&blocked), &anyhow::anyhow!("stale"));
-        // At 60 columns the whole refusal shows, down to what to do next.
+        // At 60 columns the whole refusal shows, down to where to look next.
         let buffer = draw_notice(
             &listed,
             &listed[1],
@@ -3294,7 +3322,7 @@ mod tests {
         let at = usize::from(y);
         assert_eq!(
             format!("{} {}", text[at].trim(), text[at + 1].trim()),
-            "me-endpoint: not applied: stale (REFRESH). The source is unchanged. Next: r reject it."
+            "me-endpoint: not applied: stale (REFRESH). See its Next line."
         );
         assert!(text[at + 2].contains("q leave"), "{text:#?}");
         let mut stop = blocked.clone();
@@ -3719,7 +3747,7 @@ mod tests {
         }));
         let listed = items(&runs);
         let palette = no_color();
-        let refused = "not applied: stale (REFRESH). The source is unchanged. Next: r reject it.";
+        let refused = "not applied: stale (REFRESH). See its Next line.";
         for item in &listed {
             for size in [(100, 10), (60, 12), (100, 8), (60, 9), (200, 7)] {
                 let buffer = draw_notice(&listed, item, (Kind::Refused, refused), size, &palette);
@@ -3900,7 +3928,7 @@ mod tests {
         blocked.outcome.application = ApplicationState::BlockedBySourceDrift;
         assert_eq!(
             refusal(Some(&blocked), &error),
-            "not applied: stale (REFRESH). The source is unchanged. Next: r reject it."
+            "not applied: stale (REFRESH). See its Next line."
         );
         judge(&mut blocked, Decision::Stop, true, &[REASON]);
         assert_eq!(
