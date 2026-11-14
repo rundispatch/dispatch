@@ -660,6 +660,13 @@ pub struct AttachmentRecord {
     /// and for Work made before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s0_since: Option<DateTime<Utc>>,
+    /// The workspace's HEAD was detached when the Work began, as in a
+    /// worktree made with `git worktree add --detach`. Its agent commits on
+    /// that HEAD, so a detached HEAD proves integration there as a branch
+    /// does elsewhere (`s0::follow`). Work that reopens another keeps that
+    /// Work's. `false` for Work made before this was recorded.
+    #[serde(default)]
+    pub began_detached: bool,
     pub confidence: AttachConfidence,
     /// `"claude" | "codex" | "cursor"` or other free text; never guessed.
     pub agent: Option<String>,
@@ -1137,6 +1144,7 @@ mod tests {
                 commit: "0123456789abcdef".to_owned(),
             },
             s0_since: None,
+            began_detached: false,
             confidence: AttachConfidence::Full,
             agent: Some("claude".to_owned()),
             command: Some(vec!["claude".to_owned(), "--dangerously...".to_owned()]),
