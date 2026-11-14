@@ -596,8 +596,9 @@ pub(crate) struct Owner {
     /// Each followed run's S0 and work signal when it was last evaluated:
     /// Δ against the S0 it moved to may be the same bytes as before.
     work: HashMap<String, (String, String)>,
-    /// Each Work's workspace HEAD when its S0 was last looked at.
-    heads: HashMap<String, String>,
+    /// Each Work's workspace HEAD when its S0 was last looked at, and
+    /// whether it could move S0 forward (`s0::follow`).
+    heads: HashMap<String, (String, bool)>,
     /// Each Ready result's world signal when it was last checked.
     checked: HashMap<String, world::Signal>,
     /// Each unintegrated Work's footprint, with the digest of the Δ it was

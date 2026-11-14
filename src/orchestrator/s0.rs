@@ -7,9 +7,10 @@
 //! HEAD descending from it is the proof. Without
 //! that proof (a pull of something never recorded, a cherry-pick, a squash)
 //! S0 stays, and the verdict is what it was. When the HEAD no longer has a
-//! moved S0 (a merge reset or rebased away), S0 moves back to the newest
-//! earlier one it has, or to where the Work began, at the latest when Δ is
-//! frozen, so Δ never shows the undone merge as a revert.
+//! moved S0 (a merge reset or rebased away, or a checkout of a commit
+//! without it), S0 moves back to the newest earlier one it has, or to where
+//! the Work began, at the latest when Δ is frozen, so Δ never shows the
+//! undone merge as a revert.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -105,14 +106,15 @@ pub(super) fn movable(run: &RunRecord) -> Option<&AttachmentRecord> {
 }
 
 /// Move the S0 of each Work in `runs` whose workspace integrated a newer
-/// source, replacing its record with the moved one. `looked` holds each
-/// Work's workspace HEAD when it was last looked at; only a HEAD that moved
-/// is looked at again. Whether any S0 moved, and what failed.
+/// source, replacing its record with the moved one, or back when its HEAD
+/// no longer has it. `looked` holds each Work's workspace HEAD when it was
+/// last looked at (`workspace_head`); only a HEAD that moved is looked at
+/// again. Whether any S0 moved, and what failed.
 pub(crate) fn follow(
     state: &State,
     root: &Path,
     runs: &mut [RunRecord],
-    looked: &mut HashMap<String, String>,
+    looked: &mut HashMap<String, (String, bool)>,
 ) -> (bool, Vec<anyhow::Error>) {
     let mut errors = Vec::new();
     let mut followed = HashSet::new();
@@ -123,8 +125,8 @@ pub(crate) fn follow(
         };
         followed.insert(run.id.clone());
         match workspace_head(attachment) {
-            // Mid-merge, mid-rebase, or detached where the Work began on a
-            // branch: no proof now, and the HEAD it ends on is looked at then.
+            // Mid-merge, mid-rebase or mid-cherry-pick: no proof now, and
+            // the HEAD it ends on is looked at then.
             Ok(None) => {}
             Ok(Some(head)) if looked.get(&run.id) == Some(&head) => {}
             Ok(Some(head)) => heads.push((index, head)),
@@ -150,16 +152,18 @@ pub(crate) fn follow(
     };
     let mut clean = None;
     let mut moved = false;
-    for (index, head) in heads {
+    for (index, (head, forward)) in heads {
         let run = &mut runs[index];
-        let outcome =
-            match newer_source(root, run, &head, &records, root_head.as_deref(), &mut clean)
-                .map(|newer| newer.or_else(|| earlier_s0(root, run, &head)))
-            {
-                Ok(Some(target)) => move_s0(state, root, &run.id, &head, target),
-                Ok(None) => Ok(Move::Stayed),
-                Err(error) => Err(error),
-            };
+        let newer = if forward {
+            newer_source(root, run, &head, &records, root_head.as_deref(), &mut clean)
+        } else {
+            Ok(None)
+        };
+        let outcome = match newer.map(|newer| newer.or_else(|| earlier_s0(root, run, &head))) {
+            Ok(Some(target)) => move_s0(state, root, &run.id, &head, target),
+            Ok(None) => Ok(Move::Stayed),
+            Err(error) => Err(error),
+        };
         match outcome {
             Ok(Move::Busy) => continue,
             Ok(Move::Stayed) => {}
@@ -174,18 +178,21 @@ pub(crate) fn follow(
                 continue;
             }
         }
-        looked.insert(run.id.clone(), head);
+        looked.insert(run.id.clone(), (head, forward));
     }
     (moved, errors)
 }
 
-/// The HEAD commit of `attachment`'s workspace, or `None` while it proves
-/// nothing: a merge, rebase or cherry-pick is in progress, or HEAD is
-/// detached in a workspace that began on a branch, a checkout to look at a
-/// commit rather than the branch that integrated it. In a workspace that
-/// began detached, the detached HEAD is where its agent commits; a look
-/// there moves S0 to what it checked out, and back once it leaves.
-fn workspace_head(attachment: &AttachmentRecord) -> Result<Option<String>> {
+/// The HEAD commit of `attachment`'s workspace, and whether it may prove a
+/// move forward; `None` while a merge, rebase or cherry-pick is in progress.
+/// A detached HEAD in a workspace that began on a branch is a checkout to
+/// look at a commit, not the branch that integrated it, so it proves no
+/// move forward. In a workspace that began detached, the detached HEAD is
+/// where its agent commits; a look there moves S0 to what it checked out,
+/// and back once it leaves. Any of these may prove a move back, which needs
+/// less: it asks only that the HEAD lack S0, and it goes to an S0 the Work
+/// had before, so all it can take out of Δ is a revert of what the HEAD lacks.
+fn workspace_head(attachment: &AttachmentRecord) -> Result<Option<(String, bool)>> {
     let mut command = source::git_command(&attachment.workspace);
     command.args([
         "rev-parse",
@@ -209,8 +216,8 @@ fn workspace_head(attachment: &AttachmentRecord) -> Result<Option<String>> {
     ]
     .iter()
     .any(|name| Path::new(git_dir).join(name).exists());
-    let line = attachment.began_detached || branch.starts_with("refs/heads/");
-    Ok((!busy && line).then(|| head.to_owned()))
+    let forward = attachment.began_detached || branch.starts_with("refs/heads/");
+    Ok((!busy).then(|| (head.to_owned(), forward)))
 }
 
 /// Whether `workspace`'s HEAD is detached, as Work beginning there records
@@ -233,10 +240,10 @@ pub(super) fn detached(workspace: &Path) -> Result<bool> {
 /// longer has it, as the owner's next tick would: after a merge reset away,
 /// or a look at a recorded source that the agent has left, Δ against that
 /// S0 reverts what it holds, and accepting it would land the revert. A HEAD
-/// that proves nothing, or cannot be read, leaves S0 where it is. The caller
-/// holds the run's lock.
+/// mid-merge, mid-rebase or mid-cherry-pick, or one that cannot be read,
+/// leaves S0 where it is. The caller holds the run's lock.
 pub(super) fn back_before_freeze(state: &State, run: &mut RunRecord) -> Result<()> {
-    let Some(Ok(Some(head))) = movable(run).map(workspace_head) else {
+    let Some(Ok(Some((head, _)))) = movable(run).map(workspace_head) else {
         return Ok(());
     };
     let root = run.source_path.clone();
@@ -1515,6 +1522,110 @@ mod tests {
         let root = &project.root;
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "agent\n");
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "landed\n");
+    }
+
+    /// A branch workspace whose S0 moved to R, checked out detached at a
+    /// commit without R, with an uncommitted change Git carries over.
+    async fn detached_without_the_moved_s0(project: &Project) -> (PathBuf, RunRecord, Recorded) {
+        let workspace = project.worktree("agent");
+        let work = project.attach(&workspace);
+        commit(&workspace, "a.txt", "agent\n");
+        project.land("landing", "b.txt", "landed\n").await;
+        git(
+            &workspace,
+            &["merge", "--quiet", "--no-edit", source::SOURCE_REF],
+        );
+        project.owner().tick(&project.state);
+        assert_eq!(project.run(&work.id).baseline_history.len(), 1);
+        fs::write(workspace.join("c.txt"), "agent's c\n").unwrap();
+        git(&workspace, &["checkout", "--quiet", "--detach", "main"]);
+        (workspace, work, project.recorded()[0].clone())
+    }
+
+    /// The move back, as `detached_without_the_moved_s0` leaves it.
+    fn assert_moved_back(project: &Project, workspace: &Path, work: &RunRecord, record: &Recorded) {
+        let run = project.run(&work.id);
+        assert_eq!(run.baseline_history.len(), 2);
+        assert!(run.baseline_history[1].back);
+        assert_eq!(
+            run.s0_commit(),
+            Some((merge_base(work).as_str(), work.created_at))
+        );
+        let events = project.events(&work.id);
+        assert_eq!(events.len(), 2);
+        let payload = &events[1].payload;
+        assert_eq!(
+            payload["proof"],
+            "workspace HEAD no longer descends from S0"
+        );
+        assert_eq!(payload["from"], record.commit);
+        assert_eq!(payload["to"], merge_base(work));
+        assert_eq!(
+            payload["workspace_head"],
+            git(workspace, &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_checkout_without_the_moved_s0_moves_it_back_on_a_tick() {
+        let project = Project::new();
+        let (workspace, work, record) = detached_without_the_moved_s0(&project).await;
+
+        project.owner().tick(&project.state);
+
+        assert_moved_back(&project, &workspace, &work, &record);
+        assert_eq!(paths(&delta(&project.run(&work.id))), ["c.txt"]);
+        // Its branch again, and S0 moves forward again.
+        git(&workspace, &["checkout", "--quiet", "agent"]);
+        project.owner().tick(&project.state);
+        let run = project.run(&work.id);
+        assert_eq!(run.baseline_history.len(), 3);
+        assert_eq!(run.s0_commit(), Some((record.commit.as_str(), record.at)));
+        assert_eq!(paths(&delta(&run)), ["a.txt", "c.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_detached_checkout_without_the_moved_s0_just_before_finish_lands_no_revert() {
+        let project = Project::new();
+        let (workspace, work, record) = detached_without_the_moved_s0(&project).await;
+
+        project.accept(&work.id).await;
+
+        assert_moved_back(&project, &workspace, &work, &record);
+        let root = &project.root;
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "landed\n");
+        assert_eq!(
+            fs::read_to_string(root.join("c.txt")).unwrap(),
+            "agent's c\n"
+        );
+    }
+
+    /// A commit looked at detached, in a workspace that began on a branch,
+    /// proves no move forward; on the branch, it is looked at again.
+    #[tokio::test]
+    async fn a_commit_first_seen_detached_is_looked_at_again_on_the_branch() {
+        let project = Project::new();
+        let workspace = project.worktree("agent");
+        let work = project.attach(&workspace);
+        project.land("landing", "b.txt", "landed\n").await;
+        let mut owner = project.owner();
+        git(
+            &workspace,
+            &["checkout", "--quiet", "--detach", source::SOURCE_REF],
+        );
+        owner.tick(&project.state);
+        assert!(project.run(&work.id).baseline_history.is_empty());
+
+        git(&workspace, &["checkout", "--quiet", "agent"]);
+        git(
+            &workspace,
+            &["merge", "--quiet", "--ff-only", source::SOURCE_REF],
+        );
+        owner.tick(&project.state);
+
+        let run = project.run(&work.id);
+        assert_eq!(run.baseline_history.len(), 1);
+        assert_eq!(run.s0_commit().unwrap().0, project.recorded()[0].commit);
     }
 
     #[tokio::test]
