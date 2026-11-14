@@ -46,7 +46,9 @@ fn key(path: &Path) -> String {
 
 /// What an ask calls Work `id` in a project whose other Work is `others`,
 /// by the rule of `state::short_ids`: at least 8 characters, and one more
-/// than it shares with any of the others. Work begun within 256 ms shares 8.
+/// than it shares with any of the others. A ULID's first 10 characters are
+/// its time in milliseconds, and 8 hold all but the last 10 bits of it, so
+/// Work begun in the same 1,024 ms shares 8.
 fn short_id<'a>(id: &'a str, others: &[&str]) -> &'a str {
     let shared = others
         .iter()
@@ -64,7 +66,7 @@ fn short_id<'a>(id: &'a str, others: &[&str]) -> &'a str {
 #[test]
 fn the_expected_short_id_follows_the_rule_of_the_ask() {
     let a = "01M7BQD9K4FX75FSQ3DKFB1A9M";
-    // Begun in the same 256 ms as A, and not.
+    // Begun in the same 1,024 ms as A, and not.
     assert_eq!(short_id(a, &["01M7BQD9J8YSSP2RC8K67H52B"]), "01M7BQD9K");
     assert_eq!(short_id(a, &["01M7BQDA08YSSP2RC8K67H52B"]), "01M7BQD9");
     assert_eq!(short_id(a, &[]), "01M7BQD9");
@@ -823,7 +825,10 @@ fn a_hermes_agent_is_asked_once_at_its_first_verify_merges_and_its_work_continue
         !p.events(&b, "catchup.delivered").is_empty()
     });
     let status = p.ok(&["status", &b]);
-    let asked = format!("\nCatch-up\n  asked to catch up with {} at ", &a[..8]);
+    let asked = format!(
+        "\nCatch-up\n  asked to catch up with {} at ",
+        short_id(&a, &[&b])
+    );
     assert!(status.contains(&asked), "{status}");
 
     // B does as asked: commits, merges the commit it was given, and updates

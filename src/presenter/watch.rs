@@ -917,7 +917,8 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
             .flatten();
         if loaded.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) || now != journal {
             header = Header::load(state, &root);
-            let (runs, projection) = serve::watch_view(state, &root)?;
+            let (runs, project, projection) = serve::watch_view(state, &root)?;
+            let named: Vec<&str> = project.iter().map(String::as_str).collect();
             let checks = runs
                 .iter()
                 .map(|run| (run.id.clone(), configured_checks(state, &run.id)))
@@ -939,7 +940,7 @@ pub async fn interactive(state: &State, root: PathBuf, options: Options) -> Resu
                 })
                 .filter_map(|run| {
                     let asked = orchestrator::catchup::asked(state, run)?;
-                    Some((run.id.clone(), asked.line()))
+                    Some((run.id.clone(), asked.line(&named)))
                 })
                 .collect();
             found = serve::untracked(

@@ -1750,16 +1750,19 @@ fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
     rows
 }
 
-/// What `watch`'s interactive form shows: the runs in the project view and,
-/// while an owner watches the project, how they interact.
+/// What `watch`'s interactive form shows: the runs in the project view,
+/// the ID of every Work of the project, among which a catch-up names Work
+/// (`catchup::Asked::line`), and, while an owner watches the project, how
+/// they interact.
 pub(crate) fn watch_view(
     state: &State,
     root: &Path,
-) -> Result<(Vec<RunRecord>, Option<Projection>)> {
+) -> Result<(Vec<RunRecord>, Vec<String>, Option<Projection>)> {
     let interactions = super::background::interactions(state, root);
     let runs = load_source_runs(state, root)?;
     Ok((
         view_rows(&runs).into_iter().cloned().collect(),
+        runs.iter().map(|run| run.id.clone()).collect(),
         interactions,
     ))
 }

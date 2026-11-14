@@ -567,14 +567,16 @@ pub(crate) struct Asked {
 }
 
 impl Asked {
-    /// As status and watch show it.
-    pub(crate) fn line(&self) -> String {
-        let ids: Vec<&str> = self.landings.iter().map(String::as_str).collect();
+    /// As status and watch show it, naming each landing as the ask did (`text`):
+    /// apart from every Work in `named`, the project's.
+    pub(crate) fn line(&self, named: &[&str]) -> String {
+        let mut ids: Vec<&str> = self.landings.iter().map(String::as_str).collect();
+        ids.extend_from_slice(named);
         let short = crate::state::short_ids(&ids);
-        let named: Vec<&str> = ids.iter().map(|id| short[id]).collect();
+        let landings: Vec<&str> = self.landings.iter().map(|id| short[id.as_str()]).collect();
         format!(
             "asked to catch up with {} at {}",
-            named.join(" and "),
+            landings.join(" and "),
             self.at.format("%Y-%m-%d %H:%M UTC")
         )
     }
@@ -1071,9 +1073,9 @@ mod tests {
         assert!(!text.to_lowercase().contains("must"), "{text}");
     }
 
-    /// Work begun together shares the first characters of its ID: in a
-    /// trial, three Claude Code sessions begun within 256 ms. The ask names
-    /// the landed Work apart from all of them, as notes do.
+    /// Work begun in the same 1,024 ms shares the first 8 characters of its
+    /// ID, as three Claude Code sessions did in a trial. The ask names the
+    /// landed Work apart from all of them, as notes do.
     #[tokio::test]
     async fn an_ask_names_the_landed_work_apart_from_every_work_of_the_project() {
         let mut p = Project::new();
@@ -1094,6 +1096,32 @@ mod tests {
                 "- total (src/lib.rs), which this Work uses: 01M7BEVQSS changed its signature, \
                  pub fn total(n: i32) -> i32 → pub fn total(n: i32, by: i32) -> i32",
             ]
+        );
+    }
+
+    /// The person sees the ID the agent was told: status and watch name the
+    /// landing as the ask did, though it is the only landing asked about.
+    #[tokio::test]
+    async fn the_asked_line_names_the_landing_as_the_ask_did() {
+        let mut p = Project::new();
+        let a = p.work_as("a", "claude", "01M7BEVQT4FX75FSQ3DKFB1A9M");
+        let b = p.work_as("b", "claude", "01M7BEVQSS8YSSP2RC8K67H52B");
+        let changed = LIB.replace("total(n: i32)", "total(n: i32, by: i32)");
+        let breaks = [(&a, vec![breaks_use_of("total")])];
+        p.land(&b, &changed, "observed", &breaks).await;
+        p.step();
+        let text = p.hook(&a).expect("one ask");
+        p.step();
+
+        let runs = p.runs();
+        let named: Vec<&str> = runs.iter().map(|run| run.id.as_str()).collect();
+        let a = p.state.load_run(&a.id).unwrap();
+        let line = asked(&p.state, &a).expect("asked").line(&named);
+        let ask = "Dispatch: Work 01M7BEVQS (Claude Code) landed a change this Work relies on.";
+        assert_eq!(text.lines().next(), Some(ask), "{text}");
+        assert!(
+            line.starts_with("asked to catch up with 01M7BEVQS at "),
+            "{line}"
         );
     }
 
@@ -1333,11 +1361,12 @@ mod tests {
         let recorded = s0::recorded(&p.state, &p.root).unwrap()[0].commit.clone();
         let b = p.state.load_run(&b.id).unwrap();
         let found = asked(&p.state, &b).expect("asked");
+        let named = [a.id.as_str(), b.id.as_str()];
         assert_eq!(
-            found.line(),
+            found.line(&named),
             format!(
                 "asked to catch up with {} at {}",
-                &a.id[..8],
+                crate::state::short_ids(&named)[a.id.as_str()],
                 delivered.timestamp.format("%Y-%m-%d %H:%M UTC")
             )
         );

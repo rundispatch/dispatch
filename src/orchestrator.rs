@@ -1837,7 +1837,10 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
         println!("\n{}", attach::waiting_detail(mark));
     }
     if let Some(asked) = catchup::asked(state, &run) {
-        println!("\nCatch-up\n  {}", asked.line());
+        // Display only: unreadable, the landings are named among themselves.
+        let runs = state.load_source_runs(&run.source_path).unwrap_or_default();
+        let named: Vec<&str> = runs.iter().map(|run| run.id.as_str()).collect();
+        println!("\nCatch-up\n  {}", asked.line(&named));
     }
     if let Some(attachment) = &run.attachment {
         println!("\nWorkspace");
