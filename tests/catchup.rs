@@ -44,6 +44,32 @@ fn key(path: &Path) -> String {
     hex::encode(Sha256::digest(path.to_str().unwrap().as_bytes()))
 }
 
+/// What an ask calls Work `id` in a project whose other Work is `others`,
+/// by the rule of `state::short_ids`: at least 8 characters, and one more
+/// than it shares with any of the others. Work begun within 256 ms shares 8.
+fn short_id<'a>(id: &'a str, others: &[&str]) -> &'a str {
+    let shared = others
+        .iter()
+        .map(|other| {
+            id.bytes()
+                .zip(other.bytes())
+                .take_while(|(a, b)| a == b)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    &id[..(shared + 1).max(8).min(id.len())]
+}
+
+#[test]
+fn the_expected_short_id_follows_the_rule_of_the_ask() {
+    let a = "01M7BQD9K4FX75FSQ3DKFB1A9M";
+    // Begun in the same 256 ms as A, and not.
+    assert_eq!(short_id(a, &["01M7BQD9J8YSSP2RC8K67H52B"]), "01M7BQD9K");
+    assert_eq!(short_id(a, &["01M7BQDA08YSSP2RC8K67H52B"]), "01M7BQD9");
+    assert_eq!(short_id(a, &[]), "01M7BQD9");
+}
+
 /// A JSON object with `fields` in this order, as the runtimes send them.
 fn payload(fields: &[(&str, Value)]) -> String {
     let fields: Vec<String> = fields
@@ -661,7 +687,7 @@ fn a_live_agent_is_asked_once_to_catch_up_merges_and_its_work_continues() {
     let commit = sources[0]["commit"].as_str().unwrap();
     let lines: Vec<&str> = reason.lines().collect();
     assert_eq!(lines.len(), 4, "{reason}");
-    let short = &a[..8];
+    let short = short_id(&a, &[&b]);
     assert_eq!(
         lines[0],
         format!("Dispatch: Work {short} (Claude Code) landed a change this Work relies on.")
@@ -788,7 +814,7 @@ fn a_hermes_agent_is_asked_once_at_its_first_verify_merges_and_its_work_continue
         lines[0],
         format!(
             "Dispatch: Work {} (Claude Code) landed a change this Work relies on.",
-            &a[..8]
+            short_id(&a, &[&b])
         )
     );
     assert_eq!(verify(1, "Merged."), Value::Null);
