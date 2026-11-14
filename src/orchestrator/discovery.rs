@@ -143,7 +143,7 @@ pub(crate) fn unobserved(attachment: &AttachmentRecord) -> Option<&'static Unobs
 struct Found {
     path: PathBuf,
     made: Made,
-    /// Its lock reason as Git lists it.
+    /// Its lock reason, from its Git directory.
     lock: Option<String>,
 }
 
@@ -478,8 +478,8 @@ fn unobserved_session(agent: &str, session_id: &str, worktree: &Path) -> Runtime
 }
 
 /// The root's linked worktrees that a runtime made, from `git worktree
-/// list`; missing and prunable ones are skipped. Each is tested only at the
-/// path Git gives, wherever it is.
+/// list`; missing and prunable ones, and those Git is still adding, are
+/// skipped. Each is tested only at the path Git gives, wherever it is.
 fn runtime_worktrees(root: &Path) -> Result<Vec<Found>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut list = source::git_command(root);
@@ -488,14 +488,12 @@ fn runtime_worktrees(root: &Path) -> Result<Vec<Found>> {
     let text = String::from_utf8_lossy(&output.stdout);
     let mut found = Vec::new();
     for block in text.split("\n\n") {
-        let (mut path, mut branch, mut lock, mut prunable) = (None, None, None, false);
+        let (mut path, mut branch, mut prunable) = (None, None, false);
         for line in block.lines() {
             if let Some(listed) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(listed));
             } else if let Some(listed) = line.strip_prefix("branch ") {
                 branch = Some(listed);
-            } else if line == "locked" || line.starts_with("locked ") {
-                lock = Some(line["locked".len()..].trim_start().to_owned());
             } else if line == "prunable" || line.starts_with("prunable ") {
                 prunable = true;
             }
@@ -506,6 +504,15 @@ fn runtime_worktrees(root: &Path) -> Result<Vec<Found>> {
         if path == root {
             continue;
         }
+        // `git worktree add` holds a lock of its own, worded in the adder's
+        // language, until its checkout has written the worktree's index: one
+        // without an index is still being made, and is looked at again next
+        // tick, however old.
+        let Some(gitdir) =
+            claude::linked_gitdir(&path).filter(|gitdir| gitdir.join("index").exists())
+        else {
+            continue;
+        };
         let signals = claude::worktree_signals(&path);
         let made = if claude::made_by_claude(root, &path, &signals) {
             Made::Claude(signals)
@@ -523,11 +530,13 @@ fn runtime_worktrees(root: &Path) -> Result<Vec<Found>> {
                 session_id,
             }
         };
-        found.push(Found {
-            path,
-            made,
-            lock: lock.filter(|reason| !reason.is_empty()),
-        });
+        // Read last, not taken from the list, which can be older than the
+        // index and the signals that recognized the worktree.
+        let lock = fs::read_to_string(gitdir.join("locked"))
+            .ok()
+            .map(|reason| reason.trim().to_owned())
+            .filter(|reason| !reason.is_empty());
+        found.push(Found { path, made, lock });
     }
     Ok(found)
 }

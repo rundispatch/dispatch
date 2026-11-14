@@ -13,7 +13,7 @@ use std::{
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde_json::Value;
@@ -244,12 +244,13 @@ impl Project {
     }
 
     /// What Claude Code records in a worktree it made: `CLAUDE_BASE`, and
-    /// the lock, if any.
+    /// the lock, if any. The lock first: the worktree is Claude's once
+    /// `CLAUDE_BASE` is there, so no tick sees it without that lock.
     fn mark_claude(&self, worktree: &Path, lock: Option<&str>) {
         let gitdir = self.gitdir(worktree);
         let head = git(worktree, &["rev-parse", "HEAD"]);
-        fs::write(gitdir.join("CLAUDE_BASE"), format!("{head}\n")).unwrap();
         self.lock(worktree, lock);
+        fs::write(gitdir.join("CLAUDE_BASE"), format!("{head}\n")).unwrap();
     }
 
     fn lock(&self, worktree: &Path, lock: Option<&str>) {
@@ -560,6 +561,37 @@ fn only_a_session_lock_registers_and_human_worktrees_are_never_listed() {
             .count(),
         1
     );
+}
+
+#[test]
+fn a_worktree_git_is_still_adding_is_looked_at_again_however_old() {
+    let p = Project::new();
+    p.watch();
+    // A Claude worktree as `git worktree add` leaves it until its checkout
+    // writes the index: Git's own lock on it and, on a busy machine, its
+    // `.git` file already older than the grace.
+    let worktree = p.add_worktree("slow");
+    let gitdir = p.gitdir(&worktree);
+    let index = fs::read(gitdir.join("index")).unwrap();
+    fs::remove_file(gitdir.join("index")).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(worktree.join(".git"))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    p.mark_claude(&worktree, Some("initializing"));
+    p.ticks();
+    assert!(p.listed().is_empty());
+    assert!(p.runs().is_empty());
+    assert!(!p.owner_log().contains("slow"), "{}", p.owner_log());
+
+    // Git's lock gives way to the session's that made it, the index last so
+    // that no tick sees the checkout done under Git's lock.
+    p.lock(&worktree, Some(&session_lock("slow", std::process::id())));
+    fs::write(gitdir.join("index"), index).unwrap();
+    wait_until("Work for its session", || p.runs_in(&worktree).len() == 1);
+    assert!(p.listed().is_empty());
 }
 
 #[test]
