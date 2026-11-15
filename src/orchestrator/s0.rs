@@ -379,7 +379,7 @@ fn is_clean(root: &Path, head: &str) -> Result<bool> {
 }
 
 /// Whether `ancestor` is `commit` or one of its ancestors.
-fn is_ancestor(root: &Path, ancestor: &str, commit: &str) -> Result<bool> {
+pub(super) fn is_ancestor(root: &Path, ancestor: &str, commit: &str) -> Result<bool> {
     let mut command = source::git_command(root);
     command.args(["merge-base", "--is-ancestor", ancestor, commit]);
     let output = source::run_git(command, None, "failed to compare commits")?;
