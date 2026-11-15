@@ -163,6 +163,8 @@ No migration; the schema stays at 24. Existing records are not rewritten.
   - A new reason code, `merged_three_way`, which leaves CONTINUE.
   - Work a resumed session reopened carries `attachment.s0_since`, since when its first S0
     has been the source; it is absent otherwise, and a record without it reads as before.
+  - Attached Work carries `attachment.began_detached`, whether its workspace's HEAD was
+    detached when the Work began; a record without it reads as `false`.
   - `status --json` with no Work prints `{"found_not_tracked": [{"path", "attach"}]}` when
     something is found, and `null`, as before, when nothing is.
 - **Changed behaviour.**
@@ -185,6 +187,14 @@ No migration; the schema stays at 24. Existing records are not rewritten.
     <id>` shows a `Catch-up` section for asked Work.
   - **Landing notes** end `The source with this change is commit <40 hex>.`, without
     `(refs/dispatch/source)`.
+  - **S0** follows the merge of an agent whose workspace's HEAD was detached when its Work
+    began, as every Codex worktree's is. Work registered before 0.5.0 reads as begun on a
+    branch and keeps 0.4.18's rule. Any HEAD with no merge, rebase or cherry-pick in
+    progress can now move S0 back, and a finish moves it back first when the HEAD no
+    longer has it.
+  - **`source at start`** names the Work beside a differing path only when that Work
+    landed after this Work's S0, from the recorded landings. A plain directory, and
+    landings before 0.4.18, name none.
   - **`dispatch setup --checks`** opens on letting Work run the checks while consent does
     not hold, and keeps every configured check selected when you change them.
   - **`status` with no Work** lists the worktrees found, not tracked.

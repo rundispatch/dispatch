@@ -153,3 +153,66 @@ Evidence on the machine that ran the trials.
 | hermes | native | pass | dispatch 0.4.14 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-15 | `~/dispatch-dev/conformance-0414/trials/hermes-native` |
 | hermes | worktree | pass (agent's tree: B last seen by the runner, 2026-10-16T01:20:50Z; A last seen by the runner, 2026-10-16T01:22:05Z; C last seen by the runner, 2026-10-16T01:22:31Z) | dispatch 0.4.15 | Hermes Agent v0.18.2 (2026.7.7.2) · upstream df5700eb | 2026-10-16 | `~/dispatch-dev/conformance-0415/trials/hermes-worktree` |
 <!-- conformance-table:end -->
+
+## Coordination cells (0.5.0)
+
+0.5.0 adds four cells for Work that coordinates: notes, catch-up, S0 following
+the agent's merge, and batch landing. They come from the same fixture and tasks,
+with three live sessions at once, one per task, each in the harness's own
+worktree mode while `dispatch start` watches the project. These trials were run
+by hand, not by `scripts/harness-trial.sh`, which runs one task at a time and
+has no such cells. The table is written by hand from each trial's `record.md`;
+`trial.py table` does not write it.
+
+- **Setup.** A fresh copy of the fixture with its own state directory. For
+  Claude Code, the hooks are in the project's `.claude/settings.local.json`,
+  pointing at the release build and that state, and Claude Code runs with
+  `--setting-sources local`. For Hermes, the person's `~/.hermes/config.yaml`
+  held the release build's three hooks for that state during the trial, with the
+  person's approval, and was restored byte for byte after it.
+- **Steps.**
+  1. All three sessions get their task. While A and B are live, each should hear
+     through its hooks that they interact.
+  2. B and C end their sessions and are finished. `dispatch accept` with no ID
+     proposes B and C, and `accept --expect <batch digest>` lands both.
+  3. A, live and idle, should be asked once to merge B's landing. Codex and
+     Cursor Agent have no hook to carry an ask, so the trial tells A to merge,
+     as the person would.
+  4. A commits and merges the recorded commit. Its S0 should move, and the next
+     verdict be taken against the new S0.
+  5. A ends, is finished and accepted.
+
+| Cell | Pass when |
+|---|---|
+| notes | Claude Code, Hermes: a note about A and B delivered through a hook. Codex, Cursor Agent: "none, no hook" |
+| catch-up | Claude Code, Hermes: one `catchup.written` for A naming B's landing, one `catchup.delivered` with its `via`, and no second ask. Codex, Cursor Agent: "none, no hook" |
+| S0 follows the merge | `attach.s0_moved` for A after its merge, then a verdict on the new S0 |
+| batch landing | one proposal of B and C, one `--expect`, one merged-check run, one `refs/dispatch/source` commit |
+
+"none, no hook" is not a fail: Dispatch offers that harness no hook, and its
+contract asks nothing there. The four trials below ran on the release build of
+`96fd98c` (`dispatch 0.5.0`), macOS arm64, on 2026-11-15.
+
+| Harness | Notes | Catch-up | S0 follows the merge | Batch landing | Harness version | Evidence |
+|---|---|---|---|---|---|---|
+| claude | pass (`PostToolUse`) | pass (A idle, woken 0.7 s after the ask was written) | pass | pass | 2.1.296 (Claude Code) | `~/dispatch-dev/conformance-0500/claude-2` |
+| codex | none, no hook | none, no hook | pass | pass | codex-cli 0.155.1, model gpt-6-sol | `~/dispatch-dev/conformance-0500/codex-2` |
+| cursor | none, no hook | none, no hook | pass | pass | 2026.11.13-eacade1 | `~/dispatch-dev/conformance-0500/cursor-2` |
+| hermes | pass (`pre_llm_call`) | pass (A idle, the ask with its next turn, `via: turn`; `pre_verify` not exercised) | pass | pass | Hermes Agent v0.18.2 (2026.7.7.2) | `~/dispatch-dev/conformance-0500/hermes-2` |
+
+**The first run** was on the release build of `e8067c3`, on 2026-11-13
+(`~/dispatch-dev/conformance-0500/{claude,codex,cursor,hermes}`). Every cell
+passed or read "none, no hook" there too, except one:
+
+- **Codex, S0 follows the merge: fail.** A committed, merged B's landing and
+  fixed its call, and no `attach.s0_moved` was recorded. A's finish was REFRESH,
+  and its Δ held B's and C's landed changes. Every Codex worktree is detached,
+  and S0 took no proof from a detached HEAD. Since packet Y, Dispatch records
+  whether a workspace's HEAD was detached when its Work began, and in one that
+  was, a detached HEAD moves S0 as a branch's does ([attach.md](attach.md),
+  "When S0 moves"). On the rerun, S0 moved 25 s after A was told to merge, and
+  A's Δ held only its own 2 files.
+- **Claude Code, an observation, not a cell.** The ask named B by 8
+  characters, which all three Works of the trial shared. Since packet Y, an ask
+  names each Work by as much of its ID as tells it apart from every Work of the
+  project. The rerun's ask named B by 11.

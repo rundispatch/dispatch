@@ -169,9 +169,18 @@ integration source with S0 once, as close to the start as it can. It uses the sa
 - Registration does no comparison, and the hook reply says nothing about the source.
 - An owner never observes Work published before it started, so Work registered while no
   owner, or an older one, watched stays "not observed".
-- A differing path is named as another Work's only when it is among the recorded paths of an
-  applied Work's patch on this source. Otherwise no author is named. If two applied Work items
-  touched the path, only one is named.
+- A differing path is named as another Work's when that Work landed on this source after S0
+  and the recorded paths of its patch have it; of several, the one that landed last. Landings
+  come from the recorded source (`sources.json`, see "When S0 moves"), in the order they
+  landed. A landing came after S0 when it was recorded after S0 became this Work's S0: when
+  the Work began, when its S0 last moved, or, for a session that reopens Work, when that
+  Work's did. It also came after S0 when it was recorded earlier but its record descends
+  from S0's commit: accepted Work still uncommitted in the root when the worktree was made
+  from HEAD. Any other landing is in S0, and names nothing. Otherwise no author is named.
+  That includes a plain directory, which records no landings, and landings before 0.4.18,
+  which were not recorded: with no record of a landing, nothing shows which Work made a path
+  differ, so none is named. A record of landings that can't be read names no Work either,
+  and the paths are still observed.
 - It is advisory: no verdict depends on it.
 
 `status` and `explain` show it under Workspace, `watch` as an "At start" detail (only for a
@@ -225,25 +234,44 @@ landed change it later reverts is in Δ as a revert.
 
 **No proof, no move.** S0 stays, and the verdict is what it would have been, while a merge,
 cherry-pick or rebase is in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `rebase-merge` or
-`rebase-apply`), while HEAD is detached, and for a pull of something never recorded, a
-cherry-pick or a squash of the landed change, or a merge of a source recorded before the
-Work began that does not descend from its S0. Native runs, plain directories, wrapped Work
-while its wrapper lives, and finished, closed or applied Work keep their S0. A resumed
-session goes on from the same S0, moved or not, with its history and the time it has been
-S0, so a merge of a source recorded since then moves it.
+`rebase-apply`). S0 does not move forward while HEAD is detached in a workspace whose HEAD
+was on a branch when its Work began (a checkout to look at a commit), nor for a pull of
+something never recorded, a cherry-pick or a squash of the landed change, or a merge of a
+source recorded before the Work began that does not descend from its S0. Any HEAD with no
+merge, cherry-pick or rebase in progress, detached or not, can move S0 back ("Moving back",
+below). Native runs, plain directories, wrapped Work while its wrapper lives, and finished,
+closed or applied Work keep their S0. A resumed session goes on from the same S0, moved or
+not, with its history and the time it has been S0, so a merge of a source recorded since
+then moves it.
+
+**A workspace detached from the start.** Some runtimes make worktrees with a detached HEAD,
+Codex among them, and their agents commit on that detached HEAD. Dispatch records whether a
+workspace's HEAD was detached when its Work began (`began_detached` on the attachment; a
+reopened Work keeps the one it reopens). In a workspace that began detached, a detached HEAD
+moves S0 as a branch's does, with the same proof. A `git checkout --detach` of a recorded
+source there, to look at it, moves S0 to it, and S0 moves back when the agent checks out its
+own commit again ("Moving back", below). A workspace that began on a branch keeps the rule
+above. Before 0.5.0, S0 never followed a workspace detached from the start, so such Work
+that merged a landing stayed REFRESH with the landing in its Δ.
 
 **Moving back.** If the agent later undoes the merge (a `reset`, or a rebase that drops it),
-so its HEAD no longer descends from the moved S0, S0 moves back to the newest earlier S0 the
-HEAD descends from, or else to the one the Work began from, whose kept baseline is reused.
-The event is the same, with `proof` `workspace HEAD no longer descends from S0`, and the
-history entry has `back: true`. A `git revert` committed on top is not an undo: S0 stays and
-the revert is in Δ. The same happens when a rebase copies the recorded source's commit
-instead of keeping it as an ancestor (for example a rebase that flattens the merge): S0 goes
-back, the landed change is in Δ again, and the Work is REFRESH where it could have been
-CONTINUE. That is the verdict 0.4.17 gave, and never a revert landed. `git merge` of the
-recorded commit, or a rebase onto it, keeps the record as an ancestor. Once S0 is back where
-the Work began, it stays there until HEAD moves again; before 0.5.0 a move back to a session's
-first S0 was recorded again on every tick.
+or checks out a commit without it, detached or not, so its HEAD no longer descends from the
+moved S0, S0 moves back to the newest earlier S0 the HEAD descends from, or else to the one
+the Work began from, whose kept baseline is reused. A move back needs no proof of
+integration: it goes only to an S0 the Work had before. The event is the same, with `proof`
+`workspace HEAD no longer descends from S0`, and the history entry has `back: true`. A
+finish looks once more before it freezes Δ: if the HEAD no longer has a moved S0, S0 moves
+back first, as the owner's next tick would, with the same event. A finish made just after a
+reset, before the owner looked, or while no owner ran, would otherwise freeze Δ against the
+moved S0 with the landing reverted, and accept would land the revert. A `git revert`
+committed on top is not an undo: S0 stays and the revert is in Δ. The same happens when a
+rebase copies the recorded source's commit instead of keeping it as an ancestor (for
+example a rebase that flattens the merge): S0 goes back, the landed change is in Δ again,
+and the Work is REFRESH where it could have been CONTINUE. That is the verdict 0.4.17 gave,
+and never a revert landed. `git merge` of the recorded commit, or a rebase onto it, keeps
+the record as an ancestor. Once S0 is back where the Work began, it stays there until HEAD
+moves again; before 0.5.0 a move back to a session's first S0 was recorded again on every
+tick.
 
 **Where it shows.** `explain` prints the S0 it is now, then each earlier one:
 
@@ -1161,10 +1189,12 @@ written by a model, and only through the runtime's hooks.
   source recorded at or after its landings (`s0_moved`), or when the Work is no longer in
   progress (`left_working`). Notes are unchanged: the same landing still makes its landing
   note.
-- **What it says.** At most 8 lines: the landed Work and its runtime; each target, at most
-  four, then `- and <n> more.`; for a changed signature, the old and new one, each cut at
-  200 characters; the recorded commit, which is the newest named landing's and holds the
-  earlier ones; and the request. Packet S of 0.5.0 got this one:
+- **What it says.** At most 8 lines: the landed Work and its runtime, the Work named by as
+  much of its ID as tells it apart from every Work of the project, so never by less than a
+  note names it; each target, at most four, then `- and <n> more.`; for a changed
+  signature, the old and new one, each cut at 200 characters; the recorded commit, which is
+  the newest named landing's and holds the earlier ones; and the request. Packet S of 0.5.0
+  got this one:
 
   ```text
   Dispatch: Work 01M75EBG (Claude Code) landed changes this Work relies on.
@@ -1217,10 +1247,11 @@ written by a model, and only through the runtime's hooks.
   anything itself, and never asks twice about one landing.
 - **Where it shows.** Work in progress whose agent was asked, and whose S0 has not yet moved
   past those landings, shows `asked to catch up with <short id>[ and <short id>…] at
-  <YYYY-MM-DD HH:MM UTC>`: under `Catch-up` in `dispatch status <id>`, and in `watch`'s
-  details under its REFRESH. Once S0 moves, the line goes. While it shows, `dispatch check
-  <id> --merged` gives the REFRESH next step `its agent was asked to merge <commit>; once its
-  S0 moves, Dispatch checks it again`.
+  <YYYY-MM-DD HH:MM UTC>`, each landing named by the ID the ask gave its agent, as much of
+  it as tells it apart from every Work of the project: under `Catch-up` in `dispatch status
+  <id>`, and in `watch`'s details under its REFRESH. Once S0 moves, the line goes. While it
+  shows, `dispatch check <id> --merged` gives the REFRESH next step `its agent was asked to
+  merge <commit>; once its S0 moves, Dispatch checks it again`.
 - **Recorded:** `catchup.written {landings, targets, text}` when the owner writes or adds to
   an ask, `catchup.delivered {via: stop | wake | verify | turn, landings}` timed when a hook
   took it, and `catchup.expired {why, landings}`. `docs/queries/catchup-measured.sql` counts
@@ -1231,8 +1262,13 @@ written by a model, and only through the runtime's hooks.
 `orchestrator::discovery`, on every pass of the owner's fast loop (about once a
 second), with no hook installed:
 - **What is looked at.** `git worktree list --porcelain` for the root. No directory is
-  walked: per worktree, Dispatch reads its `.git` file and the two files Claude Code
-  keeps in `.git/worktrees/<name>/`. A plain-directory root has no worktrees.
+  walked: per worktree, Dispatch reads its `.git` file, and in `.git/worktrees/<name>/`
+  whether Git has written the worktree's index yet, its lock, and the files Claude Code
+  keeps there. A worktree without an index is still being made: `git worktree add` locks
+  it with a reason of its own ("initializing", in the language of whoever runs it) until
+  its checkout has written the index. It is looked at again on the next pass, however
+  old, and so is never listed, registered or noted with Git's lock. A plain-directory root
+  has no worktrees.
 - **What counts as Claude's.** A linked worktree under `<root>/.claude/worktrees/`
   whose Git directory holds `CLAUDE_BASE`. Recognizing it belongs to the Claude
   adapter (`runtime::claude::made_by_claude`). Worktrees a person made (`git worktree
@@ -1254,7 +1290,8 @@ second), with no hook installed:
     "process_gone"`), so it reads `idle` at once;
   - locked that way, but the process's start cannot be read: looked at again next pass;
   - any other lock, or none (a subagent's or background session's worktree, whose lock
-    has not been observed): listed in the inventory after a 3 s grace, since Claude Code
+    has not been observed): listed in the inventory after a 3 s grace, counted from when
+    Git made the worktree, and only once Git has finished adding it, since Claude Code
     writes `CLAUDE_BASE` a moment before it locks a new worktree. Each is noted once in
     the owner's log.
 - **Registration** takes the workspace lock without waiting, publishes a hook's pending
@@ -1285,7 +1322,9 @@ against one sign per runtime:
   directory, found through its `.git` file without running Git, with a non-empty
   string `ownerThreadId`. The marker alone decides, wherever the worktree is; Codex
   puts its own under `~/.codex/worktrees/<4 hex>/<project folder>`, detached at HEAD.
-  The session is the thread ID.
+  That HEAD is detached when Dispatch registers the Work, so Dispatch records the Work
+  as begun detached, and S0 follows its agent's merge of a recorded source ("When S0
+  moves"). The session is the thread ID.
 - **Cursor Agent** (`cursor-agent --worktree <name>`): the path Git lists is exactly
   `canonicalize(~/.cursor/worktrees)/<project folder, lowercased>/<name>`, and its
   branch is exactly `refs/heads/<name>`. Cursor lowercases the folder name, so the

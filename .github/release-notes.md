@@ -17,9 +17,10 @@ moved, once the merged checks pass on exactly what would land.
 - **What asks.** When Work lands, a live agent whose Work uses a declaration the landing
   changed the signature of or removed, or changes a declaration the landing changed, is
   asked once to merge it. A whole-file or textual interaction never asks. The ask is fixed
-  text and names the landed Work, each declaration with its old and new signature when
-  Dispatch has them, and the recorded commit. Packet S of this release got this one, as its
-  turn ended, after packet P2h landed:
+  text and names the landed Work, by as much of its ID as tells it apart from every Work of
+  the project, each declaration with its old and new signature when Dispatch has them, and
+  the recorded commit. Packet S of this release got this one, as its turn ended, after
+  packet P2h landed:
 
   ```text
   Dispatch: Work 01M75EBG (Claude Code) landed changes this Work relies on.
@@ -45,8 +46,9 @@ moved, once the merged checks pass on exactly what would land.
   turn going with the ask, on that turn's first verify only, so it uses none of the nudges
   `agent.max_verify_nudges` allows. Otherwise the ask comes with the next turn, after any
   notes, through `pre_llm_call`. Hermes cannot be woken while idle, so an ask waits for its
-  next turn. This build's one Hermes packet ran wrapped, which is never asked, so Hermes
-  catch-up is shown by stand-in tests only.
+  next turn. This build's one Hermes packet ran wrapped, which is never asked. In the
+  coordination trial on the release build, an idle Hermes 0.18.2 session got its ask with
+  its next turn ("Measured, honestly").
 - **Codex and Cursor get none:** they have no hook that can carry it.
 - **Once, and nothing more.** Symbol-level only, once per landing and Work, fixed text.
   Landings before a hook takes the ask are one ask that names each. Dispatch never
@@ -57,9 +59,10 @@ moved, once the merged checks pass on exactly what would land.
 - **What follows.** When the agent merges the commit, S0 follows it as in 0.4.18, the
   owner checks the Work again, and the next verdict is taken against the new S0.
 - **Where it shows.** `dispatch status <id>` gains a `Catch-up` section, `asked to catch up
-  with <landed Work> at <time>`, and `dispatch watch` shows the same line under a REFRESH,
-  until S0 moves past those landings. The REFRESH next step for such Work reads `its agent
-  was asked to merge <commit>; once its S0 moves, Dispatch checks it again`.
+  with <landed Work> at <time>`, naming it by the ID the ask gave the agent, and `dispatch
+  watch` shows the same line under a REFRESH, until S0 moves past those landings. The
+  REFRESH next step for such Work reads `its agent was asked to merge <commit>; once its S0
+  moves, Dispatch checks it again`.
 - **Recorded** as `catchup.written`, `catchup.delivered {via: stop | wake | verify | turn}`
   and `catchup.expired {why: s0_moved | left_working}`.
 
@@ -182,6 +185,11 @@ and were frozen with the same checks, execution and authority:
   it was starting at that moment: Dispatch kills its process group again while anything is
   left in it. Seen on macOS.
 - A resumed session is no longer told that its new Work and the Work it reopens interact.
+- `source at start` names the Work beside a differing path only when that Work landed
+  after this Work's S0, and of several the one that landed last, read from the recorded
+  landings. It named any applied Work whose patch had the path, in no set order, including
+  Work whose change S0 already held. A plain directory, and landings before 0.4.18, which
+  were not recorded, name no Work.
 - `dispatch setup --checks` no longer replaces configured checks on two Enters: its menu
   opens on letting Work run them, and changing them keeps each one selected until you clear
   it. `/checks` in a session works the same way.
@@ -190,6 +198,15 @@ and were frozen with the same checks, execution and authority:
 - A Claude Code worktree that a busy machine left unlocked for more than 3 seconds was
   listed as not tracked for good; it now becomes Work once the session that made it locks
   it.
+- A worktree that Git was still adding when the owner looked, its checkout outlasting the
+  3 s grace, was also listed as not tracked for good, with Git's own lock (`initializing`)
+  as its reason. Discovery now looks at a worktree only once Git has written its index, for
+  every runtime it recognizes.
+- S0 now follows the merge of an agent whose worktree was detached from the start, as every
+  Codex worktree is. Such Work that merged a landing stayed REFRESH, with the landing in its
+  Δ. S0 also moves back when a workspace checks out a commit without a landing it had
+  merged, detached or not, and a finish looks once more before it freezes Δ, so such Work
+  no longer lands the landing reverted.
 - An undone merge no longer records a move of S0 to itself on every tick.
 - Test and race fixes: the owner checks Work again when its S0 moves, even when its Δ is
   byte for byte the same; and four tests that asserted a step too early or measured the CI
@@ -209,18 +226,51 @@ Dispatch's own later verdict, never a human judgment.
   file-level. 1 delivered by waking an idle session, 1 by `Stop`. Both agents merged:
   S0 moved 271 s and 96 s after delivery, and the next verdict was CONTINUE both times. No
   relaunch.
-- **Batches:** 2 landed, of 7 and 3 results, each with one merged-check run and no
-  bisection. 15 Works landed in all, 10 of them in those batches, behind 7 approvals.
-- **Suite runs:** 20 for 15 landed Works, 1.33 per landed Work (0.4.18: 1.71).
-- **Proposals:** computing one took 8.8 to 22.2 s on this repository (4 proposals of 2 to 7
-  results).
+- **Batches:** 3 landed, of 7, 3 and 2 results, each with one merged-check run and no
+  bisection. 20 Works landed in all, 12 of them in those batches, behind 11 approvals.
+- **Suite runs:** 29 for 20 landed Works, 1.45 per landed Work (0.4.18: 1.71).
+- **Hand re-applies:** 0 (0.4.18: 1). Every landing was a `dispatch accept`. Codex's packet
+  Q and Hermes's packet P4 never landed themselves: they reached the source inside the Opus
+  packets that reviewed and fixed them, Q-b and P4b, whose Δ carried their changes, and were
+  closed as superseded by them.
+- **Proposals:** computing one took 8.8 to 22.2 s on this repository (the first 4
+  proposals, of 2 to 7 results).
 - **3-way:** no landing on this build needed it. This one is read from the run events (no
   event carries `merged_three_way`), not from a documented query.
-- **Coordination conformance:** [[C: the four-harness coordination cells: notes, catch-up, S0 following the merge, batch landing, for Claude Code, Codex, Cursor and Hermes]]
-- **Landing a verified result:** [[C: p50 of 10 accepts of an already verified result on the release build, with the load]]
-- **Native start:** [[C: native start on the release build, median and load]]
-- **Hook cost:** [[C: Stop hook p95 over 1,000 calls with an ask pending, on the release build, with the load]]
-- **Out of the box:** [[C: install line, setup and accept on a temporary HOME with the release build: commands and flags]]
+
+The rest was measured on the release build of `96fd98c`, on one Mac (arm64), on
+2026-11-15, with the 1-minute load where it was recorded.
+
+- **Coordination conformance:** each harness ran the B/A/C scenario in its own worktree
+  mode, three live sessions at once, by hand (`docs/harness-conformance.md`, "Coordination
+  cells").
+  - Claude Code 2.1.296: notes, catch-up, S0 follows the merge and batch landing all pass.
+    The notes came by `PostToolUse`. The ask woke the idle session 0.7 s after it was
+    written. S0 followed the agent's merge. The batch was one proposal, one approval and one
+    merged-check run.
+  - Hermes 0.18.2: all four pass. The ask came with the next turn (`via: turn`), since
+    Hermes cannot be woken. Delivery by `pre_verify` was not exercised.
+  - Codex 0.155.1 and Cursor Agent 2026.11.13: S0 follows the merge and batch landing pass.
+    Notes and catch-up are "none, no hook": the trial told the agent to merge, as the
+    person would.
+  - The first run, on `e8067c3`, failed Codex's S0 cell. Every Codex worktree is detached,
+    and S0 took no proof from a detached HEAD. The rerun passed with the fix (Smaller
+    items).
+- **Landing a verified result:** `dispatch accept <id>` of an already verified result took
+  0.33 s at the median of 10 (0.30 to 0.43 s, load 3.4 to 4.2), on a clone of this
+  repository at `96fd98c`.
+- **Native start:** on the fixture 0.4.17 and 0.4.18 were measured on (a Git repository with
+  a 3.6 GB ignored `target/`), from invocation to the agent's start: a median of 3.0 s over
+  3 runs (2.8, 3.0 and 3.5 s, load 3.7 to 6.5). 0.4.18's was 3.3 s.
+- **Hook cost:** `Stop` with an ask pending, over 1,000 calls at a load of 3.4: 5.16 ms at
+  the median, 8.78 ms at the 95th percentile and 21.98 ms at most. Every call returned the
+  ask as a block. With no ask, 4.59 ms at the 95th percentile (load 3.2). An idle waiter
+  used 0.00 s of user and of system CPU over a 30 s wait, at 9.6 MB resident (load 3.1).
+- **Out of the box:** on a temporary HOME, the install line (from a local release packaged
+  by `scripts/package-local.py`), then `dispatch setup` (one pass, in a terminal) and
+  `dispatch accept`: 2 Dispatch commands to a first landed change, and no flags. The owner
+  finished the stand-in Claude Code session's Work by consent 9 s after the session ended,
+  and accept reused its merged checks and landed it.
 
 Nothing here says tokens, minutes or money were saved.
 
@@ -250,7 +300,7 @@ Nothing here says tokens, minutes or money were saved.
   failing one; automatic retries; a commit on landing.
 - Seeding warm build output into workspaces.
 
-Production code under `src/`, excluding `#[cfg(test)]` items, grew by 2,603 non-blank lines
-since 0.4.18 (2,188 without comment lines): batch landing is 962 of them and catch-up 618.
+Production code under `src/`, excluding `#[cfg(test)]` items, grew by 2,737 non-blank lines
+since 0.4.18 (2,276 without comment lines): batch landing is 962 of them and catch-up 632.
 
 Site impact: `dispatch accept` without an ID now proposes a batch and, with `--expect <batch digest>`, lands it (the review guide's and commands page's "acts only when exactly one result waits", the agent guide's same line, and `--expect`'s description); accept's output gains the batch proposal, the menu, `Merged checks on the source with N results`, `Applied N results … as one patch` and `Merged 3-way from S0; what landed:`; a new CONTINUE reason `merged_three_way` and new `patch_conflict` text for the verdicts page; watch's REFRESH Next (the `watch-landed` capture) and the resume step; accept's REFRESH refusal now ends with the same step as `check`, `Next: <step> (or dispatch reject <id>).` (native: `Next: dispatch refresh <id> (or dispatch reject <id>).`), where concepts' video transcript, the examples page's merged-check example, the `accept-refused` and `merged-check` captures and the explainer that the videos and GIFs are rendered from show 0.4.18's `Run your agent again …` or `Run 'dispatch refresh <id>' to redo the work …`; watch's notice after a refused accept now reads `See its Next line.`; the landing note's last line (the Claude Code guide, the agent guide and concepts' transcript show `… (refs/dispatch/source).`); `git merge refs/dispatch/source` in concepts, several agents, the review guide and the agent guide, which Claude Code refuses, should name the commit; the hooks: Claude Code's eighth (the waiter) and Hermes's `pre_verify`, with setup's two new consent sentences; the claims "A note asks nothing. Dispatch never wakes an idle session or holds a turn." (Claude Code guide), "Notes inform; they ask nothing." (limits) and `product.ts`'s `addsLittleWhen` ("It says what changed, and tells a live Claude Code or Hermes session"), which now ask a live agent once to catch up; `dispatch status` gains a Catch-up section, and with no Work lists worktrees found, not tracked.

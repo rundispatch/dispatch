@@ -421,10 +421,10 @@ commit, so a worktree made from HEAD lacks accepted changes that were never
 committed. `attach --workspace` compares the source with the Work's S0 once and
 prints it as a `Source` line. `status` repeats it, and `watch` shows it when
 they differed or nobody observed the start. When they
-differed, it lists the paths, names applied Work where its patch had the path,
-and recommends `dispatch attach -- <agent>`, which begins from the current
-source, uncommitted changes included. Nothing is recomputed later, and no
-verdict depends on it.
+differed, it lists the paths, names the Work that landed a path last since S0,
+where one did, and recommends `dispatch attach -- <agent>`, which begins from
+the current source, uncommitted changes included. Nothing is recomputed later,
+and no verdict depends on it.
 
 Both forms need a **separate worktree**: attaching your own checkout in place is
 refused (`attach needs a separate worktree; run git worktree add`), because Dispatch
