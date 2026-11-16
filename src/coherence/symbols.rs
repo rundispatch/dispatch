@@ -1199,7 +1199,8 @@ class Point(Base):
     }
 
     /// This thread's CPU time: what extraction itself costs, however many
-    /// other processes compete for the CPU.
+    /// other processes compete for the CPU. A virtual machine's guest cannot
+    /// see time its host takes, so there it also grows with the host's load.
     #[cfg(unix)]
     fn thread_cpu() -> std::time::Duration {
         let mut now = libc::timespec {
@@ -1227,23 +1228,38 @@ class Point(Base):
         assert!(elapsed.as_millis() < 500, "took {elapsed:?}");
     }
 
+    /// A 1 MB file completes in about four times the CPU time of its first
+    /// quarter, and the bound is twice that. Timed back to back, the two slow
+    /// down alike on a busy host, while a step that grows with the square of
+    /// the declarations costs sixteen times as much.
     #[cfg(unix)]
     #[test]
     fn one_megabyte_files_complete() {
-        let rust: String = (0..8000)
-            .map(|i| format!("/// doc {i}\n#[inline]\npub fn function_{i}(a: u32, b: &str) -> Vec<u32> {{\n    let x = a + {i};\n    vec![x; 4]\n}}\n\n"))
-            .collect();
-        let python: String = (0..12000)
-            .map(|i| format!("@decorator\ndef function_{i}(a: int, b: str) -> list:\n    x = a + {i}\n    return [x] * 4\n\n"))
-            .collect();
-        for (lang, src, count) in [(Lang::Rust, rust, 8000), (Lang::Python, python, 12000)] {
-            assert!(src.len() > 900_000, "{lang:?} {}", src.len());
+        let file = |lang, count| -> String {
+            (0..count)
+                .map(|i| match lang {
+                    Lang::Rust => format!("/// doc {i}\n#[inline]\npub fn function_{i}(a: u32, b: &str) -> Vec<u32> {{\n    let x = a + {i};\n    vec![x; 4]\n}}\n\n"),
+                    Lang::Python => format!("@decorator\ndef function_{i}(a: int, b: str) -> list:\n    x = a + {i}\n    return [x] * 4\n\n"),
+                })
+                .collect()
+        };
+        let cost = |lang, count| {
+            let src = file(lang, count);
             let start = thread_cpu();
             let fs = extract(lang, src.as_bytes()).unwrap();
             let elapsed = thread_cpu() - start;
             assert!(!fs.has_error);
             assert_eq!(fs.decls.len(), count);
-            assert!(elapsed.as_secs() < 5, "{lang:?} took {elapsed:?}");
+            (src.len(), elapsed)
+        };
+        for (lang, count) in [(Lang::Rust, 8000), (Lang::Python, 12000)] {
+            let (_, quarter) = cost(lang, count / 4);
+            let (len, whole) = cost(lang, count);
+            assert!(len > 900_000, "{lang:?} {len}");
+            assert!(
+                whole < quarter * 8,
+                "{lang:?} took {whole:?}, and {quarter:?} for its first quarter"
+            );
         }
     }
 

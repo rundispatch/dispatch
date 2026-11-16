@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ use crate::{
     RunRecord, SourceKind,
     config::{Config, ExecutionConfig},
     executor::{safe_local_environment, trusted_host_executable},
-    source::{self, checked_output, git_command},
+    source::{self, Patch, Stage, checked_output, git_command},
     state::State,
 };
 
@@ -90,7 +90,8 @@ pub fn describe_reuse(payload: &serde_json::Value) -> Option<String> {
 /// The key for running `config`'s verify commands on the current source of
 /// `run` with `patch` applied, or `None` when it cannot be known.
 pub fn merged_key(run: &RunRecord, patch: &Path, config: &Config) -> Option<Key> {
-    let tree = merged_tree(&run.source_path, &run.source_kind, patch)
+    let patch = Patch::new(patch, &run.baseline_path);
+    let tree = merged_tree(&run.source_path, &run.source_kind, &patch)
         .ok()
         .flatten()?;
     key(tree, &config.checks.verify, &config.execution)
@@ -103,69 +104,64 @@ pub fn workspace_key(
     commands: &[String],
     execution: &ExecutionConfig,
 ) -> Option<Key> {
-    key(workspace_tree(workspace).ok()??, commands, execution)
+    key(world(workspace).ok()??, commands, execution)
 }
 
-/// The Git tree id of `source`'s world (`source::world_commit`) with `patch`
-/// applied, built in a temporary index; `None` for a plain directory.
-fn merged_tree(source: &Path, kind: &SourceKind, patch: &Path) -> Result<Option<String>> {
+/// The Git tree id of `source`'s world with `patch` staged on it
+/// (`staged_on_world`); `None` for a plain directory.
+fn merged_tree(source: &Path, kind: &SourceKind, patch: &Patch) -> Result<Option<String>> {
     if matches!(kind, SourceKind::Directory) {
         return Ok(None);
     }
+    match staged_on_world(source, std::slice::from_ref(patch))? {
+        Some((_, Stage::Staged { tree })) => Ok(Some(tree)),
+        Some((_, Stage::Conflict { output })) => {
+            anyhow::bail!("the patch does not apply to the source's world: {output}")
+        }
+        None => Ok(None),
+    }
+}
+
+/// `source`'s world as a tree (`world`), and `patches` staged on it,
+/// 3-way where one does not apply as it is (`source::stage`); `None` when that
+/// tree is not exact.
+pub(crate) fn staged_on_world(source: &Path, patches: &[Patch]) -> Result<Option<(String, Stage)>> {
     let Some(world) = world(source)? else {
         return Ok(None);
     };
-    let scratch = tempfile::Builder::new()
-        .prefix("dispatch-memo-")
-        .tempdir()
-        .context("failed to create a temporary Git index")?;
-    let index = scratch.path().join("index");
-    let mut read_tree = git_command(source);
-    read_tree
-        .env("GIT_INDEX_FILE", &index)
-        .args(["read-tree", &world]);
-    checked_output(read_tree, "failed to read the source's world")?;
-    if fs::metadata(patch)?.len() > 0 {
-        let mut apply = git_command(source);
-        apply
-            .env("GIT_INDEX_FILE", &index)
-            .args(["apply", "--cached", "--binary", "--whitespace=nowarn", "--"])
-            .arg(patch);
-        checked_output(apply, "the patch does not apply to the source's world")?;
-    }
-    let mut write_tree = git_command(source);
-    write_tree.env("GIT_INDEX_FILE", &index).arg("write-tree");
-    let tree = checked_output(write_tree, "failed to write the merged tree")?.stdout;
-    Ok(Some(String::from_utf8_lossy(&tree).trim().to_owned()))
+    let staged = source::stage(&|| git_command(source), &world, patches, true)?;
+    Ok(Some((world, staged)))
 }
 
-/// The Git tree id of `workspace`'s files, ignored files left out.
-fn workspace_tree(workspace: &Path) -> Result<Option<String>> {
-    let Some(commit) = world(workspace)? else {
-        return Ok(None);
-    };
-    let mut tree = git_command(workspace);
-    tree.args(["rev-parse", &format!("{commit}^{{tree}}")]);
-    let tree = checked_output(tree, "failed to read the workspace's tree")?.stdout;
-    Ok(Some(String::from_utf8_lossy(&tree).trim().to_owned()))
-}
-
-/// `source::world_commit` of `checkout`, or `None` when its tree would not
-/// name all the checks see: an untracked nested repository (the world leaves
-/// those out while the checks may see them), or Git converting the bytes it
-/// stores (`converts`), so that two different files make one tree.
+/// The tree of `checkout`'s world (`source::world_tree`), ignored files left
+/// out, or `None` when it is not exact.
 fn world(checkout: &Path) -> Result<Option<String>> {
+    if !exact(checkout)? {
+        return Ok(None);
+    }
+    source::world_tree(checkout).map(Some)
+}
+
+/// Whether the tree of `checkout`'s world names exactly what the checks see,
+/// and a 3-way merge may start from it: a Git checkout whose object ids are
+/// SHA-1, as every baseline's are, with no untracked nested repository (the
+/// world leaves those out while the checks may see them) and no bytes that
+/// Git converts as it stores them (`converts`), so that two different files
+/// never make one tree.
+pub(crate) fn exact(checkout: &Path) -> Result<bool> {
+    let mut format = git_command(checkout);
+    format.args(["rev-parse", "--is-inside-work-tree", "--show-object-format"]);
+    let format = source::run_git(format, None, "failed to read the object format")?;
+    if !format.status.success() || format.stdout != b"true\nsha1\n" {
+        return Ok(false);
+    }
     let mut list = git_command(checkout);
     list.args(["ls-files", "-co", "--exclude-standard", "-z"]);
     let listed = checked_output(list, "failed to list the files")?.stdout;
-    if listed
+    Ok(!listed
         .split(|byte| *byte == 0)
         .any(|raw| raw.ends_with(b"/"))
-        || converts(checkout, &listed)?
-    {
-        return Ok(None);
-    }
-    source::world_commit(checkout).map(Some)
+        && !converts(checkout, &listed)?)
 }
 
 /// The attributes with which Git stores other bytes than the file's.
@@ -416,16 +412,65 @@ mod tests {
         git(&root, &["init", "--quiet"]);
         let empty = root.join("empty.patch");
         fs::write(&empty, "").unwrap();
+        let empty = Patch::new(&empty, &root);
         let tree = merged_tree(&root, &SourceKind::Git, &empty).unwrap();
         assert!(tree.is_some());
-        assert_eq!(workspace_tree(&root).unwrap(), tree);
+        assert_eq!(world(&root).unwrap(), tree);
 
         let nested = root.join("vendor");
         fs::create_dir(&nested).unwrap();
         fs::write(nested.join("b.txt"), "b\n").unwrap();
         git(&nested, &["init", "--quiet"]);
         assert_eq!(merged_tree(&root, &SourceKind::Git, &empty).unwrap(), None);
-        assert_eq!(workspace_tree(&root).unwrap(), None);
+        assert_eq!(world(&root).unwrap(), None);
+    }
+
+    /// A patch that applies as it is keys the tree that a plain `git apply
+    /// --cached` onto the world commit gives, as before 3-way merges.
+    #[test]
+    fn a_plainly_applying_patch_keys_the_tree_a_plain_apply_gives() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("root");
+        fs::create_dir(&root).unwrap();
+        let git = |dir: &Path, index: Option<&Path>, args: &[&str]| {
+            let mut command = git_command(dir);
+            if let Some(index) = index {
+                command.env("GIT_INDEX_FILE", index);
+            }
+            let output = command.args(args).output().unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        fs::write(root.join("b.txt"), "b\n").unwrap();
+        git(&root, None, &["init", "--quiet"]);
+        git(&root, None, &["add", "-A"]);
+        let identity = ["-c", "user.name=T", "-c", "user.email=t@example.invalid"];
+        git(
+            &root,
+            None,
+            &[&identity[..], &["commit", "-qm", "S0"]].concat(),
+        );
+        let snapshot = source::create_snapshot(&root, &base.join("run")).unwrap();
+        let workspace = base.join("workspace");
+        source::create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+        fs::write(workspace.join("a.txt"), "a, edited\n").unwrap();
+        fs::write(workspace.join("c.txt"), "c\n").unwrap();
+        let patch = base.join("delta.patch");
+        source::collect_diff(&snapshot.baseline_path, &workspace, &patch).unwrap();
+        fs::write(root.join("b.txt"), "b, moved\n").unwrap();
+
+        let index = base.join("index");
+        let world = source::world_commit(&root).unwrap();
+        git(&root, Some(&index), &["read-tree", &world]);
+        let patch_arg = patch.to_str().unwrap();
+        git(&root, Some(&index), &["apply", "--cached", "--", patch_arg]);
+        let plain = git(&root, Some(&index), &["write-tree"]);
+
+        let patch = Patch::new(&patch, &snapshot.baseline_path);
+        let tree = merged_tree(&root, &SourceKind::Git, &patch).unwrap();
+        assert_eq!(tree, Some(plain));
     }
 
     #[test]
@@ -437,7 +482,7 @@ mod tests {
         };
         fs::write(root.join("a.txt"), "a\n").unwrap();
         git(&["init", "--quiet"]);
-        let tree = || workspace_tree(&root).unwrap();
+        let tree = || world(&root).unwrap();
         for (attributes, known) in [
             ("*.png binary\n", true),
             ("*.txt -text\n", true),

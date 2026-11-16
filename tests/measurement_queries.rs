@@ -1,8 +1,10 @@
 //! The documented queries run read-only against a real state database and
 //! give the counts derived by hand from their fixtures: the interaction
 //! queries (`docs/queries/interactions-measured.sql`) from
-//! `tests/fixtures/measurement/events.jsonl`, and the note queries
-//! (`docs/queries/notes-measured.sql`) from `notes.jsonl` beside it.
+//! `tests/fixtures/measurement/events.jsonl`, the note queries
+//! (`docs/queries/notes-measured.sql`) from `notes.jsonl` beside it, and the
+//! catch-up and batch queries (`catchup-measured.sql`, `batches-measured.sql`)
+//! from `catchup.jsonl` and `batches.jsonl`.
 
 use std::{collections::BTreeSet, path::Path};
 
@@ -252,4 +254,200 @@ fn the_note_queries_report_nothing_without_notes() {
     let dir = tempfile::tempdir().unwrap();
     let sets = run_queries(&state_with(dir.path(), ""), NOTE_QUERIES);
     assert_eq!(sets, [vec![], vec![], rows(&["notes_unsettled 0 0"])]);
+}
+
+const CATCHUP_QUERIES: &str = include_str!("../docs/queries/catchup-measured.sql");
+const CATCHUP_EVENTS: &str = include_str!("fixtures/measurement/catchup.jsonl");
+const BATCH_QUERIES: &str = include_str!("../docs/queries/batches-measured.sql");
+const BATCH_EVENTS: &str = include_str!("fixtures/measurement/batches.jsonl");
+
+/// Derivation from `catchup.jsonl`. L1, L2 and L3 were accepted alone, each
+/// source recorded at hh:00:00.200, after its `result.applied`; B1 and B2
+/// landed in batch `be`, its source recorded at 11:00:00.500, before either
+/// `result.applied`.
+///
+/// Written 12, one landing each: W2 and W6 twice, every other Work once. W6
+/// is asked about L3 again: 1 repeated. Its first ask names a file: 1 file
+/// target, and 12 symbols.
+/// Delivered 7: stop W1, W3 and W6; turn W5; verify W4; wake W2 (L1 and L2
+/// in one ask) and W7, 3 landings. Expired: left_working W8, s0_moved W9.
+///
+/// Each delivered ask, and the first move forward of its Work's S0 after it
+/// to a source holding every landing it names:
+///   W1 [L1] 09:10:00: L1's source at 09:15:00, 300 s. The refresh at 09:12
+///      came before the move; the continue recorded after it at 09:15:00 is
+///      next.
+///   W3 [L1] 10:00:31.5: S0 had moved past L1 before; the move after it is
+///      back.
+///   W2 [L1, L2] 10:05:00: L1's source at 10:06 is older than L2; L2's at
+///      10:08:00, 180 s, then refresh.
+///   W4 [L2] 10:10:00: L1's source only, then back to where it began.
+///   W5 [B1] 11:10:00: the batch's source, named by B2, at 11:12:00, 120 s,
+///      then continue.
+///   W7 [L3] 12:00:05.002, 2 ms before the owner recorded it written: the
+///      root's clean HEAD at 12:20:00, 1194.998 s, rounded to 1195, then
+///      continue.
+///   W6 [L3] 12:05:00: no move, so its refresh at 12:06 is no next verdict.
+///
+/// Unsettled: WA's L3, though other Works' deliveries and expiry name it;
+/// W6's second L3, written after the delivery that settled its first.
+#[test]
+fn the_catchup_queries_give_the_hand_derived_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let sets = run_queries(&state_with(dir.path(), CATCHUP_EVENTS), CATCHUP_QUERIES);
+    assert_eq!(sets.len(), 3);
+    assert_eq!(
+        sets[0],
+        rows(&[
+            // kind, detail, events, landings, repeated_landings, symbol_targets,
+            // file_targets
+            "catchup_counts written   NULL         12 12 1    12   1",
+            "catchup_counts delivered stop         3  3  NULL NULL NULL",
+            "catchup_counts delivered turn         1  1  NULL NULL NULL",
+            "catchup_counts delivered verify       1  1  NULL NULL NULL",
+            "catchup_counts delivered wake         2  3  NULL NULL NULL",
+            "catchup_counts expired   left_working 1  1  NULL NULL NULL",
+            "catchup_counts expired   s0_moved     1  1  NULL NULL NULL",
+        ])
+    );
+    assert_eq!(
+        sets[1],
+        rows(&[
+            // run_id, landings, via, delivered_at, moved_at, seconds, next_verdict
+            "catchup_s0 W1 [\"L1\"] stop 2026-11-05T09:10:00.000000000Z \
+             2026-11-05T09:15:00.000000000Z 300 continue",
+            "catchup_s0 W3 [\"L1\"] stop 2026-11-05T10:00:31.500000000Z NULL NULL NULL",
+            "catchup_s0 W2 [\"L1\",\"L2\"] wake 2026-11-05T10:05:00.000000000Z \
+             2026-11-05T10:08:00.000000000Z 180 refresh",
+            "catchup_s0 W4 [\"L2\"] verify 2026-11-05T10:10:00.000000000Z NULL NULL NULL",
+            "catchup_s0 W5 [\"B1\"] turn 2026-11-05T11:10:00.000000000Z \
+             2026-11-05T11:12:00.000000000Z 120 continue",
+            "catchup_s0 W7 [\"L3\"] wake 2026-11-05T12:00:05.002000000Z \
+             2026-11-05T12:20:00.000000000Z 1195 continue",
+            "catchup_s0 W6 [\"L3\"] stop 2026-11-05T12:05:00.000000000Z NULL NULL NULL",
+        ])
+    );
+    assert_eq!(
+        sets[2],
+        rows(&[
+            // run_id, written_at, landings
+            "catchup_unsettled WA 2026-11-05T12:00:05.000000000Z [\"L3\"]",
+            "catchup_unsettled W6 2026-11-05T12:30:00.000000000Z [\"L3\"]",
+        ])
+    );
+}
+
+/// Without asks, empty sets, also beside other events.
+#[test]
+fn the_catchup_queries_report_nothing_without_catchups() {
+    for events in ["", NOTE_EVENTS] {
+        let dir = tempfile::tempdir().unwrap();
+        let sets = run_queries(&state_with(dir.path(), events), CATCHUP_QUERIES);
+        assert_eq!(sets, vec![Vec::<Vec<String>>::new(); 3]);
+    }
+}
+
+/// Derivation from `batches.jsonl` and the `checks` rows added here.
+///
+/// Batches: bq proposed P1 and P2 and never landed. bp was offered twice,
+/// left X1 and X2 out each time, and landed P1 to P3 on one merged run. bf
+/// failed whole (4), passed with its first 2 (a reused pass) and failed
+/// with 3: F1 and F2 landed. bz failed whole and with Z1 alone, alike in two
+/// accepts, and landed nothing. br reused the whole batch's pass, accepted
+/// with no offer recorded; bu has no checks configured.
+///
+/// Suite runs 17:
+/// - 13 merged runs: finish P1 and P2; check S1 (its other check could not
+///   build its tree); accept bp 1, bf 2, bz 4, and Z2, S1 and N1 alone;
+/// - N1's baseline and verify phases, 2;
+/// - the in-place finishes of F2 (two commands) and X1, which never landed,
+///   2. P1's and P2's rows are their merged runs' logs, P3's its reuse's,
+///   and N1's its phases'.
+///
+/// Reuses 3: P3's finish, bf's first 2 and br's whole batch; the batches'
+/// records for P2, P3, F2 and R2 are not reuses.
+/// Landed 13, 9 of them in 4 batches. Approvals 7: one per batch, and Z2, S1
+/// and N1 alone; A1 was auto-applied.
+#[test]
+fn the_batch_queries_give_the_hand_derived_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = state_with(dir.path(), BATCH_EVENTS);
+    let connection = Connection::open(&path).unwrap();
+    for (run, name, stdout) in [
+        ("P1", "verify 1", "/runs/P1/m0800/verify-01.stdout.log"),
+        ("P2", "verify 1", "/runs/P2/m0805/verify-01.stdout.log"),
+        ("P3", "verify 1", "/runs/M1/memo/verify-01.stdout.log"),
+        ("X1", "verify 1", "/runs/X1/checks/verify-01.stdout.log"),
+        ("F2", "verify 1", "/runs/F2/checks/verify-01.stdout.log"),
+        ("F2", "verify 2", "/runs/F2/checks/verify-02.stdout.log"),
+        ("N1", "verify 1", "/runs/N1/checks/verify-01.stdout.log"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO checks(run_id, name, phase, command, status, exit_code, \
+                 duration_ms, stdout_path, stderr_path) \
+                 VALUES (?1, ?2, 'verify', 'cargo test', 'passed', 0, 1, ?3, '/stderr')",
+                [run, name, stdout],
+            )
+            .unwrap();
+    }
+    let sets = run_queries(&path, BATCH_QUERIES);
+    assert_eq!(sets.len(), 3);
+    let left_out = |run: &str, code: &str| {
+        format!(
+            "batch_members bp left_out {run} NULL refresh \
+             [{{\"code\":\"{code}\",\"detail\":\"x\",\"fact_id\":null,\"path\":null}}]"
+        )
+    };
+    assert_eq!(
+        sets[0],
+        rows(&[
+            // batch, kind, run_id, position, decision, why
+            "batch_members bf proposed F1 1 NULL first",
+            "batch_members bf proposed F2 2 NULL second",
+            "batch_members bf proposed F3 3 NULL third",
+            "batch_members bf proposed F4 4 NULL fourth",
+            "batch_members bf landed   F1 1 NULL NULL",
+            "batch_members bf landed   F2 2 NULL NULL",
+            "batch_members bp proposed P1 1 NULL first",
+            "batch_members bp proposed P2 2 NULL second",
+            "batch_members bp proposed P3 3 NULL third",
+            &left_out("X1", "patch_conflict"),
+            &left_out("X2", "fact_broken"),
+            "batch_members bp landed   P1 1 NULL NULL",
+            "batch_members bp landed   P2 2 NULL NULL",
+            "batch_members bp landed   P3 3 NULL NULL",
+            "batch_members bq proposed P1 1 NULL first",
+            "batch_members bq proposed P2 2 NULL second",
+            "batch_members br landed   R1 1 NULL NULL",
+            "batch_members br landed   R2 2 NULL NULL",
+            "batch_members bu landed   U1 1 NULL NULL",
+            "batch_members bu landed   U2 2 NULL NULL",
+            "batch_members bz proposed Z1 1 NULL first",
+            "batch_members bz proposed Z2 2 NULL second",
+        ])
+    );
+    assert_eq!(
+        sets[1],
+        rows(&[
+            // batch, passed, lands, failed, verifications, full_runs, bisection_runs
+            "batch_check_runs bp 1    3 NULL 1 1 0",
+            "batch_check_runs bf 0    2 F3   1 1 1",
+            "batch_check_runs bz 0    0 Z1   2 2 2",
+            "batch_check_runs br 1    2 NULL 1 0 0",
+            "batch_check_runs bu NULL 2 NULL 1 0 0",
+        ])
+    );
+    // landed_works, in_batches, batches, approvals, suite_runs, reuses
+    assert_eq!(sets[2], rows(&["landing_counts 13 9 4 7 17 3"]));
+}
+
+/// Without batches or landings, empty sets, also beside other events.
+#[test]
+fn the_batch_queries_report_nothing_without_batches_or_accepts() {
+    for events in ["", EVENTS] {
+        let dir = tempfile::tempdir().unwrap();
+        let sets = run_queries(&state_with(dir.path(), events), BATCH_QUERIES);
+        assert_eq!(sets, vec![Vec::<Vec<String>>::new(); 3]);
+    }
 }

@@ -107,8 +107,11 @@ pub struct Landing {
     pub world_after: Option<String>,
     pub projection_computed_at: Option<DateTime<Utc>>,
     /// Every other participant, interacting or not. Empty when unwatched or
-    /// unavailable.
+    /// unavailable. Work that landed in the same batch is not listed.
     pub counterparts: Vec<Counterpart>,
+    /// The digest of the batch this Work landed in, if it landed in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<String>,
 }
 
 /// What the owner's first evaluation of a counterpart after a landing found.

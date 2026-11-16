@@ -57,7 +57,7 @@ pub(crate) struct Told {
     looked: HashMap<String, String>,
 }
 
-type Signatures = BTreeMap<Target, (String, String)>;
+pub(super) type Signatures = BTreeMap<Target, (String, String)>;
 
 /// Leave each live Work in `runs` the note `compose` gives it at `now`, from
 /// `projection` and the landings recorded at `root` since the oldest of them
@@ -256,7 +256,7 @@ fn target(key: &str) -> Option<Target> {
 
 /// `landed`'s `interaction.landed`, and the signatures it changed, as its S0
 /// and Δ show them.
-fn landing(
+pub(super) fn landing(
     state: &State,
     runs: &[RunRecord],
     landed: &str,
@@ -325,7 +325,7 @@ fn hooked(run: &RunRecord) -> bool {
 }
 
 /// `run`'s runtime as the person knows it, from what the run recorded.
-fn runtime(run: &RunRecord) -> Option<&str> {
+pub(super) fn runtime(run: &RunRecord) -> Option<&str> {
     let id = match &run.attachment {
         Some(attachment) => attachment.agent.as_deref()?,
         None => &run.candidates.first()?.harness_id,

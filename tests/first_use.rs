@@ -6,7 +6,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
@@ -42,18 +42,31 @@ impl Project {
         }
     }
 
-    /// Run without a terminal: stdin is closed and output is captured.
+    /// Run without a terminal: stdin is closed and output goes to files, so
+    /// the call ends when `dispatch` does. A pipe could stay open after it:
+    /// on macOS a pipe is marked close-on-exec only after it is made, and a
+    /// process another test spawns in between keeps it.
     fn dispatch(&self, args: &[&str]) -> Output {
         let home = self.temp.path().join("home");
-        Command::new(assert_cmd::cargo_bin!("dispatch"))
+        let stdout = self.temp.path().join("stdout");
+        let stderr = self.temp.path().join("stderr");
+        let status = Command::new(assert_cmd::cargo_bin!("dispatch"))
             .arg("--state-dir")
             .arg(&self.state)
             .args(args)
             .current_dir(&self.root)
             .env("HOME", &home)
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
-            .output()
-            .unwrap()
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .status()
+            .unwrap();
+        Output {
+            status,
+            stdout: fs::read(stdout).unwrap(),
+            stderr: fs::read(stderr).unwrap(),
+        }
     }
 
     fn consents(&self) -> usize {

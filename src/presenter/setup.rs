@@ -389,7 +389,8 @@ async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
         "Runtime integrations\nClaude Code hooks: {} ({})\nHermes hook: {} ({})\nWith them, a Claude Code session in its own worktree of a project you watch \
          (dispatch start) appears as Work by itself; a session in the checkout itself is told Dispatch cannot follow it. \
          Hermes's hooks keep a hermes --worktree session's exact changes before Hermes removes its worktree. \
-         Both deliver Dispatch's notes on other Work to the agent.",
+         Both deliver Dispatch's notes on other Work to the agent, and ask it to catch up, \
+         once per landing, when other Work lands a change its Work relies on.",
         installed(&claude),
         path.display(),
         match &hermes {
@@ -494,6 +495,16 @@ const HERMES_CONSENT: &str = "Hermes asks you once for each of these hooks, at i
      in a terminal, and they don't run until you allow them (hermes hooks list shows which are \
      allowed); a run without a terminal needs hermes --accept-hooks.";
 
+/// What updating an earlier Dispatch's Hermes hooks adds, which Hermes's
+/// allowlist has not seen.
+const HERMES_PRE_VERIFY: &str = "The pre_verify hook is new: at the end of a turn that edited \
+     files, it gives the agent an ask to catch up if one waits, so Hermes asks you about it once \
+     more, the first time Hermes starts. ";
+
+/// What the second Claude Code `Stop` hook in the preview does.
+const CLAUDE_WAITER: &str = "The second Stop hook waits in the background after each turn, \
+     for at most 8 hours, to wake the session when its Work is asked to catch up with a landing.";
+
 /// One runtime's hook, the step both setup's pass and Runtime integrations
 /// take. It shows exactly what changes and where, with the existing and new
 /// command on an Update, and needs a deliberate choice: focus starts on Skip,
@@ -523,13 +534,17 @@ async fn hook_step(ui: &mut Ui, state: &State, runtime: Runtime, menu: bool) -> 
         }
         _ => format!("Hook command, unchanged: {command}"),
     };
+    let pre_verify = match &found {
+        Hook::Earlier(_) => HERMES_PRE_VERIFY,
+        _ => "",
+    };
     let what = match (runtime, change) {
         (Runtime::Claude, Change::Install) => format!(
-            "Add these hooks to {shown}?\n{}\nOther settings and hooks are kept (key order may change); a backup is kept beside the file.",
+            "Add these hooks to {shown}?\n{}\n{CLAUDE_WAITER}\nOther settings and hooks are kept (key order may change); a backup is kept beside the file.",
             claude::hooks_preview(&command)
         ),
         (Runtime::Claude, Change::Update) => format!(
-            "Update Dispatch's hooks in {shown}?\n{commands}\nDispatch's hooks there are replaced by exactly these:\n{}\nOther settings and hooks are kept; a backup is kept beside the file.",
+            "Update Dispatch's hooks in {shown}?\n{commands}\nDispatch's hooks there are replaced by exactly these:\n{}\n{CLAUDE_WAITER}\nOther settings and hooks are kept; a backup is kept beside the file.",
             claude::hooks_preview(&command)
         ),
         (Runtime::Claude, Change::Remove) => format!(
@@ -550,7 +565,7 @@ async fn hook_step(ui: &mut Ui, state: &State, runtime: Runtime, menu: bool) -> 
         (Runtime::Hermes, Change::Update | Change::Remove) if !hermes::as_written(&path)? => {
             let change = match change {
                 Change::Update => format!(
-                    "Under hooks:, make Dispatch's entries exactly these:\n{}{HERMES_CONSENT}",
+                    "Under hooks:, make Dispatch's entries exactly these:\n{}{pre_verify}{HERMES_CONSENT}",
                     hermes::wanted(&command)?
                 ),
                 _ => "Remove the entries under hooks: that run hook hermes.".into(),
@@ -561,7 +576,7 @@ async fn hook_step(ui: &mut Ui, state: &State, runtime: Runtime, menu: bool) -> 
             return Ok(true);
         }
         (Runtime::Hermes, Change::Update) => format!(
-            "Update Dispatch's hooks in {shown}?\n{commands}\nDispatch's block is replaced by exactly these:\n{}Nothing else in the file changes; a backup is kept beside the file. {HERMES_CONSENT}",
+            "Update Dispatch's hooks in {shown}?\n{commands}\nDispatch's block is replaced by exactly these:\n{}Nothing else in the file changes; a backup is kept beside the file. {pre_verify}{HERMES_CONSENT}",
             hermes::wanted(&command)?
         ),
         (Runtime::Hermes, Change::Remove) => format!(
@@ -884,7 +899,11 @@ async fn project_checks_menu(
         Choice::new(toggle),
         Choice::new("Back"),
     ];
-    match ui.select(&body, &rows, 0).await? {
+    // Focus starts on what the person most likely came for: letting Work run
+    // the checks (Allow is still a choice of its own), or, once Work may,
+    // changing them. Stopping takes effect at once, so it is never focused.
+    let focus = if current.is_valid() { 0 } else { 1 };
+    match ui.select(&body, &rows, focus).await? {
         Some(0) => checks(ui, source).await,
         Some(1) if current.is_valid() => {
             consent::revoke(state, &root)?;
@@ -907,6 +926,15 @@ async fn project_checks_menu(
 }
 
 pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> {
+    // With checks configured, a suggestion chosen joins them: they stay
+    // selected until the person clears them, and only Save writes.
+    if !crate::consent::effective_checks(source)?.is_empty() {
+        anyhow::ensure!(
+            choose_project_checks(ui, source).await?,
+            "check selection cancelled"
+        );
+        return Ok(());
+    }
     let expected = setup::project_config_bytes(source)?;
     let commands = setup::check_choices(source);
     let mut choices = commands.iter().map(|c| Choice::new(*c)).collect::<Vec<_>>();

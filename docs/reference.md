@@ -13,7 +13,7 @@ dispatch run "<task>" [--source path] [--agent claude|codex|cursor|hermes]
 dispatch run "<task>" --json|--jsonl
 dispatch status [run-id] [--json|--jsonl]
 dispatch diff [run-id]
-dispatch accept [run-id] [--expect <Δ digest>]
+dispatch accept [run-id] [--expect <Δ digest | batch digest>]
 dispatch reject [run-id]
 dispatch close <run-id> --reason unfinished|workspace-removed|already-present|superseded [--replacement run-id]
 dispatch explain [run-id]
@@ -32,7 +32,7 @@ dispatch history [--limit count]
 dispatch version
 ```
 
-Without a run ID, `status`, `diff`, `explain`, `check`, and `refresh` resolve the latest relevant single-result run for the current source tree; `status`, `diff`, `explain` and `check` print which run they describe. `accept` and `reject` without an ID act only when exactly one result waits for review for the source; with none or several they change nothing and list the explicit commands. `close` and `finish` always need an ID. An explicit ID may be a unique, case-insensitive prefix; an ambiguous one is refused. `--task-file path|-` reads a task from a file or stdin, and `--source path` overrides the current directory.
+Without a run ID, `status`, `diff`, `explain`, `check`, and `refresh` resolve the latest relevant single-result run for the current source tree; `status`, `diff`, `explain` and `check` print which run they describe. `reject` without an ID acts only when exactly one result waits for review for the source; with none or several it changes nothing and lists the explicit commands. `accept` without an ID does the same, except in a Git project where two or more waiting results can land together: it then proposes landing them as one batch (see "One-shot CLI"). `close` and `finish` always need an ID. An explicit ID may be a unique, case-insensitive prefix; an ambiguous one is refused. `--task-file path|-` reads a task from a file or stdin, and `--source path` overrides the current directory.
 
 `run --json` writes one versioned result object to stdout. `run --jsonl` writes each committed, sequenced event followed by a final result object; `status --jsonl` replays that committed journal. Machine modes require non-interactive authorization flags when local execution needs acknowledgement, keeping stdout parseable.
 
@@ -61,6 +61,8 @@ One-shot exit codes are:
 - `124`: the goal-wide deadline expired;
 - `1`: execution or orchestration failed (including work stopped by the mid-run coherence watcher);
 - `2`: command-line usage error.
+
+`--help`, and a command that only reads and prints (`version`, `history`, `status`, `explain`, `show`, `diff`, `events`, `resources`, `check` without `--merged`, `watch --json`), is ended by `SIGPIPE` (141 in a shell) when its reader goes away. Every other command keeps running to stop its agents and checks on the way out.
 
 The result keeps execution, verification, review, and application as separate fields. Attempt records also keep requested, resolved, and harness-observed model/effort values separate; an unknown or mismatched observed identity is not replaced by configuration.
 
@@ -209,13 +211,68 @@ dispatch run "Fix the retry race"
 Local agents run with your operating-system permissions. On a terminal Dispatch asks first: `[1] This run only  [2] Allow for this project  [Enter] Cancel`. Allowing the project covers later runs and refreshes with exactly the same agent command and checks; any change asks again. A piped `y` allows one run; scripts can also use `--allow-unsafe-local` after accepting that risk.
 
 Review and apply the result. Without an ID, `diff` shows the latest result and
-names it, and `accept` acts only when exactly one result waits for review for this
-source; with several it changes nothing and lists them with their IDs:
+names it, and `accept` applies the only result waiting for review for this source:
 
 ```bash
 dispatch diff
 dispatch accept
 ```
+
+When several wait in a Git project, `accept` proposes landing together every one it
+can, behind one approval:
+
+- **Which.** Each is finished, unapplied and waiting for review, its own checks passed
+  or none are configured, and it was frozen with the same checks, execution and
+  authority as the others. The rest are listed, each with why, to accept on its own.
+- **Order.** A change comes before what uses it, and the one writer of a file before
+  the other side. Otherwise the result that finished first comes first. Each line says
+  why: `before <id>: …`, `after <id>: …` or `by finish time`.
+- **Judged in turn.** Each result is judged against the source with every result
+  before it, 3-way from its S0 where its context moved, so a result the earlier ones
+  make stale (REFRESH) or already contain (STOP) is left out, with its reasons.
+- **What you approve.** The batch digest, SHA-256 over the ordered run IDs and Δ
+  digests, shown as 12 hex characters. On a terminal Dispatch asks `Land <n> results
+  together?` with Cancel focused. Without one, it prints `nothing was decided: to land
+  <n> results together, run dispatch accept --expect <batch digest>` and exits 1.
+- **With `--expect`.** The batch is judged again under the locks and refused, with
+  nothing applied, if the results that can land changed. The project's checks run once
+  on all of it together. If they fail, Dispatch checks shorter prefixes, each tree once
+  (at most ⌈log₂ n⌉ more runs; a tree with a recorded pass is reused), finds the first
+  result they fail with, lands only the results before it, names that result with its
+  logs and exits 1. If they fail with the first result alone, nothing lands, because
+  the source's own checks may be failing.
+- **How it lands.** The verified results are applied as one patch, under the world
+  digest of the source as it was judged, and each is recorded as a single accept
+  records it, naming the batch.
+
+For example, with one result that changes the signature of `validate` and another
+that calls it:
+
+```text
+2 results can land together, in this order:
+  1. 01M7AS495DQCJSFDXVTAKXWMYE  Δ 35ab8c60d91a  attached work in wt-cli
+       by finish time
+  2. 01M7AS4AKN3RTDCFNSSKBQ2AMF  Δ 720be956c2a1  attached work in wt-changer
+       before 01M7AS48: this Work changes the signature of validate (src/auth.rs), which it uses
+Left out:
+  01M7AS484ZM3BC5WK8YQ5H88DF  attached work in wt-user
+       REFRESH: fact_broken: pub fn validate(token: &str) -> bool => pub fn validate(token: &str, strict: bool) -> bool
+Batch d965aef1c1f4. The project's checks run once on all of them together; if they fail, only the results before the first one that fails land.
+error: nothing was decided: to land 2 results together, run dispatch accept --expect d965aef1c1f4
+```
+
+A result's own Δ digest given to `--expect` without its ID is refused, with the command
+that names it. One waiting result, an explicit ID, `--despite-refresh` and plain
+directories behave as a single accept.
+
+A result whose patch no longer applies as it is, but merges 3-way from its S0, is
+CONTINUE `merged_three_way` ([coherence.md](coherence.md#l0-file-and-patch-state-coherencers)).
+Accept runs the merged checks on the merged tree and, once they pass, and only if Git's
+merge onto the source as it is still gives that tree, applies the patch from the source
+to it, kept as `runs/<id>/delta-landed.patch`, and prints `Merged 3-way from S0; what
+landed: <path>`. It then compares each path it changed with that tree: a path that
+changed as the patch landed is named on stderr (`Warning: not confirmed at <paths>: …`),
+and the landing is recorded either way. Δ never changes, and `--expect` names Δ's digest.
 
 Or reject it without changing the source tree:
 
@@ -274,7 +331,7 @@ Before a native run's agent starts, Dispatch makes sure each program in `checks.
 
 Real agents and project checks run with the permissions of the Dispatch process and receive `HOME` so installed harnesses can use local authentication. Dispatch clears most other child environment variables. Configured extra variables require the separate `--allow-forwarded-env` acknowledgement and their values are redacted from persisted logs.
 
-Dispatch freezes the source into an internal Git baseline and gives the selected agent an independent candidate workspace. It does not run the agent directly in the original tree. `dispatch accept` uses the existing safe apply path. If the source moved since the snapshot, [work coherence](coherence.md) decides whether the patch is still valid; a stale result is refused and the source is left unchanged. With `coherence.accept: strict`, any source drift is refused. `dispatch reject` never applies candidate changes.
+Dispatch freezes the source into an internal Git baseline and gives the selected agent an independent candidate workspace. It does not run the agent directly in the original tree. `dispatch accept` uses the existing safe apply path. If the source moved since the snapshot, [work coherence](coherence.md) decides whether the patch is still valid; a stale result is refused and the source is left unchanged, and the refusal ends with the next step `dispatch check` gives. With `coherence.accept: strict`, any source drift is refused. `dispatch reject` never applies candidate changes.
 
 If verification is configured, the same commands run against the candidate and their output is retained. Without configured checks, Dispatch reports `Verification: Not configured`. Verification is mechanical evidence, not a universal code-quality judgment. A completed harness invocation is reported as `Ready for review` when its patch still holds against the source now, `Finished, but stale (REFRESH)` or `Finished, already in the source (STOP)` when it does not; failed checks are reported as `Verification failed`, never as completed or verified work. The summary shows the patch, the verdict and what accept would verify; a `CONTINUE` there does not mean merged checks have passed.
 
@@ -282,7 +339,23 @@ The local backend is the supported real-agent path in this candidate. Docker exe
 
 ## Events
 
-Each run's committed events are in the `events` table, and `dispatch events` and `status --jsonl` replay them. Every payload also carries the run's `outcome`. The coherence events are listed in [coherence.md](coherence.md#events), and those of attached Work in [attach.md](attach.md#events). New in 0.4.18:
+Each run's committed events are in the `events` table, and `dispatch events` and `status --jsonl` replay them. Every payload also carries the run's `outcome`. The coherence events are listed in [coherence.md](coherence.md#events), and those of attached Work in [attach.md](attach.md#events). New in 0.5.0:
+
+| Event | When | Payload |
+|---|---|---|
+| `batch.proposed` | `dispatch accept` without an ID proposed a batch; on every result it judged, members and left out | `{"batch", "members": [{"run_id", "delta_digest", "why"}], "left_out": [{"run_id", "decision", "reasons"}]}` |
+| `batch.verified` | `accept --expect <batch>` ran, or skipped, the merged checks; on every member | `{"batch", "tree", "passed": true \| false \| null, "runs", "lands", "failed": <run id> \| null}`; `runs` counts the check runs that ran commands, bisection included, not reuses; `passed` is `null` when the checks were skipped |
+| `batch.landed` | the verified results landed as one patch; on each landed member | `{"batch", "members", "tree", "patch", "patch_digest", "world_before", "world_after", "confirmed", "unconfirmed"}` |
+| `catchup.written` | the owner wrote or added to an ask for live Work to catch up with landings ([attach.md](attach.md#catch-up-in-place)) | `{"landings": [<run id>], "targets", "text"}`; `landings` are the ones new in this write, `text` the whole ask |
+| `catchup.delivered` | the owner saw a hook take the ask; timed when the hook took it | `{"via": "stop" \| "wake" \| "verify" \| "turn", "landings"}` |
+| `catchup.expired` | before a hook took the ask, the Work's S0 moved to a source recorded at or after its landings, or the Work was no longer in progress | `{"why": "s0_moved" \| "left_working", "landings"}` |
+
+Events that gain fields in 0.5.0:
+- A batch member's `result.applied`, `interaction.landed`, `review.accepted`, `coherence.merged_checks` and `checks.reused` carry `batch`, the batch digest. The merged checks are recorded on the first member, with `members` (the results in the checked tree); the other members record `checks.reused` naming that run. A member's `interaction.landed` lists none of the Work that landed with it as a counterpart.
+- `result.applied` of a 3-way landing also has `delta_digest` (Δ, what `--expect` names), `landed_patch`, `landed_digest`, `confirmed` and `unconfirmed` (the paths that did not hold the merged tree once applied).
+- `ReasonCode` gains `merged_three_way`.
+
+New in 0.4.18:
 
 | Event | When | Payload |
 |---|---|---|
@@ -298,7 +371,7 @@ Each run's committed events are in the `events` table, and `dispatch events` and
 
 Normalized state lives in `~/.dispatch/dispatch.db`; `--state-dir` or `DISPATCH_HOME` overrides that location. Per-run evidence lives under `~/.dispatch/runs/<run-id>/`, including the frozen baseline, candidate workspace, bounded stdout/stderr, structured agent output, checks, patch, events, and inspectable metadata.
 
-After a landing on a Git project, Dispatch records the project's source as a commit and points `refs/dispatch/source` in that repository at it, with a reflog entry `dispatch: Work <id> landed`. No branch, HEAD, index or file of yours changes. Notes for live agents, and the marks hooks leave for the project owner, are files under `<state>/inbox/` and `<state>/marks/`.
+After a landing on a Git project, Dispatch records the project's source as a commit and points `refs/dispatch/source` in that repository at it, with a reflog entry `dispatch: Work <id> landed`. A batch makes one commit, `dispatch: <n> results landed together (batch <12 hex>)`, and one `sources.json` entry per result, all naming it. No branch, HEAD, index or file of yours changes. Notes for live agents, and the marks hooks leave for the project owner, are files under `<state>/inbox/` and `<state>/marks/`. Asks to catch up are files under `<state>/catchup/` (`<key>.json` pending, `delivered/<ULID>.<via>.json` taken by a hook, `work/<key>.json` the landings each Work in progress was asked about), and each Claude Code session's newest waiter is named in `<state>/waiters/<session>`. A 3-way landing keeps what it applied as `runs/<id>/delta-landed.patch`, and a batch as `runs/<first member>/batch-<12 hex>.patch`.
 
 No network service is required to create, execute, inspect, accept, or reject a task, and Dispatch uploads nothing.
 
@@ -307,7 +380,7 @@ No network service is required to create, execute, inspect, accept, or reject a 
 - Experimental developer preview, not a stable 1.0 service.
 - Real-agent testing centers on Codex CLI and Claude Code (see [provider support](provider-support.md)); Cursor Agent and Hermes Agent remain available as an explicit `--agent cursor` or `--agent hermes` choice without a funding contract. Hermes passed attach and native runs in the 0.4.14 conformance trials; its own worktree mode, which 0.4.14 did not recognize, passed with 0.4.15 on 2026-10-16, in one trial without the hook (the last-seen path). Agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current, finishes Work whose session ended when you allowed the project's checks, applies only attached work you allowed to integrate, leaves notes for live Claude Code and Hermes sessions that their hooks deliver, and moves the S0 of attached Git Work whose agent merged a recorded source; it never launches, refreshes or signals agents, and a note asks nothing of an agent. It recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's worktrees by itself, sees only Claude Code's and Hermes's sessions end, and scans no processes.
+- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current, finishes Work whose session ended when you allowed the project's checks, applies only attached work you allowed to integrate, leaves notes for live Claude Code and Hermes sessions that their hooks deliver, asks such an agent once per landing to catch up when a landing broke a declaration its Work relies on, and moves the S0 of attached Git Work whose agent merged a recorded source; it never launches, refreshes or signals agents, and never merges for them. A note asks nothing of an agent; the catch-up ask is the one request Dispatch makes, and only through the runtime's hooks. It recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's worktrees by itself, sees only Claude Code's and Hermes's sessions end, and scans no processes.
 
 ## Testing and CI
 

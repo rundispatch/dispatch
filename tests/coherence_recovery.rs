@@ -426,8 +426,15 @@ impl FakeGood {
     }
 }
 
+/// The run's Δ applied through the digest fence, as accept applies it onto a
+/// moved world.
+fn apply_validated(run: &dispatch::RunRecord, digest: &str) -> Result<Vec<PathBuf>> {
+    let patch = &run.candidates[0].diff_path;
+    dispatch::source::apply_checked(run, patch, dispatch::source::ExpectedWorld::Digest(digest))
+}
+
 // There is no hook between the coherence verdict and the real `git apply` in
-// the CLI, so this exercises `source::apply_validated` directly with the digest
+// the CLI, so this exercises `source::apply_checked` directly with the digest
 // a verdict produced before the source moved. The orchestrator passes exactly
 // this digest (`Validity::world_digest`) when it applies.
 #[test]
@@ -443,7 +450,7 @@ fn apply_validated_aborts_when_the_source_moves_after_the_verdict() -> Result<()
     fs::write(f.source.join("landed-later.txt"), "not judged\n")?;
     let before = tree(&f.source);
 
-    let error = dispatch::source::apply_validated(&run, &label, &stale_digest)
+    let error = apply_validated(&run, &stale_digest)
         .expect_err("a world the verdict never saw must not be patched");
     assert!(
         format!("{error:#}").contains("source has changed"),
@@ -457,7 +464,7 @@ fn apply_validated_aborts_when_the_source_moves_after_the_verdict() -> Result<()
     let now = dispatch::coherence::evaluate_run(&run, &label, None)?;
     assert_eq!(now.decision, dispatch::Decision::Continue);
     assert_ne!(now.world_digest, stale_digest);
-    dispatch::source::apply_validated(&run, &label, &now.world_digest)?;
+    apply_validated(&run, &now.world_digest)?;
     assert!(f.source.join("dispatch-fake-good.txt").is_file());
     assert_eq!(
         fs::read_to_string(f.source.join("landed-later.txt"))?,
@@ -475,9 +482,9 @@ fn apply_validated_digest_names_content_not_time() -> Result<()> {
     let label = run.candidates[0].label.clone();
     let digest = dispatch::coherence::evaluate_run(&run, &label, None)?.world_digest;
     fs::write(f.source.join("scratch.txt"), "transient\n")?;
-    assert!(dispatch::source::apply_validated(&run, &label, &digest).is_err());
+    assert!(apply_validated(&run, &digest).is_err());
     fs::remove_file(f.source.join("scratch.txt"))?;
-    dispatch::source::apply_validated(&run, &label, &digest)?;
+    apply_validated(&run, &digest)?;
     assert!(f.source.join("dispatch-fake-good.txt").is_file());
     Ok(())
 }

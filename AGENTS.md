@@ -35,10 +35,19 @@ native runs, advisory interactions between unintegrated Work while a project is
 watched, notes in fixed text about those interactions and about landings, delivered
 to live Claude Code and Hermes sessions through their hooks, and an S0 for attached
 Git Work that follows the agent's merge or rebase of a recorded source, with an
-ancestry proof. Claim precision for interactions only from recorded outcomes (the
-documented queries), quoted as counts, and only as agreement with Dispatch's own
-later verdict. Notes are unmeasured on real work: say what a note says and when it
-arrives, not that an agent acted on it. Do not claim tokens, minutes or money saved until a real run was
+ancestry proof. Since 0.5.0 it also includes a catch-up ask in fixed text, once per
+landing, through those hooks, to a live Claude Code or Hermes agent whose Work uses a
+declaration the landing changed the signature of or removed, or changes a declaration
+the landing changed; batch landing, where `dispatch accept` without an ID lands the
+ready results of a Git project that can land together, a change before what uses it,
+behind one approval, with the merged checks run once on the combined tree and only the
+results before the first failing one landing; and a 3-way merge from S0 for a Δ whose
+context moved, which lands only as the tree the merged checks passed on. Claim
+precision for interactions only from recorded outcomes (the documented queries),
+quoted as counts, and only as agreement with Dispatch's own later verdict. Notes and
+catch-up asks are measured only as counts of what followed them (the documented
+queries): say what a note or an ask says and when it arrives, not that an agent acted
+on it because of it. Do not claim tokens, minutes or money saved until a real run was
 stopped and the attempt timestamps show it. The metrics that decide whether the
 thesis holds, and what would falsify it, are in `docs/coherence-validation.md`.
 
@@ -170,9 +179,26 @@ Each clause is recorded and bounded, and arrives with the release that ships it.
   never stopped is watched again by the next Dispatch command or hook there, after a
   reboot or an in-place upgrade. One line says so; `dispatch stop` ends it.
 - **Notes to live agents** (approved 2026-11-04, arrives with 0.4.18). Dispatch speaks to
-  live agents only through their runtimes' hooks, with fixed text, and asks nothing of them.
+  live agents only through their runtimes' hooks, with fixed text. A note asks nothing of
+  them; the one thing Dispatch asks is catch-up, below (amended 2026-11-09).
 - **S0 follows integration** (approved 2026-11-04, arrives with 0.4.18). S0 moves only with
   an ancestry proof against a recorded source; every earlier (S0, Δ) stays recomputable.
+- **Catch-up** (approved 2026-11-09, arrives with 0.5.0). When Work lands a change to the
+  signature of a declaration that live Claude Code or Hermes Work uses, removes such a
+  declaration, or changes a declaration that Work also changes, Dispatch asks that Work's
+  agent once, in fixed text, through its runtime's hooks, to commit its work, merge the
+  recorded commit that holds the landing, update what uses it and run the project's
+  checks. Symbol-level only, never from a whole-file or textual interaction. Once per
+  landing and Work. Only Work whose S0 a merge can move is asked. Never a relaunch, a
+  merge on the agent's behalf or a second ask.
+- **Batch landing** (approved 2026-11-09, arrives with 0.5.0). `dispatch accept` without
+  an ID may land several ready results behind one approval. The merged checks run once on
+  the combined tree; if they fail, only the results before the first one they fail with
+  land, as one patch. A result that the earlier ones make stale or already contain is left
+  out of the batch with its reasons.
+- **3-way landing** (approved 2026-11-09, arrives with 0.5.0). A Δ that no longer applies
+  as it is may be merged 3-way from S0 by Git. It lands only as the tree the merged checks
+  passed on, never without them. Δ never changes; what landed is kept beside it.
 
 ## Working method
 

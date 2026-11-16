@@ -335,10 +335,7 @@ fn two_sessions_on_one_declaration_hear_of_each_other_and_of_the_landing() {
     assert!(names(lines[0], &a, landed), "{heard}");
     assert_eq!(
         lines[1],
-        format!(
-            "The source with this change is commit {} (refs/dispatch/source).",
-            &commit[..8]
-        )
+        format!("The source with this change is commit {commit}.")
     );
     assert_eq!(p.tool(&wa), None, "A, applied, hears nothing more");
 }

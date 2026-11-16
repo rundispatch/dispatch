@@ -27,6 +27,59 @@ other's way.
    allowed to overlap, and its execution log shows the numbers. The four-harness conformance
    trials (run with the user's approval) pass, including new coordination cells.
 
+## Where the six conditions stand (2026-11-15)
+
+Measured on 0.5.0's own build: its first wave of packets ran under the pinned 0.4.18, and
+its second under a release build of the branch. The counts come from the documented
+queries on that build's state (`notes-measured.sql`, `catchup-measured.sql`,
+`batches-measured.sql`), run again after its last landing (packet E, 2026-11-15 01:24 UTC).
+The timings and the coordination trials are on the release build of `96fd98c`, on one Mac
+(arm64), on 2026-11-15, with the 1-minute load where it was recorded.
+
+1. **Agents know about each other.** 26 notes delivered on real work, 0 unsettled. Their
+   next verdicts: REFRESH 7 (all 7 count as agreement with Dispatch's own later verdict),
+   CONTINUE 7, none yet 12. Counts only, with no target, as the plan asks.
+2. **Stale work catches up in place.** 2 asks on real work, naming 3 landings, with 0
+   asked twice and 0 file-level targets. One woke an idle Claude Code session, one came by
+   `Stop`. Each was followed by the agent's merge and an S0 move (271 s and 96 s after
+   delivery), then CONTINUE, with no relaunch. Hermes: this build's one Hermes packet ran
+   wrapped, which is never asked. In the coordination trial, a real Hermes 0.18.2 session,
+   idle when its ask was written, got it with its next turn; the agent merged, and S0
+   followed its merge.
+3. **Landing is one decision.** Each landing of 2 or more ready results in the second
+   wave was one `dispatch accept` proposal and one approval: 7 results, then 3, then 2,
+   each with one merged-check run and no bisection. 20 Works landed behind 11 approvals in
+   all. No result was re-applied by hand: every landing was a `dispatch accept`. Manual
+   steps are not recorded by any event.
+4. **Out of the box.** On a temporary HOME, the install line (from a local release
+   packaged by `scripts/package-local.py`), then `dispatch setup` (one pass, in a terminal)
+   and `dispatch accept`: 2 Dispatch commands to a first landed change, and no flags (gate:
+   3 commands). The owner finished the stand-in Claude Code session's Work by consent, and
+   accept reused its merged checks and landed it.
+5. **Fast.** 29 suite runs for 20 landed Works, 1.45 per landed Work (gate: at most 1.75).
+   No passing tree was verified twice: `coherence.merged_checks` ran 4 times on this
+   build's state, on 4 different trees, all passing. That is counted from those events by
+   `tree_id`, not by a documented query. An already verified result landed in 0.33 s at
+   the median of 10 accepts (0.30 to 0.43 s, load 3.4 to 4.2), on a clone of this
+   repository at `96fd98c` (gate: 10 s). A native run reached its agent in 3.0 s at the
+   median of 3 (2.8, 3.0 and 3.5 s, load 3.7 to 6.5), on the 3.6 GB measurement
+   repository 0.4.17 and 0.4.18 used (0.4.18: 3.3 s; gate: 10 s).
+6. **Proven on itself.** The second wave was supervised by a release build of the branch,
+   and recorded symbol-level interactions between live Works, for example packet P2h
+   changing the signature of `next_step`, which packet S used; P2h's landing then asked S
+   to catch up. The coordination trials pass on the release build
+   ([harness-conformance.md](harness-conformance.md), "Coordination cells"): Claude Code
+   2.1.296 and Hermes 0.18.2 on all four cells (notes, catch-up, S0 follows the merge,
+   batch landing), Codex 0.155.1 and Cursor Agent 2026.11.13 on S0 follows the merge and
+   batch landing, with notes and catch-up "none, no hook". The first run, on `e8067c3`,
+   failed Codex's S0 cell: every Codex worktree is detached, and S0 took no proof from a
+   detached HEAD. Packet Y fixed it, and the rerun passed.
+
+Also measured for the release: the `Stop` hook with an ask pending, over 1,000 calls at a
+load of 3.4, took 5.16 ms at the median, 8.78 ms at the 95th percentile (gate: 15 ms) and
+21.98 ms at most, and every call returned the ask as a block. An idle waiter used 0.00 s of
+user and of system CPU over a 30 s wait, at 9.6 MB resident (load 3.1).
+
 ## The releases
 
 | Release | Theme | What it adds | Gate to the next |

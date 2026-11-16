@@ -710,8 +710,9 @@ def widths(binary, base):
             details = watch.details()
             assert "Verdict REFRESH · " in details or "Verdict REFRESH" in details, details
             assert "def validate(token)" in details, ("the reason is visible", width, watch.screen())
-            assert "Next It can't be accepted as is. r reject it, then run the agent again from the current source." \
-                in details, (width, watch.screen())
+            assert ("Next It can't be accepted as is: run your agent again on the current source and attach it; "
+                    f"once that Work is finished: dispatch close {project.ids['me-endpoint']} --reason superseded "
+                    "--replacement <new-id>. Or r reject it.") in details, (width, watch.screen())
             hint = watch.hint()
             assert hint.startswith("r reject · d review"), (width, hint)
             assert hint.endswith("↑↓ select · q leave" if wide else "↑↓ · q leave"), (width, hint)
@@ -982,7 +983,9 @@ def states_ready(binary, base):
         "auto": ("applied", "–", "passed", ["applied by auto-apply · it was CONTINUE"],
                  "Nothing to do: it is in tinyauth.", "↑↓ select · q leave"),
         "refresh-me": ("blocked", "REFRESH", "passed", ["Verdict REFRESH · "],
-                       "It can't be accepted as is. r reject it, then run the agent again from the current source.",
+                       "It can't be accepted as is: run your agent again on the current source and attach it; "
+                       f"once that Work is finished: dispatch close {project.ids['refresh-me']} --reason superseded "
+                       "--replacement <new-id>. Or r reject it.",
                        "r reject · d review · ↑↓ select · q leave"),
         "stop-me": ("blocked", "STOP", "passed", ["Verdict STOP · its changes are already in the source"],
                     "Its changes are already in the source. c close it.",
@@ -1178,7 +1181,7 @@ def feedback(binary, base):
         watch.until("listed", lambda: listed_order(watch, order) == order)
         select(watch, "stale", order)
         watch.send("a")
-        watch.shows("stale: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.")
+        watch.shows("stale: not applied: stale (REFRESH). See its Next line.")
         assert not applied(project, "stale") and (project.root / "api.py").read_text() == source_before
         select(watch, "dup", order)
         watch.send("a")
@@ -1319,7 +1322,7 @@ def short_terminal(binary, base):
         with project.watch(width, height) as watch:
             watch.until("the selected Work on screen", lambda: watch.selected())
             watch.send("a")  # refused: a notice of up to two lines, shown whole
-            watch.shows("me-endpoint: not applied: stale (REFRESH). The source is unchanged. Next: r reject it.")
+            watch.shows("me-endpoint: not applied: stale (REFRESH). See its Next line.")
             watch.settle()
             assert watch.selected() and selected_name(watch, order) == "me-endpoint", \
                 (width, height, "the selection is off screen", watch.screen())

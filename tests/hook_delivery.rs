@@ -270,6 +270,16 @@ impl Project {
         fs::write(path, inbox.to_string()).unwrap();
     }
 
+    /// Leave an ask to catch up for Work `id` in its workspace, as the owner
+    /// writes it.
+    fn ask(&self, id: &str, text: &str) {
+        let ask = serde_json::json!({"version": 1, "run_id": id, "landings": [], "text": text});
+        let directory = self.state.join("catchup");
+        fs::create_dir_all(directory.join("delivered")).unwrap();
+        let path = directory.join(format!("{}.json", Self::key(&self.worktree)));
+        fs::write(path, ask.to_string()).unwrap();
+    }
+
     /// Run the project owner until `done` holds, then stop it.
     fn owner(&mut self, what: &str, done: impl Fn(&Self) -> bool) {
         self.release_watch();
@@ -568,6 +578,38 @@ fn hermes_hears_its_worktrees_notes_before_the_turn_from_a_megabyte_payload() {
         serde_json::json!({"context": "Work 01ABC (claude) landed fn f in src/lib.rs."})
     );
     assert_eq!(hermes(Some(&p.worktree)), Value::Null, "delivered once");
+}
+
+/// An ask to catch up that no edited turn took comes with the next turn,
+/// after the turn's notes, and each once.
+#[test]
+fn hermes_hears_an_ask_to_catch_up_after_its_notes_at_the_next_turn() {
+    let mut p = Project::new();
+    let id = p.registered();
+    let (note, ask) = (
+        "Work 01ABC (claude) landed fn f in src/lib.rs.",
+        "Dispatch: Work 01ABC (Claude Code) landed a change this Work relies on.",
+    );
+    p.inbox(&id, &[("n1", note)]);
+    p.ask(&id, ask);
+    let turn = hermes_turn(&p.root, 64 * 1024);
+    let hermes = |p: &Project| {
+        let (output, _) = p.hook("hermes", turn.as_bytes(), &[("TERMINAL_CWD", &p.worktree)]);
+        Project::printed(&output)
+    };
+    assert_eq!(
+        hermes(&p),
+        serde_json::json!({"context": format!("{note}\n{ask}")})
+    );
+    assert_eq!(hermes(&p), Value::Null, "each once");
+    p.ask(&id, ask);
+    assert_eq!(hermes(&p), serde_json::json!({"context": ask}));
+    p.owner("recorded both asks as delivered", |p| {
+        p.events(&id, "catchup.delivered").len() == 2
+    });
+    for delivered in p.events(&id, "catchup.delivered") {
+        assert_eq!(delivered["via"], "turn");
+    }
 }
 
 /// While the Work's lock and a write lock on the database are held, every

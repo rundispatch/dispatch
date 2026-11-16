@@ -55,6 +55,7 @@ printf '%s\n' "$model" >> '{root}/invocations'
 count=$(wc -l < '{root}/invocations' | tr -d ' ')
 mode=$(cat '{root}/mode')
 if [ "$mode" = 'timeout' ]; then sleep 600; fi
+if [ "$mode" = 'escape' ]; then python3 '{root}/escape.py' '{root}' & wait; fi
 if [ "$mode" = 'harness-failure' ]; then exit 9; fi
 if [ "$mode" = 'checkpoint-crash' ] || [ "$mode" = 'checkpoint-then-complete' ] || [ "$mode" = 'clarify-always' ] || {{ [ "$mode" = 'clarify' ] && [ "$count" = '1' ]; }}; then
 printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"{{\"dispatch_checkpoint\":{{\"version\":1,\"question\":\"Which label?\",\"choices\":[\"blue\",\"green\"]}}}}"}}}}'
@@ -1288,6 +1289,88 @@ fn phase4_pty_intent_answer_recovery_review_and_restoration() -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    Ok(())
+}
+
+/// The `escape` agent's helper. It stands in for a child forked as the agent's
+/// process group is killed, which joins the group after the kill went out. Its
+/// keeper is a member of the group whose parent, this helper, is not: it dies
+/// at the kill, and its zombie keeps the group until the escapee has joined.
+const ESCAPE: &str = r#"import os, signal, sys
+root = sys.argv[1]
+group = os.getpgrp()
+os.setpgid(0, 0)
+def member():
+    pid = os.fork()
+    if pid == 0:
+        while True: signal.pause()
+    os.setpgid(pid, group)
+    return pid
+def note(name, value):
+    with open(os.path.join(root, name), 'w') as f: f.write(str(value))
+r, w = os.pipe()
+keeper = member()
+os.close(w)
+note('group', group); note('helper', os.getpid()); note('ready', '')
+os.read(r, 1)  # end of file: the kill reached the keeper
+escapee = member()
+note('escapee', escapee)
+os.waitpid(keeper, 0)
+os.waitpid(escapee, 0)
+"#;
+
+/// Kills what the `escape` helper started, also when an assertion fails first.
+struct StandIns(PathBuf);
+impl Drop for StandIns {
+    fn drop(&mut self) {
+        for name in ["group", "helper"] {
+            if let Ok(id) = fs::read_to_string(self.0.join(name))
+                && let Ok(id) = id.parse::<i32>()
+            {
+                // SAFETY: the agent's group and the helper's own, as it recorded them.
+                unsafe { libc::kill(-id, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+#[test]
+fn a_hangup_kills_what_joins_the_agents_group_after_the_kill() -> Result<()> {
+    let f = Fixture::new("escape")?;
+    fs::write(f.root.join("escape.py"), ESCAPE)?;
+    let _stand_ins = StandIns(f.root.clone());
+    let mut run = OwnedChild(
+        f.run_command(&[])
+            .stdout(fs::File::create(f.root.join("run.json"))?)
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    wait_until(|| {
+        anyhow::ensure!(
+            run.0.try_wait()?.is_none(),
+            "the run ended before the hangup"
+        );
+        Ok(f.root.join("ready").exists())
+    })?;
+    // SAFETY: a hangup to the `dispatch run` this test started.
+    unsafe { libc::kill(run.0.id() as i32, libc::SIGHUP) };
+    run.0.wait()?;
+    let result: Value = serde_json::from_slice(&fs::read(f.root.join("run.json"))?)?;
+    assert_eq!(result["outcome"]["work_result"], "cancelled", "{result}");
+    f.no_live_launches()?;
+    let group: i32 = fs::read_to_string(f.root.join("group"))?.parse()?;
+    let escapee: i32 = fs::read_to_string(f.root.join("escapee"))?.parse()?;
+    assert_eq!(
+        dispatch::process::process_group_exists(Some(group)),
+        Some(false),
+        "the agent's process group outlived the run"
+    );
+    // SAFETY: signal zero only asks whether the escapee still exists.
+    assert_ne!(
+        unsafe { libc::kill(escapee, 0) },
+        0,
+        "the escapee outlived the run"
+    );
     Ok(())
 }
 

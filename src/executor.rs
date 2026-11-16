@@ -821,11 +821,21 @@ async fn terminate_child(child: &mut tokio::process::Child, group: &mut ProcessG
 /// 500 ms; only a process stuck in the kernel takes longer.
 const GROUP_EXIT: Duration = Duration::from_secs(10);
 
+/// Whether a killed process group is gone, killing it again while it is not.
+/// One kill is not enough: a member forking as the kill arrives can leave a
+/// child that joins the group after the signal went out, which macOS lets
+/// live, so the group is killed for as long as anything is in it.
 pub(crate) async fn confirm_process_group_gone(group: i32) -> bool {
     let deadline = Instant::now() + GROUP_EXIT;
     while Instant::now() < deadline {
         if crate::process::process_group_exists(Some(group)) == Some(false) {
             return true;
+        }
+        // SAFETY: the group still exists, so its id cannot name another one;
+        // a negative PID signals that group only.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

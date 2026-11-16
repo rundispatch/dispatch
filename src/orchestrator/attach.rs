@@ -303,6 +303,8 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
     )?;
 
     let mut history = Vec::new();
+    let mut s0_since = None;
+    let mut began_detached = None;
     let (snapshot, provenance, confidence, workspace, managed_workspace) = if *managed {
         let (snapshot, provenance, workspace, made) = make_workspace(state, root, run_id, &dir)
             .map_err(|error| error.context("could not make a workspace"))?;
@@ -318,12 +320,15 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
             .map_err(|error| error.context("could not record S0"))?;
         let commit = runtime.commit.clone();
         let (provenance, confidence) = if let Some(old) = &runtime.reopens {
-            // It goes on from the Work it reopens: the same S0, attributed
-            // as that Work's was, and moved as that Work's was.
+            // It goes on from the Work it reopens: the same S0, S0 since the
+            // same time, attributed as that Work's was, and moved as that
+            // Work's was.
             let old = state.load_run(old)?;
+            s0_since = Some(old.first_s0_since());
             history = old.baseline_history;
-            let old = old.attachment.context("not attached Work")?;
-            (old.provenance, old.confidence)
+            let attachment = old.attachment.context("not attached Work")?;
+            began_detached = Some(attachment.began_detached);
+            (attachment.provenance, attachment.confidence)
         } else if runtime.discovered {
             // The worktree appeared after watching began: every change in it
             // is its runtime's.
@@ -367,6 +372,10 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
             }
         };
         (snapshot, provenance, confidence, workspace.clone(), None)
+    };
+    let began_detached = match began_detached {
+        Some(kept) => kept,
+        None => repo_key.is_some() && super::s0::detached(&workspace)?,
     };
 
     let (source_kind, source_git_head) = source::inspect_source(root)?;
@@ -446,6 +455,8 @@ pub(crate) fn build(state: &State, prepared: &Prepared, run_id: &str) -> Result<
         integration_root: root.clone(),
         repo_key: repo_key.clone(),
         provenance,
+        s0_since,
+        began_detached,
         confidence,
         agent: request.agent.clone(),
         command: request.command.clone(),
@@ -1438,11 +1449,12 @@ const MAX_START_PATHS: usize = 20;
 
 /// Record, once, where the integration source differed from the Work's S0
 /// when it began: `world::observe` lists every path where they differ,
-/// whichever side has the change. A path in the retained patch of Work
-/// applied to this source (`runs`) names that Work; nothing else is
-/// attributed. Advisory: no verdict depends on it. `attach` calls this right
-/// after publishing, the project owner for Work a runtime registered; never
-/// registration. On failure nothing is recorded, and it stays not observed.
+/// whichever side has the change. A path in the retained patch of Work in
+/// `runs` that landed on this source after S0 names the last such Work;
+/// nothing else is attributed. Advisory: no verdict depends on it. `attach`
+/// calls this right after publishing, the project owner for Work a runtime
+/// registered; never registration. On failure nothing is recorded, and it
+/// stays not observed.
 pub(crate) fn observe_start(state: &State, run_id: &str, runs: &[RunRecord]) -> Result<RunRecord> {
     let pending = |run: &RunRecord| {
         run.attachment.as_ref().is_some_and(|attachment| {
@@ -1462,29 +1474,57 @@ pub(crate) fn observe_start(state: &State, run_id: &str, runs: &[RunRecord]) -> 
         &run.source_kind,
     )?;
     let (_, source_head) = source::inspect_source(&run.source_path)?;
+    let shown: Vec<&str> = world
+        .changes
+        .iter()
+        .take(MAX_START_PATHS)
+        .map(|change| change.path.as_str())
+        .collect();
+    // Newest landing first: the first after S0 to change a path names it. A
+    // landing is after S0 when recorded after S0 was, or recorded before but
+    // descending from S0's commit, as accepted Work still uncommitted when
+    // this Work began from the root's HEAD (`s0` reads them alike). Any
+    // other landing is already in S0.
+    let s0 = run.s0_commit();
+    let since = s0.map_or_else(|| run.first_s0_since(), |(_, since)| since);
+    // The names are advisory: landings that can't be read name no Work, and
+    // never stop the observation.
+    let records = super::s0::recorded(state, &run.source_path).unwrap_or_default();
     let mut applied = std::collections::HashMap::new();
-    for other in runs.iter().filter(|other| {
-        other.outcome.application == ApplicationState::Applied && other.id != run.id
-    }) {
-        let candidate = other
+    for record in records.iter().rev() {
+        let Some(other) = runs.iter().find(|other| other.id == record.landed_run) else {
+            continue;
+        };
+        let changed: Vec<&str> = other
             .candidates
             .iter()
-            .find(|candidate| other.applied_candidate.as_ref() == Some(&candidate.label));
-        for path in candidate.iter().flat_map(|c| &c.diff_stats.changed_files) {
-            applied.insert(path.as_str(), other.id.as_str());
+            .filter(|candidate| other.applied_candidate.as_ref() == Some(&candidate.label))
+            .flat_map(|candidate| &candidate.diff_stats.changed_files)
+            .map(String::as_str)
+            .filter(|path| shown.contains(path) && !applied.contains_key(path))
+            .collect();
+        if changed.is_empty() {
+            continue;
+        }
+        // Either commit may be gone: then nothing shows the record is past S0.
+        let after = record.at > since
+            || s0.is_some_and(|(s0, _)| {
+                record.commit != s0
+                    && super::s0::is_ancestor(&run.source_path, s0, &record.commit).unwrap_or(false)
+            });
+        if after {
+            applied.extend(changed.into_iter().map(|path| (path, other.id.as_str())));
         }
     }
     let observation = StartObservation {
         at: Utc::now(),
         source_head,
         differing: world.changes.len(),
-        paths: world
-            .changes
+        paths: shown
             .iter()
-            .take(MAX_START_PATHS)
-            .map(|change| StartPath {
-                path: change.path.clone(),
-                applied_work: applied.get(change.path.as_str()).map(|id| (*id).to_owned()),
+            .map(|path| StartPath {
+                path: (*path).to_owned(),
+                applied_work: applied.get(path).map(|id| (*id).to_owned()),
             })
             .collect(),
     };
@@ -1699,6 +1739,7 @@ pub(super) async fn finish_locked(
     reason: FinishReason,
     cancel: &CancellationToken,
 ) -> Result<RunRecord> {
+    super::s0::back_before_freeze(state, &mut run)?;
     let run_dir = state.run_dir(&run.id);
     let workspace = run.candidates[0].workspace_path.clone();
     let diff_path = run.candidates[0].diff_path.clone();
@@ -2250,6 +2291,17 @@ pub(crate) fn note_reopen(state: &State, old: &str, new: &str) -> Result<()> {
     crate::state::write_durably(&reopen_notes(state).join(old), new.as_bytes())
 }
 
+/// The Work of every project noted to close as superseded, from the moment
+/// its reopen is noted, whether or not the new Work is published yet.
+pub(crate) fn reopening(state: &State) -> Result<HashSet<String>> {
+    let Ok(listing) = fs::read_dir(reopen_notes(state)) else {
+        return Ok(HashSet::new());
+    };
+    listing
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect()
+}
+
 /// The reopen notes of Work in the project at `root` whose new Work is
 /// published, as (old, new). A note whose new Work will never be published
 /// is removed.
@@ -2670,7 +2722,7 @@ fn print_verdict_and_next(state: &State, run: &RunRecord) {
     if awaits_review(run) {
         print_standing(state, run, validity);
     }
-    print_review_commands(run, validity);
+    print_review_commands(state, run, validity);
 }
 
 /// A short equivalent of `print_single_result_summary` for attached work:
@@ -2705,7 +2757,7 @@ fn print_finish_summary(state: &State, run: &RunRecord) {
     if awaits_review(run) {
         print_standing(state, run, validity);
     }
-    print_review_commands(run, validity);
+    print_review_commands(state, run, validity);
 }
 
 #[cfg(test)]
@@ -2934,6 +2986,90 @@ mod last_seen_tests {
         assert_eq!(reopens(), None);
     }
 
+    /// Work that reopens another goes on from its S0 with that S0's time:
+    /// since the old Work began when its S0 never moved, and since its last
+    /// move when it did. A record without the time is S0 since the Work's
+    /// own start, as before.
+    #[test]
+    fn reopened_work_keeps_the_time_of_the_s0_it_goes_on_from() {
+        let (_temp, state, run) = attached();
+        let at =
+            |time: &str| -> DateTime<Utc> { format!("2026-11-10T{time}:00Z").parse().unwrap() };
+        let workspace = run.attachment.as_ref().unwrap().workspace.clone();
+        let reopen = |old: &RunRecord, started: &str| {
+            let request = AttachRequest {
+                workspace: workspace.clone(),
+                root: Some(old.source_path.clone()),
+                task: None,
+                agent: Some("claude".into()),
+                pid: None,
+                command: None,
+                allow_unsafe_local: false,
+                auto_apply: false,
+                runtime: Some(RuntimeStart {
+                    session: RuntimeSession {
+                        provider: "claude".into(),
+                        session_id: "s".into(),
+                        source: "resume".into(),
+                        started_at: at(started),
+                        ended_at: None,
+                        end_reason: None,
+                        model: None,
+                    },
+                    resumed: true,
+                    commit: old.s0_commit().unwrap().0.to_owned(),
+                    discovered: false,
+                    reopens: Some(old.id.clone()),
+                }),
+            };
+            create(&state, request).unwrap()
+        };
+        let save = |run: &RunRecord| {
+            Database::open(state.db_path())
+                .unwrap()
+                .sync_run(run)
+                .unwrap();
+            state.save_run(run).unwrap();
+        };
+        // A hook's result that began at 10:00, its S0 never moved.
+        let mut old = state.load_run(&run.id).unwrap();
+        old.created_at = at("10:00");
+        let commit = old.s0_commit().unwrap().0.to_owned();
+        old.attachment.as_mut().unwrap().provenance = BaselineProvenance::WorkspaceAtStart {
+            commit: commit.clone(),
+        };
+        save(&old);
+
+        let new = reopen(&old, "11:00");
+        assert_eq!(new.created_at, at("11:00"));
+        assert_eq!(new.s0_commit(), Some((commit.as_str(), at("10:00"))));
+        let mut without = serde_json::to_value(&new).unwrap();
+        without["attachment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("s0_since");
+        let without: RunRecord = serde_json::from_value(without).unwrap();
+        assert_eq!(without.s0_commit(), Some((commit.as_str(), at("11:00"))));
+
+        // Its S0 moves to a source recorded at 11:30, and a session reopens it.
+        let mut moved = new;
+        let landed = source::world_commit(&workspace).unwrap();
+        moved.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: moved.baseline_path.clone(),
+            baseline_commit: moved.baseline_commit.clone(),
+            commit: commit.clone(),
+            moved_to: landed.clone(),
+            moved_at: at("11:31"),
+            recorded_at: at("11:30"),
+            landed_run: None,
+            back: false,
+        });
+        save(&moved);
+        let newer = reopen(&moved, "12:00");
+        assert_eq!(newer.s0_commit(), Some((landed.as_str(), at("11:30"))));
+        assert_eq!(newer.baseline_history, moved.baseline_history);
+    }
+
     #[tokio::test]
     async fn a_removed_workspace_without_a_last_seen_patch_can_only_be_closed() {
         let (_temp, state, run) = attached();
@@ -2952,6 +3088,242 @@ mod last_seen_tests {
         assert_eq!(
             state.load_run(&run.id).unwrap().outcome.lifecycle,
             LifecycleState::Working
+        );
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = source::git_command(dir)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn save(state: &State, run: &RunRecord) {
+        Database::open(state.db_path())
+            .unwrap()
+            .sync_run(run)
+            .unwrap();
+        state.save_run(run).unwrap();
+    }
+
+    /// `template` as Work `id` that just landed `files` as the project has
+    /// them now: its applied patch names them, and the source is recorded.
+    fn landed(state: &State, template: &RunRecord, id: &str, files: &[&str]) -> RunRecord {
+        let mut run = template.clone();
+        run.id = id.into();
+        run.outcome.application = ApplicationState::Applied;
+        run.applied_candidate = Some(run.candidates[0].label.clone());
+        run.candidates[0].diff_stats.changed_files =
+            files.iter().map(|file| (*file).to_owned()).collect();
+        super::super::s0::record(state, &run).unwrap();
+        run
+    }
+
+    /// Work a Claude Code session registers in `workspace` from `commit`,
+    /// begun at `at`, or that goes on from the Work it `reopens` there.
+    fn register(
+        state: &State,
+        workspace: &Path,
+        root: &Path,
+        commit: &str,
+        at: DateTime<Utc>,
+        reopens: Option<&RunRecord>,
+    ) -> RunRecord {
+        let request = AttachRequest {
+            workspace: workspace.to_owned(),
+            root: Some(root.to_owned()),
+            task: None,
+            agent: Some("claude".into()),
+            pid: None,
+            command: None,
+            allow_unsafe_local: false,
+            auto_apply: false,
+            runtime: Some(RuntimeStart {
+                session: RuntimeSession {
+                    provider: "claude".into(),
+                    session_id: "s".into(),
+                    source: "startup".into(),
+                    started_at: at,
+                    ended_at: None,
+                    end_reason: None,
+                    model: None,
+                },
+                resumed: reopens.is_some(),
+                commit: commit.into(),
+                discovered: false,
+                reopens: reopens.map(|old| old.id.clone()),
+            }),
+        };
+        create(state, request).unwrap()
+    }
+
+    /// Each path a fresh observation of Work `id`'s source at start shows,
+    /// and the Work it names, against `runs` as given and reversed: the two
+    /// must agree.
+    fn named(state: &State, id: &str, mut runs: Vec<RunRecord>) -> Vec<(String, Option<String>)> {
+        let observe = |runs: &[RunRecord]| {
+            let mut run = state.load_run(id).unwrap();
+            run.attachment.as_mut().unwrap().source_at_start = Some(SourceAtStart::NotObserved);
+            save(state, &run);
+            let observed = observe_start(state, id, runs).unwrap();
+            match observed.attachment.unwrap().source_at_start {
+                Some(SourceAtStart::Observed(observation)) => observation
+                    .paths
+                    .into_iter()
+                    .map(|path| (path.path, path.applied_work))
+                    .collect::<Vec<_>>(),
+                other => panic!("not observed: {other:?}"),
+            }
+        };
+        let forward = observe(&runs);
+        runs.reverse();
+        assert_eq!(observe(&runs), forward, "the order of runs named the Work");
+        forward
+    }
+
+    /// A landed `file.txt` and `a.txt` and was committed before this Work
+    /// began from that commit, so its S0 holds them; B landed `file.txt`
+    /// after. The path names B, in either order of `runs`. `a.txt`, edited
+    /// by hand since, names nothing: only A, already in S0, landed it.
+    #[test]
+    fn a_path_names_the_last_work_that_landed_it_after_s0() {
+        let (temp, state, template) = attached();
+        let root = &template.source_path;
+        fs::write(root.join("file.txt"), "a\n").unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        let a = landed(&state, &template, "work-a", &["a.txt", "file.txt"]);
+        git(root, &["add", "a.txt", "file.txt"]);
+        git(root, &["commit", "--quiet", "-m", "A"]);
+        let head = git(root, &["rev-parse", "HEAD"]);
+        let workspace = temp.path().join("w");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "w",
+                workspace.to_str().unwrap(),
+            ],
+        );
+        // It begins as A's landing is recorded, which is not after it.
+        let began = super::super::s0::recorded(&state, root).unwrap()[0].at;
+        let w = register(&state, &workspace, root, &head, began, None);
+        fs::write(root.join("file.txt"), "b\n").unwrap();
+        let b = landed(&state, &template, "work-b", &["file.txt"]);
+        fs::write(root.join("a.txt"), "by hand\n").unwrap();
+
+        assert_eq!(
+            named(&state, &w.id, vec![a, b, w.clone()]),
+            [
+                ("a.txt".to_owned(), None),
+                ("file.txt".to_owned(), Some("work-b".to_owned())),
+            ]
+        );
+    }
+
+    /// A landed `file.txt` after this Work began, and the record of landings
+    /// can't be read: the path is still observed, and names no Work.
+    #[test]
+    fn an_unreadable_record_of_landings_still_observes_and_names_no_work() {
+        let (temp, state, template) = attached();
+        let root = &template.source_path;
+        let workspace = temp.path().join("w");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "w",
+                workspace.to_str().unwrap(),
+            ],
+        );
+        let head = git(root, &["rev-parse", "HEAD"]);
+        let w = register(&state, &workspace, root, &head, Utc::now(), None);
+        fs::write(root.join("file.txt"), "a\n").unwrap();
+        let a = landed(&state, &template, "work-a", &["file.txt"]);
+        let record = fs::read_dir(state.root.join("projects"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("sources.json"))
+            .find(|path| path.is_file())
+            .expect("A's landing was recorded");
+        fs::write(record, "{").unwrap();
+        assert!(super::super::s0::recorded(&state, root).is_err());
+
+        assert_eq!(
+            named(&state, &w.id, vec![a, w.clone()]),
+            [("file.txt".to_owned(), None)]
+        );
+    }
+
+    /// Work whose S0 moved to A's recorded landing, reopened after B landed,
+    /// goes on from that S0 and its time: B landed after it, though before
+    /// the reopened Work began, and names `file.txt`. A, which S0 is, names
+    /// nothing, and the record of B does not descend from it.
+    #[test]
+    fn reopened_work_whose_s0_moved_names_only_what_landed_after_the_move() {
+        let (temp, state, template) = attached();
+        let root = &template.source_path;
+        let workspace = temp.path().join("w");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "w",
+                workspace.to_str().unwrap(),
+            ],
+        );
+        let first = git(root, &["rev-parse", "HEAD"]);
+        let w = register(&state, &workspace, root, &first, Utc::now(), None);
+        fs::write(root.join("file.txt"), "a\n").unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        let a = landed(&state, &template, "work-a", &["a.txt", "file.txt"]);
+        // Its agent merged A's landing, and S0 moved there (`s0::follow`).
+        let to = super::super::s0::recorded(&state, root).unwrap().remove(0);
+        let mut w = state.load_run(&w.id).unwrap();
+        w.baseline_history.push(crate::EarlierBaseline {
+            baseline_path: w.baseline_path.clone(),
+            baseline_commit: w.baseline_commit.clone(),
+            commit: first,
+            moved_to: to.commit.clone(),
+            moved_at: to.at,
+            recorded_at: to.at,
+            landed_run: Some(a.id.clone()),
+            back: false,
+        });
+        save(&state, &w);
+        fs::write(root.join("file.txt"), "b\n").unwrap();
+        let b = landed(&state, &template, "work-b", &["file.txt"]);
+        fs::write(root.join("a.txt"), "by hand\n").unwrap();
+        let records = super::super::s0::recorded(&state, root).unwrap();
+        assert!(records[1].at > records[0].at, "{records:?}");
+
+        let reopened = register(&state, &workspace, root, &to.commit, Utc::now(), Some(&w));
+        assert_eq!(reopened.s0_commit(), Some((to.commit.as_str(), to.at)));
+        assert_eq!(
+            named(&state, &reopened.id, vec![a, b, w, reopened.clone()]),
+            [
+                ("a.txt".to_owned(), None),
+                ("file.txt".to_owned(), Some("work-b".to_owned())),
+            ]
         );
     }
 }
