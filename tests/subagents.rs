@@ -628,6 +628,45 @@ fn three_subagents_of_one_session_are_three_works_each_from_its_own_head() {
     parent.stop();
 }
 
+/// A subagent's worktree, made from HEAD while a change sits uncommitted in
+/// the root: its Work says what differed and Claude Code's word for that
+/// worktree, never a launch or a setting its parent's Agent tool ignores.
+#[test]
+fn a_subagent_from_head_behind_uncommitted_source_is_told_only_what_its_worktree_holds() {
+    let mut p = Project::new(&[]);
+    let parent = Parent::start();
+    fs::write(p.root.join("src/lib.rs"), LIB.replace("2", "3")).unwrap();
+    let worktree = p.subagent(B, "HEAD", Some(&parent));
+    p.start_owner();
+    let b = p.start(&worktree, B);
+    p.until(&b, "its source at start is observed", |run| {
+        run["attachment"]["source_at_start"]["observed"].is_object()
+    });
+
+    let status = p.ok(&["status", &b]);
+    let shown: Vec<&str> = status
+        .lines()
+        .skip_while(|line| !line.starts_with("  source at start:"))
+        .enumerate()
+        .take_while(|(n, line)| *n == 0 || line.starts_with("    "))
+        .map(|(_, line)| line)
+        .collect();
+    assert_eq!(shown.len(), 2, "{status}");
+    assert!(
+        shown[0].starts_with("  source at start: differed from its S0 at 1 path (observed ")
+            && shown[0].ends_with("): src/lib.rs"),
+        "{status}"
+    );
+    assert_eq!(
+        shown[1],
+        "    Claude Code: a subagent's worktree starts from the checkout's HEAD; uncommitted changes are not copied."
+    );
+    for word in ["dispatch attach", "baseRef"] {
+        assert!(!status.contains(word), "{status}");
+    }
+    parent.stop();
+}
+
 /// The parent's own `Stop` and `SessionEnd` carry its session ID, which no
 /// subagent's Work holds: they leave that Work alone. A permission prompt
 /// inside a subagent waits on the person in that subagent's Work alone, and

@@ -2586,7 +2586,8 @@ mod tests {
     }
 
     /// What differed at the start leads with the managed launch; only a
-    /// Claude worktree gets Claude's advice. The same source takes no room.
+    /// Claude worktree gets Claude's advice, and a subagent's only Claude's
+    /// word for its worktree. The same source takes no room.
     #[test]
     fn details_say_what_differed_at_the_start_and_only_claude_worktrees_get_claude_advice() {
         let id = "01M4DRXH00000000000000000B";
@@ -2626,6 +2627,25 @@ mod tests {
             [
                 "differed from its S0 at 1 path (observed 2026-10-12 09:30 UTC, source HEAD 5e3cb514): notes.txt",
                 generic,
+            ]
+        );
+        // Its parent starts a subagent: no managed launch and no setting.
+        let mut subagent = worktree(id, "agent-a85d8d5dd371b34d4", 1);
+        let session = &mut subagent.attachment.as_mut().unwrap().sessions[0];
+        session.session_id = "lock:agent-a85d8d5dd371b34d4".into();
+        session.subagent = Some(crate::Subagent {
+            parent_session: None,
+            agent_id: "a85d8d5dd371b34d4".into(),
+            agent_type: None,
+            locked: true,
+            stopped_at: None,
+            kept_on: None,
+        });
+        assert_eq!(
+            lines(&with(subagent, observed(1)), "At start"),
+            [
+                "differed from its S0 at 1 path (observed 2026-10-12 09:30 UTC, source HEAD 5e3cb514): notes.txt",
+                "Claude Code: a subagent's worktree starts from the checkout's HEAD; uncommitted changes are not copied.",
             ]
         );
         let none = |item: &Item| item.details.iter().all(|d| d.label != "At start");

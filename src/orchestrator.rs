@@ -3367,8 +3367,8 @@ pub(crate) fn last_seen_changes(run: &RunRecord) -> Option<String> {
 }
 
 /// How the integration source compared with the Work's S0 when it began, as
-/// observed then: what differed, the managed launch that avoids it, and the
-/// runtime's own advice. Empty when there was nothing to observe.
+/// observed then: what differed, and the advice for it
+/// (`runtime::start_advice`). Empty when there was nothing to observe.
 pub(crate) fn source_at_start(attachment: &crate::AttachmentRecord) -> Vec<String> {
     let observation = match &attachment.source_at_start {
         None => return Vec::new(),
@@ -3396,18 +3396,17 @@ pub(crate) fn source_at_start(attachment: &crate::AttachmentRecord) -> Vec<Strin
     if observation.differing > paths.len() {
         paths.push(format!("{} more", observation.differing - paths.len()));
     }
-    let mut lines = vec![
-        format!(
-            "differed from its S0 at {} path{} (observed {when}{head}): {}",
-            observation.differing,
-            if observation.differing == 1 { "" } else { "s" },
-            paths.join(", ")
-        ),
-        "Work started with dispatch attach -- <agent> begins from the current source, \
-         including uncommitted changes."
-            .into(),
-    ];
-    lines.extend(crate::runtime::start_advice(attachment).map(str::to_owned));
+    let mut lines = vec![format!(
+        "differed from its S0 at {} path{} (observed {when}{head}): {}",
+        observation.differing,
+        if observation.differing == 1 { "" } else { "s" },
+        paths.join(", ")
+    )];
+    lines.extend(
+        crate::runtime::start_advice(attachment)
+            .iter()
+            .map(|line| line.to_string()),
+    );
     lines
 }
 

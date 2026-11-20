@@ -491,15 +491,21 @@ fn process_started() -> (Instant, DateTime<Utc>) {
     *STARTED.get_or_init(|| (Instant::now(), Utc::now()))
 }
 
-/// The runtime's own advice for Work in a workspace it made that began from
-/// source other than the project's; none for any other workspace.
-pub fn start_advice(attachment: &AttachmentRecord) -> Option<&'static str> {
+/// The managed launch, which avoids beginning from other source.
+const ATTACH_ADVICE: &str = "Work started with dispatch attach -- <agent> begins from the \
+     current source, including uncommitted changes.";
+
+/// The advice for Work that began from source other than the project's: the
+/// managed launch, then the runtime's own for a workspace it made. A
+/// subagent's parent starts it, so its Work has only Claude Code's.
+pub fn start_advice(attachment: &AttachmentRecord) -> &'static [&'static str] {
     if attachment.workspace_owner != WorkspaceOwner::Runtime {
-        return None;
+        return &[ATTACH_ADVICE];
     }
-    match attachment.sessions.first()?.provider.as_str() {
-        "claude" => Some(claude::START_ADVICE),
-        _ => None,
+    match attachment.sessions.first() {
+        Some(session) if session.subagent.is_some() => &[claude::SUBAGENT_START_ADVICE],
+        Some(session) if session.provider == "claude" => &[ATTACH_ADVICE, claude::START_ADVICE],
+        _ => &[ATTACH_ADVICE],
     }
 }
 

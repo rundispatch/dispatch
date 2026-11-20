@@ -541,6 +541,11 @@ pub const START_ADVICE: &str = "Claude Code: local commits reach a claude --work
      only with worktree.baseRef: \"head\" in its settings; neither that setting nor a commit \
      copies uncommitted changes.";
 
+/// For a subagent's Work instead: Claude Code 2.1.296 made its worktree from
+/// the checkout's HEAD, with or without `worktree.baseRef`.
+pub const SUBAGENT_START_ADVICE: &str = "Claude Code: a subagent's worktree starts from the \
+     checkout's HEAD; uncommitted changes are not copied.";
+
 /// Where Claude Code keeps the user's settings: `$CLAUDE_CONFIG_DIR`, or
 /// `~/.claude`.
 pub fn settings_path() -> Result<std::path::PathBuf> {
