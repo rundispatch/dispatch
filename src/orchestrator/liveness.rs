@@ -27,9 +27,9 @@ use std::{path::Path, time::Duration};
 use anyhow::{Result, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
 
-use super::{attach::record_session_end, persist_event};
+use super::{attach::end_session, persist_event};
 use crate::{
-    EventRecord, LifecycleState, RunMode, RunRecord, WorkspaceOwner,
+    EventRecord, LifecycleState, RunMode, RunRecord, RuntimeSession, WorkspaceOwner,
     db::Database,
     lock::OperationLock,
     process::{self, IdentityState, ProcessIdentity},
@@ -59,12 +59,24 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
     };
     // Only a workspace the runtime made: a person's attach, with or without
     // `--pid`, is theirs. Finished Work is followed while it still records its
-    // agent: a session that outlives `finish`, even by a moment, still has its
-    // end recorded.
-    if run.mode != RunMode::Attached
-        || (run.outcome.lifecycle == LifecycleState::Finished && attachment.agent_process.is_none())
-        || attachment.workspace_owner != WorkspaceOwner::Runtime
+    // agent, or a subagent's session is open: a session that outlives
+    // `finish`, even by a moment, still has its end recorded.
+    if run.mode != RunMode::Attached || attachment.workspace_owner != WorkspaceOwner::Runtime {
+        return Ok(());
+    }
+    // A subagent's Work, unless a session of the person's, started there
+    // since, is open: that one's own lock is followed as any session's.
+    let open = |s: &&RuntimeSession| s.ended_at.is_none();
+    let sessions = || attachment.sessions.iter();
+    if sessions().filter(open).any(|s| s.subagent.is_some())
+        && sessions().filter(open).all(|s| s.subagent.is_some())
     {
+        let lock = claude::worktree_signals(&attachment.workspace).lock;
+        if matches!(lock, None | Some(Lock::Agent { .. })) {
+            return observe_subagent(state, run, lock);
+        }
+    }
+    if run.outcome.lifecycle == LifecycleState::Finished && attachment.agent_process.is_none() {
         return Ok(());
     }
     if attachment.workspace_removed.is_some() {
@@ -117,7 +129,7 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
         (Some(old), Some((pid, start))) if pid == old.pid => {
             match lock_liveness(workspace, pid, start.as_deref()) {
                 Liveness::Gone => {
-                    end_sessions(state, run, None, "process_gone")?;
+                    end_sessions(state, run, |_| true, "process_gone")?;
                     set_agent_process(state, &run.id, Some(old), None)
                 }
                 Liveness::Running | Liveness::Unknown => Ok(()),
@@ -127,15 +139,36 @@ fn observe_run(state: &State, root: &Path, run: &RunRecord) -> Result<()> {
         // released. Sessions that began before the new process stay its own.
         (Some(old), Some((pid, start))) => {
             if let Some(since) = start.as_deref().and_then(lock_start) {
-                end_sessions(state, run, Some(since), "lock_released")?;
+                end_sessions(state, run, |s| s.started_at < since, "lock_released")?;
             }
             let new = running(workspace, pid, start.as_deref());
             set_agent_process(state, &run.id, Some(old), new)
         }
         (Some(old), None) => {
-            end_sessions(state, run, None, "lock_released")?;
+            end_sessions(state, run, |_| true, "lock_released")?;
             set_agent_process(state, &run.id, Some(old), None)
         }
+    }
+}
+
+/// A Claude Code subagent's Work, with no other session open in it, its
+/// worktree's `lock` an agent lock or none. That lock names the process of
+/// its parent session, which every subagent of that session shares, so no
+/// process is ever recorded for it. A session whose run started under the
+/// lock ends once the lock goes, or once its process is gone (the parent
+/// exited), whether or not its stop came. A run that started without it, as
+/// a resumed run does, ends at its stop (`freeze_at_stop`), or here when no
+/// lock is held and that stop could not end it; a lock left behind by a
+/// parent gone is not its own.
+fn observe_subagent(state: &State, run: &RunRecord, lock: Option<Lock>) -> Result<()> {
+    let locked = |s: &RuntimeSession| s.subagent.as_ref().is_some_and(|s| s.locked);
+    let stopped = |s: &RuntimeSession| s.subagent.as_ref().is_some_and(|s| s.stopped_at.is_some());
+    match lock {
+        Some(lock) => match claude::liveness(&lock) {
+            Liveness::Gone => end_sessions(state, run, locked, "process_gone"),
+            Liveness::Running | Liveness::Unknown => Ok(()),
+        },
+        None => end_sessions(state, run, |s| locked(s) || stopped(s), "lock_released"),
     }
 }
 
@@ -151,7 +184,7 @@ fn follow_removed(state: &State, run: &RunRecord) -> Result<()> {
     };
     match process::identity_state(old) {
         IdentityState::Gone | IdentityState::Reused => {
-            end_sessions(state, run, None, "process_gone")?;
+            end_sessions(state, run, |_| true, "process_gone")?;
             set_agent_process(state, &run.id, Some(old), None)
         }
         IdentityState::ExactLive | IdentityState::Unknown => Ok(()),
@@ -178,7 +211,9 @@ pub(crate) fn session_process_gone(root: &Path, run: &RunRecord) -> bool {
     let lock_gone = if claude::made_by_claude(root, workspace, &signals) {
         match &signals.lock {
             None => true,
-            Some(lock @ Lock::Session { .. }) => claude::liveness(lock) == Liveness::Gone,
+            Some(lock @ (Lock::Session { .. } | Lock::Agent { .. })) => {
+                claude::liveness(lock) == Liveness::Gone
+            }
             Some(Lock::Other(_)) => false,
         }
     } else if hermes::made(root, workspace) {
@@ -226,27 +261,25 @@ fn lock_start(start: &str) -> Option<DateTime<Utc>> {
         .map(|start| start.and_utc())
 }
 
-/// End every open session that began before `before` (all of them for `None`),
-/// as a hook's end would. A session a hook ended already stays as it was.
+/// End every open session that `ends`, as a hook's end would. A session a
+/// hook ended already stays as it was.
 fn end_sessions(
     state: &State,
     run: &RunRecord,
-    before: Option<DateTime<Utc>>,
+    ends: impl Fn(&RuntimeSession) -> bool,
     reason: &str,
 ) -> Result<()> {
     let sessions = run.attachment.iter().flat_map(|a| &a.sessions);
-    for session in sessions.filter(|session| {
-        session.ended_at.is_none() && before.is_none_or(|before| session.started_at < before)
-    }) {
-        let recorded = record_session_end(
-            state,
-            &run.id,
-            &session.provider,
-            &session.session_id,
-            reason,
-            Utc::now(),
-            Duration::from_secs(3),
-        )?;
+    for session in sessions.filter(|session| session.ended_at.is_none() && ends(session)) {
+        // Judged again under the run's lock: a session may have started
+        // again since this tick read the Work.
+        let same = |known: &RuntimeSession| {
+            known.provider == session.provider
+                && known.session_id == session.session_id
+                && ends(known)
+        };
+        let wait = Duration::from_secs(3);
+        let recorded = end_session(state, &run.id, same, reason, Utc::now(), wait)?;
         if !recorded {
             bail!("attached work has a foreground owner: still busy after waiting 3s");
         }
@@ -311,7 +344,7 @@ mod tests {
     use crate::{
         RuntimeSession,
         orchestrator::{
-            attach::{self, AttachRequest, record_session_start},
+            attach::{self, AttachRequest, record_session_end, record_session_start},
             serve::load_source_runs,
             work_line,
         },
@@ -402,6 +435,7 @@ mod tests {
                 ended_at: None,
                 end_reason: None,
                 model: None,
+                subagent: None,
             };
             record_session_start(
                 &self.state,
@@ -728,6 +762,37 @@ mod tests {
         stop(second);
     }
 
+    /// Found in review: a subagent's run starts again after a tick read its
+    /// Work as stopped, and before that tick ends the stopped session. The
+    /// session runs on.
+    #[test]
+    fn a_subagent_that_starts_again_while_a_tick_looks_runs_on() {
+        let path = ".claude/worktrees/agent-a1";
+        let p = attached(path, "worktree-agent-a1", "claude", |gitdir| {
+            std::fs::write(gitdir.join("CLAUDE_BASE"), "base\n").unwrap();
+        });
+        let subagent = serde_json::json!({"parent_session": "p", "agent_id": "a1"});
+        let session = RuntimeSession {
+            provider: "claude".into(),
+            session_id: "p_agent-a1".into(),
+            source: "subagent".into(),
+            started_at: Utc::now() - Duration::minutes(1),
+            ended_at: None,
+            end_reason: None,
+            model: None,
+            subagent: Some(serde_json::from_value(subagent).unwrap()),
+        };
+        let wait = std::time::Duration::from_secs(5);
+        record_session_start(&p.state, &p.run_id, session.clone(), wait).unwrap();
+        p.edit(|attachment| {
+            attachment.sessions[0].subagent.as_mut().unwrap().stopped_at = Some(Utc::now());
+        });
+        let runs = load_source_runs(&p.state, &p.root).unwrap();
+        record_session_start(&p.state, &p.run_id, session, wait).unwrap();
+        observe(&p.state, &p.root, &runs).unwrap();
+        assert_eq!(p.sessions(), [("p_agent-a1".into(), None)]);
+    }
+
     const HERMES: &str = ".worktrees/hermes-0a1b2c3d";
 
     /// Work in a worktree laid out as `hermes chat --worktree` makes it, with
@@ -749,6 +814,7 @@ mod tests {
             ended_at: None,
             end_reason: None,
             model: None,
+            subagent: None,
         };
         record_session_start(
             &p.state,

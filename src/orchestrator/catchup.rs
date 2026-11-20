@@ -737,6 +737,7 @@ mod tests {
                 ended_at: None,
                 end_reason: None,
                 model: None,
+                subagent: None,
             };
             let request = AttachRequest {
                 workspace: workspace.clone(),
@@ -781,6 +782,7 @@ mod tests {
                 ended_at: None,
                 end_reason: None,
                 model: None,
+                subagent: None,
             };
             let found =
                 registration::discovered(&self.state, &self.root, &workspace, session, None);
@@ -1317,6 +1319,7 @@ mod tests {
             ended_at: None,
             end_reason: None,
             model: None,
+            subagent: None,
         };
         let wait = std::time::Duration::ZERO;
         assert!(attach::record_session_start(&p.state, &wrapped.id, session, wait).unwrap());

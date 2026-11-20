@@ -2114,6 +2114,7 @@ mod tests {
             ended_at: None,
             end_reason: None,
             model: None,
+            subagent: None,
         };
         for finishing in [false, true] {
             let temp = tempfile::tempdir().unwrap();

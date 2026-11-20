@@ -7,8 +7,13 @@
 //! agent, as `additionalContext`: Claude Code shows it to the model before
 //! the first prompt, or right after the tool's result. A pending ask to catch
 //! up is delivered at `Stop`, which it keeps going, or by the waiter, a second
-//! `Stop` hook that wakes an idle session (`wait`). Everything Claude-specific
-//! ends here.
+//! `Stop` hook that wakes an idle session (`wait`).
+//!
+//! A subagent in its own worktree (`isolation: worktree`) is a session of its
+//! own (`isolated`): `SubagentStart` registers it and delivers notes, as
+//! `SessionStart` does, and `SubagentStop`, which ends each of its responses,
+//! delivers an ask as `Stop` does or keeps its exact Δ. Everything
+//! Claude-specific ends here.
 
 use std::{
     fs,
@@ -22,7 +27,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{EventKind, Hook, Reply, RuntimeEvent};
-use crate::{NeedsYouKind, orchestrator::catchup, state::State};
+use crate::{NeedsYouKind, Subagent, orchestrator::catchup, state::State};
 
 #[derive(Deserialize)]
 struct Input {
@@ -50,6 +55,14 @@ struct Input {
     message: Option<String>,
     #[serde(default)]
     transcript_path: Option<std::path::PathBuf>,
+    /// Inside a subagent: which one, and its type. `transcript_path` is then
+    /// its parent's, and `agent_transcript_path` its own.
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    agent_transcript_path: Option<std::path::PathBuf>,
 }
 
 /// The `Notification` types that mean the session waits on the person, the
@@ -68,14 +81,46 @@ pub fn parse(input: &[u8]) -> Result<Option<RuntimeEvent>> {
         super::MAX_INPUT_BYTES
     );
     let input: Input = serde_json::from_slice(input).context("unreadable hook input")?;
+    // Every payload inside a subagent carries its parent's session ID; one
+    // outside its own worktree is its parent's.
+    let subagent = input
+        .agent_id
+        .as_deref()
+        .and_then(|id| isolated(&input.cwd, id))
+        .map(|id| Subagent {
+            parent_session: Some(input.session_id.clone()),
+            agent_id: id.to_owned(),
+            agent_type: input.agent_type.filter(|kind| !kind.is_empty()),
+            locked: false,
+            stopped_at: None,
+            kept_on: None,
+        });
+    let (session_id, transcript) = match &subagent {
+        Some(subagent) => (
+            format!("{}_agent-{}", input.session_id, subagent.agent_id),
+            input.agent_transcript_path.or(input.transcript_path),
+        ),
+        None => (input.session_id, input.transcript_path),
+    };
     let kind = match input.hook_event_name.as_str() {
         "SessionStart" => {
             let source = input.source.unwrap_or_else(|| "startup".into());
             // A new session, or a fork into its own workspace, begins before
             // any edit; anything else may follow edits made earlier.
             let resumed = !matches!(source.as_str(), "startup" | "fork");
-            EventKind::Start { source, resumed }
+            EventKind::Start {
+                source,
+                resumed,
+                subagent: None,
+            }
         }
+        // S0 is its worktree as Claude Code made it, before the first tool
+        // call; a later start of the same subagent goes on from its Work.
+        "SubagentStart" if subagent.is_some() => EventKind::Start {
+            source: "subagent".into(),
+            resumed: false,
+            subagent,
+        },
         "SessionEnd" => EventKind::End {
             reason: input.reason.unwrap_or_else(|| "other".into()),
         },
@@ -97,14 +142,14 @@ pub fn parse(input: &[u8]) -> Result<Option<RuntimeEvent>> {
             EventKind::NeedsYou {
                 kind: *kind,
                 message: input.message.unwrap_or_default(),
-                transcript: input.transcript_path,
+                transcript,
             }
         }
         // The turn ended: Claude waits for the next prompt.
         "Stop" => EventKind::NeedsYou {
             kind: NeedsYouKind::TurnEnded,
             message: "waiting for your next prompt".into(),
-            transcript: input.transcript_path,
+            transcript,
         },
         _ => return Ok(None),
     };
@@ -119,11 +164,25 @@ pub fn parse(input: &[u8]) -> Result<Option<RuntimeEvent>> {
     });
     Ok(Some(RuntimeEvent {
         provider: "claude",
-        session_id: input.session_id,
+        session_id,
         cwd,
         model,
         kind,
     }))
+}
+
+/// The subagent `agent_id` names, without Claude Code's `agent-` prefix, when
+/// `cwd` is in its own worktree, `.claude/worktrees/agent-<agent_id>`. Any
+/// other payload with an `agent_id` (a subagent without isolation, a
+/// teammate, or Claude Code's own agents for prompt suggestions and `/btw`)
+/// works in its parent's directory: it registers nothing there, and takes
+/// none of the notes or asks meant for the Work there.
+fn isolated<'a>(cwd: &Path, agent_id: &'a str) -> Option<&'a str> {
+    let id = agent_id.strip_prefix("agent-").unwrap_or(agent_id);
+    let own = Path::new(".claude")
+        .join("worktrees")
+        .join(format!("agent-{id}"));
+    (super::session_id(id) && super::workspace(cwd)?.ends_with(own)).then_some(id)
 }
 
 /// What `dispatch hook claude` prints, and its exit status.
@@ -148,11 +207,25 @@ pub fn handle(state: &State, input: &[u8]) -> Output {
     let head = super::head(input);
     let text = |name: &str| head.get(name).and_then(Value::as_str);
     let (event, cwd) = (text("hook_event_name"), text("cwd").map(Path::new));
-    // An ask to catch up keeps the turn going, as its reason, so the turn
-    // has not ended. Never on a turn a `Stop` hook already kept going.
-    if event == Some("Stop")
+    // A subagent outside its own worktree (`isolated`) registers nothing and
+    // takes no note or ask there: they are the Work's there.
+    let agent = text("agent_id");
+    let subagent = agent.and_then(|id| isolated(cwd?, id));
+    let takes = agent.is_none() || subagent.is_some();
+    if subagent.is_none() && matches!(event, Some("SubagentStart" | "SubagentStop")) {
+        return notice(Ok(Reply::Silent), None);
+    }
+    // An ask to catch up keeps the turn, or the subagent's run, going, as its
+    // reason, so it has not ended. Never on one a stop hook already kept
+    // going.
+    let via = match event {
+        Some("Stop") => Some("stop"),
+        Some("SubagentStop") => Some("subagent_stop"),
+        _ => None,
+    };
+    if let Some(via) = via.filter(|_| takes)
         && head.get("stop_hook_active") != Some(&Value::Bool(true))
-        && let Some(reason) = cwd.and_then(|cwd| super::catch_up(state, cwd, "stop"))
+        && let Some(reason) = cwd.and_then(|cwd| super::catch_up(state, cwd, via))
     {
         return Output {
             stdout: serde_json::json!({"decision": "block", "reason": reason}).to_string(),
@@ -160,8 +233,11 @@ pub fn handle(state: &State, input: &[u8]) -> Output {
             code: 0,
         };
     }
+    if let (Some("SubagentStop"), Some(cwd), Some(id)) = (event, cwd, subagent) {
+        return notice(stopped(state, cwd, id), None);
+    }
     let notes = match (event, cwd) {
-        (Some(event @ ("SessionStart" | "PostToolUse")), Some(cwd)) => {
+        (Some(event @ ("SessionStart" | "SubagentStart" | "PostToolUse")), Some(cwd)) if takes => {
             super::deliver(state, cwd, event).map(|notes| (event, notes))
         }
         _ => None,
@@ -169,11 +245,20 @@ pub fn handle(state: &State, input: &[u8]) -> Output {
     if event == Some("PostToolUse") {
         return notice(Ok(Reply::Silent), notes);
     }
-    let event = match parse(input) {
+    let mut event = match parse(input) {
         Ok(Some(event)) => event,
         Ok(None) => return notice(Ok(Reply::Silent), notes),
         Err(error) => return notice(Err(error), notes),
     };
+    // Read only in a project someone watches: it takes a `ps`.
+    if let EventKind::Start {
+        subagent: Some(subagent),
+        ..
+    } = &mut event.kind
+        && !super::unwatched(state, &event.cwd)
+    {
+        subagent.locked = agent_locked(&event.cwd, &subagent.agent_id);
+    }
     // Recorded only, never replied to: `Stop`'s stdout reaches Claude Code.
     if matches!(event.kind, EventKind::NeedsYou { .. }) {
         let _ = super::ingest(state, event);
@@ -203,6 +288,37 @@ pub fn handle(state: &State, input: &[u8]) -> Output {
             ),
             code: 2,
         },
+    }
+}
+
+/// A subagent's response ended (`SubagentStop`, read from the payload's
+/// head: its last message can make the rest larger than Dispatch reads).
+/// It runs once per response, so it never ends a session by itself: its
+/// Work's exact Δ is kept now, as Claude Code removes an unchanged worktree
+/// right after with no `WorktreeRemove`. A session whose run started under
+/// its agent lock ends when liveness sees that lock go, shortly after; one
+/// that started without, a resumed run, ends now. In a project nobody
+/// watches it decides from the files alone, as every hook there does: the
+/// owner finishes nothing there, a changed worktree stays, and an unchanged
+/// one holds nothing to keep.
+fn stopped(state: &State, cwd: &Path, agent_id: &str) -> Result<Reply> {
+    if super::unwatched(state, cwd) {
+        return Ok(Reply::Silent);
+    }
+    let Some(workspace) = super::workspace(cwd) else {
+        return Ok(Reply::Silent);
+    };
+    super::stopped(state, &workspace, agent_id).context("keeping this subagent's changes")
+}
+
+/// Whether the worktree holding `cwd` has the agent lock of `agent_id`, and
+/// the process it names runs.
+fn agent_locked(cwd: &Path, agent_id: &str) -> bool {
+    match super::workspace(cwd).and_then(|workspace| worktree_signals(&workspace).lock) {
+        Some(ref lock @ Lock::Agent { ref id, .. }) if id == agent_id => {
+            liveness(lock) == Liveness::Running
+        }
+        _ => false,
     }
 }
 
@@ -364,6 +480,8 @@ type HookSet = [(&'static str, Option<&'static str>, u64, &'static str, bool)];
 /// run Dispatch at all. `PostToolUse`, with no matcher, runs after every
 /// tool call, and does nothing but deliver notes. `Stop` runs twice: once to
 /// record the turn's end or deliver an ask, and once as the waiter.
+/// `SubagentStart` registers a subagent as `SessionStart` does, and
+/// `SubagentStop` may keep its Δ, within the same minute.
 const INSTALLED: &HookSet = &[
     ("SessionStart", None, 60, "", false),
     ("SessionEnd", None, 5, "", false),
@@ -373,12 +491,14 @@ const INSTALLED: &HookSet = &[
     ("Stop", None, 5, "", false),
     ("Stop", None, WAITER_TIMEOUT, WAIT, true),
     ("PostToolUse", None, 5, "", false),
+    ("SubagentStart", None, 60, "", false),
+    ("SubagentStop", None, 60, "", false),
 ];
 
-/// The hooks earlier Dispatches installed: 0.4.6 to 0.4.16, 0.4.17, then
-/// 0.4.18. Settings holding exactly one of these are Dispatch's own, to be
-/// updated, not changed by hand.
-const EARLIER: [&HookSet; 3] = [
+/// The hooks earlier Dispatches installed: 0.4.6 to 0.4.16, 0.4.17, 0.4.18,
+/// then 0.5.0. Settings holding exactly one of these are Dispatch's own, to
+/// be updated, not changed by hand.
+const EARLIER: [&HookSet; 4] = [
     &[
         ("SessionStart", None, 60, "", false),
         ("SessionEnd", None, 5, "", false),
@@ -400,6 +520,16 @@ const EARLIER: [&HookSet; 3] = [
         ("PreToolUse", Some("ExitWorktree"), 300, "", false),
         ("Notification", Some(WAITING_TYPES), 5, "", false),
         ("Stop", None, 5, "", false),
+        ("PostToolUse", None, 5, "", false),
+    ],
+    &[
+        ("SessionStart", None, 60, "", false),
+        ("SessionEnd", None, 5, "", false),
+        ("WorktreeRemove", None, 300, "", false),
+        ("PreToolUse", Some("ExitWorktree"), 300, "", false),
+        ("Notification", Some(WAITING_TYPES), 5, "", false),
+        ("Stop", None, 5, "", false),
+        ("Stop", None, WAITER_TIMEOUT, WAIT, true),
         ("PostToolUse", None, 5, "", false),
     ],
 ];
@@ -643,6 +773,11 @@ pub enum Lock {
         pid: u32,
         start: String,
     },
+    /// `claude agent agent-<id> (pid <pid> start <start>)`, the lock of a
+    /// subagent's worktree from its start until shortly after its first run
+    /// stops; `id` without the `agent-` prefix. The process is its parent
+    /// session's, which every subagent of that session shares.
+    Agent { id: String, pid: u32, start: String },
     /// Any other reason, verbatim: a person's lock, or one not yet observed.
     Other(String),
 }
@@ -689,24 +824,27 @@ pub fn made_by_claude(
 
 /// A lock reason, as `Lock`.
 pub fn parse_lock(reason: &str) -> Lock {
-    let session = || {
-        let rest = reason.strip_prefix("claude session ")?;
+    let locked = |by: &str| {
+        let rest = reason.strip_prefix(by)?;
         let (name, rest) = rest.split_once(" (pid ")?;
         let (pid, rest) = rest.split_once(" start ")?;
         let start = rest.strip_suffix(')')?;
-        Some(Lock::Session {
-            name: name.to_owned(),
-            pid: pid.parse().ok()?,
-            start: one_spaced(start),
-        })
+        Some((name.to_owned(), pid.parse().ok()?, one_spaced(start)))
     };
-    session().unwrap_or_else(|| Lock::Other(reason.to_owned()))
+    if let Some((name, pid, start)) = locked("claude session ") {
+        return Lock::Session { name, pid, start };
+    }
+    let agent = locked("claude agent ").and_then(|(name, pid, start)| {
+        let id = name.strip_prefix("agent-")?.to_owned();
+        Some(Lock::Agent { id, pid, start })
+    });
+    agent.unwrap_or_else(|| Lock::Other(reason.to_owned()))
 }
 
 /// Whether the process `lock` names still runs: its pid exists and started at
 /// the time the lock records, so a recycled pid is not mistaken for it.
 pub fn liveness(lock: &Lock) -> Liveness {
-    let Lock::Session { pid, start, .. } = lock else {
+    let (Lock::Session { pid, start, .. } | Lock::Agent { pid, start, .. }) = lock else {
         return Liveness::Unknown;
     };
     if !crate::process::pid_exists(*pid) {
@@ -769,10 +907,22 @@ mod tests {
                 start: "Sat Oct 3 09:00:00 2026".into(),
             }
         );
+        // A subagent's, as the probe found it, naming its parent's process.
+        assert_eq!(
+            parse_lock(
+                "claude agent agent-a85d8d5dd371b34d4 (pid 24238 start Wed Nov 18 19:01:51 2026)"
+            ),
+            Lock::Agent {
+                id: "a85d8d5dd371b34d4".into(),
+                pid: 24238,
+                start: "Wed Nov 18 19:01:51 2026".into(),
+            }
+        );
         for other in [
             "moving it",
             "claude session x (pid abc start y)",
             "claude agent a-1",
+            "claude agent a85d8d5d (pid 1 start Wed Nov 18 19:01:51 2026)",
         ] {
             assert_eq!(parse_lock(other), Lock::Other(other.into()));
         }
@@ -988,6 +1138,61 @@ mod tests {
         // The matcher setup installs names exactly the types parsed as marks.
         let names: Vec<&str> = WAITING.iter().map(|(name, _)| *name).collect();
         assert!(INSTALLED.contains(&("Notification", Some(&names.join("|")), 5, "", false)));
+    }
+
+    /// Only in its own worktree is a subagent a session of its own, named
+    /// from its parent's and its ID, with or without the `agent-` prefix.
+    /// Elsewhere it registers nothing, and its wait on the person is its
+    /// parent's.
+    #[test]
+    fn a_subagent_is_its_own_session_only_in_its_own_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap().join("repo");
+        let own = root.join(".claude/worktrees/agent-a85d8d5dd371b34d4");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(own.join("src")).unwrap();
+        fs::write(own.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let event = |cwd: &Path, name: &str, agent: &str| {
+            let fields = serde_json::json!({
+                "cwd": cwd, "agent_id": agent, "agent_type": "general-purpose",
+                "notification_type": "permission_prompt",
+                "agent_transcript_path": "/home/u/.claude/projects/p/s/subagents/a.jsonl",
+            });
+            parse(&probe(name, fields)).unwrap()
+        };
+        for agent in ["a85d8d5dd371b34d4", "agent-a85d8d5dd371b34d4"] {
+            let start = event(&own.join("src"), "SubagentStart", agent).unwrap();
+            assert_eq!(
+                start.session_id,
+                "96fce6bd-fe23-4b1c-bd1e-b171635c421b_agent-a85d8d5dd371b34d4"
+            );
+            let EventKind::Start {
+                source,
+                resumed,
+                subagent: Some(subagent),
+            } = start.kind
+            else {
+                panic!("not a subagent's start");
+            };
+            assert_eq!((source.as_str(), resumed), ("subagent", false));
+            assert_eq!(subagent.agent_id, "a85d8d5dd371b34d4");
+            assert_eq!(
+                subagent.parent_session.as_deref(),
+                Some("96fce6bd-fe23-4b1c-bd1e-b171635c421b")
+            );
+        }
+        let waiting = event(&own, "Notification", "a85d8d5dd371b34d4").unwrap();
+        assert!(waiting.session_id.ends_with("_agent-a85d8d5dd371b34d4"));
+        assert!(matches!(
+            waiting.kind,
+            EventKind::NeedsYou { transcript: Some(t), .. } if t.ends_with("subagents/a.jsonl")
+        ));
+        // Another subagent in this worktree, and any in the parent's.
+        for (cwd, agent) in [(&own, "a3af667cafd45715f"), (&root, "a85d8d5dd371b34d4")] {
+            assert!(event(cwd, "SubagentStart", agent).is_none());
+            let waiting = event(cwd, "Notification", agent).unwrap();
+            assert_eq!(waiting.session_id, "96fce6bd-fe23-4b1c-bd1e-b171635c421b");
+        }
     }
 
     #[test]
@@ -1356,8 +1561,14 @@ mod tests {
             ("0.4.17", [&removal[..], &marks].concat()),
             ("0.4.18", [&removal[..], &marks, &notes].concat()),
         ];
-        for (release, hooks) in releases {
-            fs::write(&path, written_by(theirs.clone(), old, &hooks).to_string()).unwrap();
+        // 0.5.0's, with the waiter, as `with_set` wrote it.
+        let waiter = with_set(theirs.clone(), EARLIER[3], old).unwrap();
+        let written = releases
+            .into_iter()
+            .map(|(release, hooks)| (release, written_by(theirs.clone(), old, &hooks)))
+            .chain([("0.5.0", waiter)]);
+        for (release, settings) in written {
+            fs::write(&path, settings.to_string()).unwrap();
             assert_eq!(hook(&path).unwrap(), Hook::Earlier(old.into()), "{release}");
             install_hooks(&path, COMMAND).unwrap();
             assert_eq!(
@@ -1376,6 +1587,15 @@ mod tests {
                 (&waiter["asyncRewake"], &waiter["timeout"]),
                 (&true.into(), &28_800.into())
             );
+            // A subagent registers and keeps its Δ within a minute, as a
+            // session start does.
+            for event in ["SubagentStart", "SubagentStop"] {
+                assert_eq!(
+                    settings["hooks"][event],
+                    serde_json::json!([{"hooks": [{"type": "command", "command": COMMAND, "timeout": 60}]}]),
+                    "{release}"
+                );
+            }
             uninstall_hooks(&path).unwrap();
             assert_eq!(read(), theirs, "{release}: nothing of Dispatch's left");
             assert_eq!(hook(&path).unwrap(), Hook::Absent);
