@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::{
-    AttachmentRecord, NeedsYou, NeedsYouKind, RuntimeSession, WorkspaceOwner,
+    AttachmentRecord, NeedsYou, NeedsYouKind, RuntimeSession, Subagent, WorkspaceOwner,
     orchestrator::{
         attach,
         background::{self, Watcher},
@@ -59,6 +59,7 @@ pub enum EventKind {
     Start {
         source: String,
         resumed: bool,
+        subagent: Option<Subagent>,
     },
     End {
         reason: String,
@@ -108,7 +109,18 @@ pub fn validate(event: &RuntimeEvent) -> Result<()> {
         "the working directory must be an absolute path"
     );
     let word = match &event.kind {
-        EventKind::Start { source, .. } => source.as_str(),
+        EventKind::Start {
+            source, subagent, ..
+        } => {
+            let kind = subagent.as_ref().and_then(|s| s.agent_type.as_ref());
+            anyhow::ensure!(
+                kind.is_none_or(
+                    |kind| kind.len() <= 128 && kind.bytes().all(|b| b.is_ascii_graphic())
+                ),
+                "invalid agent type"
+            );
+            source.as_str()
+        }
         EventKind::End { reason } => reason.as_str(),
         EventKind::WorkspaceRemoved => "removed",
         EventKind::NeedsYou {
@@ -183,7 +195,11 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
         return Ok(Reply::Silent);
     }
     match event.kind {
-        EventKind::Start { source, resumed } if workspace != root => {
+        EventKind::Start {
+            source,
+            resumed,
+            subagent,
+        } if workspace != root => {
             let session = RuntimeSession {
                 provider: event.provider.into(),
                 session_id: event.session_id,
@@ -192,6 +208,7 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
                 ended_at: None,
                 end_reason: None,
                 model: event.model,
+                subagent,
             };
             start(state, &root, &workspace, session, resumed, began)
         }
@@ -406,6 +423,20 @@ fn removed(state: &State, workspace: &Path) -> Result<Reply> {
     }))
 }
 
+/// A subagent's run in `workspace`, a canonical path, stopped: keep the exact
+/// Δ of its Work, if it has any, and record the stop on its open sessions.
+/// It decides within registration's budget from this process's start, as
+/// `SubagentStop` has the minute `SessionStart` has.
+pub(crate) fn stopped(state: &State, workspace: &Path, agent_id: &str) -> Result<Reply> {
+    let deadline = process_started().0 + registration::budget();
+    let left = deadline.saturating_duration_since(Instant::now());
+    registration::publish_first(state, workspace, left)?;
+    if let Some(run_id) = attach::find_active_attachment(state, workspace)? {
+        attach::freeze_at_stop(state, &run_id, agent_id, deadline)?;
+    }
+    Ok(Reply::Silent)
+}
+
 /// A session starting in a separate workspace: new Work the first time, with
 /// S0 taken now, before the session's first turn; another session on the same
 /// Work afterwards. Registration decides within its budget from `began`.
@@ -460,15 +491,21 @@ fn process_started() -> (Instant, DateTime<Utc>) {
     *STARTED.get_or_init(|| (Instant::now(), Utc::now()))
 }
 
-/// The runtime's own advice for Work in a workspace it made that began from
-/// source other than the project's; none for any other workspace.
-pub fn start_advice(attachment: &AttachmentRecord) -> Option<&'static str> {
+/// The managed launch, which avoids beginning from other source.
+const ATTACH_ADVICE: &str = "Work started with dispatch attach -- <agent> begins from the \
+     current source, including uncommitted changes.";
+
+/// The advice for Work that began from source other than the project's: the
+/// managed launch, then the runtime's own for a workspace it made. A
+/// subagent's parent starts it, so its Work has only Claude Code's.
+pub fn start_advice(attachment: &AttachmentRecord) -> &'static [&'static str] {
     if attachment.workspace_owner != WorkspaceOwner::Runtime {
-        return None;
+        return &[ATTACH_ADVICE];
     }
-    match attachment.sessions.first()?.provider.as_str() {
-        "claude" => Some(claude::START_ADVICE),
-        _ => None,
+    match attachment.sessions.first() {
+        Some(session) if session.subagent.is_some() => &[claude::SUBAGENT_START_ADVICE],
+        Some(session) if session.provider == "claude" => &[ATTACH_ADVICE, claude::START_ADVICE],
+        _ => &[ATTACH_ADVICE],
     }
 }
 
@@ -568,6 +605,7 @@ mod tests {
             kind: EventKind::Start {
                 source: "startup".into(),
                 resumed: false,
+                subagent: None,
             },
         };
         assert_eq!(ingest(&state, event).unwrap(), Reply::Silent);

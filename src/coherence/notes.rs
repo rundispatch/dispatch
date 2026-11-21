@@ -54,16 +54,18 @@ pub struct Note {
 pub struct Sent {
     /// When each key was sent.
     pub at: BTreeMap<String, DateTime<Utc>>,
-    /// Landing items waiting for the window, by key. Items about Work in
-    /// progress are not kept: each projection finds them again, or finds them
-    /// gone.
+    /// Landing items waiting for the window, by key, while their landing is
+    /// offered. Items about Work in progress are not kept: each projection
+    /// finds them again, or finds them gone.
     pub pending: BTreeMap<String, String>,
     pub last_note_at: Option<DateTime<Utc>>,
 }
 
 /// The note for `work` at `now`, if its window is open and anything unsent
 /// remains, and what is then sent. `runtimes` names the runtime of each Work
-/// in the projection.
+/// in the projection. `landings` are those offered to `work` now: an item
+/// about a landing no longer offered, as when its S0 now holds it, is
+/// dropped.
 pub fn compose(
     work: &str,
     projection: &Projection,
@@ -86,6 +88,7 @@ pub fn compose(
     ids.push(work);
     let short = crate::state::short_ids(&ids);
     let mut next = sent.clone();
+    let mut offered = Vec::new();
     for landing in landings.iter().filter(|landing| landing.run_id != work) {
         for interaction in landing.interactions.iter().filter(|i| eligible(i)) {
             let key = item_key("landing", &landing.run_id, interaction);
@@ -115,9 +118,11 @@ pub fn compose(
                 "\nThe source with this change is commit {}.",
                 landing.commit
             );
+            offered.push(key.clone());
             next.pending.entry(key).or_insert(item);
         }
     }
+    next.pending.retain(|key, _| offered.contains(key));
     let mut items = next.pending.clone();
     for (other, interaction) in projection.of(work) {
         let key = item_key("work", &other, &interaction);
@@ -412,7 +417,7 @@ mod tests {
         let (waiting, state) = compose_at(&both, &[landed()], &state, 9);
         assert!(waiting.is_empty());
         assert_eq!(state.pending.len(), 1, "the landing item is kept");
-        let (merged, state) = compose_at(&both, &[], &state, 10);
+        let (merged, state) = compose_at(&both, &[landed()], &state, 10);
         assert_eq!(merged[0].text.lines().count(), 4);
         assert_eq!(merged[0].keys.len(), 2);
         assert_ne!(initial[0].id, merged[0].id);
@@ -421,6 +426,22 @@ mod tests {
         assert_eq!(state.at.len(), 3);
         let restored: Sent = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn a_waiting_landing_item_no_longer_offered_is_dropped_not_sent() {
+        let view = projection(vec![interaction(Rule::SameDeclaration, symbol(), None)]);
+        let (_, state) = compose_at(&view, &[], &Sent::default(), 0);
+        let (waiting, state) = compose_at(&view, &[landed()], &state, 1);
+        assert!(waiting.is_empty());
+        assert_eq!(state.pending.len(), 1);
+        // The Work merged the landing: its S0 holds it, and it is not offered.
+        let (notes, state) = compose_at(&view, &[], &state, 10);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(state.pending.is_empty());
+        // Dropped is not sent: offered again, as when S0 moves back, it is.
+        let (notes, _) = compose_at(&view, &[landed()], &state, 11);
+        assert!(notes[0].text.contains("landed"), "{notes:?}");
     }
 
     #[test]

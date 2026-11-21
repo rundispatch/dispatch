@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.5.0 — experimental developer preview**
+**Dispatch 0.5.1 — experimental developer preview**
 
 <p align="center"><a href="https://rundispatch.sh/#explainer"><img src="https://rundispatch.sh/media/how-dispatch-works-short.gif" width="720" alt="How Dispatch works, in 30 seconds: two agents start from the same code; Dispatch sees where their changes touch and tells the live agent in a note; once one lands, the other hears it, and when it merges the recorded commit its S0 follows, so its own change is judged again and dispatch accept applies it."></a></p>
 <p align="center"><sub>30 seconds, no sound. The full video and its transcript are at <a href="https://rundispatch.sh/docs/concepts#transcript">rundispatch.sh/docs/concepts</a>.</sub></p>

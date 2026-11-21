@@ -771,9 +771,51 @@ fn styled_body<'a>(body: &'a str, palette: &Theme) -> Text<'a> {
     )
 }
 
+/// A menu's body and rows: the title (the body's first line) in bold, like
+/// the watch and review headers, the rest of the body as it is, a blank line,
+/// then one row per choice. The focused row is the focus color, the marker
+/// and bold, so it still stands out without color.
+fn menu<'a>(
+    body: &'a str,
+    rows: &'a [(String, bool)],
+    focus: usize,
+    palette: &Theme,
+    ascii: bool,
+) -> Text<'a> {
+    let mut lines: Vec<Line> = body
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let style = if i == 0 {
+                palette.foreground.bold()
+            } else {
+                palette.foreground
+            };
+            Line::styled(line, style)
+        })
+        .collect();
+    lines.push(Line::default());
+    for (i, (row, disabled)) in rows.iter().enumerate() {
+        let style = if *disabled {
+            palette.inactive
+        } else if i == focus {
+            palette.focus
+        } else {
+            palette.foreground
+        };
+        let (mark, style) = if i == focus {
+            (if ascii { ">" } else { "›" }, style.bold())
+        } else {
+            (" ", style)
+        };
+        lines.push(Line::styled(format!("{mark} {row}"), style));
+    }
+    Text::from(lines)
+}
+
 fn draw_view(
     frame: &mut ratatui::Frame,
-    body: &str,
+    body: Text,
     editor: Option<&Editor>,
     hint: &str,
     palette: &Theme,
@@ -794,7 +836,7 @@ fn draw_view(
     let hint_height = (hints.line_count(area.width) as u16)
         .min(3)
         .min(area.height.saturating_sub(input_height));
-    let paragraph = Paragraph::new(styled_body(body, palette)).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(body).wrap(Wrap { trim: false });
     let body_height = paragraph
         .line_count(area.width)
         .min(area.height.saturating_sub(input_height + hint_height) as usize)
@@ -1172,7 +1214,7 @@ impl Ui {
         screen.terminal.draw(|frame| {
             draw_view(
                 frame,
-                &body,
+                styled_body(&body, &self.palette),
                 editor,
                 &hint,
                 &self.palette,
@@ -1360,7 +1402,7 @@ impl Ui {
                 .map(|(i, choice)| format!("{}) {}", i + 1, choice.row()))
                 .collect::<Vec<_>>()
                 .join("\n");
-            self.commit(&format!("{body}\n{rows}"))?;
+            self.commit(&format!("{body}\n\n{rows}"))?;
             loop {
                 print!("[{}] > ", focus + 1);
                 io::stdout().flush()?;
@@ -1392,22 +1434,19 @@ impl Ui {
                 }
             }
         }
+        let body = self.display_text(body);
+        let rows: Vec<(String, bool)> = choices
+            .iter()
+            .map(|choice| (self.display_text(&choice.row()), choice.disabled.is_some()))
+            .collect();
+        let hint = self.display_text(&self.hint_with_mode("↑↓ move · Enter choose · Esc back"));
+        let (ascii, auto_apply) = (self.options.ascii, self.auto_apply && self.auto_apply_mode);
         loop {
-            let marker = if self.options.ascii { ">" } else { "›" };
-            let rows = choices
-                .iter()
-                .enumerate()
-                .map(|(i, choice)| {
-                    let mark = if i == focus { marker } else { " " };
-                    format!("{mark} {}", choice.row())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.draw(
-                &format!("{body}\n{rows}"),
-                None,
-                "↑↓ move · Enter choose · Esc back",
-            )?;
+            let key = format!("{body}\0{rows:?}\0{focus}\0{hint}");
+            self.draw_frame(&key, |frame, palette| {
+                let text = menu(&body, &rows, focus, palette, ascii);
+                draw_view(frame, text, None, &hint, palette, ascii, auto_apply);
+            })?;
             let Some(event) = self.next().await? else {
                 self.closed = true;
                 return Ok(None);
@@ -2325,7 +2364,7 @@ mod tests {
                 .draw(|f| {
                     draw_view(
                         f,
-                        "Your answer",
+                        Text::from("Your answer"),
                         Some(&editor),
                         "Enter send",
                         &Theme::from_hints(true, None, None, None, None),
@@ -2361,6 +2400,122 @@ mod tests {
             activity_hint(Duration::from_millis(200), false)
         );
     }
+
+    /// The checks menu as `select` draws it, focus on the second row, with a
+    /// disabled third row: its text, and the buffer to read styles from.
+    fn draw_menu(palette: &Theme, ascii: bool) -> (Vec<String>, ratatui::buffer::Buffer) {
+        let body = "Project checks\n  cargo test\nWork here asks you before running them.";
+        let rows = [
+            ("Change checks…".to_owned(), false),
+            ("Let Work run these checks by themselves…".to_owned(), false),
+            ("Add Codex — not found on PATH".to_owned(), true),
+            ("Back".to_owned(), false),
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|f| {
+                let text = menu(body, &rows, 1, palette, ascii);
+                draw_view(
+                    f,
+                    text,
+                    None,
+                    "↑↓ move · Enter choose · Esc back",
+                    palette,
+                    ascii,
+                    false,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = (0..buffer.area.height)
+            .map(|y| {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                row.trim_end().to_owned()
+            })
+            .collect();
+        (text, buffer)
+    }
+
+    #[test]
+    fn a_menu_tells_title_facts_choices_and_hints_apart() {
+        use ratatui::style::{Color, Modifier};
+        let palette = Theme::from_hints(false, Some("truecolor"), Some("dark"), None, None);
+        let (text, buffer) = draw_menu(&palette, false);
+        assert_eq!(
+            text[..9],
+            [
+                "  Project checks",
+                "    cargo test",
+                "  Work here asks you before running them.",
+                "",
+                "    Change checks…",
+                "  › Let Work run these checks by themselves…",
+                "    Add Codex — not found on PATH",
+                "    Back",
+                "  ↑↓ move · Enter choose · Esc back",
+            ]
+        );
+        let fg = |style: Style| style.fg.unwrap_or(Color::Reset);
+        let bold = |x, y| buffer[(x, y)].modifier.contains(Modifier::BOLD);
+        // The title: the native foreground, bold, across the line.
+        for x in 2..16 {
+            assert_eq!(buffer[(x, 0)].fg, fg(palette.foreground), "title at {x}");
+            assert!(bold(x, 0), "title at {x}");
+        }
+        // The facts and the other choices: the native foreground, not bold.
+        for (x, y) in [(4, 1), (2, 2), (4, 4), (4, 7)] {
+            assert_eq!(
+                buffer[(x, y)].fg,
+                fg(palette.foreground),
+                "{}",
+                text[y as usize]
+            );
+            assert!(!bold(x, y), "{}", text[y as usize]);
+        }
+        // The focused choice: the marker and its label in the focus role, bold.
+        for x in [2, 4, 8] {
+            assert_eq!(buffer[(x, 5)].fg, fg(palette.focus), "focus at {x}");
+            assert!(bold(x, 5), "focus at {x}");
+        }
+        // The title and the selection are both bold; their colors stay apart.
+        assert_ne!(buffer[(2, 0)].fg, buffer[(4, 5)].fg, "title and focus");
+        assert_eq!(buffer[(4, 6)].fg, fg(palette.inactive), "disabled");
+        assert_eq!(buffer[(2, 8)].fg, fg(palette.secondary), "hints");
+    }
+
+    #[test]
+    fn a_menu_without_color_keeps_the_break_the_bold_and_the_marker() {
+        use ratatui::style::{Color, Modifier};
+        let palette = Theme::from_hints(true, Some("truecolor"), None, Some("truecolor"), None);
+        for (ascii, marker) in [(false, "›"), (true, ">")] {
+            let (text, buffer) = draw_menu(&palette, ascii);
+            assert_eq!(text[3], "");
+            assert_eq!(buffer[(2, 5)].symbol(), marker);
+            for cell in &buffer.content {
+                assert_eq!(
+                    (cell.fg, cell.bg),
+                    (Color::Reset, Color::Reset),
+                    "{text:#?}"
+                );
+            }
+            let bold = |y: u16| {
+                (0..buffer.area.width)
+                    .filter(|&x| buffer[(x, y)].modifier.contains(Modifier::BOLD))
+                    .count()
+            };
+            assert_eq!(bold(0), "Project checks".len());
+            assert_eq!(
+                bold(5),
+                "› Let Work run these checks by themselves…".chars().count()
+            );
+            for y in [1, 2, 3, 4, 6, 7, 8] {
+                assert_eq!(bold(y), 0, "{}", text[y as usize]);
+            }
+        }
+    }
+
     #[test]
     fn tiny_diff_emphasizes_only_changed_graphemes() {
         let palette = Theme::from_hints(true, None, None, None, None);

@@ -1084,11 +1084,22 @@ fn resume_step(run: &RunRecord, source: Option<&s0::Recorded>) -> Option<String>
             .all(|session| session.ended_at.is_some());
     resumable.then(|| {
         format!(
-            "resume its session in {}, then commit there and run git merge {}; the session goes on as new Work from this Work's S0, and this Work closes as superseded; Dispatch then moves that S0 and checks it again",
-            attachment.workspace.display(),
+            "{}, then commit there and run git merge {}; the session goes on as new Work from this Work's S0, and this Work closes as superseded; Dispatch then moves that S0 and checks it again",
+            start_in(attachment).unwrap_or_else(|| format!(
+                "resume its session in {}",
+                attachment.workspace.display()
+            )),
             source.commit
         )
     })
+}
+
+/// How a person goes on with a subagent's Work, whose session nobody can
+/// resume by hand: a Claude Code session started in its worktree goes on
+/// from that Work. `None` for any other Work.
+fn start_in(attachment: &crate::AttachmentRecord) -> Option<String> {
+    let subagent = attachment.sessions.iter().any(|s| s.subagent.is_some());
+    subagent.then(|| format!("start Claude Code in {}", attachment.workspace.display()))
 }
 
 /// The newest source recorded at `run`'s project, which a REFRESH of
@@ -3302,8 +3313,9 @@ fn workspace_details(run: &RunRecord, attachment: &crate::AttachmentRecord) -> V
             .last()
             .is_some_and(|session| session.ended_at.is_some())
     {
+        let resume = start_in(attachment).unwrap_or_else(|| "resume it".into());
         lines.push(format!(
-            "  session ended — finish to freeze its changes (dispatch finish {id}), or resume it; or close it: {close} unfinished"
+            "  session ended — finish to freeze its changes (dispatch finish {id}), or {resume}; or close it: {close} unfinished"
         ));
     } else if unfinished && let Some(runtime) = discovery::unobserved(attachment) {
         lines.push(format!(
@@ -3355,8 +3367,8 @@ pub(crate) fn last_seen_changes(run: &RunRecord) -> Option<String> {
 }
 
 /// How the integration source compared with the Work's S0 when it began, as
-/// observed then: what differed, the managed launch that avoids it, and the
-/// runtime's own advice. Empty when there was nothing to observe.
+/// observed then: what differed, and the advice for it
+/// (`runtime::start_advice`). Empty when there was nothing to observe.
 pub(crate) fn source_at_start(attachment: &crate::AttachmentRecord) -> Vec<String> {
     let observation = match &attachment.source_at_start {
         None => return Vec::new(),
@@ -3384,18 +3396,17 @@ pub(crate) fn source_at_start(attachment: &crate::AttachmentRecord) -> Vec<Strin
     if observation.differing > paths.len() {
         paths.push(format!("{} more", observation.differing - paths.len()));
     }
-    let mut lines = vec![
-        format!(
-            "differed from its S0 at {} path{} (observed {when}{head}): {}",
-            observation.differing,
-            if observation.differing == 1 { "" } else { "s" },
-            paths.join(", ")
-        ),
-        "Work started with dispatch attach -- <agent> begins from the current source, \
-         including uncommitted changes."
-            .into(),
-    ];
-    lines.extend(crate::runtime::start_advice(attachment).map(str::to_owned));
+    let mut lines = vec![format!(
+        "differed from its S0 at {} path{} (observed {when}{head}): {}",
+        observation.differing,
+        if observation.differing == 1 { "" } else { "s" },
+        paths.join(", ")
+    )];
+    lines.extend(
+        crate::runtime::start_advice(attachment)
+            .iter()
+            .map(|line| line.to_string()),
+    );
     lines
 }
 
@@ -4289,6 +4300,7 @@ mod tests {
                 ended_at: Some(Utc::now()),
                 end_reason: Some("prompt_input_exit".into()),
                 model: None,
+                subagent: None,
             }],
             workspace_removed: None,
             source_at_start: None,
@@ -4345,6 +4357,19 @@ mod tests {
         reopened.attachment.as_mut().unwrap().s0_since =
             Some("2026-11-10T09:30:00Z".parse().unwrap());
         assert_eq!(refresh(&reopened, Some(&before)).0, resume);
+        // Nobody resumes a subagent's session by hand: a new one in its
+        // worktree goes on from its Work.
+        let mut subagent = run.clone();
+        subagent.attachment.as_mut().unwrap().sessions[0].subagent = Some(crate::Subagent {
+            parent_session: Some("s0".into()),
+            agent_id: "a85d8d5dd371b34d4".into(),
+            agent_type: None,
+            locked: false,
+            stopped_at: None,
+            kept_on: None,
+        });
+        let start = resume.replace("resume its session in", "start Claude Code in");
+        assert_eq!(refresh(&subagent, Some(&after)).0, start);
 
         // Anything else it can't do takes it back to running its agent again.
         assert_eq!(refresh(&run, None), (rerun.to_owned(), reject.clone()));

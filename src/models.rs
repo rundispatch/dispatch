@@ -799,6 +799,37 @@ pub struct RuntimeSession {
     pub end_reason: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// A Claude Code subagent's session; `None` for any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<Subagent>,
+}
+
+/// A Claude Code subagent working in its own worktree, as its hooks name it.
+/// Its session ID is `<parent_session>_agent-<agent_id>`: every hook inside it
+/// carries its parent's session ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Subagent {
+    /// The session that started it; `None` when discovery found it, since
+    /// its lock names no session.
+    #[serde(default)]
+    pub parent_session: Option<String>,
+    /// Without Claude Code's `agent-` prefix.
+    pub agent_id: String,
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    /// Whether its run held its worktree's agent lock, live, when the
+    /// session started: such a session ends when that lock goes, and one
+    /// that did not, a resumed run, at its stop. Always so for discovery's.
+    #[serde(default)]
+    pub locked: bool,
+    /// When its run last stopped (`SubagentStop`), its Δ kept then
+    /// (`attach::freeze_at_stop`); `None` while it runs.
+    #[serde(default)]
+    pub stopped_at: Option<DateTime<Utc>>,
+    /// The baseline commit that Δ was kept against: it holds only while S0
+    /// has not moved since.
+    #[serde(default)]
+    pub kept_on: Option<String>,
 }
 
 /// Who made the workspace the Work happens in.

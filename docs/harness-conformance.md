@@ -216,3 +216,44 @@ passed or read "none, no hook" there too, except one:
   characters, which all three Works of the trial shared. Since packet Y, an ask
   names each Work by as much of its ID as tells it apart from every Work of the
   project. The rerun's ask named B by 11.
+
+## Subagent cells (0.5.1)
+
+0.5.1 makes a Claude Code subagent started with `isolation: worktree` Work of its
+own ([attach.md](attach.md), "Subagents"), so these cells are Claude Code's
+only. Hermes's `delegate_task` children work in their parent's own directory and
+are part of the parent's Work (observed with the probe, 2026-11-18). The trial
+uses the same fixture and tasks: one orchestrating Claude Code session in the
+checkout starts B, A and C at once as worktree subagents with the Agent tool,
+while `dispatch start` watches the project, on the release build. It is run by
+hand, not by `scripts/harness-trial.sh`.
+
+- **Setup.** As for the coordination cells: a fresh copy of the fixture with its
+  own state directory, the release build's ten Claude Code hooks in the project's
+  `.claude/settings.local.json`, and Claude Code run with `--setting-sources
+  local`. The project's check consent is given before the orchestrator starts.
+- **Steps.**
+  1. The orchestrator starts B, A and C. Each should be Work before its first
+     edit, and no subagent worktree "Found, not tracked".
+  2. While A and B run, a subagent should hear through a hook that they interact.
+  3. B and C end. The owner should finish each by consent. `dispatch accept` with
+     no ID proposes both, and `accept --expect <batch digest>` lands them.
+  4. A, still running when B lands, should be asked once, at its next
+     `SubagentStop`, to merge it.
+  5. A merges, ends, is finished by consent and accepted.
+
+| Cell | Pass when |
+|---|---|
+| Work at spawn | one Work per subagent, registered by its `SubagentStart` or by discovery before its first edit, with S0 the commit its worktree was made from; 0 subagent worktrees "Found, not tracked" |
+| notes | a note about A and B delivered to a subagent through a hook (`PostToolUse` or `SubagentStart`) |
+| catch-up | one `catchup.written` for A naming B's landing, one `catchup.delivered {via: subagent_stop}`, and no second ask |
+| finish by consent | each subagent's Work finished by the owner (`finish_reason: by_consent`) once its session ended, with no `dispatch finish` typed |
+| batch landing | one proposal of B and C, one `--expect`, one merged-check run, one `refs/dispatch/source` commit |
+
+| Harness | Work at spawn | Notes | Catch-up | Finish by consent | Batch landing | Harness version | Evidence |
+|---|---|---|---|---|---|---|---|
+| claude | [[C: pass or fail; Works at spawn, and the "Found, not tracked" count]] | [[C: result, and which hook delivered]] | [[C: result, with the time from the ask written to its delivery]] | [[C: result]] | [[C: result]] | [[C: Claude Code version]] | [[C: evidence directory]] |
+
+Stand-in subagents, sending the probe's recorded payloads, go through each of
+these steps in `tests/subagents.rs`. That tests Dispatch, not a harness, and is
+not a conformance result.
