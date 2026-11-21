@@ -190,12 +190,11 @@ fn ask(
             record
         }
     };
-    let Some((_, since)) = run.s0_commit() else {
-        return Ok(());
-    };
     let new: Vec<Landed> = recorded
         .iter()
-        .filter(|source| source.at > since && !record.asked.contains(&source.landed_run))
+        .filter(|source| {
+            notify::after_s0(run, source) && !record.asked.contains(&source.landed_run)
+        })
         .filter_map(|source| {
             let found = landings.0.get(&source.landed_run)?.as_ref()?;
             breaking(source, found, run, runs)

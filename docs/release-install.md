@@ -114,6 +114,57 @@ To roll back, stop every session and restore a complete matching backup into a s
 directory; point the matching old binary at it with `--state-dir`. Never point an old binary
 at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.5.1
+
+No migration; the schema stays at 24. Existing records are not rewritten.
+- **Rollback.** Back up the whole state directory before upgrading, and roll back only by
+  restoring it. 0.5.0's `history` and `status` read a state directory with subagent Work
+  (checked on a stand-in project); nothing else was tried.
+- **The owner.** After an upgrade in place, the next Dispatch command in a watched project
+  restarts its owner with 0.5.1, as since 0.4.17.
+- **Claude Code hooks.** They are now ten: `SubagentStart` and `SubagentStop`, 60 s each. A
+  settings file holding 0.5.0's eight, 0.4.18's seven, 0.4.17's six or 0.4.16's four is
+  offered once as an Update in `dispatch setup`, which keeps every hook of yours and adds
+  one sentence to the consent screen: `With SubagentStart and SubagentStop, each subagent in
+  its own worktree is Work of its own.` After it, setup says `Claude Code hooks: already
+  running this Dispatch`. Until then, discovery still finds a subagent's worktree once it
+  is locked: it becomes Work from its merge base, with no type, notes after its tool calls,
+  and no ask and no Δ kept at its stops.
+- **`SubagentStop`** keeps a subagent's Δ under its Work's lock in a watched project,
+  within a 40 s budget in its 60 s timeout. In a project nobody watches it decides from the
+  files alone, as every hook does there.
+- **Going back to 0.5.0** with 0.5.1's hooks in place: its hook prints nothing for
+  `SubagentStart` and `SubagentStop`, and its setup reads the ten hooks as `changed by hand`
+  and leaves them. Remove Dispatch's Claude Code hooks first with the 0.5.1 binary
+  (`dispatch setup` → Agents Dispatch launches… → Runtime integrations → Remove Claude
+  Code hooks), then install them with 0.5.0.
+- **Nothing else asks again.** The check consent, Hermes's hooks and the agent profiles are
+  unchanged.
+- **Additive JSON and events.**
+  - A new event, `subagent.stopped {agent_id, sessions, files_changed}`, at each
+    `SubagentStop` that keeps Δ. Its payload is in [reference.md](reference.md#events).
+  - A subagent's session record carries `subagent` (`parent_session`, `agent_id`,
+    `agent_type`, `locked`, `stopped_at`, `kept_on`); it is absent for every other session,
+    and a record without it reads as before.
+  - `runtime.session_ended` gains the reason `subagent_stop`, `catchup.delivered` the `via`
+    `subagent_stop`, and `note.delivered` the `via` `SubagentStart`.
+- **Changed behaviour.**
+  - **Claude Code subagents** started with `isolation: worktree` are Work, registered by
+    `SubagentStart` or by discovery from their agent lock ([attach.md](attach.md),
+    "Subagents"). Where 0.5.0 listed their worktrees as found, not tracked, `status` and
+    `watch` now show their Work.
+  - **A payload with an `agent_id`** outside `.claude/worktrees/agent-<agent_id>` (a
+    subagent without isolation, Claude Code's own agents) takes none of the notes or asks
+    of the Work there; in 0.5.0 its `PostToolUse` took that Work's notes.
+  - **A subagent's Work** says `start Claude Code in <worktree>` in its REFRESH next step
+    and its "session ended" line, where other Work says `resume its session in
+    <worktree>`. Its "source at start" lines give, in place of the `dispatch attach` and
+    `worktree.baseRef` advice, `Claude Code: a subagent's worktree starts from the
+    checkout's HEAD; uncommitted changes are not copied.`
+  - **Menus** show a blank line before their choices, in `--plain` too, the question in
+    bold, and the focused choice as the only colored one. A script that reads `--plain`
+    output sees one more blank line before the numbered choices.
+
 ### Upgrading to 0.5.0
 
 No migration; the schema stays at 24. Existing records are not rewritten.

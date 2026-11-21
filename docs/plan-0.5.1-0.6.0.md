@@ -240,7 +240,7 @@ project at its working directory.
 |---|---|---|
 | `work` | All Work in the project, one row each: id, harness and origin (session, subagent, native, attached), state, verdict and reason, needs-you (kind, message, since), asked to catch up, interactions, files changed, ready for review | one `work_rows` lifted from `presenter/watch.rs:920-963`, which watch then uses too (one path) |
 | `status` | One Work in full | `status_json` (`orchestrator.rs:1918`) |
-| `wait` | Returns when any named Work (or any) finishes, needs input, or changes verdict, or at `timeout_s` (default 300, max 900). Sends MCP progress when given a `progressToken` | stat of runs' `metadata.json` and `events.jsonl` and of `marks/`; no SQLite in the loop, idle CPU about 0 |
+| `wait` | Returns when any named Work (or any) finishes, needs input, or changes verdict, or at `timeout_s` (default 50, under every client limit M0 measured; a client may ask for longer, up to 900). Sends MCP progress when given a `progressToken` | stat of runs' `metadata.json` and `events.jsonl` and of `marks/`; no SQLite in the loop, idle CPU about 0 |
 | `start` | Launches a native run of a named agent (Claude Code, Codex, Cursor, Hermes) on a task, detached, and returns its id at once | `run_dispatch` through `background::command`; the id from `run.created` |
 | `send` | Relays the orchestrator's message, verbatim, to a live hooked session or subagent | a new note kind `message` through `inbox::write` |
 | `propose_landing` | The batch proposal as data: members in order with why, those left out with reasons, the digest and the exact `dispatch accept --expect <digest>` for the person | a returning variant of `batch::offer` |
@@ -282,6 +282,15 @@ closes or refreshes.
 - **M0, probe (integrator):** MCP tool-call limits and progress handling in Codex 0.155.1, Cursor Agent and
   Hermes 0.18.2, with the probe server in `~/dispatch-dev/p0-subagents/mcp/`. The `wait` default comes from
   the shortest limit.
+  - **Measured** (2026-11-18, one `wait_seconds(n)` call per client; `FINDINGS.md`, "M0", and the execution
+    log):
+    - Claude Code 2.1.296: at least 650 s (calls of 200 s and 650 s returned, 663 s end to end).
+    - Codex 0.170.0 (Codex was upgraded from 0.155.1 first): 300 s ("timed out awaiting tools/call after
+      300s" at 400 s), and `codex exec` runs the server's tools only with
+      `default_tools_approval_mode = "approve"`; without it every call is refused.
+    - Cursor Agent 2026.11.13: about 60 s (50 s returned; 130 s gave "MCP error -32001: Request timed out").
+    - Hermes: not measured yet. Its MCP servers live only in `~/.hermes/config.yaml`.
+  - So `wait` defaults to 50 s, and a client may ask for longer.
 - **M1, the server and its reads (Claude Code worker; lands first):** the loop, `work_rows` shared with
   watch, and `work`, `status`, `wait` and `propose_landing`, plus the stdout and no-landing tests.
 - **M2, launch (Claude Code worker, after M1):** launch consent in setup, then `start` with its cap and

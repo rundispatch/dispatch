@@ -42,7 +42,10 @@ the landing changed; batch landing, where `dispatch accept` without an ID lands 
 ready results of a Git project that can land together, a change before what uses it,
 behind one approval, with the merged checks run once on the combined tree and only the
 results before the first failing one landing; and a 3-way merge from S0 for a Δ whose
-context moved, which lands only as the tree the merged checks passed on. Claim
+context moved, which lands only as the tree the merged checks passed on. Since 0.5.1 it
+also includes Claude Code subagents in their own worktrees (`isolation: worktree`) as Work,
+each from its `SubagentStart`, with notes, a catch-up ask at the end of a response and its
+exact Δ kept at each `SubagentStop`. Claim
 precision for interactions only from recorded outcomes (the documented queries),
 quoted as counts, and only as agreement with Dispatch's own later verdict. Notes and
 catch-up asks are measured only as counts of what followed them (the documented
