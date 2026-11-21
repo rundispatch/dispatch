@@ -61,6 +61,16 @@ def resize(w,h):
 def runs():
     path=os.path.join(state,'runs')
     return [json.load(open(os.path.join(path,d,'metadata.json'))) for d in os.listdir(path) if os.path.exists(os.path.join(path,d,'metadata.json'))]
+def diagnosis(run):
+    # What the run recorded, what its agent said and what the screen last showed, for a failed assertion.
+    with sqlite3.connect(os.path.join(state,'dispatch.db')) as db:
+        launches=db.execute('SELECT attempt_id,state,child_json FROM attempt_launches').fetchall()
+    attempts=[]
+    for a in run['attempts']:
+        result=a['detail'].get('result') or {};stderr=result.get('stderr_path')
+        attempts.append({'id':a['id'],'outcome':a['outcome'],'started_at':a['started_at'],'completed_at':a['completed_at'],'failure':a['detail'].get('failure'),
+                         'status':result.get('status'),'error':result.get('error'),'stderr':open(stderr,errors='replace').read()[-2000:] if stderr and os.path.exists(stderr) else None})
+    return json.dumps({'outcome':run['outcome'],'failure':(run.get('execution') or {}).get('failure'),'attempts':attempts,'launches':launches},indent=1)+'\n'+clean[-3000:]
 try:
     if scenario in ('panic','inspection-panic'): wait('panic-fixture-ready')
     else: wait('accomplish?')
@@ -103,7 +113,9 @@ try:
             resize(38,16);resize(100,28)
         if scenario in ('cancel','active-eof','hangup'):
             end=time.time()+WAIT
-            while not os.path.exists(os.path.join(os.path.dirname(state),'invocations')) and time.time()<end:pump()
+            while not os.path.exists(os.path.join(os.path.dirname(state),'invocations')):
+                if time.time()>=end: raise AssertionError('the agent never started\n'+clean[-3000:])
+                pump()
             if scenario=='active-eof':send(b'\x04')
             elif scenario=='hangup':os.kill(int(open(os.path.join(state,'pty-'+str(pid)+'-child')).read()),signal.SIGHUP)
             else:
@@ -152,7 +164,7 @@ try:
             assert run['allocation']['selected']['resolved_model']=='light-model'
             assert len(run['attempts'])==1
         if scenario=='clarify':assert len(run['attempts'])==2 and len(run['execution']['questions'])==1
-        if scenario in ('cancel','active-eof','hangup'):assert run['outcome']['work_result'] in ('cancelled','interrupted')
+        if scenario in ('cancel','active-eof','hangup'):assert run['outcome']['work_result'] in ('cancelled','interrupted'),diagnosis(run)
         elif scenario=='drift':assert run['outcome']['application']=='blocked_by_source_drift'
         elif scenario in ('reject','recovery','concurrent','natural'):assert run['outcome']['review']=='rejected'
         elif scenario=='auto_apply_skipped':assert run['outcome']['application']=='not_applied'
@@ -168,7 +180,7 @@ try:
             assert run['outcome']['review']=='accepted'
         else:assert run['outcome']['application']=='applied'
         with sqlite3.connect(os.path.join(state,'dispatch.db')) as db:
-            if scenario!='concurrent': assert db.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0]==0
+            if scenario!='concurrent': assert db.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0]==0,diagnosis(run)
     print('PTY passed:',scenario)
 finally:
     try:os.killpg(pid,signal.SIGKILL)
