@@ -1149,9 +1149,11 @@ may also ask the agent to catch up ("Catch-up in place", below).
 - **How often.** Each item is sent once, keyed by the other Work or landing, the target and
   the change. A Work gets at most one note per ten minutes; anything found in between is
   merged into the next note. Items about Work in progress are rebuilt each tick, so an item
-  whose Work or interaction is gone by then is not sent. A note is at most 8,000
-  characters; items past that wait for the next note, which the last line says: `And <n>
-  more in the next note.`
+  whose Work or interaction is gone by then is not sent. A landing makes an item only while
+  it is newer than the Work's S0 (recorded after S0 became the Work's S0, the rule catch-up
+  uses): once the Work merges it and its S0 moves, an item still waiting for the window is
+  dropped, not sent. A note is at most 8,000 characters; items past that wait for the next
+  note, which the last line says: `And <n> more in the next note.`
 - **Who gets notes:** Work in progress whose workspace had a Claude Code or Hermes session
   recorded. Codex and Cursor Work gets none: Dispatch installs no hook in them that can
   carry context. Neither does Work attached with `dispatch attach` and no session.
@@ -1281,7 +1283,9 @@ is Work of its own from its first moment, with no step for anyone. Observed with
 `worktree-agent-<id>`, made from the checkout's HEAD with or without `worktree.baseRef:
 head`. Claude Code writes `CLAUDE_BASE` there and locks the worktree `claude agent
 agent-<id> (pid <parent pid> start <parent start>)` before `SubagentStart` runs, and removes
-that lock shortly after the subagent's first `SubagentStop`.
+that lock shortly after the subagent's first `SubagentStop`. A subagent that Claude Code
+resumes by itself, after a background shell ends for example, keeps the lock through its
+resumed runs, and can keep it after its last stop ("Known limits").
 
 - **Registration.** In a watched project, `SubagentStart` registers the subagent before its
   first tool call, as `SessionStart` registers a session, within the same 40 s budget. S0 is
@@ -1329,9 +1333,11 @@ that lock shortly after the subagent's first `SubagentStop`.
   when that lock goes (`lock_released`), whether or not its stop came, or when the lock's
   process, the parent, is gone (`process_gone`). A run that started with no agent lock ends
   at its `SubagentStop` (`subagent_stop`), or when the owner next sees no lock after that
-  stop. Claude Code writes no lock for a run resumed with `SendMessage`, so a resumed run
-  ends at its stop. The lock names the parent's process, which every subagent of that
-  parent shares, so Dispatch never records it as the Work's agent.
+  stop. Claude Code writes no lock for a run resumed with `SendMessage`, so such a run
+  ends at its stop. A run that Claude Code resumes by itself starts under the lock the
+  subagent kept, so it ends with that lock or with the parent. The lock names the parent's
+  process, which every subagent of that parent shares, so Dispatch never records it as the
+  Work's agent.
 - **Finish and land.** Claude Code removes an unchanged subagent worktree right after its
   stop, with no `WorktreeRemove`; the owner records the removal as exact, from the Δ kept
   at that stop, and the Work closes with no changes. A changed worktree stays. With the
@@ -1360,7 +1366,8 @@ that lock shortly after the subagent's first `SubagentStop`.
   recorded: the lock names the parent's. The lock does not name the subagent's type, so
   `agent_type` is unknown, and the task reads `claude subagent in agent-<first 8
   characters>`. Whichever sees the worktree first, the hook or discovery, registers it,
-  and a later `SubagentStart` joins that Work.
+  and a later `SubagentStart` joins that Work: its session is recorded there, and the task
+  keeps discovery's label, without the type.
 - **In a project nobody watches**, `SubagentStart` and `SubagentStop` decide from the files
   alone, open no database and keep nothing, as every hook there does.
 - **Not tracked:** a subagent without isolation, and Claude Code's own agents (prompt
@@ -1903,10 +1910,16 @@ directory, exactly as it already refuses any newer schema.
     lands, and the parent's Work, which holds the same change, is left out as REFRESH
     `patch_conflict`, with its own changes, until the parent merges what landed. No rule
     puts the parent's Work first and leaves the subagent's out as already applied.
-  - **A resumed run whose parent exits before its stop stays open.** Claude Code writes no
-    lock for a run resumed with `SendMessage`, and such a run's session ends only at its
+  - **A run resumed with `SendMessage` whose parent exits before its stop stays open.**
+    Claude Code writes no lock for such a run, and its session ends only at its
     `SubagentStop`. If the parent exits mid-run, that session stays open, and its Work
     waits for a person to finish or close it.
+  - **A subagent that Claude Code resumes by itself can stay open until its parent
+    exits.** A subagent whose response ends while its background shell runs is resumed by
+    Claude Code when the shell ends, under the lock it kept. After its last stop the lock
+    can stay, so its session stays open until the parent's process is gone, and its finish
+    by consent waits until then (observed with Claude Code 2.1.296: 18 minutes, through a
+    parent turn). Nothing is lost: its Δ was kept at each stop.
   - **The parent's own hooks in a subagent's worktree.** A parent whose shell enters a
     subagent's worktree (the probe's did, after that subagent finished) sends its hooks from
     there with no `agent_id`: its `PostToolUse` and `Stop` take that Work's notes and asks,
@@ -1915,11 +1928,11 @@ directory, exactly as it already refuses any newer schema.
     since 0.4.18.
   - **No waking.** An ask reaches a subagent only at the end of a response while it runs.
     No waiter starts for a subagent, and one that has stopped is not woken.
-  - **A resume within a moment of the stop.** If the parent resumes a subagent before
-    Claude Code releases the first run's lock (shortly after the stop; P0b's resume came
-    4 s later, after the release), the resumed run starts under that lock. Its session
-    then ends when the lock goes while the run goes on, and a finish by consent could read
-    the worktree mid-edit. Not observed.
+  - **A resume within a moment of the stop.** If the parent resumes a subagent with
+    `SendMessage` before Claude Code releases the first run's lock (shortly after the stop;
+    P0b's resume came 4 s later, after the release), the resumed run starts under that
+    lock. Its session then ends when the lock goes while the run goes on, and a finish by
+    consent could read the worktree mid-edit. Not observed.
   - Work discovery registers has no `agent_type`, and no parent session.
 - Hermes's exact capture covers only the CLI's shutdown. Its TUI (`--tui`) and `/new`
   fall back to the last-seen Δ, which misses changes made after the last pass. Without

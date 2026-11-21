@@ -57,8 +57,10 @@ ORDER BY batch, CASE kind WHEN 'proposed' THEN 0 WHEN 'left_out' THEN 1 ELSE 2 E
 -- 2. batch_check_runs: each verification of a batch, its copies on the
 --    members counted once: the merged-check runs on the whole batch (0 when
 --    a recorded pass was reused) and those bisecting it once it failed.
---    `verifications` counts accepts that verified it with the same outcome.
---    `passed` is NULL when the merged checks did not run.
+--    `verifications` counts accepts that verified it with the same result.
+--    `passed` is NULL when the merged checks did not run. Each copy also
+--    carries its member's own `outcome`, which members need not share, so
+--    the copies are matched without it.
 SELECT 'batch_check_runs' AS result_set,
        json_extract(payload_json, '$.batch') AS batch,
        json_extract(payload_json, '$.passed') AS passed,
@@ -71,7 +73,7 @@ SELECT 'batch_check_runs' AS result_set,
            * MAX(json_extract(payload_json, '$.runs') - 1, 0) AS bisection_runs
 FROM events
 WHERE event_type = 'batch.verified'
-GROUP BY payload_json
+GROUP BY json_remove(payload_json, '$.outcome')
 ORDER BY MIN(timestamp), MIN(id);
 
 -- 3. landing_counts: the Work landed (`result.applied`), of it in batches,
@@ -85,8 +87,10 @@ ORDER BY MIN(timestamp), MIN(id);
 --    - a native run's baseline or verify phase (`check.started`, ordinal 1);
 --    - an attached finish that checked Δ in its workspace, which records no
 --      event of its own: its `checks` rows, one per phase, unless they are
---      in the logs of a merged run or reuse recorded on that Work. The table
---      keeps a Work's last checks, so an earlier finish of it is missed.
+--      in the logs of a merged run recorded on that Work or of another run's
+--      pass reused on it. A later reuse of the finish's own pass leaves the
+--      finish counted. The table keeps a Work's last checks, so an earlier
+--      finish of it is missed.
 --    A batch's record of its pass on its later members is not a reuse.
 --    No row until some Work landed.
 SELECT 'landing_counts' AS result_set, *
@@ -115,6 +119,8 @@ FROM (
                       SELECT 1 FROM events AS recorded
                       WHERE recorded.run_id = checks.run_id
                         AND recorded.event_type IN ('coherence.merged_checks', 'checks.reused')
+                        AND json_extract(recorded.payload_json, '$.reused_run')
+                            IS NOT checks.run_id
                         AND instr(checks.stdout_path,
                                   json_extract(recorded.payload_json, '$.logs') || '/') = 1))
            AS suite_runs,

@@ -65,7 +65,8 @@ choices, and the focused choice the only colored one.
   and runs no `WorktreeRemove`. When Claude Code removes it, the Work closes with no
   changes.
 - **How its session ends.** Claude Code locks a subagent's worktree with a lock that names
-  the parent's process, and removes the lock shortly after the subagent's first stop. The
+  the parent's process, and removes the lock shortly after the subagent's first stop,
+  unless it resumes the subagent by itself, after a background shell for example. The
   session ends when that lock goes, or when the parent's process is gone. A run resumed
   with `SendMessage` has no lock, and its session ends at its stop. Dispatch never records
   the parent's process as the subagent's agent.
@@ -89,9 +90,9 @@ choices, and the focused choice the only colored one.
 
 - **What the parent's own end does.** The parent's `Stop` and `SessionEnd` name the
   parent's session, so they never mark or end a subagent's Work. The parent exiting ends
-  the sessions of its subagents' first runs, through their locks, and with consent those
-  Works are then finished. It does not end a resumed run that has not stopped yet: that
-  Work waits for you to finish or close it.
+  the sessions of its subagents' runs that started under their locks, and with consent
+  those Works are then finished. It does not end a run resumed with `SendMessage` that has
+  not stopped yet: that Work waits for you to finish or close it.
 - **Run again.** When the parent sends a subagent another message, the subagent goes on in
   the same Work, or, once that Work is a result waiting for review, as new Work from the
   same S0, and the result closes as superseded.
@@ -141,23 +142,104 @@ In 0.5.0 a menu drew its question, its facts and its choices in one style, with 
 between them; only the `›` marker and the hint row stood apart. The words, the initial
 focus and the keys are unchanged.
 
+### Fixed
+
+- A live Claude Code or Hermes agent that merged a landing within ten minutes of its last
+  note was later sent a note about that landing, which its S0 already held. Notes now name
+  only landings after the Work's S0, as catch-up does, and a landing item still waiting
+  for the window is dropped once the Work's S0 holds it. Found in the subagent trial
+  ("Measured, honestly").
+- `docs/queries/batches-measured.sql` counted one merged-check run of a batch more than
+  once when its members' states differed, and now counts each verification once. Its
+  suite runs also left out an attached finish that checked in its workspace whenever a
+  later accept reused that finish's own pass: on 0.5.1's own state, 9 were counted where
+  10 ran. Such a finish now counts, and a reuse of another run's pass is left out as
+  before. 0.5.0's published figures are unaffected by either.
+
 ### Measured, honestly
 
-From this build's own work, in the integrator's record. Two packets landed through one
-`dispatch accept --expect`, with the merged checks run once on the combined tree (`cargo
-test` 14 min 28 s). Packet A was found by discovery 29 minutes before the project's check
+From this build's own work, in the integrator's record. Every packet ran under the pinned
+0.5.0, which watched the project. Six packets landed, in three of four `dispatch accept`s:
+
+- U and A, as one batch, with the merged checks run once on the combined tree (`cargo
+  test` 14 min 28 s).
+- F and R, as one batch: the merged checks failed in
+  `native_runs::phase4_pty_intent_answer_recovery_review_and_restoration`, its hangup
+  scenario, at a load of 25 to 27 while they ran, so F landed alone and R did not.
+- R alone: the merged checks failed in
+  `attach_scenarios::simultaneous_integration_serializes_attached_and_native`, at a load
+  of 22 while they ran, and nothing landed.
+- R, N and G, as one batch, with the merged checks run once (`cargo test` 13 min 2 s).
+
+Both failures were on the Mac that ran the checks, loaded by other work. Packet G found the
+cause of neither in the code. It made both tests say what happened when they fail, so that
+the next failure names its path, and changed no product code. The same tests passed in CI,
+including 10 of 10 runs of the suite on a macOS runner under load, a job this release adds
+to `stability.yml`. Packet A was found by discovery 29 minutes before the project's check
 consent was given, and the consent covers only Work registered while it holds, so the owner
 never finished it: it waited about 28.5 hours, until a typed `dispatch finish`.
-`docs/attach.md` now says so where it describes the consent. The other packet was finished
-by consent.
+`docs/attach.md` now says so where it describes the consent. Every other packet was
+finished by consent.
 
-[[C: this build's own notes, asks and batches, from the documented queries on its state, as 0.5.0's notes give them]]
+Counts from the documented queries on this build's state after those landings
+(`docs/queries/notes-measured.sql`, `catchup-measured.sql`, and `batches-measured.sql` as
+corrected, "Fixed"). Since 0.5.0 watched the project, they count 0.5.0's notes and asks
+on this release's work. "Followed by" means recorded later, not caused by, and agreement is
+only with Dispatch's own later verdict, never a human judgment.
 
-The rest waits on the conformance trial and a quiet machine:
+- **Notes:** none delivered, 0 unsettled.
+- **Catch-up:** no asks.
+- **Batches:** 3 landed: 2 results of 2, 1 of 2 and 3 of 3, each with one merged-check run
+  and no bisection. 6 Works landed in all, all 6 in those batches, behind 3 approvals.
+- **Suite runs:** 10 for 6 landed Works, 1.67 per landed Work (0.5.0: 1.45), and 1 reuse
+  of a recorded pass.
 
-- **Subagent conformance** (`docs/harness-conformance.md`, "Subagent cells"): [[C: an orchestrating Claude Code session starts B, A and C as worktree subagents on the release build: how many were Work at spawn and how many "Found, not tracked"; a note and a catch-up delivered to a subagent, each once; finish by consent; the batch, its order and its one merged-check run; whether the parent's end ended any subagent Work, and whether any waiter process belonged to a subagent; and whether any subagent Work was left lost]].
-- **Hook cost:** [[C: `SubagentStart` with a note pending, and `SubagentStop` with an ask pending, over 1,000 calls each on a quiet machine: median, 95th percentile and most, with the load]].
-- **Keeping Δ at a stop:** [[C: `SubagentStop` keeping Δ in a watched project with Work: median, 95th percentile and most, against its 60 s timeout, with the load]].
+The rest was measured on one Mac (arm64, 10 CPUs), with the 1-minute load where it was
+recorded.
+
+- **Subagent conformance** (`docs/harness-conformance.md`, "Subagent cells"), on
+  2026-11-20, on a release build of `f35e1d6`, before packet N's fix. One Claude Code
+  2.1.296 session in the fixture's checkout started B, A and C at once with the Agent tool
+  and `isolation: worktree`. Every cell passed.
+  - All 3 were Work, with S0 the fixture's tree, and 0 were "Found, not tracked". B's Work
+    was made by discovery from its lock 0.46 s before its `SubagentStart` arrived, and the
+    hook joined it.
+  - A note about A and B reached A by `PostToolUse`. B's expired unread, since B had
+    finished.
+  - One ask, naming B's landing, reached A at its next `SubagentStop`, 68 s after it was
+    written, and no second one. A committed and merged, and its S0 followed.
+  - B and C were finished by consent once their locks went, and landed as one batch: one
+    proposal, by finish time, one `--expect`, one merged-check run and one
+    `refs/dispatch/source` commit. A was finished by consent when the parent exited, and
+    landed later on its own.
+  - The parent's `SessionEnd` ended no subagent Work, no waiter ran for the trial's state,
+    and no Work was left lost: all three finished and landed.
+  - Two findings. Claude Code resumed A after each of its background shells, and A kept its
+    lock after its last stop, so its session stayed open until the parent exited 18
+    minutes later, and its finish waited until then ("Not in 0.5.1"). And a note about B's
+    landing was written to A 8 minutes after A's S0 already held it. It was never
+    delivered, as A was done, and packet N fixed the cause after the trial ("Fixed").
+- **Hook cost,** on the release build of `1a331ff`, on 2026-11-21, 1,000 calls each:
+  - `SubagentStart` with a note pending: 6.02 ms at the median, 9.9 ms at the 95th
+    percentile and 17.07 ms at most (load 2.9). Every call delivered the note.
+  - `SubagentStop` with an ask pending: 5.43 ms, 8.77 ms and 24.42 ms (load 2.9). Every
+    call returned the ask as a block.
+  - The bar this release set is for these two paths, where nothing is registered: 15 ms
+    at the 95th percentile. Both are under it. With nothing pending, `SubagentStart` took
+    4.99 ms at the 95th percentile (load 3.0).
+  - Timed call by call in turn, so that each saw the same load (3.7 to 4.4): at the 95th
+    percentile, 0.5.0's `Stop` with an ask took 7.57 ms and this build's 7.49 ms,
+    `SubagentStop` with an ask 7.74 ms and `SubagentStart` with a note 7.91 ms; at most,
+    17.51 ms, 14.2 ms, 200.83 ms and 22.52 ms.
+  - In a watched project, `SubagentStart` for a subagent whose Work is already registered
+    joins that Work, as `SessionStart` does for a session: 57.16 ms at the median, 64.44
+    ms at the 95th percentile and 94.73 ms at most (load 4.0), within its 60 s timeout.
+    `SessionStart` joining a session's Work took 73.89 ms at the 95th percentile with 0.5.0
+    (load 3.2) and 75.85 ms with this build (load 4.0), so a subagent's join costs no more
+    than a session's.
+- **Keeping Δ at a stop:** `SubagentStop` in a watched project, with a file changed before
+  each call, keeping the Work's exact Δ: 71.52 ms at the median, 107.4 ms at the 95th
+  percentile and 125.0 ms at most, over 200 calls (load 4.4), against its 60 s timeout.
 
 Nothing here says tokens, minutes or money were saved.
 
@@ -187,13 +269,17 @@ Nothing here says tokens, minutes or money were saved.
 - Waking a subagent that has stopped, or a waiter for one.
 - Putting a parent's Work first when it merged a subagent's branch, so that the subagent's
   is left out as already applied.
-- Ending a resumed subagent run whose parent exits before its stop.
+- Ending a run resumed with `SendMessage` whose parent exits before its stop: it has no
+  lock, and its Work waits for you.
+- Ending, before its parent exits, the session of a subagent that Claude Code resumed by
+  itself, after a background shell for example: it can keep its lock until then, and its
+  finish by consent waits. Its Δ was kept at each stop.
 - Keeping a parent's own hooks, sent from inside a subagent's worktree, away from that
   Work's notes and asks.
 - An orchestrator's own launches and messages: that is `dispatch mcp`, planned for 0.6.0.
 
-Production code under `src/`, excluding `#[cfg(test)]` items, grew by 454 non-blank lines
-since 0.5.0 (349 without comment lines): subagents are 416 of them (315), and menus 38
-(34).
+Production code under `src/`, excluding `#[cfg(test)]` items, grew by 477 non-blank lines
+since 0.5.0 (362 without comment lines): subagents are 424 of them (319), menus 38 (34),
+and the notes fix 15 (9).
 
 Site impact: Claude Code subagents started with `isolation: worktree` become Work, with two new Claude Code hooks (`SubagentStart`, `SubagentStop`, 60 s each) that setup offers once as an Update; the Claude Code guide's "Worktrees that were already there when watching began, or that have no session lock yet, are listed as *found, not tracked*" no longer covers a subagent's worktree, which has an agent lock and becomes Work, its "The hooks take a few milliseconds: they open no database and take no lock" no longer holds for `SubagentStop`, which keeps a subagent's Δ under its Work's lock, and its "With them:" list gains subagents (S0 at spawn, notes, an ask at `SubagentStop`, its Δ at each stop, finish by consent, the batch; not tracked: no isolation, Claude Code's own agents), and its "Starting from your current code" (`status` and `watch` "recommend `dispatch attach -- claude`") does not hold for a subagent's Work, whose start line reads `Claude Code: a subagent's worktree starts from the checkout's HEAD; uncommitted changes are not copied.`; limits' "Found by itself: Claude Code, Codex, Cursor Agent and Hermes Agent sessions in their own worktrees" and the agent guide's "Agents in their own worktrees" gain Claude Code subagents; a subagent's REFRESH next step reads `start Claude Code in <worktree>`.
