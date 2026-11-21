@@ -346,7 +346,7 @@ Each run's committed events are in the `events` table, and `dispatch events` and
 | `subagent.stopped` | a Claude Code subagent's `SubagentStop` kept its Work's exact Δ ([attach.md](attach.md#subagents)) | `{"agent_id", "sessions": [<session id>], "files_changed"}` |
 
 Events that gain values in 0.5.1:
-- `runtime.session_ended` has a new reason, `subagent_stop`: a subagent's run that started without its agent lock, as a resumed run does, ended at its `SubagentStop`.
+- `runtime.session_ended` has a new reason, `subagent_stop`: a subagent's run that started without its agent lock, as a run resumed with `SendMessage` does, ended at its `SubagentStop`.
 - `catchup.delivered` has a new `via`, `subagent_stop`, and `note.delivered` a new `via`, `SubagentStart` (both in the tables below).
 - A subagent's session, in `runtime.session_started` and the Work's record, carries `subagent`: `{"parent_session", "agent_id", "agent_type", "locked", "stopped_at", "kept_on"}`. Every other session has none.
 
@@ -408,11 +408,13 @@ without it: `scripts/test-in-docker.sh cargo test --locked --no-run`.
 
 CI runs the suite on every pull request and push to `main`, on Linux (in the test
 image) and macOS. A release runs the same suite on its tag before it builds any
-asset. `stability.yml` runs the suite 20 times a night on both platforms and lists
-every failing test with its count. `harness-trials.yml` runs real agents through
-`scripts/harness-trial.sh`, only by hand or weekly, never on pull requests, with
-keys from a protected environment. Only the fixture reaches the model providers,
-sent by the agents; Dispatch uploads nothing.
+asset. `stability.yml` runs the suite 20 times a night on both platforms, and 10
+times on macOS under load (16 busy loops, 4 loops that start processes without
+pause, 8 test threads), and lists every failing test with its count.
+`harness-trials.yml` runs real agents through `scripts/harness-trial.sh`, only
+by hand or weekly, never on pull requests, with keys from a protected
+environment. Only the fixture reaches the model providers, sent by the agents;
+Dispatch uploads nothing.
 
 Dispatch's promise is tested per agent: `scripts/harness-trial.sh <harness>
 <path>` runs one shared scenario through each path Dispatch offers an agent and

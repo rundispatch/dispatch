@@ -230,29 +230,80 @@ hand, not by `scripts/harness-trial.sh`.
 
 - **Setup.** As for the coordination cells: a fresh copy of the fixture with its
   own state directory, the release build's ten Claude Code hooks in the project's
-  `.claude/settings.local.json`, and Claude Code run with `--setting-sources
-  local`. The project's check consent is given before the orchestrator starts.
+  `.claude/settings.local.json` and no `worktree.baseRef`, and Claude Code run
+  with `--setting-sources local`. Folder trust is accepted first in a session with
+  hooks disabled (`claude --setting-sources '' --settings
+  '{"disableAllHooks":true}'`), which makes no state. The person gives the
+  project's check consent at a terminal, and `dispatch start` watches the project.
+- **The prompt** is a file, `.claude/orchestrator-prompt.txt`, which the
+  orchestrator is told to read: a long line typed into the terminal can arrive
+  cut short. The file is one line: this opening, then `Task A:`, `Task B:` and
+  `Task C:`, each followed by its task from `scripts/harness-trial/tasks/`, word
+  for word.
+
+  ```text
+  Start three subagents at once with the Agent tool, each with isolation: "worktree" and subagent_type "general-purpose". Give each one its task below, word for word. Do not edit any file yourself, and do not merge their branches. When all three have finished, tell me each one's result in two lines.
+  ```
+
+  Task A goes on after its task, so that A still runs when B lands, and knows in
+  advance what to do with an ask:
+
+  ```text
+  When your edit is done and python3 -B -m unittest -q passes, run sleep 100 three times, one after the other, before you finish: this trial needs you running a while. If a Dispatch hook asks you to catch up with a landing, do what it says: commit, merge the commit it names, then change promote to take (ctx, token) and pass ctx to validate, update test_app.py to match, and run the tests.
+  ```
+
 - **Steps.**
-  1. The orchestrator starts B, A and C. Each should be Work before its first
-     edit, and no subagent worktree "Found, not tracked".
+  1. The orchestrator (`claude --setting-sources local --permission-mode
+     acceptEdits`, in the checkout) reads the file and starts A, B and C. Each
+     should be Work before its first edit, and no subagent worktree "Found, not
+     tracked".
   2. While A and B run, a subagent should hear through a hook that they interact.
-  3. B and C end. The owner should finish each by consent. `dispatch accept` with
-     no ID proposes both, and `accept --expect <batch digest>` lands them.
-  4. A, still running when B lands, should be asked once, at its next
-     `SubagentStop`, to merge it.
-  5. A merges, ends, is finished by consent and accepted.
+  3. B and C end. The owner should finish each by consent once its session ends.
+     `dispatch accept` with no ID proposes both, and `accept --expect <batch
+     digest>` lands them.
+  4. A's sleeps run as background shells, and Claude Code resumes A after each
+     one. Still running when B lands, A should be asked once, at its next
+     `SubagentStop`, to merge B's landing, and its S0 should follow the merge.
+  5. Once the orchestrator reports all three done, it exits (`/exit`). A's
+     session ends then (finding 1, below), and the owner should finish it by
+     consent. `dispatch accept <id> --expect <Δ digest>` lands it on its own.
 
 | Cell | Pass when |
 |---|---|
-| Work at spawn | one Work per subagent, registered by its `SubagentStart` or by discovery before its first edit, with S0 the commit its worktree was made from; 0 subagent worktrees "Found, not tracked" |
+| Work at spawn | one Work per subagent, registered by its `SubagentStart` or by discovery before its first edit, with S0 the tree its worktree was made from; 0 subagent worktrees "Found, not tracked" |
 | notes | a note about A and B delivered to a subagent through a hook (`PostToolUse` or `SubagentStart`) |
 | catch-up | one `catchup.written` for A naming B's landing, one `catchup.delivered {via: subagent_stop}`, and no second ask |
 | finish by consent | each subagent's Work finished by the owner (`finish_reason: by_consent`) once its session ended, with no `dispatch finish` typed |
 | batch landing | one proposal of B and C, one `--expect`, one merged-check run, one `refs/dispatch/source` commit |
 
+The trial below ran on a release build of `f35e1d6` (`dispatch 0.5.1`), macOS
+arm64, on 2026-11-20, before packet N's fix. Under `src/`, the release differs
+from that build only by N, which fixed finding 2, the late note, after the trial.
+
 | Harness | Work at spawn | Notes | Catch-up | Finish by consent | Batch landing | Harness version | Evidence |
 |---|---|---|---|---|---|---|---|
-| claude | [[C: pass or fail; Works at spawn, and the "Found, not tracked" count]] | [[C: result, and which hook delivered]] | [[C: result, with the time from the ask written to its delivery]] | [[C: result]] | [[C: result]] | [[C: Claude Code version]] | [[C: evidence directory]] |
+| claude | pass (3 Works, 0 "Found, not tracked"; B's made by discovery from its lock 0.46 s before its `SubagentStart`, which joined it) | pass (`PostToolUse`, to A) | pass (A running, the ask at its next `SubagentStop`, 68 s after it was written) | pass (B and C when their locks went, A when the parent exited) | pass (B and C; A later on its own) | 2.1.296 (Claude Code) | `~/dispatch-dev/conformance-0510/claude` |
+
+The trial also checked the parent's end and that no Work was lost. Both passed:
+the parent's `SessionEnd` ended no subagent Work, A's session ended by liveness
+(`process_gone`) when the parent exited, no waiter ran for the trial's state, and
+all three Works finished and landed. Its findings, from its `record.md`:
+
+1. **A's session stayed open until the parent exited,** 18 minutes after A's
+   last stop and through one parent turn, because A kept its lock: Claude Code
+   had resumed A after each background shell. B and C, never resumed, lost their
+   locks 6 to 14 s after their stops. A's finish by consent waited for the
+   parent. Nothing was lost: Δ was kept at each stop. This is how Claude Code
+   2.1.296 behaves, and a known limit ([attach.md](attach.md), "Known limits").
+2. **A late note.** B's landing item waited for A's ten-minute note window and
+   was written to A 8 minutes after A's S0 already held the landing. It was never
+   delivered, since A was done. Packet N fixed it after the trial: a landing makes
+   a note item only while it is newer than the Work's S0 ([attach.md](attach.md),
+   "Notes to live agents").
+3. **Discovery won the race with `SubagentStart`** for B, by 0.46 s. There was
+   one Work, as designed, and its task has no agent type.
+4. **The ask waited 68 s** for A's next `SubagentStop`, which came only when its
+   background shell ended. A subagent that has stopped is not woken.
 
 Stand-in subagents, sending the probe's recorded payloads, go through each of
 these steps in `tests/subagents.rs`. That tests Dispatch, not a harness, and is
