@@ -61,8 +61,9 @@ pub(super) type Signatures = BTreeMap<Target, (String, String)>;
 
 /// Leave each live Work in `runs` the note `compose` gives it at `now`, from
 /// `projection` and the landings recorded at `root` since the oldest of them
-/// began, and record what changed at the targets of notes already written.
-/// Busy Work keeps what it was sent and is tried again on a later tick.
+/// began and after its own S0 (`after_s0`), and record what changed at the
+/// targets of notes already written. Busy Work keeps what it was sent and is
+/// tried again on a later tick.
 pub(crate) fn tell(
     state: &State,
     root: &Path,
@@ -104,6 +105,7 @@ pub(crate) fn tell(
     for &run in &hooked {
         let landings: Vec<notes::Landing> = recorded
             .iter()
+            .filter(|source| after_s0(run, source))
             .filter_map(|source| {
                 let (landing, signatures) = told.landings.get(&source.landed_run)?.as_ref()?;
                 let counterpart = landing
@@ -252,6 +254,16 @@ fn target(key: &str) -> Option<Target> {
         Some(name) => Target::Symbol { path, name },
         None => Target::File { path },
     })
+}
+
+/// Whether `source` was recorded after `run`'s S0 became its S0, so that
+/// what landed there is not in S0. A snapshot S0 never moves: it has been S0
+/// since the Work began.
+pub(super) fn after_s0(run: &RunRecord, source: &s0::Recorded) -> bool {
+    let since = run
+        .s0_commit()
+        .map_or_else(|| run.first_s0_since(), |(_, since)| since);
+    source.at > since
 }
 
 /// `landed`'s `interaction.landed`, and the signatures it changed, as its S0
@@ -434,6 +446,7 @@ mod tests {
                 ended_at: None,
                 end_reason: None,
                 model: None,
+                subagent: None,
             };
             attach::create(
                 &self.state,

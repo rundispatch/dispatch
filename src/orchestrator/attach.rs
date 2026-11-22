@@ -17,7 +17,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -35,7 +35,7 @@ use crate::{
     Closure, Config, DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState,
     ManagedWorkspace, NeedsYou, NeedsYouKind, OwnerState, ReviewState, RunMode, RunOutcome,
     RunPhase, RunRecord, RunStatus, RuntimeSession, SourceAtStart, StartObservation, StartPath,
-    VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
+    Subagent, VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
     coherence::{
         watch::{WatchSpec, Watcher},
         world,
@@ -1216,17 +1216,28 @@ pub(crate) fn record_session_start(
     let Some(attachment) = run.attachment.as_mut() else {
         return Ok(true);
     };
-    if attachment.sessions.iter().any(|known| {
+    let open = attachment.sessions.iter_mut().find(|known| {
         known.provider == session.provider
             && known.session_id == session.session_id
             && known.ended_at.is_none()
-    }) {
-        return Ok(true);
+    });
+    if let Some(known) = open {
+        // A subagent started again before its stop ended the session: it
+        // runs again, with or without the lock it starts under.
+        if known
+            .subagent
+            .as_ref()
+            .is_none_or(|subagent| subagent.stopped_at.is_none())
+        {
+            return Ok(true);
+        }
+        known.subagent = session.subagent.clone();
+    } else {
+        attachment.sessions.push(session.clone());
+        // A long-lived workspace sees many sessions; the Work keeps the latest.
+        let excess = attachment.sessions.len().saturating_sub(MAX_SESSIONS);
+        attachment.sessions.drain(..excess);
     }
-    attachment.sessions.push(session.clone());
-    // A long-lived workspace sees many sessions; the Work keeps the latest.
-    let excess = attachment.sessions.len().saturating_sub(MAX_SESSIONS);
-    attachment.sessions.drain(..excess);
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
     persist_event(
@@ -1257,21 +1268,44 @@ pub(crate) fn record_session_end(
     at: DateTime<Utc>,
     wait: Duration,
 ) -> Result<bool> {
+    let session =
+        |known: &RuntimeSession| known.provider == provider && known.session_id == session_id;
+    end_session(state, run_id, session, reason, at, wait)
+}
+
+/// `record_session_end` of the newest open session that `session` names,
+/// judged again under the run's lock: what a tick read before taking it may
+/// have changed.
+pub(crate) fn end_session(
+    state: &State,
+    run_id: &str,
+    session: impl Fn(&RuntimeSession) -> bool,
+    reason: &str,
+    at: DateTime<Utc>,
+    wait: Duration,
+) -> Result<bool> {
     let Some(_lock) =
         OperationLock::acquire_within(&state.run_dir(run_id).join(".operation.lock"), wait)?
     else {
         return Ok(false);
     };
     let mut run = state.load_run(run_id)?;
-    let Some(session) = run.attachment.as_mut().and_then(|attachment| {
-        attachment.sessions.iter_mut().rev().find(|known| {
-            known.provider == provider && known.session_id == session_id && known.ended_at.is_none()
-        })
+    let Some(known) = run.attachment.as_mut().and_then(|attachment| {
+        attachment
+            .sessions
+            .iter_mut()
+            .rev()
+            .find(|known| known.ended_at.is_none() && session(known))
     }) else {
         return Ok(true);
     };
-    session.ended_at = Some(at);
-    session.end_reason = Some(reason.to_owned());
+    known.ended_at = Some(at);
+    known.end_reason = Some(reason.to_owned());
+    let payload = serde_json::json!({
+        "provider": known.provider,
+        "session_id": known.session_id,
+        "reason": reason,
+    });
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
     persist_event(
@@ -1282,11 +1316,7 @@ pub(crate) fn record_session_end(
             candidate_label: None,
             event_type: "runtime.session_ended".into(),
             timestamp: Utc::now(),
-            payload: serde_json::json!({
-                "provider": provider,
-                "session_id": session_id,
-                "reason": reason,
-            }),
+            payload,
             ..EventRecord::default()
         },
         &mut run,
@@ -1758,31 +1788,33 @@ pub(super) async fn finish_locked(
         crate::state::write_durably(&diff_path, &fs::read(kept)?)?;
     }
     // A removed workspace is rebuilt from S0 and its kept Δ, so the checks
-    // still run on exactly the work.
+    // still run on exactly the work. So is a subagent's whose worktree is
+    // gone, or whose Δ kept at its stop is empty: Claude Code removes an
+    // unchanged worktree right after that stop, and a tree being removed is
+    // never the work.
+    let kept = removal.is_some()
+        || (kept_at_stop(&run)
+            && (!workspace.exists() || run.candidates[0].diff_stats.files_changed == 0));
     let rebuilt = tempfile::Builder::new()
         .prefix("dispatch-rebuilt-")
         .tempdir()
         .context("failed to prepare a workspace for the checks")?;
-    let (workspace, diff_stats) = match &removal {
-        Some(_) => {
-            let workspace = source::rebuild_workspace(
-                &run.baseline_path,
-                &diff_path,
-                &rebuilt.path().join("w"),
-            )?;
-            // Derive statistics from the rebuilt tree too: the live patch's
-            // statistics were not necessarily retained when removal was noticed.
-            let stats = source::collect_diff(
-                &run.baseline_path,
-                &workspace,
-                &rebuilt.path().join("delta.patch"),
-            );
-            (workspace, stats)
-        }
-        None => (
+    let (workspace, diff_stats) = if kept {
+        let workspace =
+            source::rebuild_workspace(&run.baseline_path, &diff_path, &rebuilt.path().join("w"))?;
+        // Derive statistics from the rebuilt tree too: the live patch's
+        // statistics were not necessarily retained when removal was noticed.
+        let stats = source::collect_diff(
+            &run.baseline_path,
+            &workspace,
+            &rebuilt.path().join("delta.patch"),
+        );
+        (workspace, stats)
+    } else {
+        (
             workspace.clone(),
             source::collect_diff(&run.baseline_path, &workspace, &diff_path),
-        ),
+        )
     };
 
     let diff_stats = match diff_stats {
@@ -2101,6 +2133,104 @@ pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u6
     Ok(files_changed)
 }
 
+/// A subagent's run stopped: keep the exact Δ of its Work `run_id` as its
+/// patch, on the baseline it is against, and record the stop on its open
+/// sessions. Those that started without its agent lock, as a resumed run
+/// does, end now; the others end when the lock goes (`liveness`). Each stop
+/// keeps the Δ again. The Work goes on: the subagent may run again, and until
+/// it does, a removal of its worktree works from this Δ (`kept_at_stop`).
+/// Everything waits until `deadline` at most.
+pub(crate) fn freeze_at_stop(
+    state: &State,
+    run_id: &str,
+    agent_id: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let (at, ending) = {
+        let _lock = OperationLock::acquire_wait(
+            &state.run_dir(run_id).join(".operation.lock"),
+            "attached work has a foreground owner",
+            left(),
+        )?;
+        let mut run = state.load_run(run_id)?;
+        let Some(attachment) = run.attachment.as_mut() else {
+            return Ok(());
+        };
+        if run.mode != RunMode::Attached
+            || run.outcome.lifecycle != LifecycleState::Working
+            || run.candidates.len() != 1
+            || attachment.workspace_removed.is_some()
+        {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let (mut stopped, mut ending) = (Vec::new(), Vec::new());
+        for session in attachment.sessions.iter_mut() {
+            if let Some(subagent) = session.subagent.as_mut()
+                && subagent.agent_id == agent_id
+                && session.ended_at.is_none()
+            {
+                subagent.stopped_at = Some(now);
+                subagent.kept_on = Some(run.baseline_commit.clone());
+                stopped.push(session.session_id.clone());
+                if !subagent.locked {
+                    ending.push(session.session_id.clone());
+                }
+            }
+        }
+        let staging = state.run_dir(run_id).join(".delta-at-stop.patch");
+        let stats = source::collect_diff(
+            &run.baseline_path,
+            &run.candidates[0].workspace_path,
+            &staging,
+        )?;
+        crate::state::write_durably(&run.candidates[0].diff_path, &fs::read(&staging)?)?;
+        let _ = fs::remove_file(&staging);
+        let files_changed = stats.files_changed;
+        run.candidates[0].diff_stats = stats;
+        let mut db = Database::open(state.db_path())?;
+        db.sync_run(&run)?;
+        persist_event(
+            state,
+            &db,
+            EventRecord {
+                run_id: run.id.clone(),
+                candidate_label: None,
+                event_type: "subagent.stopped".into(),
+                timestamp: now,
+                payload: serde_json::json!({
+                    "agent_id": agent_id, "sessions": stopped, "files_changed": files_changed,
+                }),
+                ..EventRecord::default()
+            },
+            &mut run,
+        )?;
+        (now, ending)
+    };
+    for session in ending {
+        let stopped = |known: &RuntimeSession| known.session_id == session;
+        end_session(state, run_id, stopped, "subagent_stop", at, left())?;
+    }
+    Ok(())
+}
+
+/// Whether `run`'s patch holds its exact Δ, kept at its last stop: it is a
+/// subagent's, every run of it stopped (`freeze_at_stop`), so nothing works
+/// in its worktree since, and its S0 has not moved since that stop.
+pub(crate) fn kept_at_stop(run: &RunRecord) -> bool {
+    let Some(attachment) = run.attachment.as_ref() else {
+        return false;
+    };
+    let stops: Option<Vec<&Subagent>> = attachment
+        .sessions
+        .iter()
+        .map(|session| session.subagent.as_ref().filter(|s| s.stopped_at.is_some()))
+        .collect();
+    let last = stops.and_then(|stops| stops.into_iter().max_by_key(|s| s.stopped_at));
+    last.and_then(|last| last.kept_on.as_deref()) == Some(run.baseline_commit.as_str())
+}
+
 /// Why a finish stopped without recording anything: its session came back.
 const CANCELLED: &str = "the finish was cancelled";
 
@@ -2129,6 +2259,9 @@ pub(crate) fn finishes_by_consent(state: &State, run: &RunRecord) -> Result<bool
     }
     let over = match &attachment.workspace_removed {
         Some(removal) => removal.exact,
+        // Claude Code removes a subagent's unchanged worktree, which closes
+        // its Work (`note_workspace_gone`).
+        None if kept_at_stop(run) && run.candidates[0].diff_stats.files_changed == 0 => false,
         None => session_over(run),
     };
     if !over {
@@ -2399,6 +2532,8 @@ pub(crate) fn supersede_reopened(state: &State, old: &str, new: &str) -> Result<
 /// The project owner found the workspace of active Work gone without being
 /// told first: only the Δ it last followed survives, kept beside the run as
 /// `delta-last-seen.patch`. A person can explicitly finish from those changes.
+/// A subagent's Δ kept at its stop (`kept_at_stop`) is its exact Δ instead,
+/// which Claude Code removes the worktree after when it is empty.
 pub(crate) fn note_workspace_gone(
     state: &State,
     run_id: &str,
@@ -2409,6 +2544,7 @@ pub(crate) fn note_workspace_gone(
         "attached work has a foreground owner",
     )?;
     let mut run = state.load_run(run_id)?;
+    let exact = kept_at_stop(&run);
     let Some(attachment) = run.attachment.as_mut() else {
         return Ok(());
     };
@@ -2420,7 +2556,7 @@ pub(crate) fn note_workspace_gone(
     }
     let now = Utc::now();
     let mut last_seen_at = None;
-    let last_seen = match last_seen.filter(|path| path.is_file()) {
+    let last_seen = match last_seen.filter(|path| path.is_file() && !exact) {
         Some(path) => {
             let mut file = fs::File::open(path)?;
             last_seen_at = Some(DateTime::<Utc>::from(file.metadata()?.modified()?));
@@ -2432,14 +2568,18 @@ pub(crate) fn note_workspace_gone(
     };
     attachment.workspace_removed = Some(WorkspaceRemoval {
         at: now,
-        exact: false,
+        exact,
         last_seen_at,
     });
     if let Some(bytes) = &last_seen {
         crate::state::write_durably(&state.run_dir(run_id).join("delta-last-seen.patch"), bytes)?;
     }
     // Last seen with no changes at all: nothing was lost, so nothing waits.
-    let empty = last_seen.as_ref().is_some_and(Vec::is_empty);
+    let empty = if exact {
+        run.candidates[0].diff_stats.files_changed == 0
+    } else {
+        last_seen.as_ref().is_some_and(Vec::is_empty)
+    };
     if empty {
         cancel_work(&mut run, now, "no_changes");
     }
@@ -2453,7 +2593,7 @@ pub(crate) fn note_workspace_gone(
             candidate_label: None,
             event_type: "workspace.removed".into(),
             timestamp: now,
-            payload: serde_json::json!({"exact": false, "no_changes": empty, "last_seen_at": last_seen_at}),
+            payload: serde_json::json!({"exact": exact, "no_changes": empty, "last_seen_at": last_seen_at}),
             ..EventRecord::default()
         },
         &mut run,
@@ -2874,6 +3014,7 @@ mod last_seen_tests {
             ended_at: Some(at + chrono::Duration::seconds(5)),
             end_reason: Some("clear".into()),
             model: None,
+            subagent: None,
         });
         assert_eq!(waiting_on_you(&run), None);
         assert_eq!(needs_you_cleared(&run), Some("session_end"));
@@ -2954,6 +3095,7 @@ mod last_seen_tests {
             ended_at: Some(Utc::now()),
             end_reason: Some("prompt_input_exit".into()),
             model: None,
+            subagent: None,
         });
         let workspace = attachment.workspace.clone();
         Database::open(state.db_path())
@@ -3015,6 +3157,7 @@ mod last_seen_tests {
                         ended_at: None,
                         end_reason: None,
                         model: None,
+                        subagent: None,
                     },
                     resumed: true,
                     commit: old.s0_commit().unwrap().0.to_owned(),
@@ -3159,6 +3302,7 @@ mod last_seen_tests {
                     ended_at: None,
                     end_reason: None,
                     model: None,
+                    subagent: None,
                 },
                 resumed: reopens.is_some(),
                 commit: commit.into(),

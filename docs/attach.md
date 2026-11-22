@@ -195,7 +195,8 @@ That remedy comes first, for any agent. Advice specific to a runtime comes from 
 runtime's adapter and appears only for workspaces it made. For a Claude Code worktree it
 adds: "Claude Code: local commits reach a claude --worktree workspace only with
 worktree.baseRef: "head" in its settings; neither that setting nor a commit copies
-uncommitted changes." Dispatch never changes settings, commits or pushes in response.
+uncommitted changes." A Claude Code subagent's Work gets one line in place of both
+("Subagents", below). Dispatch never changes settings, commits or pushes in response.
 
 ### When S0 moves
 
@@ -823,9 +824,10 @@ the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
 
 ## Work a runtime registers
 
-A runtime's session in its own worktree becomes Work in a watched project in two
-ways: through Claude Code's hooks, described here, or without any hook, when the
-owner finds the worktree ("Work that appears without hooks", below). Either way
+A runtime's session in its own worktree, or a Claude Code subagent in its own
+("Subagents", below), becomes Work in a watched project in two ways: through Claude
+Code's hooks, described here, or without any hook, when the owner finds the worktree
+("Work that appears without hooks", below). Either way
 there is one Work per worktree. Hermes's hooks register nothing; they keep the
 exact Δ of Work discovery found and deliver notes and asks to catch up ("Hermes
 Agent", below).
@@ -833,7 +835,7 @@ Agent", below).
 With Claude Code's hooks installed, the runtime tells Dispatch about its sessions
 (`dispatch hook claude`, which reads the runtime's event on stdin). `dispatch setup`
 offers them when `claude` is on `PATH`, showing the exact additions, with focus on Skip.
-There are eight, each a `command` hook running `'<dispatch>' --state-dir '<state>' hook
+There are ten, each a `command` hook running `'<dispatch>' --state-dir '<state>' hook
 claude`, except the waiter, which runs `… hook claude-wait` with `asyncRewake: true`:
 
 | Event | Matcher | Timeout | Since |
@@ -846,14 +848,19 @@ claude`, except the waiter, which runs `… hook claude-wait` with `asyncRewake:
 | `Stop` | | 5 s | 0.4.17 |
 | `PostToolUse` | | 5 s | 0.4.18 |
 | `Stop` (the waiter, `hook claude-wait`, `asyncRewake`) | | 28800 s | 0.5.0 |
+| `SubagentStart` | | 60 s | 0.5.1 |
+| `SubagentStop` | | 60 s | 0.5.1 |
 
 `PostToolUse` runs after every tool call and only delivers notes ("Notes to live agents",
 below). The two `Stop` hooks deliver asks to catch up ("Catch-up in place", below); the
 consent screen says of the second: `The second Stop hook waits in the background after each
 turn, for at most 8 hours, to wake the session when its Work is asked to catch up with a
-landing.` A settings file holding exactly the hooks an earlier Dispatch installed, 0.4.6 to
-0.4.16's four, 0.4.17's six or 0.4.18's seven, is offered as an Update, showing the hooks it
-becomes, for the same executable (`Hook command, unchanged: …`) or another. The two `Stop`
+landing.` `SubagentStart` and `SubagentStop` make each subagent in its own worktree Work of
+its own ("Subagents", below), and the consent screen adds: `With SubagentStart and
+SubagentStop, each subagent in its own worktree is Work of its own.` A settings file holding
+exactly the hooks an earlier Dispatch installed, 0.4.6 to 0.4.16's four, 0.4.17's six,
+0.4.18's seven or 0.5.0's eight, is offered as an Update, showing the hooks it becomes, for
+the same executable (`Hook command, unchanged: …`) or another. The two `Stop`
 entries are Dispatch's in either order. Hooks of Dispatch's edited by hand are left alone and reported as `changed
 by hand`; the "Agents Dispatch launches…" → Runtime integrations menu removes them (`Only
 Dispatch's own hooks are removed, hook by hook`), then installs them again. A person's own
@@ -929,6 +936,10 @@ hooks, in the same file or the same entry, are kept on install, update and remov
       until `dispatch setup` asks again.
     - Work registered or found while it holds is created with local authority
       (`attach.authorized {by: "project consent"}`).
+    - Work registered or found before the consent was given keeps no authority, so the
+      owner never finishes it, even once its session ends. `dispatch finish <id>`, with
+      no flag, finishes it under the consent when the consent names its checks, and
+      records `attach.authorized {by: "project consent"}`.
     - When `checks.verify` changes, it no longer holds until the person approves
       the new commands.
     - It authorizes checks only; applying still needs a person's review.
@@ -1094,7 +1105,9 @@ another session registering the same worktree waits for it until the hook's own 
 instead of failing after 10 s with `another session is registering this workspace`. The
 removal hooks (`WorktreeRemove`, `PreToolUse` on `ExitWorktree`, and Hermes's when Hermes
 removes its worktree) still wait, within their deadline, because they must keep the Δ before
-the worktree is deleted.
+the worktree is deleted. So does `SubagentStop` (0.5.1), which keeps a subagent's Δ at the
+end of each response, since Claude Code may remove that worktree right after
+("Subagents", below).
 
 ### Notes to live agents
 
@@ -1136,9 +1149,11 @@ may also ask the agent to catch up ("Catch-up in place", below).
 - **How often.** Each item is sent once, keyed by the other Work or landing, the target and
   the change. A Work gets at most one note per ten minutes; anything found in between is
   merged into the next note. Items about Work in progress are rebuilt each tick, so an item
-  whose Work or interaction is gone by then is not sent. A note is at most 8,000
-  characters; items past that wait for the next note, which the last line says: `And <n>
-  more in the next note.`
+  whose Work or interaction is gone by then is not sent. A landing makes an item only while
+  it is newer than the Work's S0 (recorded after S0 became the Work's S0, the rule catch-up
+  uses): once the Work merges it and its S0 moves, an item still waiting for the window is
+  dropped, not sent. A note is at most 8,000 characters; items past that wait for the next
+  note, which the last line says: `And <n> more in the next note.`
 - **Who gets notes:** Work in progress whose workspace had a Claude Code or Hermes session
   recorded. Codex and Cursor Work gets none: Dispatch installs no hook in them that can
   carry context. Neither does Work attached with `dispatch attach` and no session.
@@ -1147,8 +1162,9 @@ may also ask the agent to catch up ("Catch-up in place", below).
   each Work was sent in `<state>/inbox/sent/<run id>.json` until the Work finishes or is
   closed, so a restarted owner sends nothing twice and loses no landing.
 - **Delivery.** Claude Code's `PostToolUse` hook (after every tool call) and `SessionStart`
-  hook give the notes as `hookSpecificOutput.additionalContext`, which Claude Code shows the
-  model beside the tool's result, or before the first prompt. Hermes's `pre_llm_call` hook
+  hook, and `SubagentStart` for a subagent (0.5.1), give the notes as
+  `hookSpecificOutput.additionalContext`, which Claude Code shows the model beside the
+  tool's result, or before the first prompt. Hermes's `pre_llm_call` hook
   prints `{"context": …}`, which Hermes adds to that turn's message. The hook walks up from
   its directory (Claude Code's `cwd`, Hermes's `TERMINAL_CWD`) to the first directory with a
   `.git`, takes that workspace's inbox by renaming it, and prints it. A rename happens once,
@@ -1252,10 +1268,115 @@ written by a model, and only through the runtime's hooks.
   <id>`, and in `watch`'s details under its REFRESH. Once S0 moves, the line goes. While it
   shows, `dispatch check <id> --merged` gives the REFRESH next step `its agent was asked to
   merge <commit>; once its S0 moves, Dispatch checks it again`.
+- **Claude Code subagents** get an ask at the end of a response, from `SubagentStop`, as
+  `Stop` gives it (0.5.1; "Subagents", below).
 - **Recorded:** `catchup.written {landings, targets, text}` when the owner writes or adds to
-  an ask, `catchup.delivered {via: stop | wake | verify | turn, landings}` timed when a hook
-  took it, and `catchup.expired {why, landings}`. `docs/queries/catchup-measured.sql` counts
+  an ask, `catchup.delivered {via: stop | wake | verify | turn | subagent_stop, landings}`
+  timed when a hook took it, and `catchup.expired {why, landings}`. `docs/queries/catchup-measured.sql` counts
   them ("Measuring catch-up and batches" in [coherence-validation.md](coherence-validation.md)).
+
+### Subagents
+
+Since 0.5.1, a subagent that Claude Code starts with the Agent tool and `isolation: worktree`
+is Work of its own from its first moment, with no step for anyone. Observed with Claude Code
+2.1.296: it works in `<project>/.claude/worktrees/agent-<id>`, on the branch
+`worktree-agent-<id>`, made from the checkout's HEAD with or without `worktree.baseRef:
+head`. Claude Code writes `CLAUDE_BASE` there and locks the worktree `claude agent
+agent-<id> (pid <parent pid> start <parent start>)` before `SubagentStart` runs, and removes
+that lock shortly after the subagent's first `SubagentStop`. A subagent that Claude Code
+resumes by itself, after a background shell ends for example, keeps the lock through its
+resumed runs, and can keep it after its last stop ("Known limits").
+
+- **Registration.** In a watched project, `SubagentStart` registers the subagent before its
+  first tool call, as `SessionStart` registers a session, within the same 40 s budget. S0 is
+  its worktree as Claude Code made it. Notes waiting for that worktree arrive with it, and
+  the reply is a session's: `Dispatch is tracking this worktree as Work <id>; see it with
+  dispatch watch.` The Work's task reads `claude subagent <agent_type> in agent-<first 8
+  characters of the id>`, for example `claude subagent general-purpose in agent-a85d8d5d`.
+- **Where it began.** A worktree made from HEAD lacks accepted changes that are not
+  committed, so the source can differ from a subagent's S0 at its start ("The source at
+  the start", above). Its "source at start" lines in `status` and `watch` then give, after
+  the line naming the differing paths, `Claude Code: a subagent's worktree starts from the
+  checkout's HEAD; uncommitted changes are not copied.` in place of the `dispatch attach
+  -- <agent>` remedy and the `worktree.baseRef` line: the parent's Agent tool starts a
+  subagent, and Claude Code makes its worktree from HEAD with or without that setting. The
+  same holds for a subagent's Work that discovery registered.
+- **Its own session.** Every hook inside a subagent carries its parent's `session_id`, so
+  the Work's session is `<parent session>_agent-<id>`, with Claude Code's `agent-` prefix
+  taken off the `agent_id`. That session's record has a `subagent` field, `{parent_session,
+  agent_id, agent_type, locked, stopped_at, kept_on}`, which no other session has. The
+  parent's own `Stop` and `SessionEnd` name the parent's session, which no subagent Work
+  holds, so they never mark or end one, and a subagent's `Notification` marks only its own
+  Work. No waiter starts for a subagent: the waiter is a `Stop` hook.
+- **Notes and catch-up.** Notes reach a subagent at `SubagentStart` and after each tool call
+  (`PostToolUse`). An ask to catch up reaches it once, at the end of a response:
+  `SubagentStop` prints `{"decision":"block","reason":<the ask>}` unless `stop_hook_active`
+  is true, and the subagent keeps going with it (`catchup.delivered {via: subagent_stop}`).
+  On a stand-in project, a subagent still running when another subagent's change to `scale`
+  landed got, at its next stop:
+
+  ```text
+  Dispatch: Work 01M7WVQ96 (Claude Code) landed a change this Work relies on.
+  - scale (src/lib.rs), which this Work uses: 01M7WVQ96 changed its signature, pub fn scale(n: i32) -> i32 → pub fn scale(n: i32, by: i32) -> i32
+  These changes are in refs/dispatch/source (commit bf7573a3).
+  To catch up: commit your work, run git merge bf7573a363b69f53c6d4338ba2066440ce207dd2, update what uses them, and run the project's checks. Dispatch asks once per landing.
+  ```
+
+  An ask is given only while the subagent runs, at its next `SubagentStop`. Nothing wakes a
+  subagent that has stopped.
+- **Its exact Δ at each stop.** `SubagentStop` comes once per response, not once per
+  subagent, so it never ends the Work. Each one that delivers no ask keeps the Work's exact
+  Δ against its S0, under the Work's lock and within the 40 s budget, and records
+  `subagent.stopped {agent_id, sessions, files_changed}` and the stop on the session
+  (`stopped_at`, and `kept_on`, the S0 that Δ is against).
+- **When its session ends.** A run that started under its agent lock (`locked: true`) ends
+  when that lock goes (`lock_released`), whether or not its stop came, or when the lock's
+  process, the parent, is gone (`process_gone`). A run that started with no agent lock ends
+  at its `SubagentStop` (`subagent_stop`), or when the owner next sees no lock after that
+  stop. Claude Code writes no lock for a run resumed with `SendMessage`, so such a run
+  ends at its stop. A run that Claude Code resumes by itself starts under the lock the
+  subagent kept, so it ends with that lock or with the parent. The lock names the parent's
+  process, which every subagent of that parent shares, so Dispatch never records it as the
+  Work's agent.
+- **Finish and land.** Claude Code removes an unchanged subagent worktree right after its
+  stop, with no `WorktreeRemove`; the owner records the removal as exact, from the Δ kept
+  at that stop, and the Work closes with no changes. A changed worktree stays. With the
+  project's check consent, the owner finishes the Work once its session has ended
+  ("Session end and resume"): from the worktree while it is there, or, once it is gone,
+  from the Δ kept at the last stop, if S0 has not moved since. The result joins `dispatch
+  accept`'s batch like any other.
+- **Run again.** When the parent sends a subagent another message (`SendMessage`), Claude
+  Code runs it again in the same worktree, with a second `SubagentStart` for the same
+  `agent_id`. It goes on in the same Work, or, once that Work is a result waiting for
+  review, as new Work from the same S0, and the result closes as superseded ("Session end
+  and resume").
+- **Going on by hand.** Nobody can resume a subagent's session by hand, so where other Work
+  says `resume its session in <worktree>`, a subagent's REFRESH next step and its "session
+  ended" line say `start Claude Code in <worktree>`:
+
+  ```text
+  Next: start Claude Code in ~/project/.claude/worktrees/agent-a2f2fb9991cd71185, then commit there and run git merge bf7573a363b69f53c6d4338ba2066440ce207dd2; the session goes on as new Work from this Work's S0, and this Work closes as superseded; Dispatch then moves that S0 and checks it again  (or dispatch reject 01M7WVQA3MW5J5ZJNBS9AZ8TZQ)
+  ```
+
+- **Found by discovery.** With 0.5.0's hooks, or when the owner sees the worktree before
+  `SubagentStart` does, discovery registers an agent-locked worktree that appears after its
+  first scan ("Work that appears without hooks", below). Its S0 is the merge base, as for
+  any Work discovery registers, and its session is `lock:agent-<id>`, started when Git made
+  the worktree, with `subagent` set (`locked: true`, `parent_session: null`). No process is
+  recorded: the lock names the parent's. The lock does not name the subagent's type, so
+  `agent_type` is unknown, and the task reads `claude subagent in agent-<first 8
+  characters>`. Whichever sees the worktree first, the hook or discovery, registers it,
+  and a later `SubagentStart` joins that Work: its session is recorded there, and the task
+  keeps discovery's label, without the type.
+- **In a project nobody watches**, `SubagentStart` and `SubagentStop` decide from the files
+  alone, open no database and keep nothing, as every hook there does.
+- **Not tracked:** a subagent without isolation, and Claude Code's own agents (prompt
+  suggestions, `/btw`, which send an empty `agent_type`). They work in the parent's
+  directory, and their hooks carry an `agent_id`. Dispatch acts on a payload with an
+  `agent_id` only in `.claude/worktrees/agent-<agent_id>`: anywhere else it registers
+  nothing, and takes none of the notes or asks of the Work there, and its `Notification`
+  counts as the parent's. What they change belongs to whatever holds the parent's
+  directory: the parent's Work, or the checkout, untracked.
 
 ### Work that appears without hooks
 
@@ -1289,8 +1410,9 @@ second), with no hook installed:
     leaves it: registered, with its session recorded as ended (`end_reason:
     "process_gone"`), so it reads `idle` at once;
   - locked that way, but the process's start cannot be read: looked at again next pass;
-  - any other lock, or none (a subagent's or background session's worktree, whose lock
-    has not been observed): listed in the inventory after a 3 s grace, counted from when
+  - locked `claude agent agent-<id> (pid <pid> start <time>)`, a subagent's (0.5.1): the
+    same three cases, except that the process is never recorded ("Subagents", above);
+  - any other lock, or none: listed in the inventory after a 3 s grace, counted from when
     Git made the worktree, and only once Git has finished adding it, since Claude Code
     writes `CLAUDE_BASE` a moment before it locks a new worktree. Each is noted once in
     the owner's log.
@@ -1300,7 +1422,7 @@ second), with no hook installed:
   - S0 is the merge base of the worktree and the root, provenance `Discovered { commit
     }`, confidence full, owner the runtime;
   - the one session is `lock:<name>@<pid>`, `source: "discovered"`, started at the
-    lock's start;
+    lock's start; a subagent's is `lock:agent-<id>`, started when Git made its worktree;
   - `attach.created` records `via: "discovery"`;
   - authority to run checks comes from the project's check consent, as for a hook.
 
@@ -1503,6 +1625,10 @@ when another pid takes a Hermes lock no session is ended for it:
   gone, or its pid was reused, the open sessions end (`process_gone`) and the process is
   let go, as above. Until then nothing happens. This is not Hermes's alone: a Claude
   session whose worktree was removed while it ran ends the same way.
+- **Subagents** (0.5.1). While every open session of the Work is a subagent's and the
+  worktree's lock is an agent lock or none, the owner follows the agent lock instead, by
+  the rules in "Subagents" above, and records no process. A person's `claude` started in
+  that worktree takes a `claude session` lock, which is followed as above.
 - **Nothing else.** A lock never seen running, or a process whose start cannot be read,
   proves nothing, and nothing is recorded. A session a hook already ended stays as it
   was, so there is one end. Liveness itself finishes, applies, closes and signals nothing;
@@ -1621,7 +1747,7 @@ In addition to the existing coherence, application and review events (see
 | `attach.adopted` | `serve` takes over observation of an orphaned run | `{"owner_state": "adopted"}` |
 | `attach.authorized` | Work gains local authority: from the project's check consent (at registration, or a typed `attach` or `finish` that ran on it), or from a person's `finish --allow-unsafe-local` | `{"unsafe_local": true, "by": "project consent" \| "human"}` |
 | `runtime.session_started` | a hook records a new session on existing Work | `{"session": <RuntimeSession>}` |
-| `runtime.session_ended` | a hook's `SessionEnd`, Hermes's hook when Hermes keeps its worktree (both recorded by the owner from the hook's mark since 0.4.18, at the hook's time), or the owner from the session lock ("Liveness from the session lock") | `{"provider", "session_id", "reason"}`; Hermes's hook gives `shutdown`, the owner's reasons are `process_gone` and `lock_released` |
+| `runtime.session_ended` | a hook's `SessionEnd`, Hermes's hook when Hermes keeps its worktree (both recorded by the owner from the hook's mark since 0.4.18, at the hook's time), the owner from the session lock ("Liveness from the session lock"), or a subagent's `SubagentStop` (0.5.1, "Subagents") | `{"provider", "session_id", "reason"}`; Hermes's hook gives `shutdown`, the owner's reasons are `process_gone` and `lock_released`, and `SubagentStop`'s is `subagent_stop` |
 | `runtime.agent_running` | the owner records the process a session lock names, once it runs | `{"agent_process": <ProcessIdentity>, "previous"}` |
 | `runtime.agent_gone` | the owner clears it, once that process is gone or its lock released | `{"agent_process": null, "previous": <ProcessIdentity>}` |
 | `runtime.needs_you` | Claude Code's `Notification` or `Stop` hook marks the Work (0.4.17; recorded by the owner from the hook's mark since 0.4.18) | `{"kind": "permission" \| "input" \| "turn_ended", "message", "at", "transcript", "session_id"}` |
@@ -1630,12 +1756,13 @@ In addition to the existing coherence, application and review events (see
 | `work.not_reopened` | it could not, because that S0 can no longer be read (0.4.17) | `{"reopens": <old id>, "reason"}` |
 | `attach.s0_moved` | the owner moved S0 to a recorded source or the root's HEAD the workspace's HEAD descends from, or back (0.4.18; see "When S0 moves") | `{"from", "to", "workspace_head", "proof": "ancestor of workspace HEAD" \| "workspace HEAD no longer descends from S0", "recorded_at", "landed_run": <id> \| null, "delta_before_sha256", "delta_after_sha256"}` |
 | `note.written` | the owner put a note in the Work's inbox (0.4.18; see "Notes to live agents") | `{"note": <16 hex>, "text"}` |
-| `note.delivered` | the owner saw a hook take it; timed when the hook took it | `{"note", "via": "PostToolUse" \| "SessionStart" \| "pre_llm_call"}` |
+| `note.delivered` | the owner saw a hook take it; timed when the hook took it | `{"note", "via": "PostToolUse" \| "SessionStart" \| "SubagentStart" \| "pre_llm_call"}`; `SubagentStart` since 0.5.1 |
 | `note.expired` | the Work stopped being in progress before a hook took it | `{"note", "lifecycle"}` |
 | `note.touched` | the first change the Work's Δ made, after the note, at a target the note named | `{"note", "key": [kind, other run, path, name, change]}` |
 | `catchup.written` | the owner wrote or added to an ask to catch up (0.5.0; see "Catch-up in place") | `{"landings": [<run id>], "targets", "text"}`; `landings` new in this write, `text` the whole ask |
-| `catchup.delivered` | the owner saw a hook take the ask; timed when the hook took it | `{"via": "stop" \| "wake" \| "verify" \| "turn", "landings"}` |
+| `catchup.delivered` | the owner saw a hook take the ask; timed when the hook took it | `{"via": "stop" \| "wake" \| "verify" \| "turn" \| "subagent_stop", "landings"}`; `subagent_stop` since 0.5.1 |
 | `catchup.expired` | before a hook took it, the Work's S0 moved to a source recorded at or after its landings, or the Work was no longer in progress | `{"why": "s0_moved" \| "left_working", "landings"}` |
+| `subagent.stopped` | a subagent's `SubagentStop` kept its Work's exact Δ (0.5.1; see "Subagents") | `{"agent_id", "sessions": [<session id>], "files_changed"}` |
 | `workspace.removed` | the workspace is gone: kept exactly by a hook (Claude Code's or Hermes's), or seen missing by the owner | `{"exact": true, "files_changed"}` or `{"exact": false, "no_changes", "last_seen_at"}`; `last_seen_at` since 0.4.15 |
 | `workspace.released` | Dispatch removed a workspace it made | `{"workspace", "reason": "applied" \| "cleaned"}` |
 | `work.closed` | a person closed Work (`dispatch close`, or `c` in `watch`), or a resumed session superseded it (`by: "reopen"`, 0.4.17). Before 0.4.12, a person rejected unfinished Work whose workspace was gone | `{"reason": "unfinished" \| "workspace_removed" \| "already_present" \| "superseded", "by": "human" \| "reopen", "world_digest"?, "replacement"?}` |
@@ -1765,13 +1892,48 @@ directory, exactly as it already refuses any newer schema.
 - No foreign process is ever signaled. `--pid` and the wrapper's own child PID are
   liveness-only.
 - Discovery recognizes only Claude Code's, Codex's, Cursor Agent's and Hermes Agent's
-  worktrees, and liveness reads only a `claude session …` or `hermes pid=` lock.
-  Claude's was observed with Claude Code 2.1.296 on macOS; the lock of a subagent or
-  background-session worktree, and the format on Linux, were not. Codex's marker and
+  worktrees, and liveness reads only a `claude session …`, `claude agent …` or `hermes
+  pid=` lock. Claude's were observed with Claude Code 2.1.296 on macOS: a session's, a
+  background session's (`claude --bg --worktree`, a `claude session` lock) and a
+  subagent's; the format on Linux was not. Codex's marker and
   Cursor's location were observed with Codex 0.155.1 and Cursor Agent 2026.10.14 on
   macOS, and Hermes's place, branch, lock and hook with Hermes Agent 0.18.2 on macOS,
   in one confirming session. The end of a Codex or Cursor session is not observable.
   There is no process scanning or association by working directory.
+- Subagents ("Subagents", above) are Work only for Claude Code, and only with `isolation:
+  worktree`. Further limits:
+  - **When the parent merges a subagent's branch,** the change lands once, never twice,
+    but which Work is left out depends on where the parent works. With the parent in the
+    checkout, as the probes ran it, the merge is in the source, so the subagent's Work is
+    left out of the batch as STOP (`already_applied`). With the parent in a `claude
+    --worktree` Work of its own, the subagent's Work finished first, so it comes first and
+    lands, and the parent's Work, which holds the same change, is left out as REFRESH
+    `patch_conflict`, with its own changes, until the parent merges what landed. No rule
+    puts the parent's Work first and leaves the subagent's out as already applied.
+  - **A run resumed with `SendMessage` whose parent exits before its stop stays open.**
+    Claude Code writes no lock for such a run, and its session ends only at its
+    `SubagentStop`. If the parent exits mid-run, that session stays open, and its Work
+    waits for a person to finish or close it.
+  - **A subagent that Claude Code resumes by itself can stay open until its parent
+    exits.** A subagent whose response ends while its background shell runs is resumed by
+    Claude Code when the shell ends, under the lock it kept. After its last stop the lock
+    can stay, so its session stays open until the parent's process is gone, and its finish
+    by consent waits until then (observed with Claude Code 2.1.296: 18 minutes, through a
+    parent turn). Nothing is lost: its Δ was kept at each stop.
+  - **The parent's own hooks in a subagent's worktree.** A parent whose shell enters a
+    subagent's worktree (the probe's did, after that subagent finished) sends its hooks from
+    there with no `agent_id`: its `PostToolUse` and `Stop` take that Work's notes and asks,
+    and its `Stop` marks that Work as waiting on you. The isolation guard covers only
+    payloads with an `agent_id`; any session in another Work's worktree has done the same
+    since 0.4.18.
+  - **No waking.** An ask reaches a subagent only at the end of a response while it runs.
+    No waiter starts for a subagent, and one that has stopped is not woken.
+  - **A resume within a moment of the stop.** If the parent resumes a subagent with
+    `SendMessage` before Claude Code releases the first run's lock (shortly after the stop;
+    P0b's resume came 4 s later, after the release), the resumed run starts under that
+    lock. Its session then ends when the lock goes while the run goes on, and a finish by
+    consent could read the worktree mid-edit. Not observed.
+  - Work discovery registers has no `agent_type`, and no parent session.
 - Hermes's exact capture covers only the CLI's shutdown. Its TUI (`--tui`) and `/new`
   fall back to the last-seen Δ, which misses changes made after the last pass. Without
   the hook, a tick that falls between Hermes's `git worktree unlock` and its removal

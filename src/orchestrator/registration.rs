@@ -523,17 +523,34 @@ fn conclude(
     })
 }
 
+/// What the Work of `session` in `workspace` is called: `<provider> session
+/// in <worktree>`, or `claude subagent <type> in agent-<id prefix>`.
+fn task(session: &RuntimeSession, workspace: &Path) -> String {
+    let provider = &session.provider;
+    if let Some(subagent) = &session.subagent {
+        let kind = subagent
+            .agent_type
+            .as_deref()
+            .map(|kind| format!(" {kind}"));
+        let id: String = subagent.agent_id.chars().take(8).collect();
+        return format!(
+            "{provider} subagent{} in agent-{id}",
+            kind.unwrap_or_default()
+        );
+    }
+    let name = workspace
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    format!("{provider} session in {name}")
+}
+
 /// The attach request that builds a registration's Work from its S0.
 fn request(registration: &Registration) -> AttachRequest {
     let provider = registration.session.provider.clone();
-    let name = registration
-        .workspace
-        .file_name()
-        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     AttachRequest {
         workspace: registration.workspace.clone(),
         root: Some(registration.root.clone()),
-        task: Some(format!("{provider} session in {name}")),
+        task: Some(task(&registration.session, &registration.workspace)),
         agent: Some(provider),
         pid: None,
         command: None,
@@ -586,9 +603,6 @@ pub(crate) fn discovered(
             .context("the worktree shares no history with the project")?,
     };
     let reopens = reopens.map(|(old, _)| old);
-    let name = workspace
-        .file_name()
-        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let registered = Registered {
         started_at: session.started_at,
         via: "discovery",
@@ -598,7 +612,7 @@ pub(crate) fn discovered(
     let request = AttachRequest {
         workspace: workspace.to_owned(),
         root: Some(root.to_owned()),
-        task: Some(format!("{} session in {name}", session.provider)),
+        task: Some(task(&session, workspace)),
         agent: Some(session.provider.clone()),
         // The running session's process, seen just now: the agent liveness follows.
         pid: agent,

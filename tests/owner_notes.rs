@@ -339,3 +339,81 @@ fn two_sessions_on_one_declaration_hear_of_each_other_and_of_the_landing() {
     );
     assert_eq!(p.tool(&wa), None, "A, applied, hears nothing more");
 }
+
+/// A real trial's sequence: Work A hears of Work B, which lands a change A
+/// relies on within A's ten minutes, and the item about it waits for A's next
+/// note. A merges the landing before that window reopens. Once it reopens,
+/// the owner moves A's S0 to the landing, and A hears nothing of it.
+#[test]
+fn a_landing_merged_before_the_window_reopens_is_not_noted() {
+    let mut p = Project::new();
+    let auth = "pub fn validate(token: &str) -> bool {\n    !token.is_empty()\n}\n";
+    fs::write(p.root.join("src/auth.rs"), auth).unwrap();
+    git(&p.root, &["add", "-A"]);
+    git(&p.root, &["commit", "--quiet", "-m", "auth"]);
+    let (wa, a) = p.session("a");
+    let (wb, b) = p.session("b");
+    let report = "pub fn report() -> bool {\n    crate::auth::validate(\"t\")\n}\n";
+    fs::write(wa.join("src/report.rs"), report).unwrap();
+    let changed = auth.replace("(token: &str)", "(ctx: &str, token: &str)");
+    fs::write(wb.join("src/auth.rs"), changed).unwrap();
+    let waiting = |p: &Project| {
+        let kept: Value = serde_json::from_slice(&fs::read(p.sent(&a)).unwrap()).unwrap();
+        kept["sent"]["pending"]
+            .as_object()
+            .map_or(0, |items| items.len())
+    };
+
+    p.start_owner();
+    p.until("A has a note", |p| !p.events(&a, "note.written").is_empty());
+    let heard = p.tool(&wa).expect("one note");
+    let line =
+        " (Claude Code): it changes the signature of validate (src/auth.rs), which this Work uses";
+    assert!(heard.lines().any(|l| names(l, &b, line)), "{heard}");
+    p.ok(&["finish", &b]);
+    p.until("the owner lists B's frozen patch", |p| p.lists_frozen(&b));
+    p.ok(&["accept", &b]);
+    p.until("B's landing waits for A's window", |p| waiting(p) == 1);
+    p.stop_owner();
+
+    // A merges the landing, as its ask to catch up says.
+    let sources: Value = serde_json::from_slice(
+        &fs::read(
+            p.state
+                .join("projects")
+                .join(key(p.root.to_str().unwrap()))
+                .join("sources.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let commit = sources[0]["commit"].as_str().unwrap();
+    git(&wa, &["add", "-A"]);
+    git(&wa, &["commit", "--quiet", "-m", "report"]);
+    git(&wa, &["merge", "--quiet", "--no-edit", commit]);
+
+    // Ten minutes pass for A: its last note is moved back by that much.
+    let mut kept: Value = serde_json::from_slice(&fs::read(p.sent(&a)).unwrap()).unwrap();
+    let last: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(kept["sent"]["last_note_at"].clone()).unwrap();
+    kept["sent"]["last_note_at"] = serde_json::json!(last - chrono::Duration::minutes(10));
+    fs::write(p.sent(&a), kept.to_string()).unwrap();
+
+    // The owner's first tick moves A's S0, then gives A its note, if any.
+    p.start_owner();
+    p.until("nothing waits for A", |p| waiting(p) == 0);
+    p.stop_owner();
+    let moved = p.events(&a, "attach.s0_moved");
+    assert!(
+        moved
+            .iter()
+            .any(|m| m["to"] == commit && m["landed_run"] == b.as_str()),
+        "{moved:?}"
+    );
+    assert_eq!(
+        p.events(&a, "note.written").len(),
+        1,
+        "no note of the landing"
+    );
+    assert_eq!(p.tool(&wa), None);
+}

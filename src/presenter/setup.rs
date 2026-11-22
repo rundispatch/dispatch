@@ -503,7 +503,8 @@ const HERMES_PRE_VERIFY: &str = "The pre_verify hook is new: at the end of a tur
 
 /// What the second Claude Code `Stop` hook in the preview does.
 const CLAUDE_WAITER: &str = "The second Stop hook waits in the background after each turn, \
-     for at most 8 hours, to wake the session when its Work is asked to catch up with a landing.";
+     for at most 8 hours, to wake the session when its Work is asked to catch up with a landing. \
+     With SubagentStart and SubagentStop, each subagent in its own worktree is Work of its own.";
 
 /// One runtime's hook, the step both setup's pass and Runtime integrations
 /// take. It shows exactly what changes and where, with the existing and new

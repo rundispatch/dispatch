@@ -550,9 +550,9 @@ proves nothing, and nothing is recorded. The end is recorded even when you
 `finish` the Work first. Other agents' worktrees are not recognized:
 `dispatch attach -- <agent>` gives any agent a workspace of its own.
 
-**Work that appears with hooks.** `dispatch setup` installs Claude Code's hooks into
-`~/.claude/settings.json`: `SessionStart`, `SessionEnd`, `WorktreeRemove`,
-`PreToolUse` for the `ExitWorktree` tool only, `Notification` and `Stop`. Discovery
+**Work that appears with hooks.** `dispatch setup` installs Claude Code's ten hooks into
+`~/.claude/settings.json`; [attach.md](attach.md#work-a-runtime-registers) lists them
+with their matchers and timeouts. Discovery
 needs none of them; they add an S0 taken before the session's first edit, the exact
 changes kept when Claude Code removes a worktree, and "waiting on you".
 - **Consent:** the screen shows exactly what is added, and focus starts on Cancel.

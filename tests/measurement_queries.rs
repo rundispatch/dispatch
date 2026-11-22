@@ -354,19 +354,23 @@ fn the_catchup_queries_report_nothing_without_catchups() {
 /// failed whole (4), passed with its first 2 (a reused pass) and failed
 /// with 3: F1 and F2 landed. bz failed whole and with Z1 alone, alike in two
 /// accepts, and landed nothing. br reused the whole batch's pass, accepted
-/// with no offer recorded; bu has no checks configured.
+/// with no offer recorded; bu has no checks configured. bo failed whole and
+/// landed O1 alone on the pass of O1's own finish. Each member's record of a
+/// verification carries its own outcome: P1's, blocked by source drift at an
+/// earlier accept, is not P2's and P3's, and bp still verified once.
 ///
-/// Suite runs 17:
-/// - 13 merged runs: finish P1 and P2; check S1 (its other check could not
-///   build its tree); accept bp 1, bf 2, bz 4, and Z2, S1 and N1 alone;
+/// Suite runs 19:
+/// - 14 merged runs: finish P1 and P2; check S1 (its other check could not
+///   build its tree); accept bp 1, bf 2, bz 4, bo 1, and Z2, S1 and N1 alone;
 /// - N1's baseline and verify phases, 2;
-/// - the in-place finishes of F2 (two commands) and X1, which never landed,
-///   2. P1's and P2's rows are their merged runs' logs, P3's its reuse's,
-///   and N1's its phases'.
+/// - the in-place finishes of F2 (two commands), O1 and X1, which never
+///   landed, 3. P1's and P2's rows are their merged runs' logs, P3's its
+///   reuse's, and N1's its phases'. O1's are in the logs bo reused, but that
+///   pass was its own finish's.
 ///
-/// Reuses 3: P3's finish, bf's first 2 and br's whole batch; the batches'
-/// records for P2, P3, F2 and R2 are not reuses.
-/// Landed 13, 9 of them in 4 batches. Approvals 7: one per batch, and Z2, S1
+/// Reuses 4: P3's finish, bf's first 2, bo's first and br's whole batch; the
+/// batches' records for P2, P3, F2 and R2 are not reuses.
+/// Landed 14, 10 of them in 5 batches. Approvals 8: one per batch, and Z2, S1
 /// and N1 alone; A1 was auto-applied.
 #[test]
 fn the_batch_queries_give_the_hand_derived_counts() {
@@ -381,6 +385,7 @@ fn the_batch_queries_give_the_hand_derived_counts() {
         ("F2", "verify 1", "/runs/F2/checks/verify-01.stdout.log"),
         ("F2", "verify 2", "/runs/F2/checks/verify-02.stdout.log"),
         ("N1", "verify 1", "/runs/N1/checks/verify-01.stdout.log"),
+        ("O1", "verify 1", "/runs/O1/checks/verify-01.stdout.log"),
     ] {
         connection
             .execute(
@@ -409,6 +414,9 @@ fn the_batch_queries_give_the_hand_derived_counts() {
             "batch_members bf proposed F4 4 NULL fourth",
             "batch_members bf landed   F1 1 NULL NULL",
             "batch_members bf landed   F2 2 NULL NULL",
+            "batch_members bo proposed O1 1 NULL first",
+            "batch_members bo proposed O2 2 NULL second",
+            "batch_members bo landed   O1 1 NULL NULL",
             "batch_members bp proposed P1 1 NULL first",
             "batch_members bp proposed P2 2 NULL second",
             "batch_members bp proposed P3 3 NULL third",
@@ -436,10 +444,11 @@ fn the_batch_queries_give_the_hand_derived_counts() {
             "batch_check_runs bz 0    0 Z1   2 2 2",
             "batch_check_runs br 1    2 NULL 1 0 0",
             "batch_check_runs bu NULL 2 NULL 1 0 0",
+            "batch_check_runs bo 0    1 O2   1 1 0",
         ])
     );
     // landed_works, in_batches, batches, approvals, suite_runs, reuses
-    assert_eq!(sets[2], rows(&["landing_counts 13 9 4 7 17 3"]));
+    assert_eq!(sets[2], rows(&["landing_counts 14 10 5 8 19 4"]));
 }
 
 /// Without batches or landings, empty sets, also beside other events.

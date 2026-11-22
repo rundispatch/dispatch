@@ -134,6 +134,12 @@ for line in sys.stdin:
     # once Work may, on changing them, where they stay selected.
     three=b'checks:\n  verify:\n  - cargo fmt --check\n  - cargo clippy --all-targets -- -D warnings\n  - cargo test\n'
     (source/'dispatch.yml').write_bytes(three)
+    # On a screen too, the first frame marks letting Work run them.
+    with session('checks-consent-focus',['setup','--checks']) as ui:
+        ui.wait('Esc back');ui.mark('consent-focus')
+        assert re.search(r'›\s+Let Work run these checks', ui.clean), ui.clean[-3000:]
+        assert not re.search(r'›\s+(Change checks|Back)', ui.clean), ui.clean[-3000:]
+        ui.send('\x1b');ui.finish()
     def two_enters(name):
         with session(name,['--plain','setup','--checks']) as ui:
             ui.wait('3) Back');ui.wait('] >');ui.send('\r');ui.wait('] >');ui.send('\r');ui.finish()

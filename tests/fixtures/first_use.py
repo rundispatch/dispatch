@@ -413,7 +413,9 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
                                 ('Notification', 'permission_prompt|idle_prompt|agent_needs_input', 5,
                                  False, False),
                                 ('Stop', '', 5, False, False), ('Stop', '', 28800, True, True),
-                                ('PostToolUse', '', 5, False, False)]), found
+                                ('PostToolUse', '', 5, False, False),
+                                ('SubagentStart', '', 60, False, False),
+                                ('SubagentStop', '', 60, False, False)]), found
         assert settings['model'] == 'keep' and settings['hooks']['Stop'][0] == mine, settings
         case.settings.write_text(earlier)
         through_menu(case, 'claude-upgrade-menu', '1) Update Claude Code hooks',

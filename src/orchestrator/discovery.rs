@@ -29,7 +29,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AttachmentRecord, BaselineProvenance, LifecycleState, RunRecord, RuntimeSession,
+    AttachmentRecord, BaselineProvenance, LifecycleState, RunRecord, RuntimeSession, Subagent,
     process::ProcessIdentity,
     runtime::{
         claude::{self, Liveness, Lock, WorktreeSignals},
@@ -255,11 +255,16 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
             inventory.entries.remove(at);
             changed = true;
         }
-        // The process a session's lock names, and whether it runs.
+        // The process a session's lock names, whether it runs, and whether
+        // it is the Work's agent: a subagent's lock names its parent
+        // session's process, which every subagent of that session shares.
         let (name, locked) = match &found.made {
             Made::Claude(signals) => match &signals.lock {
                 Some(lock @ Lock::Session { pid, .. }) => {
-                    ("Claude Code", Some((*pid, claude::liveness(lock))))
+                    ("Claude Code", Some((Some(*pid), claude::liveness(lock))))
+                }
+                Some(lock @ Lock::Agent { .. }) => {
+                    ("Claude Code", Some((None, claude::liveness(lock))))
                 }
                 _ => ("Claude Code", None),
             },
@@ -267,7 +272,7 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
                 let pid = found.lock.as_deref().and_then(hermes::lock_pid);
                 (
                     "Hermes",
-                    pid.map(|pid| (pid, hermes::liveness(pid, &found.path))),
+                    pid.map(|pid| (Some(pid), hermes::liveness(pid, &found.path))),
                 )
             }
             // It appeared after watching began; its liveness is Unknown.
@@ -280,14 +285,14 @@ pub(crate) fn scan(state: &State, root: &Path, runs: &[RunRecord]) -> Result<()>
                 continue;
             }
         };
-        if let Some((pid, liveness)) = locked {
+        if let Some((agent, liveness)) = locked {
             match liveness {
                 // A running session's process is recorded as the Work's
                 // agent, so that liveness sees it end even if it ends before
                 // liveness first looks.
                 Liveness::Running => {
                     let session = locked_session(found, false);
-                    register(state, root, &found.path, name, session, Some(pid));
+                    register(state, root, &found.path, name, session, agent);
                 }
                 // It appeared after watching began and its session already
                 // ended: a `claude -p` run between two ticks leaves its lock.
@@ -370,7 +375,7 @@ fn locked_by_its_maker(listed: &InventoryEntry, found: &Found) -> bool {
 fn lock_pid(lock: &Lock) -> Option<u32> {
     match lock {
         Lock::Session { pid, .. } => Some(*pid),
-        Lock::Other(_) => None,
+        Lock::Agent { .. } | Lock::Other(_) => None,
     }
 }
 
@@ -428,6 +433,26 @@ fn register(
 /// now, when that process was seen gone.
 fn locked_session(found: &Found, ended: bool) -> Result<RuntimeSession> {
     match &found.made {
+        // A subagent's, since Git made its worktree: its lock records its
+        // parent's start.
+        Made::Claude(WorktreeSignals {
+            lock: Some(Lock::Agent { id, .. }),
+            ..
+        }) => {
+            let mut session =
+                unobserved_session("claude", &format!("lock:agent-{id}"), &found.path);
+            session.subagent = Some(Subagent {
+                parent_session: None,
+                agent_id: id.clone(),
+                agent_type: None,
+                locked: true,
+                stopped_at: None,
+                kept_on: None,
+            });
+            session.ended_at = ended.then(Utc::now);
+            session.end_reason = ended.then(|| "process_gone".into());
+            Ok(session)
+        }
         Made::Claude(WorktreeSignals {
             lock: Some(lock), ..
         }) => session(lock, ended),
@@ -459,6 +484,7 @@ fn session(lock: &Lock, ended: bool) -> Result<RuntimeSession> {
         ended_at: ended.then(Utc::now),
         end_reason: ended.then(|| "process_gone".into()),
         model: None,
+        subagent: None,
     })
 }
 
@@ -474,6 +500,7 @@ fn unobserved_session(agent: &str, session_id: &str, worktree: &Path) -> Runtime
         ended_at: None,
         end_reason: None,
         model: None,
+        subagent: None,
     }
 }
 

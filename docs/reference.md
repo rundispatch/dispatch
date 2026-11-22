@@ -339,7 +339,18 @@ The local backend is the supported real-agent path in this candidate. Docker exe
 
 ## Events
 
-Each run's committed events are in the `events` table, and `dispatch events` and `status --jsonl` replay them. Every payload also carries the run's `outcome`. The coherence events are listed in [coherence.md](coherence.md#events), and those of attached Work in [attach.md](attach.md#events). New in 0.5.0:
+Each run's committed events are in the `events` table, and `dispatch events` and `status --jsonl` replay them. Every payload also carries the run's `outcome`. The coherence events are listed in [coherence.md](coherence.md#events), and those of attached Work in [attach.md](attach.md#events). New in 0.5.1:
+
+| Event | When | Payload |
+|---|---|---|
+| `subagent.stopped` | a Claude Code subagent's `SubagentStop` kept its Work's exact Δ ([attach.md](attach.md#subagents)) | `{"agent_id", "sessions": [<session id>], "files_changed"}` |
+
+Events that gain values in 0.5.1:
+- `runtime.session_ended` has a new reason, `subagent_stop`: a subagent's run that started without its agent lock, as a run resumed with `SendMessage` does, ended at its `SubagentStop`.
+- `catchup.delivered` has a new `via`, `subagent_stop`, and `note.delivered` a new `via`, `SubagentStart` (both in the tables below).
+- A subagent's session, in `runtime.session_started` and the Work's record, carries `subagent`: `{"parent_session", "agent_id", "agent_type", "locked", "stopped_at", "kept_on"}`. Every other session has none.
+
+New in 0.5.0:
 
 | Event | When | Payload |
 |---|---|---|
@@ -347,7 +358,7 @@ Each run's committed events are in the `events` table, and `dispatch events` and
 | `batch.verified` | `accept --expect <batch>` ran, or skipped, the merged checks; on every member | `{"batch", "tree", "passed": true \| false \| null, "runs", "lands", "failed": <run id> \| null}`; `runs` counts the check runs that ran commands, bisection included, not reuses; `passed` is `null` when the checks were skipped |
 | `batch.landed` | the verified results landed as one patch; on each landed member | `{"batch", "members", "tree", "patch", "patch_digest", "world_before", "world_after", "confirmed", "unconfirmed"}` |
 | `catchup.written` | the owner wrote or added to an ask for live Work to catch up with landings ([attach.md](attach.md#catch-up-in-place)) | `{"landings": [<run id>], "targets", "text"}`; `landings` are the ones new in this write, `text` the whole ask |
-| `catchup.delivered` | the owner saw a hook take the ask; timed when the hook took it | `{"via": "stop" \| "wake" \| "verify" \| "turn", "landings"}` |
+| `catchup.delivered` | the owner saw a hook take the ask; timed when the hook took it | `{"via": "stop" \| "wake" \| "verify" \| "turn" \| "subagent_stop", "landings"}`; `subagent_stop` since 0.5.1 |
 | `catchup.expired` | before a hook took the ask, the Work's S0 moved to a source recorded at or after its landings, or the Work was no longer in progress | `{"why": "s0_moved" \| "left_working", "landings"}` |
 
 Events that gain fields in 0.5.0:
@@ -361,7 +372,7 @@ New in 0.4.18:
 |---|---|---|
 | `attach.s0_moved` | the project owner moved attached Git Work's S0 to a recorded source or the root's HEAD that the workspace's HEAD descends from, or back when it no longer does | `{"from", "to", "workspace_head", "proof": "ancestor of workspace HEAD" \| "workspace HEAD no longer descends from S0", "recorded_at", "landed_run": <run id> \| null, "delta_before_sha256", "delta_after_sha256"}` |
 | `note.written` | the owner put a note in the Work's inbox | `{"note": <16 hex characters>, "text"}` |
-| `note.delivered` | the owner saw a hook take the note; the event's time is when the hook took it | `{"note", "via": "PostToolUse" \| "SessionStart" \| "pre_llm_call"}` |
+| `note.delivered` | the owner saw a hook take the note; the event's time is when the hook took it | `{"note", "via": "PostToolUse" \| "SessionStart" \| "SubagentStart" \| "pre_llm_call"}`; `SubagentStart` since 0.5.1 |
 | `note.expired` | the Work stopped being in progress before a hook took the note | `{"note", "lifecycle"}` |
 | `note.touched` | the first change the Work's Δ made, after the note was written, at a target the note named: the declaration, compared by its full text, or the file for a textual overlap; once per target | `{"note", "key": [kind, other run, path, name, change]}` |
 
@@ -397,11 +408,13 @@ without it: `scripts/test-in-docker.sh cargo test --locked --no-run`.
 
 CI runs the suite on every pull request and push to `main`, on Linux (in the test
 image) and macOS. A release runs the same suite on its tag before it builds any
-asset. `stability.yml` runs the suite 20 times a night on both platforms and lists
-every failing test with its count. `harness-trials.yml` runs real agents through
-`scripts/harness-trial.sh`, only by hand or weekly, never on pull requests, with
-keys from a protected environment. Only the fixture reaches the model providers,
-sent by the agents; Dispatch uploads nothing.
+asset. `stability.yml` runs the suite 20 times a night on both platforms, and 10
+times on macOS under load (16 busy loops, 4 loops that start processes without
+pause, 8 test threads), and lists every failing test with its count.
+`harness-trials.yml` runs real agents through `scripts/harness-trial.sh`, only
+by hand or weekly, never on pull requests, with keys from a protected
+environment. Only the fixture reaches the model providers, sent by the agents;
+Dispatch uploads nothing.
 
 Dispatch's promise is tested per agent: `scripts/harness-trial.sh <harness>
 <path>` runs one shared scenario through each path Dispatch offers an agent and

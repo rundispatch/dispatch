@@ -1,8 +1,8 @@
 name: Stability
 
 # The twenty-clean-runs bar: the whole suite, run repeatedly on both shipped
-# platforms. Failures are listed with counts in the step summary, and each
-# failing run's log is uploaded. Nothing is retried.
+# platforms, and on macOS also under load. Failures are listed with counts in
+# the step summary, and each failing run's log is uploaded. Nothing is retried.
 on:
   schedule:
     - cron: "17 7 * * *"
@@ -19,13 +19,17 @@ permissions:
 
 jobs:
   stability:
-    name: stability (${{ matrix.os }})
+    name: stability (${{ matrix.os }}${{ matrix.loops > 0 && ', under load' || '' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15]
+        include:
+          - { os: ubuntu-22.04, loops: 0 }
+          - { os: macos-15, loops: 0 }
+          # macOS has no test image, so its load runs on the runner itself.
+          - { os: macos-15, loops: 16 }
     env:
       RUNS: ${{ inputs.runs || 20 }}
     steps:
@@ -61,6 +65,7 @@ jobs:
         env:
           DISPATCH_DOCKER_TARGET_DIR: ${{ runner.temp }}/cargo-target
           DISPATCH_DOCKER_CARGO_REGISTRY: ${{ runner.temp }}/cargo-registry
+          LOOPS: ${{ matrix.loops }}
         run: |
           case "$RUNS" in ''|*[!0-9]*|0*) echo "runs must be a positive integer: $RUNS" >&2; exit 1 ;; esac
           # Linux runs in the test image, macOS natively.
@@ -69,6 +74,19 @@ jobs:
           }
           mkdir -p "$DISPATCH_DOCKER_TARGET_DIR" "$DISPATCH_DOCKER_CARGO_REGISTRY" stability-logs
           suite cargo test --locked --no-run
+          if [ "$LOOPS" -gt 0 ]; then
+            # As the Linux stress job: busy loops and 8 test threads, after the
+            # build. Four more loops start processes without pause, since
+            # process start is where macOS-only races have been seen.
+            i=0
+            while [ "$i" -lt "$LOOPS" ]; do (while :; do :; done) & i=$((i + 1)); done
+            for i in 1 2 3 4; do (while :; do /usr/bin/true; done) & done
+            trap 'kill $(jobs -p) 2>/dev/null' EXIT
+            export RUST_TEST_THREADS=8
+            # A loaded run takes about twice as long (30 minutes against 15),
+            # so half as many runs end with the unloaded job.
+            RUNS=$(((RUNS + 1) / 2))
+          fi
 
           : > failures.txt
           failed_runs=0
@@ -92,7 +110,7 @@ jobs:
           done
 
           {
-            echo "## Stability on ${{ matrix.os }}: $((RUNS - failed_runs))/$RUNS clean runs"
+            echo "## Stability on ${{ matrix.os }}${{ matrix.loops > 0 && ', under load' || '' }}: $((RUNS - failed_runs))/$RUNS clean runs"
             if [ "$failed_runs" -gt 0 ]; then
               echo
               echo "| Failing test | Runs failed |"
@@ -108,7 +126,7 @@ jobs:
         if: steps.repeat.outputs.failed_runs != '' && steps.repeat.outputs.failed_runs != '0'
         uses: actions/upload-artifact@v4
         with:
-          name: stability-failures-${{ matrix.os }}
+          name: stability-failures-${{ matrix.os }}-${{ matrix.loops }}
           path: stability-logs/run-*.log
           if-no-files-found: error
 

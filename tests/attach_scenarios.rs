@@ -473,7 +473,7 @@ impl Fixture {
     }
 
     /// Waits for the native agent slot `role` (`lib`, `conflict` or `other`)
-    /// to reach its gate.
+    /// to reach its gate. A run that ends first fails with what it said.
     fn wait_native_started(&self, role: &str, child: &mut OwnedChild) {
         let marker = self._temp.path().join(format!("started-{role}"));
         wait_until(
@@ -481,7 +481,14 @@ impl Fixture {
             || marker.exists() || child.0.try_wait().unwrap().is_some(),
             &format!("native agent {role} never started"),
         );
-        assert!(marker.exists(), "native agent {role} never started");
+        if !marker.exists() {
+            let status = child.0.wait().unwrap();
+            let stdout = std::io::read_to_string(child.0.stdout.take().unwrap()).unwrap();
+            let stderr = std::io::read_to_string(child.0.stderr.take().unwrap()).unwrap();
+            panic!(
+                "native agent {role} never started: dispatch run exited first ({status})\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
     }
 
     fn release_native(&self, role: &str) {
