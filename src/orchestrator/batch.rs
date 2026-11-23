@@ -126,13 +126,7 @@ fn frozen(
         VerificationState::Failed => "its own checks failed",
         VerificationState::Inconclusive => "its own checks were inconclusive",
         VerificationState::NotRun => "its own checks did not run",
-        _ if !matches!(
-            run.status,
-            RunStatus::ReadyForEvaluation | RunStatus::Evaluated
-        ) || apply::was_planned(run) =>
-        {
-            "it cannot be applied"
-        }
+        _ if !applies(run) => "it cannot be applied",
         _ if fs::metadata(&candidate.diff_path)?.len() == 0 => "it changes nothing",
         _ => match (
             run_config(&run_dir),
@@ -150,17 +144,31 @@ fn frozen(
     Ok(Err(why.to_owned()))
 }
 
+/// Whether `run` is a result an accept may apply: completed, unapplied, and
+/// not a planned goal from an earlier Dispatch.
+fn applies(run: &RunRecord) -> bool {
+    matches!(
+        run.status,
+        RunStatus::ReadyForEvaluation | RunStatus::Evaluated
+    ) && !apply::was_planned(run)
+}
+
 /// When `run` finished, then its id: the order of results nothing else
 /// orders.
 fn finished(run: &RunRecord) -> (chrono::DateTime<Utc>, String) {
     (run.completed_at.unwrap_or(run.created_at), run.id.clone())
 }
 
+/// What a proposal that does not wait for a lock answers when one is held.
+pub(super) const BUSY: &str = "The source is busy with checks or a landing; call again shortly.";
+
 /// Every run's lock, in id order, then the source lock; the runs as they
-/// are under them that still wait for a decision.
+/// are under them that still wait for a decision. Without `wait`, a held
+/// lock is refused at once with `BUSY`, and none is kept.
 fn lock(
     state: &State,
     eligible: &Eligible,
+    wait: bool,
 ) -> Result<(Vec<OperationLock>, OperationLock, Vec<RunRecord>)> {
     let mut locks = Vec::new();
     let mut runs = Vec::new();
@@ -170,7 +178,7 @@ fn lock(
             candidate_id: sole_candidate(run)?.id.clone(),
             revision: run.state_revision,
         };
-        let (run, lock) = locked_delivery(state, &command, false, false)?;
+        let (run, lock) = locked_delivery(state, &command, false, false, wait)?;
         locks.push(lock);
         if waits_for_decision(&run) {
             runs.push(run);
@@ -181,6 +189,10 @@ fn lock(
         "no result waits for review here any more; nothing was decided"
     );
     let path = apply::source_lock_path(state, &eligible.runs[0]);
+    if !wait {
+        let source_lock = OperationLock::acquire_within(&path, Duration::ZERO)?.context(BUSY)?;
+        return Ok((locks, source_lock, runs));
+    }
     if OperationLock::is_held(&path)? {
         eprintln!(
             "Accept: waiting for the source lock on {}",
@@ -416,9 +428,7 @@ pub(super) async fn offer(
     options: presenter::Options,
 ) -> Result<Option<String>> {
     let proposal = {
-        let (_runs, _source, runs) = lock(state, eligible)?;
-        let workspace = check_workspace_path(&state.root, &eligible.root);
-        let mut proposal = propose(eligible, runs, &workspace, &mut Worlds::default())?;
+        let (_runs, _source, mut proposal) = judge(state, eligible, true)?;
         record_proposed(state, &mut proposal)?;
         proposal
     };
@@ -441,6 +451,64 @@ pub(super) async fn offer(
         println!("Nothing was decided.");
         Ok(None)
     }
+}
+
+/// The batch as `offer` proposes it, judged under every run's lock and the
+/// source lock, which stay held while the caller keeps them; `wait` as for
+/// `lock`.
+fn judge(
+    state: &State,
+    eligible: &Eligible,
+    wait: bool,
+) -> Result<(Vec<OperationLock>, OperationLock, Proposal)> {
+    let (locks, source_lock, runs) = lock(state, eligible, wait)?;
+    let workspace = check_workspace_path(&state.root, &eligible.root);
+    let proposal = propose(eligible, runs, &workspace, &mut Worlds::default())?;
+    Ok((locks, source_lock, proposal))
+}
+
+/// What `offer` would propose, as data, with nothing recorded or printed
+/// and no lock waited for (`BUSY`): the members in order with why, then
+/// what is left out, each with its verdict and reasons, those judged with
+/// the batch first and then the others, each judged `alone`; and the digest
+/// that `accept --expect` takes, when anything can land together.
+pub(super) fn proposal(state: &State, eligible: &Eligible) -> Result<serde_json::Value> {
+    // The locks go as soon as it is judged.
+    let (.., proposal) = judge(state, eligible, false)?;
+    let members = proposal.members.iter().map(|member| {
+        serde_json::json!({"id": member.run.id, "task": member.run.task, "why": member.why})
+    });
+    let left_out = proposal.left_out.iter().map(|(run, decision, reasons)| {
+        let reasons: Vec<String> = reasons.iter().map(reason_line).collect();
+        serde_json::json!({"id": run.id, "decision": decision, "reasons": reasons, "accept": null})
+    });
+    let others = eligible
+        .others
+        .iter()
+        .map(|(run, why)| alone(run, Some(why)));
+    let batch = (!proposal.members.is_empty()).then(|| &proposal.digest[..DIGEST_SHOWN]);
+    Ok(serde_json::json!({
+        "batch": batch,
+        "members": members.collect::<Vec<_>>(),
+        "left_out": left_out.chain(others).collect::<Vec<_>>(),
+    }))
+}
+
+/// `run`, waiting for review and not judged with a batch, judged on its own
+/// by its verdict as it is now (`live_validity`, which only reads): with
+/// `dispatch accept <id>` when that verdict is CONTINUE and it can be
+/// applied, else with no command. `why` is why it is not in the batch.
+pub(super) fn alone(run: &RunRecord, why: Option<&String>) -> serde_json::Value {
+    let validity = coherence::live_validity(run);
+    let mut reasons: Vec<String> = match &validity {
+        Some(validity) => validity.reasons.iter().map(reason_line).collect(),
+        None => vec!["its verdict could not be judged against the source now".to_owned()],
+    };
+    reasons.extend(why.cloned());
+    let decision = validity.map(|validity| validity.decision);
+    let accept = (decision == Some(Decision::Continue) && applies(run))
+        .then(|| format!("dispatch accept {}", run.id));
+    serde_json::json!({"id": run.id, "decision": decision, "reasons": reasons, "accept": accept})
 }
 
 /// "1 result", "3 results".
@@ -568,7 +636,7 @@ pub(super) async fn land(
         );
     }
     let reasons = super::normalize_reasons(reasons)?;
-    let (_runs, source_lock, runs) = lock(state, &eligible)?;
+    let (_runs, source_lock, runs) = lock(state, &eligible, true)?;
     let workspace = check_workspace_path(&state.root, &eligible.root);
     let mut worlds = Worlds::default();
     let mut proposal = propose(&eligible, runs, &workspace, &mut worlds)?;

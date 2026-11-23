@@ -204,8 +204,15 @@ printf '{{"type":"result","model":"%s"}}\n' "$model"
         wait_until(done)
     }
 
+    /// One edit, made as one change of the source: written outside the source
+    /// and renamed over the file, so the watcher never sees it half-written,
+    /// nor the temporary file. A file written in place is empty for a moment,
+    /// and a watcher that reads it then records that too (see
+    /// `a_file_read_while_it_is_written_is_a_refresh_and_then_the_stop`).
     fn edit_source(&self, path: &str, contents: &str) -> Result<()> {
-        fs::write(self.source.join(path), contents)?;
+        let edit = self.root.join("edit");
+        fs::write(&edit, contents)?;
+        fs::rename(&edit, self.source.join(path))?;
         Ok(())
     }
 
@@ -479,6 +486,41 @@ fn stop_mode_kills_the_agent_when_the_work_is_stale() -> Result<()> {
         assert!(!f.accept(id)?.status.success());
         assert_eq!(fs::read_to_string(f.source.join("src/lib.rs"))?, edit);
     }
+    Ok(())
+}
+
+/// A file written in place is empty between its truncation and its write. A
+/// watcher that reads it then records a refresh, which stops nothing without
+/// `stop_on_refresh`; once the write lands, the stop is a second verdict. The
+/// empty file stands for that moment, held open.
+#[test]
+fn a_file_read_while_it_is_written_is_a_refresh_and_then_the_stop() -> Result<()> {
+    let f = Fixture::new("  poll_secs: 1\n  mid_run: stop\n")?;
+    let mut child = f.start()?;
+    let pid = f.wait_for_agent(&mut child)?;
+    f.edit_source("src/lib.rs", "")?;
+    wait_until(|| Ok(f.event_count("coherence.invalidated") == 1))?;
+    assert!(alive(pid));
+    f.edit_source("src/lib.rs", "// delivered\n")?;
+    wait_until(|| Ok(!alive(pid)))?;
+    let result = Fixture::result(&child.output()?)?;
+    assert_eq!(result["execution"]["failure"], "stale_work");
+    let db = rusqlite::Connection::open(f.state.join("dispatch.db"))?;
+    let verdicts = db
+        .prepare(
+            "SELECT event_type, json_extract(payload_json, '$.coherence.decision') FROM events \
+             WHERE event_type LIKE 'coherence.%' ORDER BY id",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    assert_eq!(
+        verdicts,
+        [
+            ("coherence.invalidated".into(), "refresh".into()),
+            ("coherence.invalidated".into(), "stop".into()),
+            ("coherence.stopped".into(), "stop".into()),
+        ]
+    );
     Ok(())
 }
 

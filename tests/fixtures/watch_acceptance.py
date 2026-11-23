@@ -1535,10 +1535,14 @@ def plain(binary, base):
     watcher = json.loads(records[0])
     assert list(watcher) == ["type", "watcher"] and watcher["type"] == "watcher", records[0]
     assert HEADER.match(watcher["watcher"]), watcher
+    # Added in 0.6.0 for `dispatch mcp`, whose `work` gives these rows too.
+    added = ["asked_to_catch_up", "files_changed", "ready_for_review", "subagent", "task", "workspace"]
     for raw, (_, want) in zip(records[1:], expected):
         record = json.loads(raw)
-        keys = sorted(want) + ["interactions", "needs_you"]
+        keys = sorted(want) + ["interactions", "needs_you"] + added
         assert list(record) == sorted(keys), ("0.4.10 key order (sorted)", list(record))
+        for key in added:
+            record.pop(key)
         assert record["interactions"] in (None, []) or isinstance(record["interactions"], list), record
         record.pop("interactions")
         # No session here waits on anyone (contract D).

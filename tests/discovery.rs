@@ -82,6 +82,14 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+/// Whether `log` names worktree `name` other than in Git's error while Git
+/// adds it: Git makes the worktree's `commondir` and then writes it, and for
+/// that moment `git worktree list` and `git status` fail, naming the file.
+fn names(log: &str, name: &str) -> bool {
+    log.replace(&format!(".git/worktrees/{name}/commondir"), "")
+        .contains(name)
+}
+
 /// The lock a running `claude --worktree <name>` session holds.
 fn session_lock(name: &str, pid: u32) -> String {
     let output = Command::new("ps")
@@ -529,7 +537,7 @@ fn only_a_session_lock_registers_and_human_worktrees_are_never_listed() {
         "{log}"
     );
     assert!(log.contains("(moving it)"), "{log}");
-    assert!(!log.contains("human"), "{log}");
+    assert!(!names(&log, "human"), "{log}");
 
     // Listed is final: a session that later locks a listed worktree does not
     // make it Work. Its process started after Git made the worktree, since
@@ -581,10 +589,18 @@ fn a_worktree_git_is_still_adding_is_looked_at_again_however_old() {
         .set_modified(SystemTime::now() - Duration::from_secs(60))
         .unwrap();
     p.mark_claude(&worktree, Some("initializing"));
+    // Before its checkout, Git makes the worktree's `commondir` and then
+    // writes it: for that moment `git worktree list` fails, naming it, and
+    // discovery looks again next tick.
+    let commondir = fs::read(gitdir.join("commondir")).unwrap();
+    fs::write(gitdir.join("commondir"), "").unwrap();
+    wait_until("Git's error", || p.owner_log().contains("slow/commondir"));
+    fs::write(gitdir.join("commondir"), commondir).unwrap();
     p.ticks();
     assert!(p.listed().is_empty());
     assert!(p.runs().is_empty());
-    assert!(!p.owner_log().contains("slow"), "{}", p.owner_log());
+    let log = p.owner_log();
+    assert!(!names(&log, "slow"), "{log}");
 
     // Git's lock gives way to the session's that made it, the index last so
     // that no tick sees the checkout done under Git's lock.
@@ -734,19 +750,28 @@ fn a_registration_in_flight_is_left_alone_and_a_failure_is_noted_once_then_retri
     drop(file);
     wait_until("Work once the lock is free", || p.runs_in(&held).len() == 1);
 
-    // A registration that fails is noted once, and tried again each tick.
+    // A registration that fails is noted once, what failed first, and tried
+    // again each tick.
     let config = fs::read_to_string(p.root.join("dispatch.yml")).unwrap();
     fs::write(p.root.join("dispatch.yml"), "coherence: [\n").unwrap();
     let broken = p.running("broken");
     p.ticks();
     assert!(p.runs_in(&broken).is_empty());
     let log = p.owner_log();
-    assert_eq!(
-        log.matches("could not track the Claude Code session in")
-            .count(),
-        1,
-        "{log}"
+    let noted: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("is not tracked yet"))
+        .collect();
+    let [line] = noted[..] else { panic!("{log}") };
+    let failed = format!(
+        " discovery: failed to parse config {}: ",
+        p.root.join("dispatch.yml").display()
     );
+    let retried = format!(
+        "; the Claude Code session in {} is not tracked yet, looked at again next tick",
+        broken.display()
+    );
+    assert!(line.contains(&failed) && line.ends_with(&retried), "{log}");
     fs::write(p.root.join("dispatch.yml"), config).unwrap();
     wait_until("Work once it can register", || {
         p.runs_in(&broken).len() == 1

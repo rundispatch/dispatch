@@ -336,7 +336,9 @@ async fn next_watch_message(watcher: &mut Option<Watcher>) -> Option<WatchMsg> {
 
 /// Apply one watcher verdict on the owning loop: remember it on the run and
 /// persist it as an event. In `stop` mode (`stale` is `Some` only while the
-/// attempt is running) a verdict that warrants it also cancels the run.
+/// attempt is running) the first verdict that warrants it also cancels the
+/// run; one that arrives while that stop is still killing the agent is only
+/// recorded, so the run is stopped once, for that first verdict's reason.
 fn apply_watch(
     state: &State,
     db: &Database,
@@ -349,6 +351,7 @@ fn apply_watch(
     let validity = message.validity;
     apply::persist_verdict(state, db, run, &validity)?;
     if let Some(stale) = stale
+        && stale.is_none()
         && config.coherence.stopping().contains(&validity.decision)
     {
         transition(
@@ -1202,4 +1205,122 @@ pub fn cancel_question(
     let (run, _lock) = resolve(state, &command, None)?;
     emit(state, &run, output)?;
     Ok(run)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AnalysisLevel, Reason, ReasonCode, Validity, config::MidRunMode};
+
+    /// While a stop is still killing the agent, the watcher can send another
+    /// verdict that warrants one: a file read while it was being written
+    /// stops the attempt, and the file once written is a new world. Both are
+    /// recorded, and the attempt is stopped once, for the first one's reason.
+    #[test]
+    fn only_the_first_verdict_that_warrants_it_stops_the_attempt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (root, workspace) = (temp.path().join("project"), temp.path().join("work"));
+        fs::create_dir(&root)?;
+        fs::write(root.join("a.txt"), "a\n")?;
+        let git = |args: &[&str]| -> Result<()> {
+            let status = source::git_command(&root)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .status()?;
+            anyhow::ensure!(status.success(), "git {args:?}");
+            Ok(())
+        };
+        git(&["init", "--quiet"])?;
+        git(&["add", "."])?;
+        git(&["commit", "--quiet", "-m", "initial"])?;
+        git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "work",
+            workspace.to_str().unwrap(),
+        ])?;
+        let state = State {
+            root: temp.path().join("state"),
+        };
+        state.initialize()?;
+        let mut run = attach::create(
+            &state,
+            attach::AttachRequest {
+                workspace,
+                root: Some(root.clone()),
+                task: None,
+                agent: None,
+                pid: None,
+                command: None,
+                allow_unsafe_local: true,
+                auto_apply: false,
+                runtime: None,
+            },
+        )?;
+        let db = Database::open(state.db_path())?;
+        let mut config = Config::default();
+        config.coherence.mid_run = MidRunMode::Stop;
+        config.coherence.stop_on_refresh = true;
+        let cancellation = CancellationToken::new();
+        let mut stale = None;
+        for (world, detail) in [("written", "first"), ("rewritten", "second")] {
+            let validity = Validity {
+                decision: Decision::Refresh,
+                evaluated_at: Utc::now(),
+                world_digest: world.into(),
+                world_changed: true,
+                changed_files: 1,
+                reasons: vec![Reason {
+                    code: ReasonCode::PatchConflict,
+                    fact_id: None,
+                    path: None,
+                    detail: detail.into(),
+                }],
+                analysis: AnalysisLevel::FilesOnly,
+            };
+            apply_watch(
+                &state,
+                &db,
+                &mut run,
+                &config,
+                &cancellation,
+                WatchMsg { validity },
+                Some(&mut stale),
+            )?;
+        }
+        let events: Vec<_> = db
+            .events_for_run(&run.id)?
+            .into_iter()
+            .filter(|event| event.event_type.starts_with("coherence."))
+            .collect();
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "coherence.invalidated",
+                "coherence.stopped",
+                "coherence.invalidated"
+            ]
+        );
+        // The second is recorded, not dropped, and is the run's verdict now.
+        assert_eq!(
+            events[2].payload["coherence"]["reasons"][0]["detail"],
+            "second"
+        );
+        let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+        assert_eq!(validity.unwrap().reasons[0].detail, "second");
+        assert_eq!(stale.as_deref(), Some("first"));
+        assert!(cancellation.is_cancelled());
+        Ok(())
+    }
 }

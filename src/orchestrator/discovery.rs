@@ -418,10 +418,13 @@ fn register(
         }
         // Someone else is registering it, or has: the next tick sees which.
         Ok(None) => {}
+        // Noted with what failed first: that can be the repository, not this
+        // worktree, as when Git cannot list worktrees while it adds another.
         Err(error) => {
             if failed.insert(workspace.to_owned()) {
                 note(&format!(
-                    "could not track the {name} session in {}: {error:#}",
+                    "{error:#}; the {name} session in {} is not tracked yet, looked at \
+                     again next tick",
                     workspace.display()
                 ));
             }

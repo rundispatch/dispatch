@@ -179,6 +179,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Serve this project's Work to an orchestrating agent: a local MCP
+    /// server on stdin and stdout, which the agent's runtime starts. Its
+    /// tools only read; only you land Work, with `dispatch accept`.
+    Mcp {
+        /// Defaults to the main worktree of the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Stop watching this project in the background.
     Stop {
         /// Defaults to the current directory.
@@ -735,6 +743,12 @@ async fn run(cli: Cli) -> Result<()> {
             orchestrator::background::start(&state, root, cli.verbose, options).await
         }
         Command::Stop { root } => orchestrator::background::stop(&state, root),
+        Command::Mcp { root } => {
+            orchestrator::mcp::serve(&state, root).await?;
+            // What was answered is written: a read still running past that
+            // bound has no one to answer.
+            std::process::exit(0)
+        }
         Command::Watch { root, json } => {
             use std::io::IsTerminal;
             keep_watching(&state, root.as_deref())?;

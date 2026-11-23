@@ -6,6 +6,7 @@ pub(crate) mod catchup;
 pub mod discovery;
 pub mod inbox;
 pub(crate) mod liveness;
+pub mod mcp;
 pub(crate) mod native;
 mod notify;
 pub mod registration;
@@ -1952,7 +1953,14 @@ pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Resul
             run
         }
     };
-    let run = crate::coherence::with_live_validity(&run);
+    println!("{}", serde_json::to_string(&status_value(state, &run)?)?);
+    Ok(())
+}
+
+/// What `status --json` prints for `run`: its result with the verdict as it
+/// is now, the checks it reused, and how it interacts with other Work.
+pub(crate) fn status_value(state: &State, run: &RunRecord) -> Result<serde_json::Value> {
+    let run = crate::coherence::with_live_validity(run);
     let mut result = serde_json::to_value(run_result(&run))?;
     let reused = Database::open(state.db_path())?
         .events_for_run(&run.id)?
@@ -1970,8 +1978,7 @@ pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Resul
     {
         result["interactions"] = serde_json::Value::Array(projection.json(&run.id));
     }
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    Ok(result)
 }
 
 pub fn status_jsonl(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
@@ -2130,7 +2137,7 @@ pub(crate) fn review_target(
     state: &State,
     command: &ReviewCommand,
 ) -> Result<(RunRecord, OperationLock)> {
-    let (run, lock) = locked_delivery(state, command, true, true)?;
+    let (run, lock) = locked_delivery(state, command, true, true, true)?;
     anyhow::ensure!(
         run.outcome.review == ReviewState::Pending,
         "result has already been reviewed"
@@ -2149,34 +2156,40 @@ pub(crate) fn review_target(
 /// `exact_revision` is for a review of the result as it was shown: the
 /// command line names a run, not a revision, and a verdict the owner records
 /// meanwhile is not a change to the result. Unless `quiet`, a wait is said.
+/// Without `wait`, a held lock is refused at once (`batch::BUSY`).
 fn locked_delivery(
     state: &State,
     command: &ReviewCommand,
     exact_revision: bool,
     quiet: bool,
+    wait: bool,
 ) -> Result<(RunRecord, OperationLock)> {
     let id = state.resolve_run_id(&command.run_id)?;
     anyhow::ensure!(
         id == command.run_id,
         "review requires the complete run identity"
     );
-    let wait = state
-        .load_run(&id)
-        .ok()
-        .filter(|run| {
-            run.outcome.lifecycle == LifecycleState::Finished
-                && run.outcome.work_result == WorkResult::Ready
-        })
-        .map_or(5, |run| run.environment.timeout_secs);
     let path = state.run_dir(&id).join(".operation.lock");
-    if !quiet && OperationLock::is_held(&path)? {
-        eprintln!("Waiting for Work {id}: another process is using it.");
-    }
-    let lock = OperationLock::acquire_wait(
-        &path,
-        "run has a foreground owner",
-        std::time::Duration::from_secs(wait),
-    )?;
+    let lock = if wait {
+        let wait = state
+            .load_run(&id)
+            .ok()
+            .filter(|run| {
+                run.outcome.lifecycle == LifecycleState::Finished
+                    && run.outcome.work_result == WorkResult::Ready
+            })
+            .map_or(5, |run| run.environment.timeout_secs);
+        if !quiet && OperationLock::is_held(&path)? {
+            eprintln!("Waiting for Work {id}: another process is using it.");
+        }
+        OperationLock::acquire_wait(
+            &path,
+            "run has a foreground owner",
+            std::time::Duration::from_secs(wait),
+        )?
+    } else {
+        OperationLock::acquire_within(&path, Duration::ZERO)?.context(batch::BUSY)?
+    };
     let run = state.load_run(&id)?;
     anyhow::ensure!(
         !exact_revision || run.state_revision == command.revision,
@@ -2395,7 +2408,7 @@ pub(crate) fn decide(
     // One lock covers the review and the apply. A result may be reviewed
     // again (the latest revision stands), so this does not require a
     // pending review the way the interactive delivery does.
-    let (run, _lock) = locked_delivery(state, &command, false, quiet)?;
+    let (run, _lock) = locked_delivery(state, &command, false, quiet, true)?;
     if !quiet && let Some(label) = last_seen_changes(&run) {
         println!("{label}");
     }

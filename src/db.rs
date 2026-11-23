@@ -1537,7 +1537,8 @@ impl Database {
     }
 
     /// Commit the semantic state revision and its event in one SQLite transaction.
-    /// Files in the run directory are projections written only after this succeeds.
+    /// Files in the run directory are projections written only after this succeeds,
+    /// and `run` keeps the new revision only once it is committed.
     pub fn commit_transition(
         &self,
         run: &mut RunRecord,
@@ -1545,9 +1546,15 @@ impl Database {
     ) -> Result<EventRecord> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let event = Self::transition_on(&transaction, run, event)?;
-        transaction.commit()?;
-        Ok(event)
+        let revision = run.state_revision;
+        let committed = Self::transition_on(&transaction, run, event).and_then(|event| {
+            transaction.commit()?;
+            Ok(event)
+        });
+        if committed.is_err() {
+            run.state_revision = revision;
+        }
+        committed
     }
 
     fn transition_on(
@@ -2214,6 +2221,44 @@ mod tests {
             "a policy application must not reopen rejected work"
         );
         database.sync_run(&reopened(crate::AppliedBy::Human))?;
+        Ok(())
+    }
+
+    /// A transition whose commit fails leaves the run at the revision that is
+    /// stored, so the caller's next write is not refused as a concurrent one.
+    #[test]
+    fn a_transition_that_fails_to_commit_keeps_the_stored_revision() -> Result<()> {
+        let mut database = Database::open_in_memory()?;
+        let mut run = run("uncommitted");
+        database.sync_run(&run)?;
+        // The event's insert breaks a deferred foreign key, which only the
+        // commit checks.
+        database.connection.execute_batch(
+            "CREATE TEMP TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TEMP TRIGGER refuse AFTER INSERT ON main.events BEGIN INSERT INTO child VALUES (1); END;",
+        )?;
+        let event = |kind: &str| EventRecord {
+            run_id: "uncommitted".into(),
+            event_type: kind.into(),
+            timestamp: at(5),
+            payload: json!({}),
+            ..Default::default()
+        };
+        let error = database
+            .commit_transition(&mut run, event("refused"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("FOREIGN KEY"), "{error:#}");
+        assert_eq!(run.state_revision, 0);
+        database.connection.execute_batch("DROP TRIGGER refuse;")?;
+        database.commit_transition(&mut run, event("committed"))?;
+        assert_eq!(run.state_revision, 1);
+        let kinds: Vec<_> = database
+            .events_for_run("uncommitted")?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect();
+        assert_eq!(kinds, ["committed"]);
         Ok(())
     }
 

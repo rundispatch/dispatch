@@ -160,7 +160,7 @@ async fn run(
         // Render every tick: a run attached, finished or applied by another
         // process changes the view without any verdict or apply of our own.
         // `render` prints only what differs from what is already shown.
-        view.render(None, &tick.runs, json, owner.projection(), &[]);
+        view.render(state, None, &tick.runs, json, owner.projection(), &[]);
         let _ = io::stdout().flush();
     };
     // A finish under way is stopped, its checks with it, and its Work stays
@@ -575,7 +575,14 @@ pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
         match load_source_runs(state, &root) {
             Ok(runs) => {
                 let found = untracked(&now.3, &runs);
-                view.render(Some(&now.1), &runs, json, interactions.as_ref(), &found);
+                view.render(
+                    state,
+                    Some(&now.1),
+                    &runs,
+                    json,
+                    interactions.as_ref(),
+                    &found,
+                );
             }
             Err(error) => eprintln!("watch: {error:#}"),
         }
@@ -1734,7 +1741,7 @@ fn describe(run: &RunRecord) -> (WorkLine, Option<Decision>) {
 /// Runs whose `source_path` is `root` and that are still active, still wait
 /// for your review, or finished within the last hour (part 4/14.11 of the
 /// view), sorted for a stable redraw.
-fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
+pub(crate) fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
     let now = Utc::now();
     let mut rows: Vec<&RunRecord> = runs
         .iter()
@@ -1821,6 +1828,65 @@ fn row(run: &RunRecord, id: &str, interactions: Option<&Projection>) -> String {
     line
 }
 
+/// One row of the project view as data, for `watch --json` and `dispatch
+/// mcp`: the Work line's fields, what it was asked to do and where, and
+/// whom it interacts with, `null` while nothing watches the project.
+pub(crate) fn work_row(
+    state: &State,
+    run: &RunRecord,
+    interactions: Option<&Projection>,
+) -> serde_json::Value {
+    let (line, decision) = describe(run);
+    let needs_you = super::attach::waiting_on_you(run).map(|mark| {
+        serde_json::json!({
+            "kind": mark.kind,
+            "message": mark.message,
+            "since": mark.at,
+        })
+    });
+    let attachment = run.attachment.as_ref();
+    let subagent = attachment
+        .and_then(|attachment| attachment.sessions.iter().find_map(|s| s.subagent.as_ref()))
+        .map(|subagent| {
+            serde_json::json!({
+                "agent_id": subagent.agent_id,
+                "agent_type": subagent.agent_type,
+            })
+        });
+    let workspace = attachment
+        .map(|attachment| &attachment.workspace)
+        .or_else(|| run.candidates.first().map(|c| &c.workspace_path));
+    // Unknown until the Work finished with a Δ: a candidate counts nothing
+    // before then.
+    let files_changed = run
+        .candidates
+        .first()
+        .filter(|c| run.outcome.lifecycle == LifecycleState::Finished && c.diff_path.is_file())
+        .map(|c| c.diff_stats.files_changed);
+    serde_json::json!({
+        "type": "work",
+        "run_id": run.id,
+        "task": run.task,
+        "agent": line.agent,
+        "verdict": decision,
+        "state": line.state,
+        "reason": line.reason.as_deref().unwrap_or("—"),
+        "origin": line.origin,
+        "subagent": subagent,
+        "workspace": workspace,
+        "s0": line.s0,
+        "files_changed": files_changed,
+        "verification": line.verification,
+        "ready_for_review": awaits_review(run),
+        "review": line.review,
+        "applied_by": line.applied_by,
+        "overridden": line.verdict == "overridden",
+        "interactions": interactions.map(|p| p.json(&run.id)),
+        "needs_you": needs_you,
+        "asked_to_catch_up": super::catchup::asked(state, run).is_some(),
+    })
+}
+
 /// The project view: what is shown, so each tick prints only what changed.
 /// Shared by `serve` in the foreground and `watch`.
 #[derive(Default)]
@@ -1840,6 +1906,7 @@ impl View {
     /// in place on a TTY and appended as lines otherwise.
     pub(crate) fn render(
         &mut self,
+        state: &State,
         header: Option<&str>,
         runs: &[RunRecord],
         json: bool,
@@ -1870,37 +1937,12 @@ impl View {
 
         if json {
             for run in rows {
-                let (line, decision) = describe(run);
-                // `null` while nothing watches the project: not known.
-                let concurrent = interactions.map(|p| p.json(&run.id));
-                let needs_you = super::attach::waiting_on_you(run).map(|mark| {
-                    serde_json::json!({
-                        "kind": mark.kind,
-                        "message": mark.message,
-                        "since": mark.at,
-                    })
-                });
-                let key = format!("{line} {concurrent:?} {needs_you:?}");
+                let row = work_row(state, run, interactions);
+                // The Work line stays in the key: it tells an unmoved result
+                // from CONTINUE, which the row's `verdict` cannot.
+                let key = format!("{} {row}", describe(run).0);
                 if shown.get(&run.id) != Some(&key) {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "type": "work",
-                            "run_id": run.id,
-                            "agent": line.agent,
-                            "verdict": decision,
-                            "state": line.state,
-                            "reason": line.reason.as_deref().unwrap_or("—"),
-                            "origin": line.origin,
-                            "s0": line.s0,
-                            "verification": line.verification,
-                            "review": line.review,
-                            "applied_by": line.applied_by,
-                            "overridden": line.verdict == "overridden",
-                            "interactions": concurrent,
-                            "needs_you": needs_you,
-                        })
-                    );
+                    println!("{row}");
                     shown.insert(run.id.clone(), key);
                 }
             }
