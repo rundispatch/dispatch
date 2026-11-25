@@ -302,6 +302,19 @@ struct RunArgs {
     /// is coherent with the current source. Records no human review.
     #[arg(long)]
     auto_apply: bool,
+
+    /// The run's id, chosen by `dispatch mcp`'s `start` so that it answers
+    /// with it at once.
+    #[arg(long, hide = true)]
+    run_id: Option<ulid::Ulid>,
+
+    /// Who asked for the run, recorded as `launch.requested`.
+    #[arg(long, hide = true, value_parser = ["mcp"], requires = "client")]
+    requested_by: Option<String>,
+
+    /// The name the MCP client that asked gave itself.
+    #[arg(long, hide = true, requires = "requested_by")]
+    client: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -634,6 +647,8 @@ async fn run(cli: Cli) -> Result<()> {
                 allow_forwarded_env: args.allow_forwarded_env,
                 output: run_output_mode(json, jsonl, auto_apply),
                 refreshed_from: None,
+                run_id: args.run_id.map(|id| id.to_string()),
+                requested_by: args.requested_by.zip(args.client),
             };
             let run = orchestrator::run_dispatch(&state, request).await?;
             finish_run(&state, run, auto_apply, json, jsonl)

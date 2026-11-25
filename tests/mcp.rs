@@ -39,7 +39,7 @@ const SESSION: &str = "96fce6bd-fe23-4b1c-bd1e-b171635c421b";
 const PARENT: &str = "80a7793b-dddd-43a5-989c-f275463399fb";
 const SUBAGENT: &str = "a85d8d5dd371b34d4";
 
-const TOOLS: [&str; 4] = ["work", "status", "wait", "propose_landing"];
+const TOOLS: [&str; 5] = ["work", "status", "wait", "start", "propose_landing"];
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -63,9 +63,9 @@ fn text(output: &Output) -> String {
     )
 }
 
-/// The lock at `path`, held as Dispatch holds one until the file is
-/// dropped; `None` when another holds it.
-fn hold(path: &Path) -> Option<fs::File> {
+/// The lock at `path`, held as Dispatch holds one until it is dropped;
+/// `None` when another holds it.
+fn hold(path: &Path) -> Option<Held> {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let file = fs::OpenOptions::new()
         .create(true)
@@ -75,7 +75,20 @@ fn hold(path: &Path) -> Option<fs::File> {
         .unwrap();
     // SAFETY: the descriptor stays open while the lock is held.
     let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (locked == 0).then_some(file)
+    (locked == 0).then_some(Held(file))
+}
+
+/// A lock `hold` took. Dropped, it unlocks, as Dispatch's `OperationLock`
+/// does, before its descriptor closes: a child another test's thread is
+/// starting holds a copy of every descriptor until it execs, and a lock
+/// let go of only by closing stays held that long.
+struct Held(fs::File);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // SAFETY: unlocks only the descriptor this guard locked.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Waits for what it waits for: only a hang reaches the bound.
@@ -133,7 +146,7 @@ struct Project {
     root: PathBuf,
     state: PathBuf,
     /// The serve lock while no owner runs: the project reads as watched.
-    watched: Option<fs::File>,
+    watched: Option<Held>,
 }
 
 impl Project {
@@ -416,12 +429,97 @@ impl Project {
             .find(|id| self.run(id)["attachment"]["workspace"].as_str() == workspace.to_str())
             .expect("registered")
     }
+
+    /// Launch consent for `agents`, as setup grants it: each with what its
+    /// launch runs on the host as the project is now.
+    fn allow(&self, agents: &[&str], max_running: usize) {
+        let state = dispatch::state::State::discover(Some(self.state.clone())).unwrap();
+        let (config, _) = dispatch::Config::discover(&self.root, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let commands = |agent: &str| {
+            let now = dispatch::consent::native_commands(&self.root, agent, &config);
+            runtime.block_on(now).unwrap()
+        };
+        let consent = dispatch::consent::LaunchConsent {
+            agents: agents
+                .iter()
+                .map(|agent| ((*agent).to_owned(), commands(agent)))
+                .collect(),
+            max_running,
+        };
+        dispatch::consent::grant_launch(&state, &self.root, &consent).unwrap();
+    }
+
+    /// Whether run `id` was created: its `metadata.json` is written.
+    fn created(&self, id: &str) -> bool {
+        self.state
+            .join("runs")
+            .join(id)
+            .join("metadata.json")
+            .exists()
+    }
+
+    /// The ids `start` launched, by the task files it wrote.
+    fn launched(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(self.state.join("started")) else {
+            return Vec::new();
+        };
+        let names = entries.map(|entry| entry.unwrap().file_name().into_string().unwrap());
+        let mut ids: Vec<String> = names
+            .filter_map(|name| name.strip_suffix(".task").map(str::to_owned))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The process group of the agent run `id` started, once its launch is
+    /// recorded.
+    fn agent_group(&self, id: &str) -> Option<i32> {
+        let db = dispatch::db::Database::open(self.state.join("dispatch.db")).unwrap();
+        let launches = dispatch::launch::launches_for_run(&db, id).unwrap();
+        launches
+            .into_iter()
+            .filter(|launch| launch.state == dispatch::launch::LaunchState::Spawned)
+            .find_map(|launch| launch.child?.process_group)
+    }
+
+    /// The `dispatch run` launched as `id`, while it runs.
+    fn launch_pid(&self, id: &str) -> Option<i32> {
+        let found = Command::new("pgrep")
+            .args(["-f", &format!("run-id={id}")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&found.stdout).trim().parse().ok()
+    }
 }
 
 impl Drop for Project {
     fn drop(&mut self) {
         self.watched = None;
         let _ = self.dispatch(&["stop"]);
+        // Each run `start` launched stops its agent and records how it
+        // ended, a run a test stopped too.
+        for id in self.launched() {
+            let Some(pid) = self.launch_pid(&id) else {
+                continue;
+            };
+            // SAFETY: signals to the one process this test launched.
+            unsafe {
+                libc::kill(pid, libc::SIGCONT);
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while self.launch_pid(&id).is_some() {
+                if Instant::now() > deadline {
+                    // SAFETY: as above.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -813,7 +911,7 @@ fn claude_code_asks_server_discover_first_then_initializes() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, TOOLS, "exactly the four tools, none that lands");
+    assert_eq!(names, TOOLS, "exactly these tools, none that lands");
     for tool in tools["result"]["tools"].as_array().unwrap() {
         assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
         assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
@@ -843,7 +941,7 @@ fn codex_and_cursor_initialize_with_their_own_versions() {
             .as_array()
             .unwrap()
             .len(),
-        4
+        TOOLS.len()
     );
     mcp.send(
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{"callId":"exec-177f9dd3-4fcf-4ad8-84eb-36724cdc2a43","x-codex-turn-metadata":{"session_id":"01a1f044-0a99-7f43-a994-73a6fa154f81","thread_id":"01a1f044-0a99-7f43-a994-73a6fa154f81","reasoning_effort":"ultra","turn_id":"01a1f044-0c1b-7d02-af3e-13787addaf43","model":"gpt-6.2-astra","thread_source":"user","turn_trigger":"exec","sandbox":"seatbelt","sandbox_mode":"workspace-write","auto_review_enabled":false,"node_repl_auto_review_required":true,"node_repl_disabled":false,"workspaces":{"/home/u/project":{"has_changes":false}},"turn_started_at_unix_ms":1795032353831,"codex_version":"0.170.0"},"threadId":"01a1f044-0a99-7f43-a994-73a6fa154f81","sessionId":"01a1f044-0a99-7f43-a994-73a6fa154f81","windowId":"01a1f044-0a99-7f43-a994-73a6fa154f81:0","itemId":"ctc_0bd745e451b4c175016afe052b17a487d1afee19d33bdb9e6f","progressToken":1},"name":"work","arguments":{}}}"#,
@@ -869,7 +967,7 @@ fn codex_and_cursor_initialize_with_their_own_versions() {
             .as_array()
             .unwrap()
             .len(),
-        4
+        TOOLS.len()
     );
     // A version not answered as asked gets the newest.
     mcp.send(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#);
@@ -1195,6 +1293,21 @@ fn no_tool_can_land_and_stdout_is_the_protocol_only() {
         ("wait", json!({"timeout_s": 901})),
         ("wait", json!({"timeout_s": -1})),
         ("wait", json!({"timeout_s": 1, "then": "accept"})),
+        // There is no launch consent here.
+        ("start", json!({})),
+        ("start", json!({"agent": "claude"})),
+        ("start", json!({"agent": "claude", "task": ""})),
+        ("start", json!({"agent": 5, "task": "t"})),
+        ("start", json!({"agent": "claude", "task": ["t"]})),
+        ("start", json!({"agent": "claude", "task": "t"})),
+        (
+            "start",
+            json!({"agent": "claude", "task": "t", "accept": true}),
+        ),
+        (
+            "start",
+            json!({"agent": long.clone(), "task": long.clone()}),
+        ),
     ];
     for (name, arguments) in refused {
         let words = mcp.refused(name, arguments.clone());
@@ -1239,6 +1352,7 @@ fn no_tool_can_land_and_stdout_is_the_protocol_only() {
         "a tool changed what only a person may"
     );
     assert_eq!(p.of("batch.proposed"), 0);
+    assert!(!p.state.join("started").exists(), "something was launched");
 }
 
 #[test]
@@ -1787,5 +1901,459 @@ fn wait_times_out_at_timeout_s_with_progress_for_each_token() {
             assert_eq!(notification["params"]["total"], 15.0);
         }
     }
+    mcp.close();
+}
+
+/// No launch consent, an agent it does not name, forwarded environment and
+/// arguments that are not an agent and a task: each refused in a sentence,
+/// and nothing launched.
+#[test]
+fn start_launches_nothing_its_launch_consent_does_not_allow() {
+    let (p, mut mcp) = server();
+    mcp.initialize();
+    let task = json!({"agent": "fake-good", "task": "add a file"});
+    assert_eq!(
+        mcp.refused("start", task.clone()),
+        "Nothing may be launched here until the person allows it, with `dispatch setup` in a terminal."
+    );
+    p.allow(&["fake-good", "fake-bad"], 3);
+    assert_eq!(
+        mcp.refused("start", json!({"agent": "claude", "task": "add a file"})),
+        "The launch consent here names fake-bad, fake-good, not \"claude\"; start one of \
+         those, or ask the person to change it with `dispatch setup`."
+    );
+    for arguments in [
+        json!({}),
+        json!({"agent": "fake-good"}),
+        json!({"task": "add a file"}),
+        json!({"agent": "fake-good", "task": " \n"}),
+        json!({"agent": 5, "task": "add a file"}),
+        json!({"agent": "fake-good", "task": ["add a file"]}),
+        json!({"agent": "fake-good", "task": "add a file", "then": "accept"}),
+    ] {
+        mcp.refused("start", arguments);
+    }
+    // Only the person, at a terminal, passes --allow-forwarded-env.
+    fs::write(
+        p.root.join("dispatch.yml"),
+        "execution:\n  forwarded_env: [DISPATCH_TEST_TOKEN]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        mcp.refused("start", task),
+        "This project's dispatch.yml forwards environment variables to its runs, so only the \
+         person can launch one, from a terminal, with --allow-forwarded-env."
+    );
+    assert!(!p.state.join("started").exists(), "something was launched");
+    assert_eq!(p.ids(), Vec::<String>::new(), "a run was made");
+    mcp.close();
+}
+
+/// Launch consent holds for each agent's command and the project's checks
+/// as the person allowed them. A check or an executable that a pull or a
+/// branch switch changed since is refused before anything runs; unchanged,
+/// the agent launches.
+#[test]
+fn start_refuses_an_agent_whose_command_or_checks_changed_since_it_was_allowed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (p, mut mcp) = server();
+    mcp.initialize();
+    let ran = p.temp.path().join("ran");
+    let stand_in = |name: &str| {
+        let path = p.temp.path().join(name);
+        fs::write(&path, format!("#!/bin/sh\ntouch {ran:?}\nexit 91\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let (first, second) = (stand_in("claude-first"), stand_in("claude-second"));
+    let config = |claude: &Path, verify: &[String]| {
+        let verify: String = verify.iter().map(|c| format!("    - {c:?}\n")).collect();
+        let checks = if verify.is_empty() {
+            String::new()
+        } else {
+            format!("checks:\n  verify:\n{verify}")
+        };
+        let yml = format!("{checks}harnesses:\n  claude:\n    executable: {claude:?}\n");
+        fs::write(p.root.join("dispatch.yml"), yml).unwrap();
+    };
+    let changed = |name: &str| {
+        format!(
+            "This project's command or checks for {name} changed since the person allowed \
+             launches; ask them to allow it again with `dispatch setup`."
+        )
+    };
+    config(&first, &[]);
+    p.allow(&["fake-good", "claude"], 3);
+    // A check added since, as the reviewer reproduced it.
+    config(&first, &[format!("touch {}", ran.display())]);
+    for (agent, name) in [("fake-good", "fake-good"), ("claude", "Claude Code")] {
+        let task = json!({"agent": agent, "task": "add a file"});
+        assert_eq!(mcp.refused("start", task), changed(name));
+    }
+    // Another executable since.
+    config(&second, &[]);
+    let task = json!({"agent": "claude", "task": "add a file"});
+    assert_eq!(mcp.refused("start", task), changed("Claude Code"));
+    assert!(!ran.exists(), "a changed command ran");
+    assert!(!p.state.join("started").exists(), "something was launched");
+
+    // As the person allowed it: it launches, and its checks run.
+    config(&first, &["true".to_owned()]);
+    p.allow(&["fake-good"], 3);
+    let started = mcp.tool("start", json!({"agent": "fake-good", "task": "add a file"}));
+    let woke = mcp.tool("wait", json!({"ids": [started["id"]], "timeout_s": 300}));
+    assert_eq!(woke["woke"], "finished", "{woke}");
+    assert_eq!(woke["work"][0]["state"], "ready", "{woke}");
+    assert!(!ran.exists());
+    mcp.close();
+}
+
+/// `max_running` counts this server's own launch before its run is
+/// created, and once it is, counts it once.
+#[test]
+fn start_holds_to_max_running_counting_its_own_launch_before_its_run_is_created() {
+    let (p, mut mcp) = server();
+    p.allow(&["fake-timeout"], 1);
+    mcp.initialize();
+    let task = json!({"agent": "fake-timeout", "task": "take your time"});
+    let full = "1 of this project's native runs is running, and its launch consent allows 1 at \
+                once; wait for one to finish, then start again.";
+    // Hold writes once the database is made, so that `dispatch run` cannot
+    // record its run before it is stopped, as soon as it is found.
+    dispatch::db::Database::open(p.state.join("dispatch.db")).unwrap();
+    let db = rusqlite::Connection::open(p.state.join("dispatch.db")).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let start = mcp.request(
+        "tools/call",
+        json!({"name": "start", "arguments": task.clone()}),
+    );
+    until("the launch", || !p.launched().is_empty());
+    let id = p.launched()[0].clone();
+    let mut pid = None;
+    until("its dispatch run", || {
+        pid = p.launch_pid(&id);
+        pid.is_some()
+    });
+    let pid = pid.unwrap();
+    // SAFETY: signals to the one process this test launched.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    drop(db);
+    assert_eq!(result(&mcp.answer(&start).1)["id"], id);
+    assert!(!p.created(&id));
+    assert_eq!(mcp.refused("start", task.clone()), full);
+    // SAFETY: as above.
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    until("its run created", || p.created(&id));
+    assert_eq!(mcp.refused("start", task), full);
+    assert_eq!(p.launched(), [id]);
+    mcp.close();
+}
+
+/// A launched run whose `dispatch run` was killed after its agent started
+/// stays unfinished, and keeps its place while that agent, in its own
+/// process group, still runs; once the agent is gone too, it gives its
+/// place back.
+#[test]
+fn a_launched_run_whose_dispatch_run_was_killed_keeps_its_place_while_its_agent_runs() {
+    let (p, mut mcp) = server();
+    p.allow(&["fake-timeout"], 1);
+    mcp.initialize();
+    let task = json!({"agent": "fake-timeout", "task": "take your time"});
+    let full = "1 of this project's native runs is running, and its launch consent allows 1 at \
+                once; wait for one to finish, then start again.";
+    let first = mcp.tool("start", task.clone())["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut group = None;
+    until("its agent started", || {
+        group = p.agent_group(&first);
+        group.is_some()
+    });
+    let group = group.unwrap();
+    assert_eq!(mcp.refused("start", task.clone()), full);
+    // As an OOM kill or a SIGKILL would: kill only its `dispatch run`, and
+    // wait until this server reaped it.
+    let pid = p.launch_pid(&first).expect("its dispatch run");
+    // SAFETY: a signal to the one process this test launched, then probes
+    // of it.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    until(
+        "its dispatch run reaped",
+        || unsafe { libc::kill(pid, 0) } != 0,
+    );
+    let while_alive = mcp.call("start", task.clone());
+    // Its agent still runs. Kill its group before asserting, so that a
+    // failure leaves no agent behind.
+    // SAFETY: the agent leads its own process group; this kills only it.
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    assert_eq!(while_alive["result"]["isError"], true, "{while_alive}");
+    assert_eq!(
+        while_alive["result"]["content"][0]["text"], full,
+        "{while_alive}"
+    );
+    let mut again = Value::Null;
+    until("its place back", || {
+        again = mcp.call("start", task.clone());
+        again["result"]["isError"] != true
+    });
+    let again = result(&again)["id"].as_str().unwrap().to_owned();
+    assert_ne!(again, first);
+    let rows = mcp.tool("work", json!({}))["work"].clone();
+    let row = |id: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["run_id"] == id)
+            .cloned()
+    };
+    assert_ne!(p.run(&first)["outcome"]["lifecycle"], "finished");
+    assert!(row(&first).is_some(), "{rows}");
+    mcp.close();
+}
+
+/// A launch answers its id once its run is created, with the task given
+/// verbatim, its own output in its private log and none on stdout; `wait`
+/// on the id answers `finished`; the run records who asked right after
+/// `run.created`; and its process is reaped.
+#[test]
+fn a_launch_answers_its_id_and_wait_answers_finished_for_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (p, mut mcp) = server();
+    p.allow(&["fake-good"], 3);
+    mcp.initialize();
+    let task = "--allow-forwarded-env \"quoted\" ü 🙂\nDispatch: a second line\n";
+    let started = mcp.tool("start", json!({"agent": "fake-good", "task": task}));
+    let id = started["id"].as_str().unwrap().to_owned();
+    assert_eq!(p.launched(), std::slice::from_ref(&id));
+    assert_eq!(started["agent"], "fake-good");
+    assert_eq!(started.get("task"), None, "{started}");
+    let log = p.state.join("started").join(format!("{id}.log"));
+    assert_eq!(started["log"], log.to_str().unwrap());
+    assert!(
+        started["note"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("Wait on it with wait {{\"ids\": [\"{id}\"]}};")),
+        "{started}"
+    );
+    let file = p.state.join("started").join(format!("{id}.task"));
+    assert_eq!(fs::read_to_string(&file).unwrap(), task);
+    for private in [&file, &log] {
+        let mode = fs::metadata(private).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{}", private.display());
+    }
+    // Once its run is created, `status` knows it.
+    until("its run created", || p.created(&id));
+    assert_eq!(mcp.tool("status", json!({"id": id}))["run_id"], id);
+
+    let woke = mcp.tool("wait", json!({"ids": [id], "timeout_s": 300}));
+    assert_eq!(woke["woke"], "finished", "{woke}");
+    let [row] = &woke["work"].as_array().unwrap()[..] else {
+        panic!("one row: {woke}");
+    };
+    assert_eq!(row["run_id"], id);
+    assert_eq!(row["origin"], "native");
+    assert_eq!(row["agent"], "fake-good");
+    assert_eq!(row["state"], "ready");
+    assert_eq!(row["task"], task);
+    assert_eq!(p.run(&id)["task"], task);
+    let output = fs::read_to_string(&log).unwrap();
+    assert!(output.contains(&format!("RUN {id}")), "{output}");
+
+    let events: Vec<_> = p.events().into_iter().filter(|e| e.1 == id).collect();
+    assert_eq!(events[0].2, "run.created");
+    assert_eq!(events[1].2, "launch.requested");
+    let asked: Value = serde_json::from_str(&events[1].3).unwrap();
+    assert_eq!(
+        (&asked["by"], &asked["client"], &asked["agent"]),
+        (&json!("mcp"), &json!("claude-code"), &json!("fake-good"))
+    );
+    assert_eq!(p.of("launch.requested"), 1);
+
+    let pid = p.run(&id)["execution"]["supervisor"]["pid"]
+        .as_i64()
+        .unwrap();
+    let pid = i32::try_from(pid).unwrap();
+    // SAFETY: signal 0 only asks whether the process, a zombie too, exists.
+    until(
+        "the launched run reaped",
+        || unsafe { libc::kill(pid, 0) } != 0,
+    );
+    mcp.close();
+}
+
+/// `launch.requested` names the client as its `initialize` named itself,
+/// as Codex and Cursor do, or `unknown`.
+#[test]
+fn launch_requested_names_the_client_that_asked() {
+    let p = Project::new(&[]);
+    p.allow(&["fake-good"], 3);
+    let handshakes = [
+        (
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{"codex/auth-change":{}},"elicitation":{"form":{},"url":{}}},"clientInfo":{"name":"codex-mcp-client","title":"Codex","version":"0.170.0"}}}"#,
+            "codex-mcp-client",
+        ),
+        (
+            r#"{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}},"clientInfo":{"name":"Cursor","version":"1.0.0"}},"jsonrpc":"2.0","id":0}"#,
+            "Cursor",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+            "unknown",
+        ),
+    ];
+    for (initialize, client) in handshakes {
+        let mut mcp = Mcp::start(&p, &p.root, &[]);
+        mcp.send(initialize);
+        mcp.answer(&json!(0));
+        let started = mcp.tool("start", json!({"agent": "fake-good", "task": client}));
+        let id = started["id"].as_str().unwrap();
+        let woke = mcp.tool("wait", json!({"ids": [id], "timeout_s": 300}));
+        assert_eq!(woke["woke"], "finished", "{woke}");
+        let event = p
+            .events()
+            .into_iter()
+            .find(|e| e.1 == id && e.2 == "launch.requested")
+            .expect("launch.requested");
+        let asked: Value = serde_json::from_str(&event.3).unwrap();
+        assert_eq!(asked["client"], client);
+        mcp.close();
+    }
+}
+
+/// A launch whose `dispatch run` exits before its run is created is
+/// reported once, with its log's last lines: by `start` when that happens
+/// while it waits, else by the next `work`, or by a `wait` on it. It is
+/// never launched again, and what it left half made takes no place.
+#[test]
+fn a_launch_that_exits_before_its_run_is_created_is_reported_once() {
+    let (p, mut mcp) = server();
+    p.allow(&["fake-good", "fake-nope"], 1);
+    mcp.initialize();
+    let id = mcp.tool("start", json!({"agent": "fake-good", "task": "first"}))["id"].clone();
+    let woke = mcp.tool("wait", json!({"ids": [id], "timeout_s": 300}));
+    assert_eq!(woke["woke"], "finished", "{woke}");
+
+    // No harness answers to fake-nope: `dispatch run` stops at once. `start`
+    // reports it, or, when it stopped only after `start` answered, the first
+    // `work` that sees it does; then neither reports it again. The first
+    // `dispatch run` holds the one place until this server reaped it, and a
+    // refused `start` launches nothing, so it is sent again until then.
+    let full = "1 of this project's native runs is running, and its launch consent allows 1 at \
+                once; wait for one to finish, then start again.";
+    let mut answer = Value::Null;
+    until("the first run's place", || {
+        answer = mcp.call("start", json!({"agent": "fake-nope", "task": "nope"}));
+        answer["result"]["isError"] != true || answer["result"]["content"][0]["text"] != full
+    });
+    let said = if answer["result"]["isError"] == true {
+        let said = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            said.starts_with("The launch exited before its run was created (exit status: "),
+            "{said}"
+        );
+        said.to_owned()
+    } else {
+        let id = result(&answer)["id"].clone();
+        let mut work = Value::Null;
+        until("work to report it", || {
+            work = mcp.tool("work", json!({}));
+            work.get("launch_failed").is_some()
+        });
+        let [failed] = &work["launch_failed"].as_array().unwrap()[..] else {
+            panic!("one failure: {work}");
+        };
+        assert_eq!(failed["id"], id);
+        failed["last_lines"].as_str().unwrap().to_owned()
+    };
+    assert!(said.contains("unknown harness \"fake-nope\""), "{said}");
+    assert!(mcp.tool("work", json!({})).get("launch_failed").is_none());
+
+    for reporter in ["work", "wait"] {
+        // Hold writes, so that `dispatch run` cannot record its run before
+        // it is stopped, as soon as it is found.
+        let db = rusqlite::Connection::open(p.state.join("dispatch.db")).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let before = p.launched();
+        let start = mcp.request(
+            "tools/call",
+            json!({"name": "start", "arguments": {"agent": "fake-good", "task": reporter}}),
+        );
+        let mut id = String::new();
+        until("the launch", || {
+            let new = p.launched().into_iter().find(|id| !before.contains(id));
+            id = new.unwrap_or_default();
+            !id.is_empty()
+        });
+        let log = p.state.join("started").join(format!("{id}.log"));
+        let mut pid = None;
+        until("its dispatch run", || {
+            pid = p.launch_pid(&id);
+            pid.is_some()
+        });
+        let pid = pid.unwrap();
+        // SAFETY: signals to the one process this test launched.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        drop(db);
+        let started = result(&mcp.answer(&start).1);
+        assert_eq!(started["id"], id);
+        assert!(!p.created(&id));
+        let waiting = (reporter == "wait").then(|| {
+            let arguments = json!({"ids": [id], "timeout_s": 300});
+            mcp.request(
+                "tools/call",
+                json!({"name": "wait", "arguments": arguments}),
+            )
+        });
+        // SAFETY: as above.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let failed = match waiting {
+            Some(waiting) => {
+                let woke = result(&mcp.answer(&waiting).1);
+                assert_eq!(woke["woke"], "launch_failed", "{woke}");
+                assert_eq!(woke["work"], json!([]));
+                woke["launch_failed"].clone()
+            }
+            None => {
+                let mut work = Value::Null;
+                until("work to report it", || {
+                    work = mcp.tool("work", json!({}));
+                    work.get("launch_failed").is_some()
+                });
+                work["launch_failed"].clone()
+            }
+        };
+        let [failed] = &failed.as_array().unwrap()[..] else {
+            panic!("one failure: {failed}");
+        };
+        assert_eq!(failed["id"], id);
+        assert_eq!(failed["agent"], "fake-good");
+        assert_eq!(failed["task"], reporter);
+        assert_eq!(failed["log"], log.to_str().unwrap());
+        assert!(
+            failed["exit"].as_str().unwrap().contains("SIGKILL"),
+            "{failed}"
+        );
+        // It was stopped as soon as it was found: its log holds what it
+        // said by then, if anything.
+        let written = fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = written.lines().collect();
+        let last = lines[lines.len().saturating_sub(20)..].join("\n");
+        assert_eq!(failed["last_lines"], last);
+
+        // Once: neither work nor a wait reports it again.
+        assert!(mcp.tool("work", json!({})).get("launch_failed").is_none());
+        let unknown = mcp.refused("wait", json!({"ids": [id], "timeout_s": 1}));
+        assert!(unknown.starts_with("No Work"), "{unknown}");
+        assert!(p.launch_pid(&id).is_none());
+    }
+    // Never launched again, and the runs left half made take no place.
+    assert_eq!(p.launched().len(), 4);
+    let id = mcp.tool("start", json!({"agent": "fake-good", "task": "last"}))["id"].clone();
+    let woke = mcp.tool("wait", json!({"ids": [id], "timeout_s": 300}));
+    assert_eq!(woke["woke"], "finished", "{woke}");
     mcp.close();
 }

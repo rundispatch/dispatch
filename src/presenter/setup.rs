@@ -56,6 +56,9 @@ async fn project_setup(
     if !carry_on {
         return ui.commit(SETUP_STOPPED);
     }
+    if !launch_step(ui, state, source).await? {
+        return ui.commit(SETUP_STOPPED);
+    }
     let rows = [
         Choice::new("Done"),
         Choice::new("Agents Dispatch launches…"),
@@ -212,6 +215,138 @@ async fn allow_project_checks(
     consent::grant_exact(state, &root, &commands)?;
     ui.commit("Check consent saved in Dispatch's state for these exact commands.")?;
     Ok(true)
+}
+
+/// The agents an orchestrator may be allowed to launch, as setup lists them.
+const AGENTS: [&str; 4] = ["claude", "codex", "cursor", "hermes"];
+
+/// Launch consent for this project (`consent::LaunchConsent`): which agents
+/// found here an orchestrator may launch through `dispatch mcp`, none chosen
+/// at first, each with the executable it pins and the checks it pins listed
+/// once, and how many of the project's native runs may run at once. A
+/// consent already given opens chosen, saying which agents changed since,
+/// with a Remove row. Focus starts on Skip. Returns false when the person
+/// backed out.
+async fn launch_step(ui: &mut Ui, state: &State, source: &std::path::Path) -> Result<bool> {
+    use crate::consent::{self, LaunchConsent};
+    let root = consent::project_root(source)?;
+    let current = consent::launch_consent(state, &root)?;
+    let (config, _) = Config::discover(&root, None)?;
+    // What each agent's launch would run now; none for one not found.
+    let mut found = Vec::new();
+    for agent in AGENTS {
+        found.push(consent::native_commands(&root, agent, &config).await.ok());
+    }
+    if current.is_none() && found.iter().all(Option::is_none) {
+        return Ok(true);
+    }
+    let allowed = |agent: &str| current.as_ref().and_then(|c| c.agents.get(agent));
+    let names = |agents: Vec<&str>| {
+        let names: Vec<&str> = agents.into_iter().map(orchestrator::harness_name).collect();
+        names.join(", ")
+    };
+    let changed = names(
+        AGENTS
+            .into_iter()
+            .zip(&found)
+            .filter(|(agent, now)| {
+                allowed(agent).is_some_and(|pinned| now.as_ref() != Some(pinned))
+            })
+            .map(|(agent, _)| agent)
+            .collect(),
+    );
+    let mut chosen: Vec<bool> = AGENTS
+        .iter()
+        .zip(&found)
+        .map(|(agent, now)| now.is_some() && allowed(agent).is_some())
+        .collect();
+    let mut max_running = current.as_ref().map_or(3, |current| current.max_running);
+    loop {
+        let mut rows: Vec<Choice> = AGENTS
+            .iter()
+            .zip(&found)
+            .zip(&chosen)
+            .map(|((agent, now), chosen)| {
+                let label = format!(
+                    "[{}] {}",
+                    if *chosen { "x" } else { " " },
+                    orchestrator::harness_name(agent)
+                );
+                match now {
+                    Some(Some(commands)) => {
+                        Choice::new(format!("{label} ({})", commands.executable.display()))
+                    }
+                    Some(None) => Choice::new(label),
+                    None => Choice::disabled(label, "not found on PATH"),
+                }
+            })
+            .collect();
+        rows.push(Choice::new(format!("At most {max_running} at once…")));
+        rows.push(Choice::new("Allow"));
+        if current.is_some() {
+            rows.push(Choice::new("Remove"));
+        }
+        rows.push(Choice::new("Skip"));
+        let mut body = format!(
+            "Agents an orchestrator may launch\nAn orchestrating agent connected through dispatch \
+             mcp may start the agents you allow here, each on a task it gives, with at most \
+             {max_running} of this project's native runs running at once, counting runs you \
+             start yourself. Each runs on this machine with your permissions, not in a sandbox, \
+             in its own snapshot of the project, and this project's checks run there too. \
+             Allowing this is the same acknowledgement as --allow-unsafe-local, given once for \
+             these agents. Dispatch lands nothing they make in this project until you run \
+             dispatch accept; unsandboxed, they can still change any file you can.\n{}",
+            orchestrator::listed_checks(&config.checks.baseline, &config.checks.verify)
+        );
+        if !changed.is_empty() {
+            body.push_str(&format!(
+                "Changed since you allowed launches, so not launched until you allow them \
+                 again: {changed}.\n"
+            ));
+        }
+        match ui.select(body.trim_end(), &rows, rows.len() - 1).await? {
+            Some(i) if i < AGENTS.len() => chosen[i] = !chosen[i],
+            Some(i) if i == AGENTS.len() => {
+                let counts: Vec<Choice> = (1..=9).map(|n| Choice::new(n.to_string())).collect();
+                let asked = "How many of this project's native runs may run at once?";
+                let focus = max_running.clamp(1, 9) - 1;
+                if let Some(count) = ui.select(asked, &counts, focus).await? {
+                    max_running = count + 1;
+                }
+            }
+            Some(i) if i == AGENTS.len() + 1 => {
+                let agents: std::collections::BTreeMap<_, _> = AGENTS
+                    .into_iter()
+                    .zip(&found)
+                    .zip(&chosen)
+                    .filter_map(|((agent, now), chosen)| {
+                        Some((agent.to_owned(), now.clone().filter(|_| *chosen)?))
+                    })
+                    .collect();
+                if agents.is_empty() {
+                    ui.commit("Choose at least one agent to allow, or Skip.")?;
+                    continue;
+                }
+                let allowed = names(agents.keys().map(String::as_str).collect());
+                let consent = LaunchConsent {
+                    agents,
+                    max_running,
+                };
+                consent::grant_launch(state, &root, &consent)?;
+                ui.commit(&format!(
+                    "Launch consent saved in Dispatch's state: an orchestrator may start \
+                     {allowed} here, with at most {max_running} native runs running at once."
+                ))?;
+                return Ok(true);
+            }
+            Some(i) if i == AGENTS.len() + 2 && current.is_some() => {
+                consent::revoke_launch(state, &root)?;
+                ui.commit("Launch consent removed: no orchestrator may launch agents here.")?;
+                return Ok(true);
+            }
+            choice => return Ok(choice.is_some()),
+        }
+    }
 }
 
 /// `dispatch setup --checks --verify …` without a terminal: save exactly

@@ -69,8 +69,22 @@ impl Project {
         }
     }
 
+    /// Records in `projects/` whose name starts with `prefix`: `""` for
+    /// check consent, beside `native-` and `launch-` consent.
+    fn records(&self, prefix: &str) -> usize {
+        fs::read_dir(self.state.join("projects")).map_or(0, |entries| {
+            let names = entries.map(|entry| entry.unwrap().file_name().into_string().unwrap());
+            names
+                .filter(|name| match prefix {
+                    "" => !name.contains('-'),
+                    prefix => name.starts_with(prefix),
+                })
+                .count()
+        })
+    }
+
     fn consents(&self) -> usize {
-        fs::read_dir(self.state.join("projects")).map_or(0, |entries| entries.count())
+        self.records("")
     }
 
     fn assert_nothing_ran(&self) {
@@ -194,6 +208,7 @@ fn setup_without_a_terminal_cannot_grant_or_install_anything() {
     assert!(text(&output).contains("terminal"), "{}", text(&output));
     assert!(!project.root.join("dispatch.yml").exists());
     assert_eq!(project.consents(), 0);
+    assert_eq!(project.records("launch-"), 0);
     assert!(
         !project
             .temp

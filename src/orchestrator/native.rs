@@ -49,7 +49,7 @@ fn expects_execution(run: &RunRecord) -> bool {
 }
 
 /// Whether any agent this run launched may still be running.
-fn any_launch_alive(db: &Database, id: &str) -> Result<bool> {
+pub(crate) fn any_launch_alive(db: &Database, id: &str) -> Result<bool> {
     Ok(crate::launch::launches_for_run(db, id)?
         .iter()
         .any(crate::launch::LaunchRecord::possibly_alive))

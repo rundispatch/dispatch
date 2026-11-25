@@ -126,6 +126,11 @@ pub struct RunRequest {
     pub output: RunOutputMode,
     /// The run this one redoes on the current source (`dispatch refresh`).
     pub refreshed_from: Option<String>,
+    /// The run's id when whoever launched it chose one (`dispatch mcp`).
+    pub run_id: Option<String>,
+    /// Who asked for the run and through which client, recorded as
+    /// `launch.requested` right after `run.created`.
+    pub requested_by: Option<(String, String)>,
 }
 
 pub fn init(state: &State, path: &Path, force: bool) -> Result<()> {
@@ -432,7 +437,7 @@ fn funding_refused_message(profile: &crate::config::ResourceProfile, reason: &st
     )
 }
 
-fn harness_name(id: &str) -> &str {
+pub(crate) fn harness_name(id: &str) -> &str {
     match id {
         "claude" => "Claude Code",
         "codex" => "Codex",
@@ -440,6 +445,24 @@ fn harness_name(id: &str) -> &str {
         "hermes" => "Hermes",
         _ => id,
     }
+}
+
+/// The checks a native launch runs on the host, as consent to it lists them.
+pub(crate) fn listed_checks(baseline: &[String], verify: &[String]) -> String {
+    let mut listed = String::new();
+    for (label, checks) in [
+        ("Baseline checks", baseline),
+        ("Verification checks", verify),
+    ] {
+        listed += &format!("{label}:\n");
+        if checks.is_empty() {
+            listed += "  (none)\n";
+        }
+        for check in checks {
+            listed += &format!("  {check}\n");
+        }
+    }
+    listed
 }
 
 /// What allows a native launch's host commands: the flag, standing consent
@@ -454,42 +477,12 @@ struct NativeAuthority<'a> {
 
 impl NativeAuthority<'_> {
     async fn authorize(&mut self, harness: &str, config: &Config) -> Result<Option<PathBuf>> {
-        if self.allowed_by_flag || config.execution.backend != "local" {
+        if self.allowed_by_flag {
             return Ok(None);
         }
-        if harness.starts_with("fake-")
-            && config.checks.baseline.is_empty()
-            && config.checks.verify.is_empty()
-        {
+        let Some(commands) = crate::consent::native_commands(self.source, harness, config).await?
+        else {
             return Ok(None);
-        }
-        let harness_config = config.harnesses.get(harness);
-        let detection = adapter_for(harness, &config.harnesses)?.detect().await;
-        let executable = detection.executable.with_context(|| {
-            format!(
-                "harness {harness} is unavailable: {}",
-                detection
-                    .detail
-                    .as_deref()
-                    .unwrap_or("executable not found")
-            )
-        })?;
-        let commands = crate::consent::NativeCommands {
-            root: crate::consent::project_root(self.source)?,
-            harness: harness.to_owned(),
-            executable: executable.canonicalize().with_context(|| {
-                format!(
-                    "failed to resolve agent executable {}",
-                    executable.display()
-                )
-            })?,
-            baseline: config.checks.baseline.clone(),
-            verify: config.checks.verify.clone(),
-            model: harness_config.model.clone(),
-            effort: harness_config.effort.clone(),
-            provider: harness_config.provider.clone(),
-            extra_args: harness_config.extra_args.clone(),
-            service_mode: harness_config.allocation_service_mode.clone(),
         };
         if self.this_run.contains(&commands)
             || crate::consent::native_consented(self.state, &commands)?
@@ -506,19 +499,7 @@ impl NativeAuthority<'_> {
             commands.executable.display()
         );
         println!("The agent works in an isolated candidate workspace.");
-        for (label, checks) in [
-            ("Baseline checks", &commands.baseline),
-            ("Verification checks", &commands.verify),
-        ] {
-            println!("{label}:");
-            if checks.is_empty() {
-                println!("  (none)");
-            } else {
-                for check in checks {
-                    println!("  {check}");
-                }
-            }
-        }
+        print!("{}", listed_checks(&commands.baseline, &commands.verify));
         print!("[1] This run only  [2] Allow for this project  [Enter] Cancel: ");
         io::stdout().flush()?;
         let mut answer = String::new();
@@ -633,7 +614,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
 
     state.initialize()?;
     let mut db = Database::open(state.db_path())?;
-    let run_id = Ulid::new().to_string();
+    let run_id = request.run_id.unwrap_or_else(|| Ulid::new().to_string());
     let run_dir = state.run_dir(&run_id);
     fs::create_dir(&run_dir)
         .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
@@ -772,6 +753,15 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     };
     let created = db.commit_run_transition(&mut run, created_event)?;
     publish_event(state, created, &run)?;
+    if let Some((by, client)) = request.requested_by {
+        transition(
+            state,
+            &db,
+            &mut run,
+            "launch.requested",
+            serde_json::json!({"by": by, "client": client, "agent": harness}),
+        )?;
+    }
 
     persist_event(
         state,
@@ -2902,6 +2892,8 @@ pub fn refresh_request(
         allow_forwarded_env: options.allow_forwarded_env,
         output: options.output,
         refreshed_from: Some(run.id.clone()),
+        run_id: None,
+        requested_by: None,
     })
 }
 
@@ -4563,6 +4555,8 @@ mod tests {
                             allow_forwarded_env: false,
                             output: RunOutputMode::Json,
                             refreshed_from: None,
+                            run_id: None,
+                            requested_by: None,
                         },
                     ),
                 )

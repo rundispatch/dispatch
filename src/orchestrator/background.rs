@@ -410,34 +410,47 @@ fn command(
     log: &fs::File,
     environment: Option<&BTreeMap<String, String>>,
 ) -> Result<std::process::Command> {
-    use std::os::unix::process::CommandExt;
-
-    let mut command = std::process::Command::new(std::env::current_exe()?);
-    command.arg("--state-dir").arg(&state.root);
+    let mut command = detached(state, root, log)?;
     for _ in 0..verbose {
         command.arg("-v");
     }
-    command
-        .args(["serve", "--background", "--root"])
-        .arg(root)
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log.try_clone()?);
+    command.args(["serve", "--background", "--root"]).arg(root);
     if let Some(environment) = environment {
         for name in crate::executor::safe_local_environment().keys() {
             command.env_remove(name);
         }
         command.envs(environment);
     }
-    // SAFETY: setsid is async-signal-safe and touches only the child.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    Ok(command)
+}
+
+/// This Dispatch on the same state, in `root`, in a session of its own,
+/// stdin null and its output to `log`; the caller adds its arguments.
+pub(crate) fn detached(
+    state: &State,
+    root: &Path,
+    log: &fs::File,
+) -> Result<std::process::Command> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg("--state-dir")
+        .arg(&state.root)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log.try_clone()?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and touches only the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     Ok(command)
 }

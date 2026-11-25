@@ -1,32 +1,41 @@
 //! `dispatch mcp`: a local stdio MCP server for one project, so an
-//! orchestrating agent can see the project's Work, wait on it and get the
-//! landing proposal without a person polling a screen. JSON-RPC 2.0, one
-//! message per line on stdin and stdout; stdout carries nothing else. Its
-//! tools only read: none of them lands, accepts, rejects, closes, refreshes
-//! or starts anything, and nothing is uploaded.
+//! orchestrating agent can see the project's Work, launch agents, wait on
+//! them and get the landing proposal without a person polling a screen.
+//! JSON-RPC 2.0, one message per line on stdin and stdout; stdout carries
+//! nothing else. None of its tools lands, accepts, rejects, closes,
+//! refreshes or retries anything, and nothing is uploaded. `start` launches
+//! only what the person's launch consent for the project allows.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::AbortHandle,
     time::Instant,
 };
+use ulid::Ulid;
 
 use super::{
     background::{self, Watcher},
     batch, one_line, serve, waits_for_decision,
 };
-use crate::{RunRecord, source, state::State};
+use crate::{
+    Config, LifecycleState, RunMode, RunRecord, consent,
+    db::Database,
+    process::{IdentityState, identity_state},
+    source,
+    state::State,
+};
 
 /// The protocol versions answered as asked; any other gets the first.
 const VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -50,7 +59,11 @@ fn tools() -> Value {
                 files_changed (null until the Work finished with a Δ); ready_for_review; \
                 verification and review. watched is false while nothing watches the \
                 project: verdicts, needs-you and interactions are then not kept until the \
-                person runs `dispatch start` there. It starts and lands nothing.",
+                person runs `dispatch start` there. launch_failed, when there is one, \
+                lists each run the start tool launched that exited before it was created \
+                (id, agent, task, log, exit, last_lines), each reported once, by work, \
+                wait or start. It lands nothing, and starts nothing: only the start tool \
+                launches, as the person's launch consent allows.",
             "inputSchema": nothing,
         },
         {
@@ -75,10 +88,13 @@ fn tools() -> Value {
                 continue); finished (its state became ready, blocked, finished, applied, \
                 rejected or closed); or timeout. Work this server has not given yet \
                 wakes it at once if it needs the person or is finished. Without ids it \
-                waits on every Work that `work` lists, and on Work that appears. While \
-                nothing watches the project (`dispatch start`), nothing records needs-you \
-                marks, or verdicts for attached Work and finished results: attached Work \
-                then wakes it only by finishing. It starts and lands nothing.",
+                waits on every Work that `work` lists, and on Work that appears. An id the \
+                start tool gave is waited on before its run is created too, and a run it \
+                launched that exits before it is created wakes it as launch_failed, with \
+                work [] and launch_failed as work gives it. While nothing watches the \
+                project (`dispatch start`), nothing records needs-you marks, or verdicts \
+                for attached Work and finished results: attached Work then wakes it only by \
+                finishing. It starts and lands nothing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -96,6 +112,37 @@ fn tools() -> Value {
                         "description": "The most seconds to wait.",
                     },
                 },
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "start",
+            "description": format!("Launch an agent on a task in this project, detached, \
+                as `dispatch run --agent <agent>` would: it works in its own snapshot of the \
+                project, and the project's checks run on what it makes. Returns {{id, agent, \
+                log, note}} once its run is created, or after at most {} s while it is still \
+                being prepared; wait on it with wait {{ids: [id]}}. Only an agent the person's \
+                launch consent here names may be launched, with its command and the project's \
+                checks as they were when the person allowed it, and only while fewer of the \
+                project's native runs are running than that consent allows at once, a run \
+                started elsewhere counting only once it is created. The person gives that \
+                consent once, with `dispatch setup` in a terminal. A launch that exits before \
+                its run is created is reported once, here or by the next work or wait, and \
+                never launched again. It lands nothing: only the person lands what the agent \
+                makes, with `dispatch accept`.", START_WAIT.as_secs()),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "The agent to launch, as the person's launch consent names it: claude, codex, cursor or hermes.",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "What the agent is to do. It is given this text verbatim.",
+                    },
+                },
+                "required": ["agent", "task"],
                 "additionalProperties": false,
             },
         },
@@ -125,6 +172,28 @@ type Calls = Arc<Mutex<HashMap<String, (AbortHandle, bool)>>>;
 /// `wait`, by run id: what a `wait` reports changes from.
 type Seen = Arc<Mutex<HashMap<String, Value>>>;
 
+/// The client's name, as its `initialize` gave it.
+type Client = Arc<OnceLock<String>>;
+
+/// A run `start` launched, by its id in `LAUNCHES`.
+struct Launch {
+    agent: String,
+    task: String,
+    log: PathBuf,
+    /// Whether its `dispatch run` still runs.
+    running: bool,
+    /// How it exited before its run was created, until that is reported.
+    failed: Option<String>,
+}
+
+/// Every run this server launched. One server serves one client, so they
+/// are this process's; a launch reported as failed leaves.
+static LAUNCHES: Mutex<BTreeMap<String, Launch>> = Mutex::new(BTreeMap::new());
+
+/// Held by a `start` from counting what runs to recording its launch, so
+/// that two cannot both take the last place.
+static STARTING: Mutex<()> = Mutex::new(());
+
 /// Where whole messages go to be written to stdout, one line each.
 type Out = mpsc::UnboundedSender<Value>;
 
@@ -147,7 +216,7 @@ pub async fn serve(state: &State, root: Option<PathBuf>) -> Result<()> {
         }
         std::io::Result::Ok(())
     });
-    let (calls, seen) = (Calls::default(), Seen::default());
+    let (calls, seen, client) = (Calls::default(), Seen::default(), Client::default());
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line = Vec::new();
     let gone = loop {
@@ -162,7 +231,7 @@ pub async fn serve(state: &State, root: Option<PathBuf>) -> Result<()> {
         if line.trim_ascii().is_empty() {
             continue;
         }
-        if let Some(answer) = handle(state, &root, &line, &out, &calls, &seen) {
+        if let Some(answer) = handle(state, &root, &line, &out, &calls, &seen, &client) {
             let _ = out.send(answer);
         }
     };
@@ -198,6 +267,7 @@ fn handle(
     out: &Out,
     calls: &Calls,
     seen: &Seen,
+    client: &Client,
 ) -> Option<Value> {
     let Ok(message) = serde_json::from_slice::<Value>(line) else {
         return Some(error(Value::Null, -32700, "Parse error"));
@@ -228,6 +298,8 @@ fn handle(
     };
     let result = match method {
         "initialize" => {
+            let name = params["clientInfo"]["name"].as_str().unwrap_or("unknown");
+            let _ = client.set(name.to_owned());
             let asked = params["protocolVersion"].as_str();
             let version = VERSIONS.into_iter().find(|&known| Some(known) == asked);
             json!({
@@ -256,11 +328,12 @@ fn handle(
             let (state, root, name) = (state.clone(), root.to_owned(), name.to_owned());
             let (key, out, done) = (id.to_string(), out.clone(), Arc::clone(calls));
             let (seen, wait) = (Arc::clone(seen), name == "wait");
+            let client = Arc::clone(client);
             // Held while the call is spawned, so that it cannot leave the
             // table before it is in it.
             let mut calls = calls.lock().unwrap();
             let task = tokio::spawn(async move {
-                let result = call(state, root, seen, &name, arguments, progress).await;
+                let result = call(state, root, seen, client, &name, arguments, progress).await;
                 done.lock().unwrap().remove(&id.to_string());
                 let _ = out.send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
             });
@@ -282,26 +355,33 @@ async fn call(
     state: State,
     root: PathBuf,
     seen: Seen,
+    client: Client,
     name: &str,
     arguments: Map<String, Value>,
     progress: Option<(Out, Value)>,
 ) -> Value {
     let result = match name {
         "work" => {
-            let work = blocking(move || {
+            let mut work = blocking(move || {
                 only(&arguments, &[])?;
                 work(&state, &root)
             })
             .await;
             // Nothing awaits between here and the answer, so the rows of a
-            // call cancelled meanwhile are not taken as given.
-            if let Ok(work) = &work {
+            // call cancelled meanwhile are not taken as given, and no failed
+            // launch is taken as reported.
+            if let Ok(work) = &mut work {
                 remember(&seen, work["work"].as_array().into_iter().flatten());
+                let failed = failures(None);
+                if !failed.is_empty() {
+                    work["launch_failed"] = failed.into();
+                }
             }
             work
         }
         "status" => blocking(move || status(&state, &root, &arguments)).await,
         "wait" => wait(state, root, seen, arguments, progress).await,
+        "start" => start(state, root, client, arguments).await,
         "propose_landing" => {
             blocking(move || {
                 only(&arguments, &[])?;
@@ -364,7 +444,11 @@ fn rows(state: &State, root: &Path, ids: Option<&[String]>) -> Result<Vec<Value>
         Some(ids) => {
             let mut named_runs: Vec<&RunRecord> = Vec::new();
             for id in ids {
-                let run = named(&runs, id)?;
+                let run = match named(&runs, id) {
+                    // A run `start` launched has no row until it is created.
+                    Err(_) if launched(id) => continue,
+                    run => run?,
+                };
                 if !named_runs.iter().any(|named| named.id == run.id) {
                     named_runs.push(run);
                 }
@@ -459,8 +543,18 @@ async fn wait(
         blocking(move || rows(&state, &root, ids.as_deref()))
     };
     let mut rows = read(ids.clone()).await?;
-    // Named Work is read by its full id from here on.
-    let ids = ids.map(|_| rows.iter().map(id).collect::<Vec<_>>());
+    // Named Work is read by its full id from here on, and so is a run
+    // `start` launched, which has no row before it is created.
+    let ids = ids.map(|ids| {
+        let mut full: Vec<String> = rows.iter().map(id).collect();
+        for launch in ids.iter().filter(|id| launched(id)) {
+            let launch = launch.to_ascii_uppercase();
+            if !full.contains(&launch) {
+                full.push(launch);
+            }
+        }
+        full
+    });
     let mut stats = None;
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     let every = Duration::from_secs(10);
@@ -469,7 +563,7 @@ async fn wait(
         if let Some(answer) = changed(&seen, &rows) {
             return Ok(answer);
         }
-        let files = watched(&state, &rows, ids.is_none());
+        let files = watched(&state, &rows, ids.as_deref());
         loop {
             tokio::select! {
                 _ = &mut deadline => return Ok(json!({"woke": "timeout", "work": []})),
@@ -488,6 +582,10 @@ async fn wait(
                     continue;
                 }
                 _ = poll.tick() => {}
+            }
+            let failed = failures(ids.as_deref());
+            if !failed.is_empty() {
+                return Ok(json!({"woke": "launch_failed", "work": [], "launch_failed": failed}));
             }
             let now: Vec<_> = files.iter().map(|file| stat(file)).collect();
             if stats.as_ref() != Some(&now) {
@@ -519,16 +617,23 @@ fn changed(seen: &Seen, rows: &[Value]) -> Option<Value> {
     Some(json!({"woke": why, "work": rows}))
 }
 
-/// What a wait stats for `rows`: each run's `events.jsonl`, appended to
-/// whenever its row changes, after the database and `metadata.json`. While
-/// any Work that appears is waited on, also `runs/`, which a run joins, and
-/// the `events.jsonl` of each run there with no `metadata.json` yet: one
-/// that `dispatch run` still prepares has no row until it is published, and
-/// what is written inside it does not change `runs/`.
-fn watched(state: &State, rows: &[Value], any: bool) -> Vec<PathBuf> {
-    let ids = rows.iter().filter_map(|row| row["run_id"].as_str());
-    let mut files: Vec<PathBuf> = ids.map(|id| state.events_path(id)).collect();
-    if any {
+/// What a wait stats for `rows`, or for the Work `ids` names: each run's
+/// `events.jsonl`, appended to whenever its row changes, after the database
+/// and `metadata.json`. While any Work that appears is waited on, also
+/// `runs/`, which a run joins, and the `events.jsonl` of each run there with
+/// no `metadata.json` yet: one that `dispatch run` still prepares has no row
+/// until it is published, and what is written inside it does not change
+/// `runs/`.
+fn watched(state: &State, rows: &[Value], ids: Option<&[String]>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = match ids {
+        Some(ids) => ids.iter().map(|id| state.events_path(id)).collect(),
+        None => rows
+            .iter()
+            .filter_map(|row| row["run_id"].as_str())
+            .map(|id| state.events_path(id))
+            .collect(),
+    };
+    if ids.is_none() {
         files.push(state.runs_dir());
         let entries = fs::read_dir(state.runs_dir()).into_iter().flatten();
         for entry in entries.flatten() {
@@ -572,6 +677,240 @@ fn woke(then: Option<&Value>, now: &Value) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// How long `start` waits for its run to be created, or for its child to
+/// exit first, before it answers with the run still being prepared.
+const START_WAIT: Duration = Duration::from_secs(5);
+
+/// Launch an agent as the project's launch consent allows (`launch`), and
+/// answer once its run is created, its child exited, or `START_WAIT`
+/// passed. A child that exited before its run was created is reported
+/// here, once; it is never launched again.
+async fn start(
+    state: State,
+    root: PathBuf,
+    client: Client,
+    arguments: Map<String, Value>,
+) -> Result<Value> {
+    only(&arguments, &["agent", "task"])?;
+    let text = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let Some(agent) = text("agent") else {
+        bail!("start needs agent: one the person's launch consent names, such as claude.");
+    };
+    let Some(task) = text("task").filter(|task| !task.trim().is_empty()) else {
+        bail!("start needs task: what the agent is to do, as text.");
+    };
+    let client = client.get().map_or("unknown", String::as_str).to_owned();
+    let (id, log, mut exited) = {
+        let (state, root) = (state.clone(), root.clone());
+        let (agent, task) = (agent.clone(), task.clone());
+        blocking(move || launch(&state, &root, &agent, &task, &client)).await?
+    };
+    let created = state.metadata_path(&id);
+    let deadline = tokio::time::sleep(START_WAIT);
+    tokio::pin!(deadline);
+    let mut poll = tokio::time::interval(Duration::from_millis(50));
+    while !created.exists() {
+        tokio::select! {
+            _ = &mut exited => break,
+            _ = &mut deadline => break,
+            _ = poll.tick() => {}
+        }
+    }
+    if let [failed] = &failures(Some(std::slice::from_ref(&id)))[..] {
+        bail!(
+            "The launch exited before its run was created ({}), and is not launched again; \
+             its log, {}, ends:\n{}",
+            failed["exit"].as_str().unwrap_or_default(),
+            log.display(),
+            failed["last_lines"].as_str().unwrap_or_default()
+        );
+    }
+    let note = format!(
+        "Wait on it with wait {{\"ids\": [\"{id}\"]}}; work lists it once its run is created, \
+         and only the person lands what it makes, with dispatch accept."
+    );
+    Ok(json!({"id": id, "agent": agent, "log": log, "note": note}))
+}
+
+/// Launch `agent` on `task` in the project at `root`, as its launch consent
+/// allows: a `dispatch run` of its own, detached, on an id chosen here, the
+/// consent being its `--allow-unsafe-local`. A thread reaps it and notes how
+/// it ended in `LAUNCHES`. Returns the id, the log and what fires when the
+/// child exits.
+fn launch(
+    state: &State,
+    root: &Path,
+    agent: &str,
+    task: &str,
+    client: &str,
+) -> Result<(String, PathBuf, oneshot::Receiver<()>)> {
+    let Some(allowed) = consent::launch_consent(state, &consent::project_root(root)?)? else {
+        bail!(
+            "Nothing may be launched here until the person allows it, with `dispatch setup` in a terminal."
+        );
+    };
+    let Some(pinned) = allowed.agents.get(agent) else {
+        let names: Vec<&str> = allowed.agents.keys().map(String::as_str).collect();
+        bail!(
+            "The launch consent here names {}, not {}; start one of those, or ask the person to change it with `dispatch setup`.",
+            names.join(", "),
+            shown(agent)
+        );
+    };
+    let (config, _) = Config::discover(root, None)?;
+    if !config.execution.forwarded_env.is_empty() {
+        bail!(
+            "This project's dispatch.yml forwards environment variables to its runs, so only the person can launch one, from a terminal, with --allow-forwarded-env."
+        );
+    }
+    let now = tokio::runtime::Handle::current()
+        .block_on(consent::native_commands(root, agent, &config))?;
+    if now != *pinned {
+        bail!(
+            "This project's command or checks for {} changed since the person allowed launches; ask them to allow it again with `dispatch setup`.",
+            super::harness_name(agent)
+        );
+    }
+    let _starting = STARTING.lock().unwrap();
+    let running = running(state, root)?;
+    if running >= allowed.max_running {
+        let are = if running == 1 { "is" } else { "are" };
+        bail!(
+            "{running} of this project's native runs {are} running, and its launch consent allows {} at once; wait for one to finish, then start again.",
+            allowed.max_running
+        );
+    }
+    let id = Ulid::new().to_string();
+    state.initialize()?;
+    let started = state.root.join("started");
+    fs::create_dir_all(&started)?;
+    let task_file = started.join(format!("{id}.task"));
+    private(&task_file)?.write_all(task.as_bytes())?;
+    let log = started.join(format!("{id}.log"));
+    let mut child = background::detached(state, root, &private(&log)?)?
+        .arg("run")
+        .arg(format!("--agent={agent}"))
+        .arg("--task-file")
+        .arg(&task_file)
+        .arg("--allow-unsafe-local")
+        .arg(format!("--run-id={id}"))
+        .args(["--requested-by", "mcp"])
+        .arg(format!("--client={client}"))
+        .spawn()
+        .context("failed to start dispatch run")?;
+    let launch = Launch {
+        agent: agent.to_owned(),
+        task: task.to_owned(),
+        log: log.clone(),
+        running: true,
+        failed: None,
+    };
+    LAUNCHES.lock().unwrap().insert(id.clone(), launch);
+    let (exit, exited) = oneshot::channel();
+    let (reaped, created) = (id.clone(), state.metadata_path(&id));
+    std::thread::spawn(move || {
+        let status = child.wait();
+        if let Some(launch) = LAUNCHES.lock().unwrap().get_mut(&reaped) {
+            launch.running = false;
+            if !created.exists() {
+                launch.failed = Some(status.map_or_else(|e| e.to_string(), |s| s.to_string()));
+            }
+        }
+        let _ = exit.send(());
+    });
+    Ok((id, log, exited))
+}
+
+/// A new file only its owner can read.
+fn private(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))
+}
+
+/// How many of the project's native runs count against its launch consent:
+/// this server's launches whose `dispatch run` still runs, and native Work
+/// not finished whose supervisor still runs or whose agent may. A run
+/// started elsewhere counts only once it is created.
+fn running(state: &State, root: &Path) -> Result<usize> {
+    let mut ids: HashSet<String> = LAUNCHES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, launch)| launch.running)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let db = Database::open(state.db_path())?;
+    for run in state.load_source_runs(root)? {
+        if run.mode != RunMode::Native || run.outcome.lifecycle == LifecycleState::Finished {
+            continue;
+        }
+        let supervisor = run.execution.as_ref().and_then(|e| e.supervisor.as_ref());
+        let gone = supervisor.is_some_and(|owner| {
+            matches!(
+                identity_state(owner),
+                IdentityState::Gone | IdentityState::Reused
+            )
+        });
+        if !gone || super::native::any_launch_alive(&db, &run.id)? {
+            ids.insert(run.id);
+        }
+    }
+    Ok(ids.len())
+}
+
+/// Whether `id` names a run `start` launched, not yet reported as failed.
+fn launched(id: &str) -> bool {
+    LAUNCHES
+        .lock()
+        .unwrap()
+        .contains_key(&id.to_ascii_uppercase())
+}
+
+/// The launches of `ids`, or of any without ids, whose child exited before
+/// their run was created, each reported now and never again: its id, agent,
+/// task, log, exit and the log's last lines, where `dispatch run` says why.
+fn failures(ids: Option<&[String]>) -> Vec<Value> {
+    let failed: Vec<(String, Launch)> = {
+        let mut launches = LAUNCHES.lock().unwrap();
+        let named = |id: &String| ids.is_none_or(|ids| ids.contains(id));
+        let failed: Vec<String> = launches
+            .iter()
+            .filter(|(id, launch)| launch.failed.is_some() && named(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        failed
+            .iter()
+            .filter_map(|id| launches.remove_entry(id))
+            .collect()
+    };
+    failed
+        .into_iter()
+        .map(|(id, launch)| {
+            let log = fs::read(&launch.log).unwrap_or_default();
+            let log = String::from_utf8_lossy(&log);
+            let lines: Vec<&str> = log.lines().collect();
+            json!({
+                "id": id,
+                "agent": launch.agent,
+                "task": launch.task,
+                "log": launch.log,
+                "exit": launch.failed,
+                "last_lines": lines[lines.len().saturating_sub(20)..].join("\n"),
+            })
+        })
+        .collect()
 }
 
 /// What `dispatch accept` without an id would land now, and the commands

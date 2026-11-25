@@ -1913,6 +1913,8 @@ async fn run_goal(
         allow_forwarded_env: false,
         output: RunOutputMode::Silent,
         refreshed_from: None,
+        run_id: None,
+        requested_by: None,
     };
     ui.draft.clear();
     let mut run = ui

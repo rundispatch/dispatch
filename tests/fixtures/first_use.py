@@ -53,7 +53,13 @@ class Case:
                        self.source, self.captures, name, env=self.env, width=120, height=44)
 
     def consent_records(self):
-        return list((self.state / 'projects').glob('*.json'))
+        # Check consent; native and launch consent are native-… and launch-….
+        return [path for path in (self.state / 'projects').glob('*.json') if '-' not in path.name]
+
+    def launch_consent(self):
+        records = list((self.state / 'projects').glob('launch-*.json'))
+        assert len(records) <= 1, records
+        return json.loads(records[0].read_text()) if records else None
 
     def watcher_record(self):
         records = [path for path in (self.state / 'watchers').glob('*.json')
@@ -117,7 +123,15 @@ def hooks_prompt(ui, case, action):
     ui.wait('[2] >')  # A bare Enter cannot edit Claude settings.
 
 
+def skip_launch(ui):
+    """Pass launch consent by: focus starts on Skip."""
+    ui.wait('Agents an orchestrator may launch')
+    ui.wait('[7] >')
+    ui.send('\r')
+
+
 def finish_setup(ui, watching):
+    skip_launch(ui)
     ui.wait('Agents Dispatch launches')
     ui.send('\r')  # Done is focused; no account setup is required.
     ui.wait(watching)
@@ -145,6 +159,7 @@ def through_menu(case, name, row, done, skip=True):
             ui.wait('2) Skip')
             ui.wait('[2] >')
             ui.send('\r')
+        skip_launch(ui)
         ui.wait('Agents Dispatch launches')
         ui.send('2\r')
         ui.wait('4) Runtime integrations')
@@ -175,6 +190,9 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             ui.wait('Claude Code hooks installed')
             finish_setup(ui, 'Watching')
             assert 'Dispatch is running in the background' in ui.clean
+            # The launch step lists the checks a launch consent would pin.
+            listed = 'Baseline checks:\n  (none)\nVerification checks:\n  sh ./verify.sh\n  make test'
+            assert listed in ui.clean.replace('\r\n', '\n'), ui.clean[-5000:]
         assert case.sessions == 1, 'first setup took more than one Dispatch command'
         saved = case.config.read_text()
         assert saved == 'checks:\n  verify:\n  - sh ./verify.sh\n  - make test\n', saved
@@ -184,6 +202,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         consent = json.loads(records[0].read_text())
         assert consent['version'] == 2 and consent['commands'] == ['sh ./verify.sh', 'make test'], consent
         assert 'consent' not in saved, 'consent belongs in Dispatch state'
+        assert case.launch_consent() is None, 'Enter on Skip allowed launches'
         settings = json.loads(case.settings.read_text())
         commands = [hook['command'] for event in settings['hooks'].values()
                     for entry in event for hook in entry['hooks']]
@@ -471,6 +490,130 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         assert config.read_bytes() == by_hand
         assert_nothing_ran(case)
 
+    # Launch consent is the person's, at a terminal: Enter alone skips it, and
+    # Allow names exactly the agents chosen, each with the command it pins,
+    # and how many may run at once, after saying what that allows and listing
+    # the checks it pins. Setup opens it again chosen, with Remove, and says
+    # which agents changed since.
+    with Case(parent, 'launch-consent') as case:
+        hermes = case.bin / 'hermes'
+        hermes.write_text(f'#!/bin/sh\ntouch "{case.agent_ran}"\nexit 91\n')
+        hermes.chmod(0o755)
+        claude = str((case.bin / 'claude').resolve())
+        hermes = str(hermes.resolve())
+
+        def to_launch_step(ui):
+            ui.wait('5) Continue without checks')
+            ui.send('\r')
+            for hook in ('Claude Code hooks · Install', 'Hermes hook · Install'):
+                ui.wait(hook)
+                ui.wait('[2] >')
+                ui.send('\r')
+            ui.wait('Agents an orchestrator may launch')
+
+        def done(ui):
+            ui.wait('Agents Dispatch launches')
+            ui.send('\r')
+            ui.wait('atching')
+            ui.finish()
+
+        def pinned(executable, harness):
+            return {'root': str(case.source.resolve()), 'harness': harness,
+                    'executable': executable, 'baseline': [], 'verify': [], 'model': None,
+                    'effort': None, 'provider': None, 'extra_args': [], 'service_mode': None}
+
+        with case.session('launch-allow') as ui:
+            to_launch_step(ui)
+            ui.wait('7) Skip')
+            ui.wait('[7] >')  # A bare Enter cannot allow a launch.
+            for words in ('not in a sandbox', 'your permissions', 'its own snapshot',
+                          "this project's checks run there too", '--allow-unsafe-local',
+                          'Dispatch lands nothing they make in this project until you run '
+                          'dispatch accept; unsandboxed, they can still change any file you can.',
+                          'at most 3', 'counting runs you start yourself',
+                          'Baseline checks:\n  (none)\nVerification checks:\n  (none)',
+                          f'1) [ ] Claude Code ({claude})', '2) [ ] Codex — not found on PATH',
+                          '3) [ ] Cursor — not found on PATH', f'4) [ ] Hermes ({hermes})'):
+                assert words in ui.clean.replace('\r\n', '\n'), (words, ui.clean[-5000:])
+            assert ') Remove' not in ui.clean and 'Changed since' not in ui.clean, ui.clean[-5000:]
+            ui.send('6\r')
+            ui.wait('Choose at least one agent to allow, or Skip.')
+            ui.wait('[7] >')
+            ui.send('1\r')
+            ui.wait('1) [x] Claude Code')
+            ui.wait('[7] >')
+            ui.send('5\r')
+            ui.wait('How many')
+            ui.wait('[3] >')
+            ui.send('2\r')
+            ui.wait('5) At most 2 at once')
+            ui.wait('[7] >')
+            ui.send('6\r')
+            ui.wait('an orchestrator may start Claude Code here, with at most 2 native runs')
+            done(ui)
+        consent = case.launch_consent()
+        assert consent.pop('granted_at'), consent
+        assert consent == {'version': 1, 'root': str(case.source.resolve()),
+                           'agents': {'claude': pinned(claude, 'claude')},
+                           'max_running': 2}, consent
+        assert not case.consent_records(), 'launch consent granted checks'
+
+        with case.session('launch-change') as ui:
+            to_launch_step(ui)
+            ui.wait(f'1) [x] Claude Code ({claude})')
+            ui.wait('5) At most 2 at once')
+            ui.wait('7) Remove')
+            ui.wait('8) Skip')
+            ui.wait('[8] >')
+            assert 'Changed since' not in ui.clean, ui.clean[-5000:]
+            ui.send('4\r')
+            ui.wait('4) [x] Hermes')
+            ui.wait('[8] >')
+            ui.send('6\r')
+            ui.wait('may start Claude Code, Hermes here')
+            done(ui)
+        assert list(case.launch_consent()['agents']) == ['claude', 'hermes'], case.launch_consent()
+        assert case.launch_consent()['max_running'] == 2
+
+        with case.session('launch-keep') as ui:
+            to_launch_step(ui)
+            ui.wait('4) [x] Hermes')
+            ui.wait('[8] >')  # Enter alone keeps it.
+            ui.send('\r')
+            done(ui)
+        assert list(case.launch_consent()['agents']) == ['claude', 'hermes']
+
+        # The project's configuration now names another executable for
+        # Claude Code: setup says so, and Allow pins the one found now.
+        moved = case.bin / 'claude-next'
+        moved.write_text(f'#!/bin/sh\ntouch "{case.agent_ran}"\nexit 91\n')
+        moved.chmod(0o755)
+        moved = str(moved.resolve())
+        before = case.config.read_text() if case.config.exists() else ''
+        case.config.write_text(before + f'harnesses:\n  claude:\n    executable: {json.dumps(moved)}\n')
+        with case.session('launch-changed') as ui:
+            to_launch_step(ui)
+            ui.wait('Changed since you allowed launches, so not launched until you allow them '
+                    'again: Claude Code.')
+            ui.wait(f'1) [x] Claude Code ({moved})')
+            ui.wait('[8] >')
+            ui.send('6\r')
+            ui.wait('may start Claude Code, Hermes here')
+            done(ui)
+        agents = case.launch_consent()['agents']
+        assert agents == {'claude': pinned(moved, 'claude'), 'hermes': pinned(hermes, 'hermes')}, agents
+
+        with case.session('launch-remove') as ui:
+            to_launch_step(ui)
+            ui.wait('[8] >')
+            assert 'Changed since' not in ui.clean, ui.clean[-5000:]
+            ui.send('7\r')
+            ui.wait('Launch consent removed')
+            done(ui)
+        assert case.launch_consent() is None
+        assert not case.settings.exists()
+        assert_nothing_ran(case)
+
     # Explicit --checks --verify remains usable without entering the new pass.
     with Case(parent, 'explicit-checks') as case:
         with case.session('setup-verify', ('setup', '--checks', '--verify', 'sh ./verify.sh --strict')) as ui:
@@ -491,4 +634,4 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         assert not case.consent_records()
         assert_nothing_ran(case)
 
-    print('one-command first setup, focused cancel/skip, hook update, one hook step from both menus, and explicit checks passed')
+    print('one-command first setup, focused cancel/skip, hook update, one hook step from both menus, launch consent, and explicit checks passed')

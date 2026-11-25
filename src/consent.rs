@@ -10,9 +10,15 @@
 //!
 //! Beside it, per harness, is a person's standing consent for native `run`
 //! and `refresh`: exactly the agent command and checks they were shown, granted
-//! only in a terminal.
+//! only in a terminal. And per project, a person's launch consent: which agents
+//! an orchestrator connected through `dispatch mcp` may launch there, each with
+//! exactly its agent command and the checks the person was shown, and how many
+//! may run at once, granted only by `dispatch setup` in a terminal.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -171,7 +177,11 @@ pub fn consented(state: &State, path: &Path, commands: &[String]) -> bool {
 }
 
 pub fn revoke(state: &State, root: &Path) -> Result<()> {
-    match std::fs::remove_file(record_path(state, root)) {
+    remove(&record_path(state, root))
+}
+
+fn remove(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
         _ => Ok(()),
     }
@@ -232,6 +242,118 @@ pub fn grant_native(state: &State, commands: &NativeCommands) -> Result<()> {
         granted_at: Utc::now(),
     };
     write(state, &native_path(state, commands), &record)
+}
+
+/// What a native launch of `harness` runs on the host in the project of
+/// `source` under `config`: the agent's executable as found now, canonical,
+/// with its configured choices, and the project's checks. None when it runs
+/// nothing there to consent to: another backend, or a built-in fake agent
+/// with no checks.
+pub async fn native_commands(
+    source: &Path,
+    harness: &str,
+    config: &Config,
+) -> Result<Option<NativeCommands>> {
+    if config.execution.backend != "local"
+        || harness.starts_with("fake-")
+            && config.checks.baseline.is_empty()
+            && config.checks.verify.is_empty()
+    {
+        return Ok(None);
+    }
+    let harness_config = config.harnesses.get(harness);
+    let detection = crate::harness::adapter_for(harness, &config.harnesses)?
+        .detect()
+        .await;
+    let executable = detection.executable.with_context(|| {
+        format!(
+            "harness {harness} is unavailable: {}",
+            detection
+                .detail
+                .as_deref()
+                .unwrap_or("executable not found")
+        )
+    })?;
+    Ok(Some(NativeCommands {
+        root: project_root(source)?,
+        harness: harness.to_owned(),
+        executable: executable.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve agent executable {}",
+                executable.display()
+            )
+        })?,
+        baseline: config.checks.baseline.clone(),
+        verify: config.checks.verify.clone(),
+        model: harness_config.model.clone(),
+        effort: harness_config.effort.clone(),
+        provider: harness_config.provider.clone(),
+        extra_args: harness_config.extra_args.clone(),
+        service_mode: harness_config.allocation_service_mode.clone(),
+    }))
+}
+
+/// The agents an orchestrator may launch in one project through `dispatch
+/// mcp`'s `start`, each with what its launch runs on the host as the person
+/// allowed it (`native_commands`), and how many of the project's native runs
+/// may run at once. It is the unsafe-local acknowledgement for exactly those
+/// commands; a change to them needs it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchConsent {
+    pub agents: BTreeMap<String, Option<NativeCommands>>,
+    pub max_running: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LaunchRecord {
+    version: u32,
+    root: PathBuf,
+    #[serde(flatten)]
+    consent: LaunchConsent,
+    granted_at: DateTime<Utc>,
+}
+
+/// One record per project, beside its check consent.
+fn launch_path(state: &State, root: &Path) -> PathBuf {
+    let key = hex::encode(Sha256::digest(root.to_string_lossy().as_bytes()));
+    state
+        .root
+        .join("projects")
+        .join(format!("launch-{key}.json"))
+}
+
+/// The launch consent of the project at `root`, if it has one: a record
+/// that is unreadable, of another version or for another root is none.
+pub fn launch_consent(state: &State, root: &Path) -> Result<Option<LaunchConsent>> {
+    let bytes = match std::fs::read(launch_path(state, root)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(serde_json::from_slice::<LaunchRecord>(&bytes)
+        .ok()
+        .filter(|record| record.version == 1 && record.root == root)
+        .map(|record| record.consent))
+}
+
+/// Allow exactly `consent` in the project at `root`; only setup, in a
+/// terminal, grants it.
+pub fn grant_launch(state: &State, root: &Path, consent: &LaunchConsent) -> Result<()> {
+    anyhow::ensure!(
+        !consent.agents.is_empty() && consent.max_running > 0,
+        "launch consent names at least one agent and lets at least one run"
+    );
+    let record = LaunchRecord {
+        version: 1,
+        root: root.to_owned(),
+        consent: consent.clone(),
+        granted_at: Utc::now(),
+    };
+    write(state, &launch_path(state, root), &record)
+}
+
+pub fn revoke_launch(state: &State, root: &Path) -> Result<()> {
+    remove(&launch_path(state, root))
 }
 
 #[cfg(test)]
@@ -317,5 +439,71 @@ mod tests {
     fn a_project_without_checks_cannot_be_granted() {
         let (_temp, state, root) = project("");
         assert!(grant(&state, &root).is_err());
+    }
+
+    #[test]
+    fn launch_consent_is_exactly_what_was_granted_for_one_project() {
+        let (temp, state, root) = project("");
+        assert_eq!(launch_consent(&state, &root).unwrap(), None);
+        let claude = NativeCommands {
+            root: root.clone(),
+            harness: "claude".into(),
+            executable: "/bin/sh".into(),
+            baseline: Vec::new(),
+            verify: vec!["make test".into()],
+            model: None,
+            effort: None,
+            provider: None,
+            extra_args: Vec::new(),
+            service_mode: None,
+        };
+        let given = LaunchConsent {
+            agents: BTreeMap::from([
+                ("claude".into(), Some(claude.clone())),
+                ("fake-good".into(), None),
+            ]),
+            max_running: 2,
+        };
+        grant_launch(&state, &root, &given).unwrap();
+        assert_eq!(launch_consent(&state, &root).unwrap(), Some(given));
+        // Neither checks nor any native consent come with it.
+        assert_eq!(consent(&state, &root).unwrap(), CheckConsent::NotGranted);
+        let other = temp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert_eq!(launch_consent(&state, &other).unwrap(), None);
+
+        // Nothing grants it but `grant_launch` itself.
+        let path = launch_path(&state, &root);
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (key, value) in [
+            ("version", serde_json::json!(2)),
+            ("root", serde_json::json!(other)),
+            ("agents", serde_json::json!(["claude"])),
+        ] {
+            let mut changed = record.clone();
+            changed[key] = value;
+            std::fs::write(&path, changed.to_string()).unwrap();
+            assert_eq!(launch_consent(&state, &root).unwrap(), None, "{key}");
+        }
+        std::fs::write(&path, "{").unwrap();
+        assert_eq!(launch_consent(&state, &root).unwrap(), None);
+
+        revoke_launch(&state, &root).unwrap();
+        assert!(!path.exists());
+        revoke_launch(&state, &root).unwrap();
+        for nothing in [
+            LaunchConsent {
+                agents: BTreeMap::new(),
+                max_running: 3,
+            },
+            LaunchConsent {
+                agents: BTreeMap::from([("claude".into(), Some(claude))]),
+                max_running: 0,
+            },
+        ] {
+            assert!(grant_launch(&state, &root, &nothing).is_err());
+        }
+        assert!(!path.exists());
     }
 }
