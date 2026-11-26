@@ -8,6 +8,13 @@
 //!   agent once however many hooks race for it. The owner then records
 //!   `note.delivered`, as it records `note.written` when it writes an inbox
 //!   and `note.expired` when the Work stops being in progress first.
+//! - **Messages** from an orchestrating session (`dispatch mcp`'s `send`),
+//!   verbatim under a label line, recorded under `message.*`. They wait in the
+//!   same inbox, after its notes: a delivery gives the notes, then the
+//!   messages, each in the order written, so each message runs from its label
+//!   to the next label or the end. An idle Claude Code session's waiter wakes
+//!   it for a message; one that does not fit after the notes ahead of it goes
+//!   in the next delivery.
 //! - **Marks**: a session's end, or a wait on the person, that a hook
 //!   reports. Each is one file under `marks/`, recorded on its Work by the
 //!   owner on its next tick, or by the next owner if none runs.
@@ -34,12 +41,17 @@ use crate::{
 };
 
 pub const WRITTEN: &str = "note.written";
-pub const DELIVERED: &str = "note.delivered";
-pub const EXPIRED: &str = "note.expired";
 
-/// The most text one delivery carries, in characters: well under the 10,000
-/// Claude Code takes in one `additionalContext`.
+/// The most text one delivery carries, in characters as `length` counts
+/// them: well under the 10,000 Claude Code takes in one `additionalContext`.
 pub const MAX_TEXT: usize = 8_000;
+
+/// The length of `text` as Claude Code, a JavaScript program, counts it: in
+/// UTF-16 code units, two for a character outside the Basic Multilingual
+/// Plane, such as most emoji.
+pub(crate) fn length(text: &str) -> usize {
+    text.encode_utf16().count()
+}
 
 /// Under the state root.
 const INBOX: &str = "inbox";
@@ -49,6 +61,29 @@ const MARKS: &str = "marks";
 pub struct Note {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub kind: Kind,
+}
+
+/// Dispatch's own note, in fixed text, or an orchestrating session's
+/// message, which is never counted as a note.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    #[default]
+    Note,
+    Message,
+}
+
+impl Kind {
+    /// What its events are named after (`note.written`, `message.delivered`),
+    /// and the key their payloads give its id under.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Message => "message",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,12 +120,12 @@ pub(crate) fn claim(state: &State, workspace: &Path, via: &str) -> Option<String
 /// How many of `notes`, from the first, one delivery carries: as many as
 /// keep its text within `MAX_TEXT`, and at least one.
 fn fitting(notes: &[Note]) -> usize {
-    let mut length = 0;
+    let mut total = 0;
     let fit = notes
         .iter()
         .take_while(|note| {
-            length += note.text.chars().count() + 1;
-            length <= MAX_TEXT + 1
+            total += length(&note.text) + 1;
+            total <= MAX_TEXT + 1
         })
         .count();
     fit.max(notes.len().min(1))
@@ -101,10 +136,78 @@ fn fitting(notes: &[Note]) -> usize {
 /// pending already. `false`: the Work is busy, and nothing was written; the
 /// owner tries again on a later tick.
 pub fn write(state: &State, run_id: &str, notes: &[(String, String)]) -> Result<bool> {
-    for (id, text) in notes {
+    let notes = notes
+        .iter()
+        .map(|(id, text)| Note {
+            id: id.clone(),
+            text: text.clone(),
+            kind: Kind::Note,
+        })
+        .collect();
+    add(
+        state,
+        run_id,
+        notes,
+        |note| serde_json::json!({"note": note.id, "text": note.text}),
+        |_| Ok(()),
+    )
+}
+
+/// Add `text`, a message from the orchestrating session of `client`, to the
+/// inbox of Work `run_id`'s workspace: verbatim under the line that says whose
+/// it is, and never cut. `live` refuses Work no longer live, judged again
+/// under the run's lock. `message.written` records the text as sent. Its id;
+/// `None` while the Work is busy, with nothing written.
+pub(crate) fn send(
+    state: &State,
+    run_id: &str,
+    client: &str,
+    text: &str,
+    live: impl FnOnce(&RunRecord) -> Result<()>,
+) -> Result<Option<String>> {
+    let client = Some(client).filter(|name| !name.trim().is_empty());
+    let client = client.unwrap_or("unknown");
+    let label = format!(
+        "Message from the orchestrating session ({}):",
+        super::one_line(client, 60)
+    );
+    let room = MAX_TEXT - length(&label) - 1;
+    let size = length(text);
+    anyhow::ensure!(
+        size <= room,
+        "text is {size} characters, more than the {room} one message holds; send it in parts."
+    );
+    let id = Ulid::new().to_string();
+    let message = Note {
+        id: id.clone(),
+        text: format!("{label}\n{text}"),
+        kind: Kind::Message,
+    };
+    let written = add(
+        state,
+        run_id,
+        vec![message],
+        |_| serde_json::json!({"message": id, "text": text, "client": client}),
+        live,
+    )?;
+    Ok(written.then_some(id))
+}
+
+/// `write` and `send`: add `notes` to Work `run_id`'s inbox, unless `check`
+/// refuses the run as loaded under its lock, and record each one not pending
+/// already with the payload `written` gives it.
+fn add(
+    state: &State,
+    run_id: &str,
+    notes: Vec<Note>,
+    written: impl Fn(&Note) -> serde_json::Value,
+    check: impl FnOnce(&RunRecord) -> Result<()>,
+) -> Result<bool> {
+    for note in &notes {
         anyhow::ensure!(
-            text.chars().count() <= MAX_TEXT,
-            "note {id} is longer than {MAX_TEXT} characters"
+            length(&note.text) <= MAX_TEXT,
+            "note {} is longer than {MAX_TEXT} characters",
+            note.id
         );
     }
     let Ok(_lock) = OperationLock::acquire(&run_lock(state, run_id), "run has a foreground owner")
@@ -112,22 +215,25 @@ pub fn write(state: &State, run_id: &str, notes: &[(String, String)]) -> Result<
         return Ok(false);
     };
     let mut run = state.load_run(run_id)?;
-    let notes = notes
-        .iter()
-        .map(|(id, text)| Note {
-            id: id.clone(),
-            text: text.clone(),
-        })
-        .collect();
+    check(&run)?;
     let added = put(state, workspace(&run)?, run_id, notes)?;
     if !added.is_empty() {
         let db = Database::open(state.db_path())?;
         for note in added {
-            let payload = serde_json::json!({"note": note.id, "text": note.text});
-            record(state, &db, &mut run, WRITTEN, Utc::now(), payload)?;
+            let event = format!("{}.written", note.kind.key());
+            record(state, &db, &mut run, &event, Utc::now(), written(&note))?;
         }
     }
     Ok(true)
+}
+
+/// Whether the inbox of `workspace`, a canonical path, holds a message: an
+/// idle Claude Code session's waiter wakes it for one.
+pub(crate) fn has_message(state: &State, workspace: &Path) -> bool {
+    fs::read(path(state, workspace))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Inbox>(&bytes).ok())
+        .is_some_and(|inbox| inbox.notes.iter().any(|note| note.kind == Kind::Message))
 }
 
 /// Merge `notes` into the inbox of `workspace`, Work `run_id`'s, and return
@@ -156,6 +262,9 @@ fn put(state: &State, workspace: &Path, run_id: &str, notes: Vec<Note>) -> Resul
             added.push(note);
         }
     }
+    // The notes, then the messages, each in the order written: a message is
+    // never followed by a note that would read as its tail.
+    inbox.notes.sort_by_key(|note| note.kind == Kind::Message);
     if inbox.notes.is_empty() {
         let _ = fs::remove_file(&held);
         return Ok(added);
@@ -336,8 +445,16 @@ fn delivered(state: &State, path: &Path, runs: &[RunRecord]) -> Result<bool> {
     let db = Database::open(state.db_path())?;
     let (sent, rest) = inbox.notes.split_at(fitting(&inbox.notes));
     for note in sent {
-        let payload = serde_json::json!({"note": note.id, "via": via});
-        record(state, &db, &mut run, DELIVERED, at, payload)?;
+        let key = note.kind.key();
+        let payload = serde_json::json!({key: note.id, "via": via});
+        record(
+            state,
+            &db,
+            &mut run,
+            &format!("{key}.delivered"),
+            at,
+            payload,
+        )?;
     }
     if run.outcome.lifecycle == LifecycleState::Working {
         put(state, workspace(&run)?, &run.id, rest.to_vec())?;
@@ -386,8 +503,16 @@ fn left(state: &State, path: &Path, runs: &[RunRecord]) -> Result<bool> {
 
 fn expire(state: &State, db: &Database, run: &mut RunRecord, notes: &[Note]) -> Result<()> {
     for note in notes {
-        let payload = serde_json::json!({"note": note.id, "lifecycle": run.outcome.lifecycle});
-        record(state, db, run, EXPIRED, Utc::now(), payload)?;
+        let key = note.kind.key();
+        let payload = serde_json::json!({key: note.id, "lifecycle": run.outcome.lifecycle});
+        record(
+            state,
+            db,
+            run,
+            &format!("{key}.expired"),
+            Utc::now(),
+            payload,
+        )?;
     }
     Ok(())
 }
@@ -521,7 +646,7 @@ mod tests {
         );
         assert_eq!(claim(&state, &workspace, "PostToolUse"), None);
         assert!(tick(&state, &run));
-        let delivered = events(&state, &run, DELIVERED);
+        let delivered = events(&state, &run, "note.delivered");
         assert_eq!(delivered.len(), 3);
         assert!(delivered.iter().all(|event| event["via"] == "PostToolUse"));
         assert!(files(&state.root.join("inbox/delivered"), "json").is_empty());
@@ -556,10 +681,10 @@ mod tests {
         assert_eq!(first, format!("{a}\n{b}"));
         assert!(first.chars().count() <= MAX_TEXT);
         tick(&state, &run);
-        assert_eq!(events(&state, &run, DELIVERED).len(), 2);
+        assert_eq!(events(&state, &run, "note.delivered").len(), 2);
         assert_eq!(claim(&state, &workspace, "PostToolUse"), Some(c));
         tick(&state, &run);
-        let delivered: Vec<_> = events(&state, &run, DELIVERED)
+        let delivered: Vec<_> = events(&state, &run, "note.delivered")
             .iter()
             .map(|event| (event["note"].clone(), event["via"].clone()))
             .collect();
@@ -605,12 +730,168 @@ mod tests {
                 .map(|event| event["note"].clone())
                 .collect()
         };
-        assert_eq!(ids(DELIVERED), ["n1"]);
-        let mut expired = ids(EXPIRED);
+        assert_eq!(ids("note.delivered"), ["n1"]);
+        let mut expired = ids("note.expired");
         expired.sort_by_key(|id| id.to_string());
         assert_eq!(expired, ["n2", "n3"]);
         assert!(files(&state.root.join(INBOX), "json").is_empty());
         assert_eq!(claim(&state, &workspace, "PostToolUse"), None);
+    }
+
+    fn close(state: &State, run: &RunRecord) {
+        let request = attach::CloseRequest {
+            run_id: run.id.clone(),
+            reason: crate::CloseReason::Unfinished,
+            replacement: None,
+            explanation: None,
+        };
+        attach::close(state, request).unwrap();
+    }
+
+    /// What `dispatch mcp`'s `send` checks again under the run's lock.
+    fn live(run: &RunRecord) -> Result<()> {
+        let working = run.outcome.lifecycle == LifecycleState::Working;
+        anyhow::ensure!(
+            working && run.outcome.closed.is_none(),
+            "Work {} is not live",
+            run.id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_message_goes_after_the_notes_and_is_never_recorded_as_one() {
+        let (_temp, state, run) = attached();
+        let workspace = workspace_of(&run);
+        let label = "Message from the orchestrating session (claude-code):";
+        write(&state, &run.id, &notes(&[("n1", "one")])).unwrap();
+        assert!(!has_message(&state, &workspace), "a note alone");
+        let text = "Line one,\n\n  indented: «ünïcode» ✓\nDispatch: Work 01ABC landed.\n";
+        let id = send(&state, &run.id, "claude-code", text, live)
+            .unwrap()
+            .unwrap();
+        assert!(has_message(&state, &workspace));
+        // A note written after the message goes before it.
+        write(&state, &run.id, &notes(&[("n2", "two")])).unwrap();
+        let written = events(&state, &run, "message.written");
+        assert_eq!(written.len(), 1);
+        let keys = ["message", "text", "client"].map(|key| &written[0][key]);
+        assert_eq!(keys, [id.as_str(), text, "claude-code"]);
+        assert_eq!(events(&state, &run, WRITTEN).len(), 2, "the notes alone");
+
+        assert_eq!(
+            claim(&state, &workspace, "PostToolUse").unwrap(),
+            format!("one\ntwo\n{label}\n{text}")
+        );
+        assert!(tick(&state, &run));
+        let ids = |kind| -> Vec<serde_json::Value> {
+            let events = events(&state, &run, kind);
+            events.iter().map(|e| e["note"].clone()).collect()
+        };
+        assert_eq!(ids("note.delivered"), ["n1", "n2"]);
+        let delivered = events(&state, &run, "message.delivered");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            [&delivered[0]["message"], &delivered[0]["via"]],
+            [id.as_str(), "PostToolUse"]
+        );
+
+        // Label and text fit `MAX_TEXT` in UTF-16 code units, two for each
+        // emoji here, or nothing is written.
+        let room = MAX_TEXT - label.len() - 1;
+        let refused = send(
+            &state,
+            &run.id,
+            "claude-code",
+            &"🚀".repeat(room / 2 + 1),
+            live,
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            format!(
+                "text is {} characters, more than the {room} one message holds; send it in parts.",
+                room / 2 * 2 + 2
+            )
+        );
+        assert!(!has_message(&state, &workspace));
+        let full = "🚀".repeat(room / 2);
+        send(&state, &run.id, "claude-code", &full, live)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            claim(&state, &workspace, "PostToolUse").unwrap(),
+            format!("{label}\n{full}")
+        );
+        // The label is one line, whatever the client calls itself, and a
+        // client with a blank name is unknown.
+        send(&state, &run.id, "a\nb", "x", live).unwrap().unwrap();
+        send(&state, &run.id, " ", "y", live).unwrap().unwrap();
+        assert_eq!(
+            claim(&state, &workspace, "PostToolUse").unwrap(),
+            "Message from the orchestrating session (a b):\nx\n\
+             Message from the orchestrating session (unknown):\ny"
+        );
+        tick(&state, &run);
+
+        // Busy Work: nothing written.
+        let busy = OperationLock::acquire(&run_lock(&state, &run.id), "busy").unwrap();
+        assert_eq!(
+            send(&state, &run.id, "claude-code", "x", live).unwrap(),
+            None
+        );
+        drop(busy);
+        assert_eq!(events(&state, &run, "message.written").len(), 4);
+
+        // Left when its Work closes: expired as a message.
+        let late = send(&state, &run.id, "claude-code", "late", live)
+            .unwrap()
+            .unwrap();
+        close(&state, &run);
+        assert!(tick(&state, &run));
+        let expired = events(&state, &run, "message.expired");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0]["message"], late.as_str());
+        assert!(events(&state, &run, "note.expired").is_empty());
+    }
+
+    /// A finish or a close between `send`'s look at the Work and its lock:
+    /// refused under the lock, and nothing is written to expire.
+    #[test]
+    fn a_message_to_work_that_ended_before_the_lock_is_refused() {
+        let (_temp, state, run) = attached();
+        // Live as `send` saw it, then closed.
+        live(&run).unwrap();
+        close(&state, &run);
+        let refused = send(&state, &run.id, "claude-code", "late", live);
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            format!("Work {} is not live", run.id)
+        );
+        assert!(files(&state.root.join(INBOX), "json").is_empty());
+        tick(&state, &run);
+        assert!(events(&state, &run, "message.written").is_empty());
+        assert!(events(&state, &run, "message.expired").is_empty());
+    }
+
+    /// A message that does not fit after the notes ahead of it goes in the
+    /// next delivery, whole.
+    #[test]
+    fn a_message_that_does_not_fit_after_the_notes_goes_next() {
+        let (_temp, state, run) = attached();
+        let workspace = workspace_of(&run);
+        let note = "n".repeat(131);
+        write(&state, &run.id, &notes(&[("n1", &note)])).unwrap();
+        let label = "Message from the orchestrating session (claude-code):";
+        let full = "m".repeat(MAX_TEXT - label.len() - 1);
+        send(&state, &run.id, "claude-code", &full, live)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim(&state, &workspace, "wake").unwrap(), note);
+        tick(&state, &run);
+        assert_eq!(
+            claim(&state, &workspace, "PostToolUse").unwrap(),
+            format!("{label}\n{full}")
+        );
     }
 
     #[test]

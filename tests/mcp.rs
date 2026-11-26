@@ -39,7 +39,7 @@ const SESSION: &str = "96fce6bd-fe23-4b1c-bd1e-b171635c421b";
 const PARENT: &str = "80a7793b-dddd-43a5-989c-f275463399fb";
 const SUBAGENT: &str = "a85d8d5dd371b34d4";
 
-const TOOLS: [&str; 5] = ["work", "status", "wait", "start", "propose_landing"];
+const TOOLS: [&str; 6] = ["work", "status", "wait", "start", "propose_landing", "send"];
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -123,6 +123,16 @@ impl Agent {
 
     /// The lock `claude --worktree <name>` holds while this process runs.
     fn lock(&self, name: &str) -> String {
+        self.holding(&format!("session {name}"))
+    }
+
+    /// The lock this process, a parent session, holds on the worktree of
+    /// its subagent `agent_id`.
+    fn subagent_lock(&self, agent_id: &str) -> String {
+        self.holding(&format!("agent agent-{agent_id}"))
+    }
+
+    fn holding(&self, what: &str) -> String {
         let output = Command::new("ps")
             .env("TZ", "UTC0")
             .args(["-o", "lstart=", "-p", &self.0.id().to_string()])
@@ -130,7 +140,7 @@ impl Agent {
             .unwrap();
         let start = String::from_utf8(output.stdout).unwrap();
         let start = start.split_whitespace().collect::<Vec<_>>().join(" ");
-        format!("claude session {name} (pid {} start {start})", self.0.id())
+        format!("claude {what} (pid {} start {start})", self.0.id())
     }
 }
 
@@ -138,6 +148,27 @@ impl Drop for Agent {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// A waiter this test started, stopped when the test ends unless it left.
+struct Waiter(Option<Child>);
+
+impl Waiter {
+    /// How it left, once it does.
+    fn left(mut self) -> Output {
+        let child = self.0.as_mut().unwrap();
+        until("the waiter left", || child.try_wait().unwrap().is_some());
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -420,6 +451,144 @@ impl Project {
         let reply = self.hook(&payload(&fields));
         assert!(reply.contains("tracking this worktree"), "{reply}");
         self.newest_in(cwd)
+    }
+
+    /// `SessionStart` of `session` in `cwd`: the Work it registered.
+    fn session_start_as(&self, session: &str, cwd: &Path) -> String {
+        let mut fields = self.head(session, cwd);
+        fields.extend([
+            ("hook_event_name", "SessionStart".into()),
+            ("source", "startup".into()),
+            ("model", "claude-opus-5-5".into()),
+        ]);
+        let reply = self.hook(&payload(&fields));
+        assert!(reply.contains("tracking this worktree"), "{reply}");
+        self.newest_in(cwd)
+    }
+
+    /// What a hook gave the agent, as Claude Code reads its reply.
+    fn reply(&self, fields: &[(&str, Value)]) -> Value {
+        match self.hook(&payload(fields)).trim() {
+            "" => Value::Null,
+            reply => serde_json::from_str(reply).unwrap(),
+        }
+    }
+
+    /// `SessionStart` of `SESSION` in `cwd`, resumed.
+    fn resume(&self, cwd: &Path) -> Value {
+        let mut fields = self.head(SESSION, cwd);
+        fields.extend([
+            ("hook_event_name", "SessionStart".into()),
+            ("source", "resume".into()),
+            ("model", "claude-opus-5-5".into()),
+        ]);
+        self.reply(&fields)
+    }
+
+    /// `PostToolUse` of a `Bash` call in `cwd`, as the probe recorded it:
+    /// `SESSION`'s, or inside the subagent `SUBAGENT` when `subagent`.
+    fn tool_use(&self, cwd: &Path, subagent: bool) -> Value {
+        let session = if subagent { PARENT } else { SESSION };
+        let mut fields = self.head(session, cwd);
+        fields.push(("permission_mode", "auto".into()));
+        if subagent {
+            fields.extend([
+                ("agent_id", SUBAGENT.into()),
+                ("agent_type", "general-purpose".into()),
+            ]);
+        }
+        fields.extend([
+            ("effort", json!({"level": "high"})),
+            ("hook_event_name", "PostToolUse".into()),
+            ("tool_name", "Bash".into()),
+            (
+                "tool_input",
+                json!({"command": "ls", "description": "List files"}),
+            ),
+            (
+                "tool_response",
+                json!({"stdout": "lib.rs\n", "stderr": "", "interrupted": false}),
+            ),
+            ("tool_use_id", "toolu_012CZdy6zhyfJAasPA9MioXo".into()),
+            ("duration_ms", 3519.into()),
+        ]);
+        self.reply(&fields)
+    }
+
+    /// `Stop` of `session` in `cwd`, as the probe recorded it.
+    fn stop(&self, session: &str, cwd: &Path) -> String {
+        let mut fields = self.head(session, cwd);
+        fields.extend([
+            ("permission_mode", "auto".into()),
+            ("effort", json!({"level": "high"})),
+            ("hook_event_name", "Stop".into()),
+            ("stop_hook_active", false.into()),
+            ("last_assistant_message", "Done.".into()),
+            ("background_tasks", json!([])),
+            ("session_crons", json!([])),
+        ]);
+        payload(&fields)
+    }
+
+    /// `SubagentStop` of `SUBAGENT` in `cwd`, as the probe recorded it.
+    fn subagent_stop(&self, cwd: &Path) {
+        let mut fields = self.head(PARENT, cwd);
+        fields.extend([
+            ("permission_mode", "auto".into()),
+            ("agent_id", SUBAGENT.into()),
+            ("agent_type", "general-purpose".into()),
+            ("effort", json!({"level": "high"})),
+            ("hook_event_name", "SubagentStop".into()),
+            ("stop_hook_active", false.into()),
+            (
+                "agent_transcript_path",
+                format!("/tmp/subagents/agent-{SUBAGENT}.jsonl").into(),
+            ),
+            ("last_assistant_message", "Done.".into()),
+            ("background_tasks", json!([])),
+            ("session_crons", json!([])),
+        ]);
+        assert_eq!(self.reply(&fields), Value::Null);
+    }
+
+    /// `dispatch hook claude-wait`, the waiter `Stop` of `session` in `cwd`
+    /// starts, once it waits.
+    fn waiter(&self, session: &str, cwd: &Path) -> Waiter {
+        let mut child = self
+            .command(&["hook", "claude-wait"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(self.stop(session, cwd).as_bytes()).unwrap();
+        drop(stdin);
+        let waiter = Waiter(Some(child));
+        until("the waiter waits", || {
+            self.state.join("waiters").join(session).exists()
+        });
+        waiter
+    }
+
+    /// Let go of the serve lock held for the project, and watch it with an
+    /// owner.
+    fn watch(&mut self) {
+        self.watched = None;
+        // A process forked meanwhile holds the lock with this one until it
+        // execs.
+        until("the serve lock is free", || {
+            hold(&self.lock("serve")).is_some()
+        });
+        self.start();
+    }
+
+    /// The payloads of the events of `kind`.
+    fn payloads(&self, kind: &str) -> Vec<Value> {
+        let events = self.events().into_iter().filter(|event| event.2 == kind);
+        events
+            .map(|event| serde_json::from_str(&event.3).unwrap())
+            .collect()
     }
 
     fn newest_in(&self, workspace: &Path) -> String {
@@ -1308,6 +1477,24 @@ fn no_tool_can_land_and_stdout_is_the_protocol_only() {
             "start",
             json!({"agent": long.clone(), "task": long.clone()}),
         ),
+        ("send", json!({})),
+        ("send", json!({"id": w.needs_you.clone()})),
+        ("send", json!({"text": "x"})),
+        ("send", json!({"id": 5, "text": "x"})),
+        ("send", json!({"id": w.needs_you.clone(), "text": 5})),
+        ("send", json!({"id": w.needs_you.clone(), "text": null})),
+        ("send", json!({"id": w.needs_you.clone(), "text": ""})),
+        (
+            "send",
+            json!({"id": w.needs_you.clone(), "text": long.clone()}),
+        ),
+        (
+            "send",
+            json!({"id": w.needs_you.clone(), "text": "x", "land": true}),
+        ),
+        ("send", json!({"id": "ZZZZZZZZ", "text": "x"})),
+        ("send", json!({"id": "0", "text": "x"})),
+        ("send", json!({"id": long.clone(), "text": "x"})),
     ];
     for (name, arguments) in refused {
         let words = mcp.refused(name, arguments.clone());
@@ -1344,13 +1531,38 @@ fn no_tool_can_land_and_stdout_is_the_protocol_only() {
         error_code(&mcp.next(Duration::from_secs(60)).unwrap().1),
         -32700
     );
-
-    mcp.close();
     assert_eq!(
         Snapshot::of(&p),
         before,
         "a tool changed what only a person may"
     );
+
+    // No Work here but the session and the subagent has a hook that
+    // delivers a message.
+    for id in w.all() {
+        if id == w.needs_you || id == w.subagent {
+            sent(&mut mcp, id, "x", "next_tool_call");
+        } else {
+            let words = mcp.refused("send", json!({"id": id, "text": "x"}));
+            assert!(
+                words.starts_with("No hook carries messages to wt-"),
+                "{words}"
+            );
+        }
+    }
+    mcp.close();
+    // A message is written, and nothing else.
+    let mut after = Snapshot::of(&p);
+    let mut written = after.events.clone();
+    written.retain(|event| event.2 == "message.written");
+    after.events.retain(|event| event.2 != "message.written");
+    let ids: HashSet<&str> = written.iter().map(|event| event.1.as_str()).collect();
+    assert_eq!(ids, HashSet::from([&w.needs_you[..], &w.subagent[..]]));
+    for id in ids {
+        let revision = &before.runs[id]["state_revision"];
+        after.runs.get_mut(id).unwrap()["state_revision"] = revision.clone();
+    }
+    assert_eq!(after, before, "a tool changed what only a person may");
     assert_eq!(p.of("batch.proposed"), 0);
     assert!(!p.state.join("started").exists(), "something was launched");
 }
@@ -1901,6 +2113,379 @@ fn wait_times_out_at_timeout_s_with_progress_for_each_token() {
             assert_eq!(notification["params"]["total"], 15.0);
         }
     }
+    mcp.close();
+}
+
+/// What `send` puts above a message from Claude Code (`initialize`).
+const LABEL: &str = "Message from the orchestrating session (claude-code):";
+
+/// A message to deliver as it is: blank and indented lines, Unicode, a line
+/// that reads like a Dispatch note, and a final newline.
+const MESSAGE: &str = "  Rebase on main first.\n\nThen rerun:\n\tcargo test\n\
+Dispatch: Work 01AAAAAA (Claude Code) landed a change this Work relies on.\n\
+Ünïcödé ✓ 日本語 🚀\n";
+
+/// `send`'s answer, checked: Work `id`, delivered by `by`. The message's id.
+fn sent(mcp: &mut Mcp, id: &str, text: &str, by: &str) -> String {
+    let sent = mcp.tool("send", json!({"id": id, "text": text}));
+    assert_eq!(sent["delivered_by"], by, "{sent}");
+    assert!(sent["id"].as_str().is_some_and(|sent| sent.starts_with(id)));
+    sent["message"].as_str().unwrap().to_owned()
+}
+
+/// What a Claude Code hook gave the agent, after `event`.
+fn context(reply: &Value, event: &str) -> String {
+    let output = &reply["hookSpecificOutput"];
+    assert_eq!(output["hookEventName"], event, "{reply}");
+    output["additionalContext"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn send_is_delivered_verbatim_at_the_next_tool_call_and_recorded_as_a_message() {
+    let mut p = Project::new(&[]);
+    p.watched = hold(&p.lock("serve"));
+    let worktree = p.claude_worktree("x", false);
+    let id = p.session_start(&worktree);
+    let mut mcp = Mcp::start(&p, &p.root, &[]);
+    mcp.initialize();
+    let message = sent(&mut mcp, &id[..12], MESSAGE, "next_tool_call");
+    // From a subdirectory, once.
+    let reply = p.tool_use(&worktree.join("src"), false);
+    assert_eq!(
+        context(&reply, "PostToolUse"),
+        format!("{LABEL}\n{MESSAGE}")
+    );
+    assert_eq!(p.tool_use(&worktree, false), Value::Null, "delivered once");
+
+    p.watch();
+    until("the delivery recorded", || {
+        !p.payloads("message.delivered").is_empty()
+    });
+    let [written] = &p.payloads("message.written")[..] else {
+        panic!("written once");
+    };
+    assert_eq!(
+        [&written["message"], &written["text"], &written["client"]],
+        [message.as_str(), MESSAGE, "claude-code"]
+    );
+    let [delivered] = &p.payloads("message.delivered")[..] else {
+        panic!("delivered once");
+    };
+    assert_eq!(
+        [&delivered["message"], &delivered["via"]],
+        [message.as_str(), "PostToolUse"]
+    );
+    let events = p.events();
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.2.starts_with("message."))
+            .all(|event| event.1 == id)
+    );
+    assert!(
+        events.iter().all(|event| !event.2.starts_with("note.")),
+        "a message is never a note"
+    );
+    mcp.close();
+}
+
+#[test]
+fn send_reaches_a_resumed_session_and_a_subagent_at_their_start_and_tool_calls() {
+    let p = Project::new(&[]);
+    let _watched = hold(&p.lock("serve"));
+    let worktree = p.claude_worktree("x", false);
+    let session = p.session_start(&worktree);
+    let isolated = p.claude_worktree(&format!("agent-{SUBAGENT}"), true);
+    let subagent = p.subagent_start(&isolated);
+    let mut mcp = Mcp::start(&p, &p.root, &[]);
+    mcp.initialize();
+
+    sent(&mut mcp, &session, "to the session", "next_tool_call");
+    let reply = p.resume(&worktree);
+    assert_eq!(
+        context(&reply, "SessionStart"),
+        format!("{LABEL}\nto the session")
+    );
+
+    // A subagent run again starts again: its start carries the message.
+    sent(&mut mcp, &subagent, "to the subagent", "next_tool_call");
+    let mut fields = p.head(PARENT, &isolated);
+    fields.extend([
+        ("agent_id", SUBAGENT.into()),
+        ("agent_type", "general-purpose".into()),
+        ("hook_event_name", "SubagentStart".into()),
+    ]);
+    assert_eq!(
+        context(&p.reply(&fields), "SubagentStart"),
+        format!("{LABEL}\nto the subagent")
+    );
+    // Its tool calls take its own messages, never its parent's.
+    sent(&mut mcp, &subagent, "again", "next_tool_call");
+    sent(&mut mcp, &session, "for the parent", "next_tool_call");
+    assert_eq!(
+        context(&p.tool_use(&isolated, true), "PostToolUse"),
+        format!("{LABEL}\nagain")
+    );
+    assert_eq!(
+        context(&p.tool_use(&worktree, false), "PostToolUse"),
+        format!("{LABEL}\nfor the parent")
+    );
+    mcp.close();
+}
+
+/// An idle session whose agent was never asked to catch up still has its
+/// waiter: the owner keeps a record for every live Work's workspace. The
+/// waiter wakes the session with the message, and the owner records it.
+#[test]
+fn an_idle_session_never_asked_to_catch_up_is_woken_by_its_waiter_with_a_message() {
+    let mut p = Project::new(&[]);
+    p.start();
+    let worktree = p.claude_worktree("x", false);
+    let id = p.session_start(&worktree);
+    let key = hex::encode(Sha256::digest(worktree.as_os_str().as_encoded_bytes()));
+    let record = p.state.join(format!("catchup/work/{key}.json"));
+    until("the owner's record", || record.exists());
+    let record: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert_eq!(record["asked"], json!([]), "never asked");
+    assert_eq!(p.hook(&p.stop(SESSION, &worktree)), "");
+    p.until(&id, "the turn's end", |run| {
+        run["attachment"]["needs_you"]["kind"] == "turn_ended"
+    });
+    p.quiet();
+    let mut mcp = Mcp::start(&p, &p.root, &[]);
+    mcp.initialize();
+    // Idle, and no waiter waits: the next tool call carries it.
+    sent(&mut mcp, &id, "no waiter yet", "next_tool_call");
+    assert_eq!(
+        context(&p.tool_use(&worktree, false), "PostToolUse"),
+        format!("{LABEL}\nno waiter yet")
+    );
+
+    let waiter = p.waiter(SESSION, &worktree);
+    let message = sent(&mut mcp, &id, MESSAGE, "waiter");
+    let woke = waiter.left();
+    assert_eq!(woke.status.code(), Some(2), "{woke:?}");
+    assert!(woke.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(woke.stderr).unwrap(),
+        format!("{LABEL}\n{MESSAGE}\n")
+    );
+    assert_eq!(p.tool_use(&worktree, false), Value::Null, "delivered once");
+    // The waiter left with it, though the mark still says the turn ended.
+    sent(&mut mcp, &id, "after the waiter", "next_tool_call");
+
+    p.watch();
+    until("the deliveries recorded", || {
+        p.payloads("message.delivered").len() == 2
+    });
+    let delivered = &p.payloads("message.delivered")[1];
+    assert_eq!(
+        [&delivered["message"], &delivered["via"]],
+        [message.as_str(), "wake"]
+    );
+    mcp.close();
+}
+
+/// Hermes Work, found as `hermes chat --worktree` leaves it, hears a message
+/// before its next turn.
+#[test]
+fn send_reaches_hermes_at_its_next_turn() {
+    let p = Project::new(&[]);
+    fs::write(p.root.join(".gitignore"), ".claude/\n.worktrees/\n").unwrap();
+    git(&p.root, &["commit", "--quiet", "-am", "ignore worktrees"]);
+    p.start();
+    // Its process, then its worktree, locked by that process.
+    let hermes = Agent::start();
+    let path = ".worktrees/hermes-0a1b2c3d";
+    git(
+        &p.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "hermes/hermes-0a1b2c3d",
+            path,
+        ],
+    );
+    let lock = format!("hermes pid={}", hermes.0.id());
+    git(&p.root, &["worktree", "lock", "--reason", &lock, path]);
+    let worktree = fs::canonicalize(p.root.join(path)).unwrap();
+    until("the owner finds it", || {
+        p.ids()
+            .iter()
+            .any(|id| p.run(id)["attachment"]["workspace"] == worktree.to_str().unwrap())
+    });
+    let id = p.newest_in(&worktree);
+    let mut mcp = Mcp::start(&p, &p.root, &[]);
+    mcp.initialize();
+    sent(&mut mcp, &id, MESSAGE, "next_turn");
+
+    // `pre_llm_call` as Hermes Agent sends it, from the main checkout.
+    let extra = json!({"task_id": "20261104_074818_70b971", "user_message": "Go on.",
+                       "conversation_history": [], "is_first_turn": false});
+    let turn = payload(&[
+        ("hook_event_name", "pre_llm_call".into()),
+        ("tool_name", Value::Null),
+        ("tool_input", Value::Null),
+        ("session_id", "20261104_074818_70b971".into()),
+        ("cwd", p.root.to_str().unwrap().into()),
+        ("extra", extra),
+    ]);
+    let mut child = p
+        .command(&["hook", "hermes"])
+        .env("TERMINAL_CWD", &worktree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(turn.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply, json!({"context": format!("{LABEL}\n{MESSAGE}")}));
+    mcp.close();
+}
+
+#[test]
+fn send_is_refused_where_no_hook_carries_a_message_or_while_the_work_is_busy() {
+    let p = Project::new(&[]);
+    let _watched = hold(&p.lock("serve"));
+    let run = p.ok(&[
+        "run",
+        "--allow-unsafe-local",
+        "--agent",
+        "fake-good",
+        "--json",
+        "Create the fake artifact.",
+    ]);
+    let native: Value = serde_json::from_str(&run).unwrap();
+    let native = native["run_id"].as_str().unwrap();
+    let codex = p.attach("codex", &[]);
+    let cursor = p.attach("cursor", &[]);
+    // `dispatch attach --agent claude`: no hook reports its session.
+    let unhooked = p.attach("claude", &[]);
+    let worktree = p.claude_worktree("x", false);
+    let live = p.session_start(&worktree);
+    let mut mcp = Mcp::start(&p, &p.root, &[]);
+    mcp.initialize();
+    let refused =
+        |mcp: &mut Mcp, id: &str, text: &str| mcp.refused("send", json!({"id": id, "text": text}));
+    assert_eq!(
+        refused(&mut mcp, native, "x"),
+        "No hook carries messages to fake-good in a native run."
+    );
+    assert_eq!(
+        refused(&mut mcp, &codex, "x"),
+        "No hook carries messages to Codex."
+    );
+    assert_eq!(
+        refused(&mut mcp, &cursor, "x"),
+        "No hook carries messages to Cursor."
+    );
+    assert_eq!(
+        refused(&mut mcp, &unhooked, "x"),
+        format!("No Claude Code hook has reported a session for Work {unhooked}.")
+    );
+    assert_eq!(
+        refused(&mut mcp, &live, ""),
+        "text is empty; give the message to send."
+    );
+    assert_eq!(
+        refused(&mut mcp, &live, " \n\t"),
+        "text is blank; give the message to send."
+    );
+    let lock = p.state.join("runs").join(&live).join(".operation.lock");
+    let busy = hold(&lock).unwrap();
+    assert_eq!(
+        refused(&mut mcp, &live, "x"),
+        format!("Work {live} is busy; call again shortly.")
+    );
+    drop(busy);
+    sent(&mut mcp, &live, "x", "next_tool_call");
+    assert_eq!(p.of("message.written"), 1, "only the message sent");
+    // Each connection's own client, `unknown` when it names none.
+    let mut anonymous = Mcp::start(&p, &p.root, &[]);
+    let initialize = anonymous.request(
+        "initialize",
+        json!({"protocolVersion": "2025-11-25", "capabilities": {}}),
+    );
+    anonymous.answer(&initialize);
+    sent(&mut anonymous, &live, "y", "next_tool_call");
+    assert_eq!(
+        context(&p.tool_use(&worktree, false), "PostToolUse"),
+        format!("{LABEL}\nx\nMessage from the orchestrating session (unknown):\ny")
+    );
+    let clients: Vec<Value> = p
+        .payloads("message.written")
+        .iter()
+        .map(|written| written["client"].clone())
+        .collect();
+    assert_eq!(clients, ["claude-code", "unknown"]);
+    anonymous.close();
+    mcp.close();
+}
+
+#[test]
+fn send_is_refused_for_work_that_is_not_live_and_a_subagent_that_stopped() {
+    let p = Project::new(&[]);
+    p.start();
+    let sessions = ["c", "f", "e"].map(|name| {
+        let session = format!("{name}0000000-0000-4000-8000-000000000000");
+        (session, p.claude_worktree(name, false))
+    });
+    let [closed, finished, ended] = sessions
+        .each_ref()
+        .map(|(session, worktree)| p.session_start_as(session, worktree));
+    p.ok(&["close", &closed, "--reason", "unfinished"]);
+    p.ok(&["finish", &finished]);
+    let mut fields = p.head(&sessions[2].0, &p.root);
+    fields.extend([
+        ("hook_event_name", "SessionEnd".into()),
+        ("reason", "prompt_input_exit".into()),
+    ]);
+    assert_eq!(p.hook(&payload(&fields)), "");
+    p.until(&ended, "the session's end", |run| {
+        !run["attachment"]["sessions"][0]["ended_at"].is_null()
+    });
+    // A subagent whose parent holds its worktree's lock: its stop ends no
+    // session.
+    let parent = Agent::start();
+    let isolated = p.claude_worktree(&format!("agent-{SUBAGENT}"), true);
+    fs::write(
+        p.gitdir(&isolated).join("locked"),
+        parent.subagent_lock(SUBAGENT),
+    )
+    .unwrap();
+    let subagent = p.subagent_start(&isolated);
+    p.subagent_stop(&isolated);
+    p.until(&subagent, "the subagent's stop", |run| {
+        let session = &run["attachment"]["sessions"][0];
+        session["ended_at"].is_null() && !session["subagent"]["stopped_at"].is_null()
+    });
+
+    let mut mcp = Mcp::start(&p, &p.root, &[]);
+    mcp.initialize();
+    let only = "only a live session gets a message";
+    for (id, why) in [
+        (&closed, format!("Work {closed} is closed; {only}.")),
+        (&finished, format!("Work {finished} is finished; {only}.")),
+        (&ended, format!("Work {ended}'s session ended; {only}.")),
+        (
+            &subagent,
+            format!(
+                "Work {subagent} is a subagent that stopped, and a stopped subagent is not woken."
+            ),
+        ),
+    ] {
+        assert_eq!(mcp.refused("send", json!({"id": id, "text": "x"})), why);
+    }
+    assert_eq!(p.of("message.written"), 0);
     mcp.close();
 }
 

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::interactions::{self, Change, Interaction, Projection, Rule, Side, Target};
-use crate::orchestrator::inbox::MAX_TEXT;
+use crate::orchestrator::inbox::{MAX_TEXT, length};
 
 const WINDOW: Duration = Duration::minutes(10);
 /// Room kept for the line that says how many items wait.
@@ -147,11 +147,11 @@ pub fn compose(
         "Dispatch: other Work touches this Work ({}), your changes in this workspace.",
         short[work]
     );
-    let mut length = text.chars().count() + MORE;
+    let mut total = length(&text) + MORE;
     let mut keys = Vec::new();
     for (key, item) in &items {
-        length += 1 + item.chars().count();
-        if length > MAX_TEXT && !keys.is_empty() {
+        total += 1 + length(item);
+        if total > MAX_TEXT && !keys.is_empty() {
             break;
         }
         text += "\n";

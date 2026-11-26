@@ -17,6 +17,28 @@ from review_refinement import Session
 
 binary = str(Path(sys.argv[1]).resolve())
 
+# Claude Code's CLI as setup's MCP step runs it: `mcp add` and `mcp remove`
+# change .claude.json as Claude Code 2.1.296 does. Any other call would be an
+# agent session, which setup never starts.
+CLAUDE = '''
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+config = Path(os.environ.get('CLAUDE_CONFIG_DIR') or os.environ['HOME']) / '.claude.json'
+data = json.loads(config.read_text()) if config.exists() else {{}}
+servers = data.setdefault('mcpServers', {{}})
+if args[:6] == ['mcp', 'add', '--scope', 'user', 'dispatch', '--'] and len(args) > 6 \\
+        and 'dispatch' not in servers:
+    servers['dispatch'] = {{'type': 'stdio', 'command': args[6], 'args': args[7:], 'env': {{}}}}
+elif args == ['mcp', 'remove', '--scope', 'user', 'dispatch'] and 'dispatch' in servers:
+    del servers['dispatch']
+else:
+    Path({ran!r}).touch()
+    sys.exit(91)
+config.parent.mkdir(parents=True, exist_ok=True)
+config.write_text(json.dumps(data, indent=2))
+'''
+
 
 class Case:
     def __init__(self, parent, name):
@@ -35,11 +57,12 @@ class Case:
         (self.source / 'Makefile').write_text(f'test:\n\ttouch "{self.ran}"\n')
         # Discovery needs an executable on PATH, not a real provider call.
         stand_in = self.bin / 'claude'
-        stand_in.write_text(f'#!/bin/sh\ntouch "{self.agent_ran}"\nexit 91\n')
+        stand_in.write_text(f'#!{sys.executable}\n' + CLAUDE.format(ran=str(self.agent_ran)))
         stand_in.chmod(0o755)
         self.env = {
             'HOME': str(self.home),
             'CLAUDE_CONFIG_DIR': str(self.home / '.claude'),
+            'CODEX_HOME': str(self.home / '.codex'),
             'HERMES_HOME': str(self.home / '.hermes'),
             'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
             'NO_COLOR': '1',
@@ -69,6 +92,12 @@ class Case:
         assert Path(record['root']) == self.source.resolve(), record
         assert record['background'] and record['discovery_ready'], record
         os.kill(record['identity']['pid'], 0)
+
+    def stand_in(self, name):
+        """An agent's executable on PATH, which setup must never run."""
+        path = self.bin / name
+        path.write_text(f'#!/bin/sh\ntouch "{self.agent_ran}"\nexit 91\n')
+        path.chmod(0o755)
 
     def __enter__(self):
         return self
@@ -123,6 +152,14 @@ def hooks_prompt(ui, case, action):
     ui.wait('[2] >')  # A bare Enter cannot edit Claude settings.
 
 
+def skip_connect(ui):
+    """Pass setup's MCP step by: a bare Enter cannot connect an agent."""
+    ui.wait('Connect Dispatch to these agents?')
+    ui.wait('2) Skip')
+    ui.wait('[2] >')
+    ui.send('\r')
+
+
 def skip_launch(ui):
     """Pass launch consent by: focus starts on Skip."""
     ui.wait('Agents an orchestrator may launch')
@@ -147,6 +184,7 @@ def through_setup(case, name, done, watching='Already watching'):
         ui.wait('[2] >')
         ui.send('1\r')
         ui.wait(done)
+        skip_connect(ui)
         finish_setup(ui, watching)
 
 
@@ -159,6 +197,7 @@ def through_menu(case, name, row, done, skip=True):
             ui.wait('2) Skip')
             ui.wait('[2] >')
             ui.send('\r')
+        skip_connect(ui)
         skip_launch(ui)
         ui.wait('Agents Dispatch launches')
         ui.send('2\r')
@@ -188,6 +227,11 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             hooks_prompt(ui, case, 'Install')
             ui.send('1\r')
             ui.wait('Claude Code hooks installed')
+            ui.wait('Connect Dispatch to your agents')
+            ui.wait('claude mcp add --scope user dispatch --')
+            ui.wait('[2] >')
+            ui.send('1\r')
+            ui.wait("Claude Code: Dispatch's MCP server connected")
             finish_setup(ui, 'Watching')
             assert 'Dispatch is running in the background' in ui.clean
             # The launch step lists the checks a launch consent would pin.
@@ -209,6 +253,11 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         assert commands and all(binary in command and str(case.state) in command
                                 and command.endswith(('hook claude', 'hook claude-wait'))
                                 for command in commands), commands
+        # Claude Code's own CLI registered this Dispatch's server, with this state.
+        registered = json.loads((case.home / '.claude' / '.claude.json').read_text())
+        assert registered == {'mcpServers': {'dispatch': {
+            'type': 'stdio', 'command': binary, 'args': ['--state-dir', str(case.state), 'mcp'],
+            'env': {}}}}, registered
         case.watcher_record()
         assert_nothing_ran(case)
 
@@ -274,6 +323,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             ui.wait('[2] >')
             ui.send('1\r')
             ui.wait('Hermes hook installed')
+            skip_connect(ui)
             finish_setup(ui, 'Already watching')
         installed = hermes_config.read_text()
         assert installed.startswith(prefix) and binary in installed, installed
@@ -289,6 +339,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             ui.wait('[2] >')
             ui.send('1\r')
             ui.wait('Hermes hook updated')
+            skip_connect(ui)
             finish_setup(ui, 'Already watching')
         assert hermes_config.read_text().startswith(prefix)
         assert old_executable not in hermes_config.read_text()
@@ -306,6 +357,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             ui.wait('[2] >')
             ui.send('1\r')
             ui.wait('Hermes hook updated')
+            skip_connect(ui)
             finish_setup(ui, 'Already watching')
         assert hermes_config.read_text() == current
         assert_nothing_ran(case)
@@ -341,10 +393,12 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             ui.wait('No checks are configured; check consent was not granted.')
             hooks_prompt(ui, case, 'Install')
             ui.send('\r')
+            skip_connect(ui)
             finish_setup(ui, 'Watching')
             assert 'No checks are configured' in ui.clean
         assert not case.config.exists() and not case.consent_records()
         assert not case.settings.exists()
+        assert not (case.home / '.claude' / '.claude.json').exists(), 'Enter connected Claude Code'
         case.watcher_record()
         assert_nothing_ran(case)
 
@@ -354,6 +408,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             allow_checks(ui)
             hooks_prompt(ui, case, 'Install')
             ui.send('\r')
+            skip_connect(ui)
             finish_setup(ui, 'Watching')
         assert case.config.exists() and len(case.consent_records()) == 1
         assert not case.settings.exists(), 'Enter installed hooks despite Skip focus'
@@ -418,6 +473,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             ui.wait('[2] >')
             ui.send('1\r')
             ui.wait('Claude Code hooks updated')
+            skip_connect(ui)
             finish_setup(ui, 'Watching')
         upgraded = case.settings.read_bytes()
         settings = json.loads(upgraded)
@@ -448,6 +504,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             ui.wait('5) Continue without checks')
             ui.send('\r')
             ui.wait('changed by hand')
+            skip_connect(ui)
             finish_setup(ui, 'Already watching')
         assert case.settings.read_text() == edited
         assert_nothing_ran(case)
@@ -486,8 +543,209 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
             ui.wait('5) Continue without checks')
             ui.send('\r')
             ui.wait('changed by hand')
+            skip_connect(ui)
             finish_setup(ui, 'Already watching')
         assert config.read_bytes() == by_hand
+        assert_nothing_ran(case)
+
+    # Dispatch's MCP server is the user's, for every project. Setup shows each
+    # agent on PATH exactly what it runs or writes, and where, with focus on
+    # Skip; Connect writes it (Claude Code's through its own CLI), an earlier
+    # path is an Update, and Runtime integrations removes each, leaving the
+    # person's own configuration as it was. A server of the person's, a file
+    # Dispatch cannot read and Hermes's own mcp_servers: are left alone. No
+    # agent runs.
+    with Case(parent, 'mcp') as case:
+        for name in ('codex', 'cursor-agent', 'hermes'):
+            case.stand_in(name)
+        claude = case.home / '.claude' / '.claude.json'
+        codex = case.home / '.codex' / 'config.toml'
+        cursor = case.home / '.cursor' / 'mcp.json'
+        hermes = case.home / '.hermes' / 'config.yaml'
+        agents = (('Claude Code', claude), ('Codex', codex), ('Cursor', cursor), ('Hermes', hermes))
+        theirs = {
+            claude: json.dumps({'numStartups': 3, 'mcpServers': {'time': {
+                'type': 'stdio', 'command': 'uvx', 'args': ['mcp-server-time'], 'env': {}}}}),
+            codex: 'model = "o3"\n\n[mcp_servers.time]\ncommand = "uvx"\n',
+            cursor: json.dumps({'mcpServers': {'time': {'command': 'uvx'}}}),
+            hermes: '# mine\nmodel:\n  default: keep\n',
+        }
+        for path, text in theirs.items():
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(text)
+        args = ['--state-dir', str(case.state), 'mcp']
+        listed = ', '.join(json.dumps(arg) for arg in args)
+        marker = '# Added by dispatch setup, which removes it unless it is edited.\n'
+        codex_block = (f'\n{marker}[mcp_servers.dispatch]\ncommand = {json.dumps(binary)}\n'
+                       f'args = [{listed}]\ndefault_tools_approval_mode = "approve"\n')
+        hermes_block = (f'\n{marker}mcp_servers:\n  dispatch:\n    command: {json.dumps(binary)}\n'
+                        f'    args: [{listed}]\n')
+
+        def past_claude_hooks(ui):
+            ui.wait('5) Continue without checks')
+            ui.send('\r')
+            ui.wait('Claude Code hooks · Install')
+            ui.wait('[2] >')
+            ui.send('\r')
+
+        with case.session('mcp-skip') as ui:
+            past_claude_hooks(ui)
+            ui.wait('Hermes hook · Install')
+            ui.wait('[2] >')
+            ui.send('\r')
+            ui.wait('Connect Dispatch to your agents')
+            ui.wait('Connect Dispatch to these agents?')
+            shown = ['none of them lands Work', 'This is for your user, in every project',
+                     'Claude Code · Connect', str(claude),
+                     f'claude mcp add --scope user dispatch -- {binary} --state-dir {case.state} mcp',
+                     'Codex · Connect', f'At the end of {codex}',
+                     'default_tools_approval_mode = "approve" lets Codex call',
+                     'codex exec refuses every call to them otherwise',
+                     'Cursor · Connect', f'Under mcpServers in {cursor}',
+                     'Hermes · Connect', f'At the end of {hermes}']
+            shown += (codex_block + hermes_block).strip().splitlines()
+            for line in shown:
+                assert line in ui.clean, (line, ui.clean[-6000:])
+            ui.wait('2) Skip')
+            ui.wait('[2] >')
+            ui.send('\r')  # A bare Enter connects nothing.
+            finish_setup(ui, 'Watching')
+        for path, text in theirs.items():
+            assert path.read_text() == text, path
+
+        # The Hermes hook and the server change config.yaml in one pass, and
+        # each change keeps a backup of its own.
+        with case.session('mcp-connect') as ui:
+            past_claude_hooks(ui)
+            ui.wait('Hermes hook · Install')
+            ui.wait('[2] >')
+            ui.send('1\r')
+            ui.wait('Hermes hook installed')
+            ui.wait('Connect Dispatch to these agents?')
+            ui.wait('[2] >')
+            ui.send('1\r')
+            for name, path in agents:
+                ui.wait(f"{name}: Dispatch's MCP server connected in {path}")
+            finish_setup(ui, 'Already watching')
+        entry = {'command': binary, 'args': args}
+        want = json.loads(theirs[claude])
+        want['mcpServers']['dispatch'] = {'type': 'stdio', **entry, 'env': {}}
+        assert json.loads(claude.read_text()) == want
+        assert codex.read_text() == theirs[codex] + codex_block
+        want = json.loads(theirs[cursor])
+        want['mcpServers']['dispatch'] = entry
+        assert json.loads(cursor.read_text()) == want
+        hooked = hermes.read_text().removesuffix(hermes_block)
+        assert hooked.startswith(theirs[hermes]) and 'hook hermes' in hooked, hermes.read_text()
+        for path, kept in ((codex, [theirs[codex]]), (cursor, [theirs[cursor]]),
+                           (hermes, sorted([theirs[hermes], hooked]))):
+            backups = sorted(backup.read_text()
+                             for backup in path.parent.glob(f'{path.name}.dispatch-backup-*'))
+            assert backups == kept, (path, backups)
+        connected = {path: path.read_text() for path in theirs}
+
+        # Registration is per user: once every agent has it, setup offers nothing.
+        with case.session('mcp-connected') as ui:
+            past_claude_hooks(ui)
+            ui.wait('Hermes hook: already running this Dispatch')
+            finish_setup(ui, 'Already watching')
+            assert 'Connect Dispatch to' not in ui.clean, ui.clean[-5000:]
+
+        # Each server running an earlier Dispatch's path is an Update.
+        old = '/old/dispatch'
+        for path in theirs:
+            path.write_text(path.read_text().replace(json.dumps(binary), json.dumps(old)))
+        with case.session('mcp-update') as ui:
+            past_claude_hooks(ui)
+            ui.wait('Connect Dispatch to these agents?')
+            for line in ('Claude Code · Update', 'Codex · Update', 'Cursor · Update', 'Hermes · Update',
+                         f'Existing server command: {old} --state-dir {case.state} mcp',
+                         f"Dispatch's block in {codex} becomes this",
+                         f"Dispatch's block in {hermes} becomes this",
+                         'claude mcp remove --scope user dispatch'):
+                assert line in ui.clean, (line, ui.clean[-6000:])
+            ui.wait('[2] >')
+            ui.send('1\r')
+            for name, path in agents:
+                ui.wait(f"{name}: Dispatch's MCP server updated in {path}")
+            finish_setup(ui, 'Already watching')
+        for path, text in connected.items():
+            assert json.loads(path.read_text()) == json.loads(text) if path in (claude, cursor) \
+                else path.read_text() == text, path
+
+        # Only Runtime integrations removes it, one agent at a time, and only
+        # on a deliberate choice.
+        with case.session('mcp-remove') as ui:
+            past_claude_hooks(ui)
+            skip_launch(ui)
+            ui.wait('Agents Dispatch launches')
+            ui.send('2\r')
+            ui.wait('4) Runtime integrations')
+            ui.send('4\r')
+            for name, path in agents:
+                ui.wait(f"Dispatch's MCP server in {name}: connected ({path})")
+            ui.wait("3) Remove Dispatch's MCP server from Claude Code")
+            ui.wait("6) Remove Dispatch's MCP server from Hermes")
+            ui.wait('7) Back')
+            ui.send('3\r')
+            ui.wait('claude mcp remove --scope user dispatch')
+            ui.wait('2) Cancel')
+            ui.wait('[2] >')
+            ui.send('\r')
+            ui.wait('5) Back')
+            assert claude.read_text() == connected[claude], 'Enter removed the server'
+            for name, path in agents:
+                if name == 'Hermes':
+                    # `hermes config set` drops every comment: the server is
+                    # still Dispatch's, but only the person can remove it.
+                    written = hermes.read_text()
+                    hermes.write_text(written.replace(marker, ''))
+                    ui.send('4\r')
+                    ui.wait("Dispatch's MCP server in Hermes: connected, but not as Dispatch added it")
+                    ui.wait('remove dispatch: under mcp_servers: there by hand')
+                    ui.wait('3) Back')  # No Remove row.
+                    ui.send('3\r')
+                    ui.wait('5) Back')
+                    hermes.write_text(written)
+                ui.send('4\r')
+                ui.wait(f"3) Remove Dispatch's MCP server from {name}")
+                ui.send('3\r')
+                ui.wait('2) Cancel')
+                ui.wait('[2] >')
+                ui.send('1\r')
+                ui.wait(f"{name}: Dispatch's MCP server removed from {path}")
+                ui.wait('5) Back')
+            ui.send('5\r')
+            ui.wait('Already watching')
+            ui.finish()
+        assert json.loads(claude.read_text()) == json.loads(theirs[claude])
+        assert codex.read_text() == theirs[codex]
+        assert json.loads(cursor.read_text()) == json.loads(theirs[cursor])
+        assert hermes.read_text() == hooked
+
+        mine = {
+            codex: theirs[codex] + '[mcp_servers.dispatch]\ncommand = "dispatch"\n',
+            cursor: '{',
+            hermes: hooked + 'mcp_servers:\n  time:\n    command: uvx\n',
+        }
+        for path, text in mine.items():
+            path.write_text(text)
+        with case.session('mcp-theirs') as ui:
+            past_claude_hooks(ui)
+            ui.wait(f'Codex: {codex} has a dispatch MCP server that setup did not write; '
+                    'setup leaves it as it is.')
+            ui.wait(f'Cursor: {cursor} is not valid JSON; it was left untouched')
+            ui.wait(f'Hermes: {hermes} has an mcp_servers: key of its own, so Dispatch leaves '
+                    'the file alone. Add these lines under it by hand:')
+            ui.wait(f'    command: {json.dumps(binary)}')
+            ui.wait('Claude Code · Connect')
+            for agent in ('Codex · ', 'Cursor · ', 'Hermes · '):
+                assert agent not in ui.clean, (agent, ui.clean[-6000:])
+            skip_connect(ui)
+            finish_setup(ui, 'Already watching')
+        for path, text in mine.items():
+            assert path.read_text() == text, path
+        assert json.loads(claude.read_text()) == json.loads(theirs[claude])
         assert_nothing_ran(case)
 
     # Launch consent is the person's, at a terminal: Enter alone skips it, and
@@ -509,6 +767,7 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
                 ui.wait(hook)
                 ui.wait('[2] >')
                 ui.send('\r')
+            skip_connect(ui)
             ui.wait('Agents an orchestrator may launch')
 
         def done(ui):
@@ -634,4 +893,4 @@ with tempfile.TemporaryDirectory(prefix='dispatch-first-use-') as tmp:
         assert not case.consent_records()
         assert_nothing_ran(case)
 
-    print('one-command first setup, focused cancel/skip, hook update, one hook step from both menus, launch consent, and explicit checks passed')
+    print('one-command first setup, focused cancel/skip, hook update, one hook step from both menus, MCP connect, update and removal, launch consent, and explicit checks passed')

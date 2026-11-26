@@ -335,7 +335,7 @@ pub fn hook_command(state: &State) -> Result<String> {
 }
 
 /// The first line of the block Dispatch appends, which is how it finds it.
-const MARKER: &str = "# Added by dispatch setup, which removes it unless it is edited.";
+pub(super) const MARKER: &str = "# Added by dispatch setup, which removes it unless it is edited.";
 
 /// The hooks Dispatch installs, each with its timeout. `on_session_finalize`
 /// has Hermes's most, which covers the minute keeping a removed worktree's Δ
@@ -535,7 +535,7 @@ fn ours(text: &str) -> Option<(std::ops::Range<usize>, String)> {
 }
 
 /// The configuration's text, `None` when there is no file.
-fn read(path: &Path) -> Result<Option<String>> {
+pub(super) fn read(path: &Path) -> Result<Option<String>> {
     match fs::read(path) {
         Ok(bytes) => String::from_utf8(bytes)
             .map(Some)
@@ -545,7 +545,7 @@ fn read(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn parse(text: &str, path: &Path) -> Result<serde_yaml::Value> {
+pub(super) fn parse(text: &str, path: &Path) -> Result<serde_yaml::Value> {
     serde_yaml::from_str(text).with_context(|| {
         format!(
             "{} is not valid YAML; it was left untouched",
@@ -554,10 +554,9 @@ fn parse(text: &str, path: &Path) -> Result<serde_yaml::Value> {
     })
 }
 
-/// Write `text` over the configuration at `path`, through a symbolic link if
-/// it is one, after keeping a backup of `existing` beside it. Only if Hermes
-/// will read back exactly Dispatch's hooks running `command`, or none for an
-/// empty `command`.
+/// Write `text` over the configuration at `path`, with a backup of `existing`
+/// beside it (`mcp::save`). Only if Hermes will read back exactly Dispatch's
+/// hooks running `command`, or none for an empty `command`.
 fn write(
     path: &Path,
     existing: Option<&str>,
@@ -573,22 +572,7 @@ fn write(
         "the hooks would not read back as written; {} was left untouched",
         path.display()
     );
-    let backup = match existing {
-        Some(existing) => {
-            let backup = path.with_extension(format!(
-                "yaml.dispatch-backup-{}",
-                Utc::now().format("%Y%m%d%H%M%S")
-            ));
-            // Durably, and readable only by its owner, as Hermes keeps it.
-            crate::state::write_durably(&backup, existing.as_bytes())
-                .with_context(|| format!("failed to keep a backup at {}", backup.display()))?;
-            Some(backup)
-        }
-        None => None,
-    };
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-    crate::state::write_durably(&target, text.as_bytes())?;
-    Ok(backup)
+    super::mcp::save(path, existing, text)
 }
 
 #[cfg(test)]

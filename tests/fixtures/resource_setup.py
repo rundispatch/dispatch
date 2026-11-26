@@ -32,7 +32,7 @@ for line in sys.stdin:
     print(json.dumps({'id':q['id'],'result':r}),flush=True)
 '''
         (bins/provider).write_text(script);(bins/provider).chmod(0o755)
-    env={'HOME':str(home),'PATH':str(bins)+os.pathsep+os.environ['PATH'],'USER':'dispatch-fixture','DISPATCH_COLOR':'truecolor','COLORTERM':'truecolor','NO_COLOR':None,'OPENAI_API_KEY':'not-a-real-key','ANTHROPIC_API_KEY':'not-a-real-key'}
+    env={'HOME':str(home),'CODEX_HOME':str(home/'.codex'),'HERMES_HOME':str(home/'.hermes'),'PATH':str(bins)+os.pathsep+os.environ['PATH'],'USER':'dispatch-fixture','DISPATCH_COLOR':'truecolor','COLORTERM':'truecolor','NO_COLOR':None,'OPENAI_API_KEY':'not-a-real-key','ANTHROPIC_API_KEY':'not-a-real-key'}
     captures=os.environ.get('DISPATCH_SETUP_CAPTURES',str(root/'captures'))
     def session(name,args=None):return Session([binary,'--state-dir',str(state)]+(args or []),source,captures,name,env=env,width=100,height=36)
     # Setup is chosen, not typed. Rows with no profiles: 1 Add Claude Code,

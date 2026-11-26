@@ -347,6 +347,32 @@ impl Project {
         .unwrap();
     }
 
+    /// Leave `entries`, `(id, kind, text)`, in the inbox of `worktree`, as
+    /// the owner and `dispatch mcp`'s `send` leave them.
+    fn inbox(&self, worktree: &Path, entries: &[(&str, &str, &str)]) {
+        let notes: Vec<Value> = entries
+            .iter()
+            .map(|(id, kind, text)| serde_json::json!({"id": id, "text": text, "kind": kind}))
+            .collect();
+        let inbox = serde_json::json!({"version": 1, "run_id": "r", "notes": notes});
+        let directory = self.state.join("inbox");
+        fs::create_dir_all(directory.join("delivered")).unwrap();
+        let path = directory.join(format!("{}.json", key(worktree)));
+        fs::write(path.with_extension("tmp"), inbox.to_string()).unwrap();
+        fs::rename(path.with_extension("tmp"), path).unwrap();
+    }
+
+    /// The inboxes hooks took, by name.
+    fn inbox_delivered(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(self.state.join("inbox/delivered"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        names
+    }
+
     fn delivered(&self) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(self.state.join("catchup/delivered"))
             .into_iter()
@@ -492,6 +518,68 @@ fn the_waiter_wakes_its_session_with_an_ask_that_comes_while_it_waits() {
         delivered.len() == 1 && delivered[0].ends_with(".wake.json"),
         "{delivered:?}"
     );
+}
+
+/// Notes alone never wake an idle session; a message from an orchestrating
+/// session does, and the notes waiting with it go with it, in order.
+#[test]
+fn the_waiter_wakes_its_session_for_a_message_after_the_notes_ahead_of_it() {
+    let p = Project::new();
+    let worktree = p.worktree("w");
+    p.follow(&worktree);
+    let mut waiter = p.waiter("s1", &worktree, 3_600);
+    until("the waiter waits", || p.registered("s1").exists());
+    let note = ("n1", "note", "Work 01ABC (Claude Code) changed fn f.");
+    p.inbox(&worktree, &[note]);
+    // Long enough for a few looks: a shorter wait can only miss a wrong
+    // wake, never fail this test.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(waiter.waiting(), "a note woke the session");
+    let message = "Message from the orchestrating session (claude-code):\nRebase first.";
+    // As the inbox holds them: the notes, then the messages.
+    p.inbox(
+        &worktree,
+        &[note, ("n2", "note", "Two."), ("m1", "message", message)],
+    );
+    let output = waiter.left();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "nothing on stdout");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("{}\nTwo.\n{message}\n", note.2)
+    );
+    assert_eq!(p.inbox_delivered().len(), 1);
+    assert!(p.inbox_delivered()[0].ends_with(".wake.json"));
+    assert!(p.delivered().is_empty(), "no ask");
+}
+
+/// A message that no longer fits after the notes ahead of it is the next
+/// delivery's: the waiter wakes the session with the notes alone.
+#[test]
+fn a_waiter_wakes_with_the_notes_alone_when_the_message_does_not_fit_after_them() {
+    let p = Project::new();
+    let worktree = p.worktree("w");
+    p.follow(&worktree);
+    let waiter = p.waiter("s1", &worktree, 3_600);
+    until("the waiter waits", || p.registered("s1").exists());
+    let note = "n".repeat(131);
+    // The most a message from claude-code holds: 8,000 with its label.
+    let label = "Message from the orchestrating session (claude-code):";
+    let message = format!("{label}\n{}", "m".repeat(8_000 - label.len() - 1));
+    p.inbox(
+        &worktree,
+        &[("n1", "note", &note), ("m1", "message", &message)],
+    );
+    let output = waiter.left();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), format!("{note}\n"));
+    // It took both; the owner puts the message back for the next one.
+    let taken = p
+        .state
+        .join("inbox/delivered")
+        .join(&p.inbox_delivered()[0]);
+    let taken: Value = serde_json::from_slice(&fs::read(taken).unwrap()).unwrap();
+    assert_eq!(taken["notes"].as_array().unwrap().len(), 2);
 }
 
 #[test]
@@ -958,8 +1046,10 @@ fn an_undone_merge_moves_a_resumed_s0_back_to_its_time_and_a_new_merge_moves_it_
     // The merge undone, S0 moves back to the S0 B began from, with B's time.
     p.start_owner();
     git(&wb, &["reset", "--quiet", "--hard", "HEAD~1"]);
+    // On what the assertions read: the move's event is committed before its
+    // metadata.json is written.
     until("the new Work's S0 moved back", || {
-        p.events(&new, "attach.s0_moved").len() >= 2
+        !p.run(&new)["baseline_history"][1].is_null()
     });
     let back = &p.run(&new)["baseline_history"][1];
     assert_eq!(back["back"], true);

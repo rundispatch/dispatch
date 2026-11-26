@@ -53,6 +53,7 @@ async fn project_setup(
             carry_on = hook_step(ui, state, runtime, false).await?;
         }
     }
+    carry_on = carry_on && connect_step(ui, state).await?;
     if !carry_on {
         return ui.commit(SETUP_STOPPED);
     }
@@ -503,8 +504,10 @@ pub(super) async fn accounts(
 /// Claude Code's session hooks and Hermes's session-end hook, which let Work
 /// appear by itself in watched projects and keep a worktree's changes before
 /// its runtime removes it. They are observation hooks, not a resource: no
-/// account, model or funding is involved.
+/// account, model or funding is involved. Dispatch's MCP server, which setup
+/// connects to each agent, is removed here too.
 async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
+    use crate::runtime::mcp::{Agent, Server};
     let found = |runtime: Runtime| -> Result<(std::path::PathBuf, Result<Change>)> {
         let path = runtime.path()?;
         let command = runtime.command(state)?;
@@ -520,12 +523,42 @@ async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
         Change::Install => "not installed",
         _ => "installed",
     };
+    // Dispatch's MCP server, which only the menu removes, and only where
+    // Dispatch can change it.
+    let mut servers = String::new();
+    let mut connected = Vec::new();
+    for agent in Agent::ALL {
+        let now = match agent.path() {
+            Ok(path) => {
+                let now = match agent.server(&path) {
+                    Ok(Server::Ours(_)) if agent.as_written(&path).unwrap_or(false) => {
+                        connected.push(agent);
+                        "connected"
+                    }
+                    Ok(Server::Ours(_)) => {
+                        "connected, but not as Dispatch added it (hermes config set rewrites \
+                         the whole file), so remove dispatch: under mcp_servers: there by hand"
+                    }
+                    Ok(Server::Absent) => "not connected",
+                    Ok(Server::Changed) => "a dispatch server of your own",
+                    Err(_) => "unknown, its configuration is unreadable",
+                };
+                format!("{now} ({})", path.display())
+            }
+            Err(error) => format!("unknown: {error:#}"),
+        };
+        servers.push_str(&format!(
+            "\nDispatch's MCP server in {}: {now}",
+            agent.name()
+        ));
+    }
     let body = format!(
-        "Runtime integrations\nClaude Code hooks: {} ({})\nHermes hook: {} ({})\nWith them, a Claude Code session in its own worktree of a project you watch \
+        "Runtime integrations\nClaude Code hooks: {} ({})\nHermes hook: {} ({}){servers}\nWith the hooks, a Claude Code session in its own worktree of a project you watch \
          (dispatch start) appears as Work by itself; a session in the checkout itself is told Dispatch cannot follow it. \
          Hermes's hooks keep a hermes --worktree session's exact changes before Hermes removes its worktree. \
          Both deliver Dispatch's notes on other Work to the agent, and ask it to catch up, \
-         once per landing, when other Work lands a change its Work relies on.",
+         once per landing, when other Work lands a change its Work relies on. \
+         With Dispatch's MCP server, an agent sees the Work of the project it works in and waits on it.",
         installed(&claude),
         path.display(),
         match &hermes {
@@ -534,17 +567,24 @@ async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
         },
         hermes_path.display()
     );
-    let rows = [
+    let mut rows = vec![
         Choice::new(format!("{} Claude Code hooks", claude.verb())),
         Choice::new(format!(
             "{} the Hermes hook",
             hermes.unwrap_or(Change::Install).verb()
         )),
-        Choice::new("Back"),
     ];
+    rows.extend(connected.iter().map(|agent| {
+        Choice::new(format!(
+            "Remove Dispatch's MCP server from {}",
+            agent.name()
+        ))
+    }));
+    rows.push(Choice::new("Back"));
     let runtime = match ui.select(&body, &rows, 0).await? {
         Some(0) => Runtime::Claude,
         Some(1) => Runtime::Hermes,
+        Some(i) if i - 2 < connected.len() => return disconnect_step(ui, connected[i - 2]).await,
         _ => return Ok(()),
     };
     hook_step(ui, state, runtime, true).await.map(drop)
@@ -735,9 +775,7 @@ async fn hook_step(ui: &mut Ui, state: &State, runtime: Runtime, menu: bool) -> 
         (Runtime::Hermes, Change::Update) => hermes::update(&path, &command)?,
         (Runtime::Hermes, Change::Remove) => hermes::uninstall(&path)?,
     };
-    let kept = backup.map_or_else(String::new, |backup| {
-        format!(" Previous configuration: {}.", backup.display())
-    });
+    let kept = previous(backup);
     ui.commit(&format!(
         "{name} {} in {shown}.{kept}{}",
         match change {
@@ -752,6 +790,180 @@ async fn hook_step(ui: &mut Ui, state: &State, runtime: Runtime, menu: bool) -> 
         }
     ))?;
     Ok(true)
+}
+
+/// What connecting Dispatch's MCP server gives the person's agents.
+const CONNECT: &str = "Connect Dispatch to your agents\nEach agent below can then start \
+     Dispatch's MCP server, dispatch mcp, in the project it works in, to see that project's \
+     Work, wait on it, and get what dispatch accept would land. Dispatch's tools only read, \
+     launch what your launch consent allows, or relay messages; none of them lands Work. This \
+     is for your user, in every project; Runtime integrations… removes it.";
+
+/// Why Codex's entry carries one more line than the others.
+const CODEX_APPROVE: &str = "default_tools_approval_mode = \"approve\" lets Codex call \
+     Dispatch's tools without asking you each time: codex exec refuses every call to them \
+     otherwise.";
+
+/// Setup's step that registers Dispatch's MCP server with each agent found
+/// on PATH. Registration is the user's, not the project's, so the step is
+/// offered only while an agent lacks it or runs another Dispatch's (an
+/// Update). It shows exactly what is run or written for each, and where, and
+/// focus starts on Skip. A server the person wrote, and a file Dispatch
+/// cannot read or leaves alone, stay as they are, and what cannot be
+/// connected is said in one line, never stopping setup. Returns false when
+/// the person backed out.
+async fn connect_step(ui: &mut Ui, state: &State) -> Result<bool> {
+    use crate::runtime::mcp::{self, Agent, Server};
+    let agents: Vec<Agent> = Agent::ALL
+        .into_iter()
+        .filter(|agent| which::which(agent.program()).is_ok())
+        .collect();
+    if agents.is_empty() {
+        return Ok(true);
+    }
+    let argv = match mcp::command(state) {
+        Ok(argv) => argv,
+        Err(error) => {
+            ui.commit(&format!(
+                "Dispatch's MCP server was not connected to your agents: {error:#}"
+            ))?;
+            return Ok(true);
+        }
+    };
+    let mut shown = vec![CONNECT.to_owned()];
+    let mut offered = Vec::new();
+    for agent in agents {
+        let name = agent.name();
+        let path = match agent.path() {
+            Ok(path) => path,
+            Err(error) => {
+                ui.commit(&format!("{name}: not connected: {error:#}"))?;
+                continue;
+            }
+        };
+        let at = path.display();
+        let read = agent
+            .server(&path)
+            .and_then(|found| Ok((found, agent.by_hand(&path, &argv)?)));
+        let found = match read {
+            Ok((Server::Ours(current), _)) if current == argv => continue,
+            Ok((Server::Changed, _)) => {
+                ui.commit(&format!(
+                    "{name}: {at} has a dispatch MCP server that setup did not write; setup leaves it as it is."
+                ))?;
+                continue;
+            }
+            Ok((_, Some(lines))) => {
+                ui.commit(&format!(
+                    "{name}: {at} has an mcp_servers: key of its own, so Dispatch leaves the file alone. Add these lines under it by hand:\n{lines}"
+                ))?;
+                continue;
+            }
+            Ok((found, None)) => found,
+            Err(error) => {
+                ui.commit(&format!("{name}: {error:#}"))?;
+                continue;
+            }
+        };
+        let update = matches!(found, Server::Ours(_));
+        let existing = match &found {
+            Server::Ours(old) => format!("Existing server command: {}\n", shell_words::join(old)),
+            _ => String::new(),
+        };
+        let how = match agent {
+            Agent::Claude => format!(
+                "Claude Code's own CLI writes it into {at}; Claude Code keeps its own backup:"
+            ),
+            Agent::Cursor => format!(
+                "Under mcpServers in {at}; its other settings are kept (key order may change), and a backup is kept beside the file:"
+            ),
+            _ if update => format!(
+                "Dispatch's block in {at} becomes this; every other byte of the file is kept, and a backup is kept beside it:"
+            ),
+            _ => format!(
+                "At the end of {at}; every other byte of the file is kept, and a backup is kept beside it:"
+            ),
+        };
+        let approve = match agent {
+            Agent::Codex => format!("\n{CODEX_APPROVE}"),
+            _ => String::new(),
+        };
+        shown.push(format!(
+            "{name} · {}\n{existing}{how}\n{}{approve}",
+            if update { "Update" } else { "Connect" },
+            agent.lines(&found, &argv)
+        ));
+        offered.push((agent, path, update));
+    }
+    if offered.is_empty() {
+        return Ok(true);
+    }
+    // The lines go to scrollback first, so a short terminal never clips the
+    // choice.
+    ui.commit(&shown.join("\n\n"))?;
+    let rows = [Choice::new("Connect"), Choice::new("Skip")];
+    match ui
+        .select("Connect Dispatch to these agents?", &rows, 1)
+        .await?
+    {
+        Some(0) => {}
+        choice => return Ok(choice.is_some()),
+    }
+    for (agent, path, update) in offered {
+        let name = agent.name();
+        ui.commit(&match agent.change(&path, Some(&argv)) {
+            Ok(backup) => format!(
+                "{name}: Dispatch's MCP server {} in {}.{}",
+                if update { "updated" } else { "connected" },
+                path.display(),
+                previous(backup)
+            ),
+            Err(error) => format!(
+                "{name}: not connected: {}",
+                clip(&format!("{error:#}"), 500)
+            ),
+        })?;
+    }
+    Ok(true)
+}
+
+/// Runtime integrations' removal of Dispatch's MCP server from one agent's
+/// configuration: only Dispatch's own entry, on a deliberate choice (focus
+/// starts on Cancel).
+async fn disconnect_step(ui: &mut Ui, agent: crate::runtime::mcp::Agent) -> Result<()> {
+    use crate::runtime::mcp::{Agent, REMOVE};
+    let name = agent.name();
+    let path = agent.path()?;
+    let at = path.display();
+    let what = match agent {
+        Agent::Claude => format!(
+            "Claude Code's own CLI removes it from {at}:\nclaude {}",
+            REMOVE.join(" ")
+        ),
+        Agent::Cursor => format!(
+            "Only mcpServers.dispatch is removed from {at}; its other settings are kept (key order may change), and a backup is kept beside the file."
+        ),
+        Agent::Codex | Agent::Hermes => format!(
+            "Only the block Dispatch added to {at} is removed, and only as Dispatch added it; a backup is kept beside the file."
+        ),
+    };
+    let body = format!("{name} · Remove Dispatch's MCP server\n{what}");
+    let rows = [Choice::new("Remove"), Choice::new("Cancel")];
+    if ui.select(&body, &rows, 1).await? != Some(0) {
+        return Ok(());
+    }
+    let backup = agent.change(&path, None)?;
+    ui.commit(&format!(
+        "{name}: Dispatch's MCP server removed from {at}.{}",
+        previous(backup)
+    ))
+}
+
+/// Where the configuration a step changed was kept, if it was.
+fn previous(backup: Option<std::path::PathBuf>) -> String {
+    backup.map_or_else(String::new, |backup| {
+        format!(" Previous configuration: {}.", backup.display())
+    })
 }
 
 /// A profile as a menu row: selecting it revalidates. A disabled profile

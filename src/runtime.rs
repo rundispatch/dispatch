@@ -20,6 +20,7 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod hermes;
+pub mod mcp;
 
 use std::{
     path::{Path, PathBuf},

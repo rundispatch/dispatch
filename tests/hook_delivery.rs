@@ -263,6 +263,11 @@ impl Project {
             .iter()
             .map(|(id, text)| serde_json::json!({"id": id, "text": text}))
             .collect();
+        self.pending(id, notes);
+    }
+
+    /// Leave `notes`, as the inbox holds them, for Work `id`.
+    fn pending(&self, id: &str, notes: Vec<Value>) {
         let inbox = serde_json::json!({"version": 1, "run_id": id, "notes": notes});
         let directory = self.state.join("inbox");
         fs::create_dir_all(directory.join("delivered")).unwrap();
@@ -578,6 +583,61 @@ fn hermes_hears_its_worktrees_notes_before_the_turn_from_a_megabyte_payload() {
         serde_json::json!({"context": "Work 01ABC (claude) landed fn f in src/lib.rs."})
     );
     assert_eq!(hermes(Some(&p.worktree)), Value::Null, "delivered once");
+}
+
+/// Two of Dispatch's notes and an orchestrating session's message, as the
+/// inbox keeps them: the notes, then the messages.
+fn notes_then_a_message() -> (Vec<Value>, String) {
+    let message = "Message from the orchestrating session (claude-code):\nRebase on main.";
+    let notes = vec![
+        serde_json::json!({"id": "n1", "text": "Work 01ABC (claude) landed fn f.", "kind": "note"}),
+        serde_json::json!({"id": "n2", "text": "Work 01DEF (hermes) changed fn g."}),
+        serde_json::json!({"id": "01M8MESSAGE0000000000000AA", "text": message, "kind": "message"}),
+    ];
+    let text =
+        format!("Work 01ABC (claude) landed fn f.\nWork 01DEF (hermes) changed fn g.\n{message}");
+    (notes, text)
+}
+
+/// A message and Dispatch's notes share one delivery, in the inbox's order,
+/// and the owner records each under its own kind.
+#[test]
+fn a_message_and_notes_are_delivered_together_in_order_and_recorded_apart() {
+    let mut p = Project::new();
+    let id = p.registered();
+    let (notes, text) = notes_then_a_message();
+    p.pending(&id, notes);
+    let reply = p.claude(&Project::tool(&p.worktree, ""));
+    assert_eq!(context(&reply, "PostToolUse").as_deref(), Some(&text[..]));
+    assert_eq!(p.claude(&Project::tool(&p.worktree, "")), Value::Null);
+    p.owner("recorded the delivery", |p| {
+        p.events(&id, "message.delivered").len() == 1
+    });
+    let notes: Vec<Value> = p
+        .events(&id, "note.delivered")
+        .iter()
+        .map(|event| event["note"].clone())
+        .collect();
+    assert_eq!(notes, ["n1", "n2"]);
+    let message = &p.events(&id, "message.delivered")[0];
+    assert_eq!(message["message"], "01M8MESSAGE0000000000000AA");
+    assert_eq!(message["via"], "PostToolUse");
+}
+
+/// Hermes's `pre_llm_call` carries a message as it carries a note.
+#[test]
+fn hermes_hears_a_message_before_its_next_turn_with_the_notes() {
+    let p = Project::new();
+    let id = p.registered();
+    let (notes, text) = notes_then_a_message();
+    p.pending(&id, notes);
+    let turn = hermes_turn(&p.root, 64 * 1024);
+    let hermes = || {
+        let (output, _) = p.hook("hermes", turn.as_bytes(), &[("TERMINAL_CWD", &p.worktree)]);
+        Project::printed(&output)
+    };
+    assert_eq!(hermes(), serde_json::json!({"context": text}));
+    assert_eq!(hermes(), Value::Null, "once");
 }
 
 /// An ask to catch up that no edited turn took comes with the next turn,

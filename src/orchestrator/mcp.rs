@@ -1,10 +1,11 @@
 //! `dispatch mcp`: a local stdio MCP server for one project, so an
-//! orchestrating agent can see the project's Work, launch agents, wait on
-//! them and get the landing proposal without a person polling a screen.
-//! JSON-RPC 2.0, one message per line on stdin and stdout; stdout carries
-//! nothing else. None of its tools lands, accepts, rejects, closes,
-//! refreshes or retries anything, and nothing is uploaded. `start` launches
-//! only what the person's launch consent for the project allows.
+//! orchestrating agent can see the project's Work, launch agents, message
+//! their live sessions, wait on them and get the landing proposal without a
+//! person polling a screen. JSON-RPC 2.0, one message per line on stdin and
+//! stdout; stdout carries nothing else. None of its tools lands, accepts,
+//! rejects, closes, refreshes or retries anything, and nothing is uploaded.
+//! `start` launches only what the person's launch consent for the project
+//! allows.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -27,12 +28,13 @@ use ulid::Ulid;
 
 use super::{
     background::{self, Watcher},
-    batch, one_line, serve, waits_for_decision,
+    batch, inbox, notify, one_line, serve, waits_for_decision,
 };
 use crate::{
-    Config, LifecycleState, RunMode, RunRecord, consent,
+    Config, LifecycleState, NeedsYouKind, RunMode, RunRecord, RuntimeSession, consent,
     db::Database,
     process::{IdentityState, identity_state},
+    runtime::claude,
     source,
     state::State,
 };
@@ -160,6 +162,34 @@ fn tools() -> Value {
                 While checks or a landing hold the source, it says so at once and \
                 waits for nothing.",
             "inputSchema": nothing,
+        },
+        {
+            "name": "send",
+            "description": "Send a message to the live agent session of a Work: a \
+                Claude Code session or subagent, or a Hermes session. Its hooks deliver \
+                it once and verbatim, after any of Dispatch's notes waiting there, under \
+                the line \"Message from the orchestrating session (<client>):\". \
+                delivered_by says when: next_tool_call (with the result of the session's \
+                next tool call; an idle session with no waiter, such as one started by \
+                `dispatch attach -- claude`, gets it in its next turn), waiter (the \
+                Claude Code session is idle, and its waiter wakes it with the message \
+                within about a second) or next_turn (Hermes, before its next turn). The \
+                text holds 8,000 characters less its label line and a newline (7,946 \
+                for the client claude-code), counted as Claude Code counts them, in \
+                UTF-16 code units, two for most emoji; a longer one is refused, never \
+                cut. Returns {id, message, delivered_by}. It is refused for Codex, \
+                Cursor and native runs, which no hook carries messages to; for Work \
+                that is finished or closed, or whose session ended; and for a subagent \
+                that stopped, which is not woken. It starts and lands nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The Work's run_id, or a unique prefix of it."},
+                    "text": {"type": "string", "minLength": 1, "description": "The message, delivered exactly as written."},
+                },
+                "required": ["id", "text"],
+                "additionalProperties": false,
+            },
         },
     ])
 }
@@ -388,6 +418,10 @@ async fn call(
                 propose_landing(&state, &root)
             })
             .await
+        }
+        "send" => {
+            let client = client.get().map_or("unknown", String::as_str).to_owned();
+            blocking(move || send(&state, &root, &client, &arguments)).await
         }
         _ => unreachable!("only a listed tool is called"),
     };
@@ -973,4 +1007,86 @@ fn propose_landing(state: &State, root: &Path) -> Result<Value> {
     }
     .into();
     Ok(proposal)
+}
+
+/// Relay `text` from the orchestrating session of `client` to the live
+/// session of the Work `id` names, through its inbox, and say which hook
+/// delivers it (`carrier`).
+fn send(state: &State, root: &Path, client: &str, arguments: &Map<String, Value>) -> Result<Value> {
+    only(arguments, &["id", "text"])?;
+    let given = |key: &str| arguments.get(key).and_then(Value::as_str);
+    let (Some(id), Some(text)) = (given("id"), given("text")) else {
+        bail!("send needs id, a Work's run_id as work gives it, and text, the message.");
+    };
+    if text.trim().is_empty() {
+        let blank = if text.is_empty() { "empty" } else { "blank" };
+        bail!("text is {blank}; give the message to send.");
+    }
+    let runs = state.load_source_runs(root)?;
+    let run = named(&runs, id)?;
+    let delivered_by = carrier(state, run)?;
+    // A finish or a close may come before the lock: judged again under it.
+    let Some(message) = inbox::send(state, &run.id, client, text, in_progress)? else {
+        bail!("Work {} is busy; call again shortly.", run.id);
+    };
+    Ok(json!({"id": run.id, "message": message, "delivered_by": delivered_by}))
+}
+
+/// What ends `send`'s refusals of Work that is not live.
+const LIVE: &str = "only a live session gets a message";
+
+/// Refuse `run` once it is closed or finished.
+fn in_progress(run: &RunRecord) -> Result<()> {
+    if run.outcome.closed.is_some() {
+        bail!("Work {} is closed; {LIVE}.", run.id);
+    }
+    if run.outcome.lifecycle != LifecycleState::Working {
+        bail!("Work {} is finished; {LIVE}.", run.id);
+    }
+    Ok(())
+}
+
+/// The hook that delivers a message to `run`'s agent next, or why none
+/// will: only Claude Code's and Hermes's hooks deliver an inbox (as they do
+/// notes), to a session still open in Work in progress, and a subagent that
+/// stopped is not woken. An idle Claude Code session's waiter delivers it
+/// within about a second, when one waits (`claude::waiting`).
+fn carrier(state: &State, run: &RunRecord) -> Result<&'static str> {
+    let hooked =
+        |session: &RuntimeSession| matches!(session.provider.as_str(), "claude" | "hermes");
+    let attached = run.attachment.as_ref();
+    let Some(attachment) = attached.filter(|a| a.sessions.iter().any(hooked)) else {
+        let runtime = notify::runtime(run).unwrap_or("its agent");
+        if attached.is_some() && runtime == "Claude Code" {
+            bail!(
+                "No Claude Code hook has reported a session for Work {}.",
+                run.id
+            );
+        }
+        let native = attached.map_or(" in a native run", |_| "");
+        bail!("No hook carries messages to {runtime}{native}.");
+    };
+    in_progress(run)?;
+    let id = &run.id;
+    if attachment.workspace_removed.is_some() {
+        bail!("Work {id}'s workspace was removed; {LIVE}.");
+    }
+    let open = |session: &&RuntimeSession| hooked(session) && session.ended_at.is_none();
+    let Some(session) = attachment.sessions.iter().rfind(open) else {
+        bail!("Work {id}'s session ended; {LIVE}.");
+    };
+    if let Some(subagent) = &session.subagent {
+        if subagent.stopped_at.is_some() {
+            bail!("Work {id} is a subagent that stopped, and a stopped subagent is not woken.");
+        }
+        return Ok("next_tool_call");
+    }
+    let idle = attachment.needs_you.as_ref().is_some_and(|mark| {
+        mark.session_id == session.session_id && mark.kind != NeedsYouKind::Permission
+    });
+    Ok(match session.provider.as_str() {
+        "hermes" => "next_turn",
+        _ if idle && claude::waiting(state, &session.session_id) => "waiter",
+        _ => "next_tool_call",
+    })
 }

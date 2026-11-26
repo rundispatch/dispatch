@@ -57,6 +57,8 @@ impl Project {
             .current_dir(&self.root)
             .env("HOME", &home)
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("HERMES_HOME", home.join(".hermes"))
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout).unwrap())
             .stderr(fs::File::create(&stderr).unwrap())
@@ -215,6 +217,11 @@ fn setup_without_a_terminal_cannot_grant_or_install_anything() {
             .path()
             .join("home/.claude/settings.json")
             .exists()
+    );
+    // No agent's configuration either: hooks, or Dispatch's MCP server.
+    assert_eq!(
+        files(&project.temp.path().join("home")),
+        Vec::<String>::new()
     );
     assert!(!project.state.join("watchers").exists());
     project.assert_nothing_ran();

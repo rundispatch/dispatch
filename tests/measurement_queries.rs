@@ -248,6 +248,74 @@ fn the_note_queries_give_the_hand_derived_counts() {
     assert_eq!(sets[2], rows(&["notes_unsettled 1 1"]));
 }
 
+/// An orchestrating session's messages (`message.*`) are not notes: with
+/// them recorded on the same Work, written, delivered, left pending and
+/// expired, every row of the note queries is the same.
+#[test]
+fn the_note_queries_count_no_message() {
+    let messages = [
+        (
+            "message.written",
+            "10:00:30",
+            r#"{"message": "m1", "text": "t", "client": "claude-code"}"#,
+        ),
+        (
+            "message.delivered",
+            "10:00:40",
+            r#"{"message": "m1", "via": "PostToolUse"}"#,
+        ),
+        (
+            "message.written",
+            "10:30:00",
+            r#"{"message": "m2", "text": "t", "client": "codex-mcp-client"}"#,
+        ),
+        (
+            "message.delivered",
+            "10:30:30",
+            r#"{"message": "m2", "via": "wake"}"#,
+        ),
+        (
+            "message.written",
+            "10:40:00",
+            r#"{"message": "m3", "text": "t", "client": "Cursor"}"#,
+        ),
+        (
+            "message.written",
+            "10:45:00",
+            r#"{"message": "m4", "text": "t", "client": "unknown"}"#,
+        ),
+        (
+            "message.expired",
+            "10:50:00",
+            r#"{"message": "m4", "lifecycle": "finished"}"#,
+        ),
+    ];
+    let mut events = NOTE_EVENTS.to_owned();
+    for run in ["01J9NOTEW10000000000000000", "01J9NOTEW30000000000000000"] {
+        for (kind, at, payload) in messages {
+            events += &format!(
+                r#"{{"run_id": "{run}", "event_type": "{kind}", "timestamp": "2026-11-05T{at}Z", "payload": {payload}}}"#
+            );
+            events.push('\n');
+        }
+    }
+    let queried = |events: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = state_with(dir.path(), events);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE runs SET outcome_json = '{\"lifecycle\": \"working\"}' WHERE id = ?1",
+                ["01J9NOTEW30000000000000000"],
+            )
+            .unwrap();
+        run_queries(&path, NOTE_QUERIES)
+    };
+    let without = queried(NOTE_EVENTS);
+    assert_eq!(without[2], rows(&["notes_unsettled 1 1"]));
+    assert_eq!(queried(&events), without);
+}
+
 /// Without notes: no rows, and nothing unsettled.
 #[test]
 fn the_note_queries_report_nothing_without_notes() {

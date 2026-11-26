@@ -3,11 +3,12 @@
 //! the `ExitWorktree` tool with `action: remove`, which does not run
 //! `WorktreeRemove`; and `Notification` and `Stop`, when the session waits on
 //! the person) as `RuntimeEvent`s, and the reply Claude Code shows the
-//! person. `SessionStart` and `PostToolUse` also deliver pending notes to the
-//! agent, as `additionalContext`: Claude Code shows it to the model before
-//! the first prompt, or right after the tool's result. A pending ask to catch
-//! up is delivered at `Stop`, which it keeps going, or by the waiter, a second
-//! `Stop` hook that wakes an idle session (`wait`).
+//! person. `SessionStart` and `PostToolUse` also deliver pending notes, and
+//! an orchestrating session's messages, to the agent, as `additionalContext`:
+//! Claude Code shows it to the model before the first prompt, or right after
+//! the tool's result. A pending ask to catch up is delivered at `Stop`, which
+//! it keeps going, or by the waiter, a second `Stop` hook that wakes an idle
+//! session (`wait`), as it does for a message.
 //!
 //! A subagent in its own worktree (`isolation: worktree`) is a session of its
 //! own (`isolated`): `SubagentStart` registers it and delivers notes, as
@@ -27,7 +28,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{EventKind, Hook, Reply, RuntimeEvent};
-use crate::{NeedsYouKind, Subagent, orchestrator::catchup, state::State};
+use crate::{
+    NeedsYouKind, Subagent,
+    orchestrator::{catchup, inbox},
+    state::State,
+};
 
 #[derive(Deserialize)]
 struct Input {
@@ -362,11 +367,14 @@ pub const MAX_WAIT: Duration = Duration::from_secs(WAITER_TIMEOUT - 60);
 /// Claude Code runs in the background (`asyncRewake`). Its exit status 2
 /// gives the session its stderr, waking it when idle, or at the next tool
 /// call when busy (observed with Claude Code 2.1.296). It waits for an ask
-/// to catch up for its workspace, looking once a second with one `stat`, and
-/// leaves at once in a project nobody watches or a workspace the owner keeps
-/// no record for. It leaves when a newer waiter of its session starts, when
-/// its session ends (its parent, the Claude Code process, changes), and
-/// after `max_wait`. It never prints to stdout.
+/// to catch up for its workspace, or for a message from an orchestrating
+/// session in its inbox, which it delivers after the notes there; a message
+/// that does not fit after them goes in the next delivery. It looks once a
+/// second, with one `stat` of the ask and one read of the inbox, and leaves
+/// at once in a project nobody watches or a workspace the owner keeps no
+/// record for. It leaves when a newer waiter of its session starts, when its
+/// session ends (its parent, the Claude Code process, changes), and after
+/// `max_wait`. It never prints to stdout.
 pub fn wait(state: &State, input: &[u8], max_wait: Duration) -> Output {
     let (began, claude) = (Instant::now(), parent());
     let quiet = Output {
@@ -396,9 +404,14 @@ pub fn wait(state: &State, input: &[u8], max_wait: Duration) -> Output {
         if began.elapsed() >= max_wait || parent() != claude || !newest.still() {
             return quiet;
         }
-        if pending.exists()
-            && let Some(text) = catchup::claim(state, &workspace, "wake")
-        {
+        let text = if pending.exists() {
+            catchup::claim(state, &workspace, "wake")
+        } else if inbox::has_message(state, &workspace) {
+            inbox::claim(state, &workspace, "wake")
+        } else {
+            None
+        };
+        if let Some(text) = text {
             return Output {
                 stdout: String::new(),
                 stderr: text,
@@ -406,6 +419,23 @@ pub fn wait(state: &State, input: &[u8], max_wait: Duration) -> Output {
             };
         }
     }
+}
+
+/// Whether a waiter of `session` waits now: one passed its gates and wrote
+/// its pid to `waiters/<session>` (`Newest::start`) less than `MAX_WAIT`
+/// ago, and that process runs.
+pub(crate) fn waiting(state: &State, session: &str) -> bool {
+    if !super::session_id(session) {
+        return false;
+    }
+    let path = state.root.join("waiters").join(session);
+    let recent = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|written| written.elapsed().is_ok_and(|age| age < MAX_WAIT));
+    let pid = fs::read_to_string(&path)
+        .ok()
+        .and_then(|pid| pid.parse().ok());
+    recent && pid.is_some_and(crate::process::pid_exists)
 }
 
 /// A waiter as the newest of its session's: `waiters/<session>` is its own
@@ -546,11 +576,20 @@ pub const START_ADVICE: &str = "Claude Code: local commits reach a claude --work
 pub const SUBAGENT_START_ADVICE: &str = "Claude Code: a subagent's worktree starts from the \
      checkout's HEAD; uncommitted changes are not copied.";
 
+/// `$CLAUDE_CONFIG_DIR`, where Claude Code keeps the user's configuration in
+/// place of `~/.claude` and `~/.claude.json`. An empty value is unset: it
+/// would put Claude Code's files in the working directory.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|directory| !directory.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// Where Claude Code keeps the user's settings: `$CLAUDE_CONFIG_DIR`, or
 /// `~/.claude`.
 pub fn settings_path() -> Result<std::path::PathBuf> {
-    let directory = match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(directory) => std::path::PathBuf::from(directory),
+    let directory = match config_dir() {
+        Some(directory) => directory,
         None => std::path::PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
             .join(".claude"),
     };
